@@ -54,6 +54,20 @@ GLOBAL and built ONCE per process — the FIRST render call in a process fixes t
 `ProcessPoolExecutor(max_workers=16)` pass `threads=1` (each worker process gets its own
 pool) so 16 concurrent renders do not each grab every core.
 
+## Logging
+
+The binding is **silent by default**: the engine's diagnostic stderr lines (e.g.
+`simsat ingest: run=... dims=... wall=...` progress, MAP_PROJ / moving-nest warnings)
+are suppressed when the module is imported, so batch runs are not spammed. To see them:
+
+- `simsat.set_verbose(True)` — enable at runtime (`set_verbose(False)` silences again), or
+- set the environment variable `SIMSAT_LOG=1` (or `true`) before `import simsat`.
+
+The messages go to **STDERR** and their text is unchanged from the CLI's, so existing
+log-parsing scripts work when enabled. This switch gates diagnostic chatter only —
+render-honesty reporting (`georef.time_is_fallback` / `ground_source` / `ground_status`
+and their `UserWarning`s) is data, not logs, and is always active.
+
 ## The `georef` object
 
 | attribute | value |

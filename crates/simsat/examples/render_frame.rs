@@ -45,6 +45,20 @@
 //!                      1.0 = disable the shoulder (hard clamp).
 //!   topdown-cloudnorm=<f>  OVERRIDE the baked TOP-DOWN CLOUD NORMALIZATION
 //!                      (topdown::TOPDOWN_CLOUD_NORM); 1.0 = no normalization.
+//!   synthetic-green=<b> on | off (default off) — the ABI SYNTHETIC-GREEN display mode
+//!                      prototype (low-sun visible pass): display green becomes
+//!                      G' = 0.45*R + 0.45*B + 0.10*G (Bah et al. 2018), the real
+//!                      GOES-R true-color green arithmetic (khaki/mauve casts are
+//!                      impossible in it by construction). A/B judgment flag; applies
+//!                      to the whole process (all products rendered by this run).
+//!   bands-out=<path.bin>  QA/diagnostic: ALSO render the SAME scene through
+//!                      `Product::VisibleBands` and write the RAW pre-tonemap,
+//!                      pre-exposure reflectance (`nx*ny*3` little-endian f32, row 0 =
+//!                      north, band order R,G,B per pixel) + print a `BANDS ...` line.
+//!                      Splits the pipeline for offline analysis: physics color/texture
+//!                      is in the .bin; the display transform's contribution is the
+//!                      delta between the .bin pushed through the (pure) tonemap and
+//!                      the PNG. Costs a second full render.
 //!
 //! On completion it prints a one-line `SUMMARY ...` (dims, on-earth fraction, centre sun
 //! elevation, exposure, multiscatter, wall time, peak/median display luminance, the
@@ -116,6 +130,10 @@ struct Opts {
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
     topdown_cloud_norm: Option<f64>,
+    /// QA/diagnostic: also dump the raw pre-tonemap reflectance bands to this path.
+    bands_out: Option<PathBuf>,
+    /// ABI synthetic-green display mode (prototype A/B; default off).
+    synthetic_green: bool,
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -160,6 +178,11 @@ fn run(args: &[String]) -> Result<(), String> {
         std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
     ));
     simsat::platform::lower_ingest_thread_priority();
+    // ABI synthetic-green display mode (prototype A/B; process-global, default off).
+    simsat::render::set_synthetic_green(opts.synthetic_green);
+    if opts.synthetic_green {
+        eprintln!("render_frame: ABI SYNTHETIC-GREEN display mode ON (G' = 0.45R + 0.45B + 0.10G)");
+    }
 
     // ── the one shared render assembly ──
     let params = render_params(&opts);
@@ -212,6 +235,27 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // ── optional raw-bands diagnostic dump (a second render through VisibleBands) ──
+    if let Some(bands_path) = &opts.bands_out {
+        let bands_result = api::render(&params, Product::VisibleBands)?;
+        let reflectance = match &bands_result.data {
+            FrameData::Bands { reflectance } => reflectance,
+            _ => return Err("expected a bands frame".to_string()),
+        };
+        let mut bytes = Vec::with_capacity(reflectance.len() * 4);
+        for v in reflectance {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(bands_path, &bytes)
+            .map_err(|e| format!("write bands {}: {e}", bands_path.display()))?;
+        println!(
+            "BANDS file={} dims={}x{} channels=3 dtype=f32le rows=north-first",
+            bands_path.display(),
+            bands_result.nx,
+            bands_result.ny,
+        );
+    }
+
     // ── stats for the manifest ──
     let (on_earth, peak_lum, median_lum) = display_luma_stats(rgba);
     let on_earth_frac = on_earth as f64 / (rnx * rny).max(1) as f64;
@@ -224,7 +268,8 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
         "SUMMARY file={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
-         sun_elev={:.1} exposure={:.3} multiscatter={} steps={} on_earth_frac={:.3} \
+         sun_elev={:.1} exposure={:.3} multiscatter={} steps={} synthetic_green={} \
+         on_earth_frac={:.3} \
          peak_lum={:.3} median_lum={:.3} cloud_frac={:.3} peak_reflectance={:.4} \
          peak_sun_reflectance={:.4} cloud_lum_p90_p10={:.4} cloud_lum_frac={:.3} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
@@ -247,6 +292,7 @@ fn run(args: &[String]) -> Result<(), String> {
         } else {
             "interactive"
         },
+        opts.synthetic_green,
         on_earth_frac,
         peak_lum,
         median_lum,
@@ -333,6 +379,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         multiscatter: opts.multiscatter,
         steps: opts.steps,
         clouds: opts.clouds,
+        granulation: None, // the api product-scoping default (display products granulate)
         sun_override,
         cache: opts.cache.clone(),
         bluemarble,
@@ -455,6 +502,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut ground_gain: Option<f64> = None;
     let mut cloud_softclip: Option<f64> = None;
     let mut topdown_cloud_norm: Option<f64> = None;
+    let mut bands_out: Option<PathBuf> = None;
+    let mut synthetic_green = false;
 
     for a in args {
         let (k, v) = a
@@ -515,6 +564,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                         .map_err(|_| format!("bad topdown-cloudnorm '{v}'"))?,
                 )
             }
+            "bands-out" | "bands_out" | "bandsout" => bands_out = Some(PathBuf::from(v)),
+            "synthetic-green" | "synthetic_green" | "syngreen" => synthetic_green = parse_bool(v)?,
             other => return Err(format!("unknown key '{other}'")),
         }
     }
@@ -545,6 +596,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         ground_gain,
         cloud_softclip,
         topdown_cloud_norm,
+        bands_out,
+        synthetic_green,
     })
 }
 
@@ -641,6 +694,8 @@ fn print_usage() {
          \x20 sandwich=<b>       on|off  Sandwich (true-color base + color IR on cold tops)\n\
          \x20 ground-gain=<f>    override the baked GROUND LIFT (1.0 = neutral)\n\
          \x20 cloud-softclip=<f> override the highlight soft-clip knee (1.0 = disable)\n\
-         \x20 topdown-cloudnorm=<f>  override the top-down cloud normalization (1.0 = none)\n"
+         \x20 topdown-cloudnorm=<f>  override the top-down cloud normalization (1.0 = none)\n\
+         \x20 synthetic-green=<b> on|off ABI synthetic-green display mode (G'=0.45R+0.45B+0.10G)\n\
+         \x20 bands-out=<path.bin>  QA: also dump raw pre-tonemap reflectance (f32le RGB)\n"
     );
 }

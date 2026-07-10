@@ -223,6 +223,297 @@ pub fn edge_feather(fi: f64, fj: f64, nx: usize, ny: usize, band_cells: f64) -> 
     t * t * (3.0 - 2.0 * t) // smoothstep, monotone on [0, 1]
 }
 
+// ── sub-grid cloud GRANULATION (edge-erosion detail noise) ────────────────────
+//
+// WRF cannot resolve the sub-kilometre elements of a boundary-layer cumulus field
+// (its effective resolution is ~7 dx — Skamarock 2004, MWR 132), so popcorn-cu /
+// confluence-band cloud renders as hard-edged solid-white cutouts where the real sky
+// is a granular carpet of sub-grid elements. GRANULATION represents that unresolved
+// variability by a SUBTRACT-ONLY, deterministic EROSION of the sampled extinction:
+//
+//   sigma' = sigma * m(d, e),  m = remap-style multiplier (Nubis/Decima lineage),
+//   d = sigma / (trilinear-corner-neighbourhood max)  — the RELATIVE density,
+//   e = amplitude/GRAN_AMP_CAP * gate * noise         — the erosion threshold,
+//
+// where `noise` is a 3-octave 2-D WORLEY (cellular) F1 field — cumulus morphology per
+// the Nubis/Decima detail-erosion lineage (Schneider, "The Real-Time Volumetric
+// Cloudscapes of Horizon: Zero Dawn", SIGGRAPH 2015 Advances) — with octave weights
+// following a k^-5/3 spectrum envelope (observed liquid-water spectra: Davis et al.
+// 1996, JAS 53; the 3DCLOUD realism criterion: Szczap et al. 2014, GMD 7), base cell
+// scale a few hundred metres to ~1 km (the dominant element scale of the observed
+// cloud-size distribution, power-law exponent ~1.66: Wood & Field 2011, J. Climate 24).
+// The noise is 2-D (horizontal) so grains are vertically-coherent COLUMNS, the honest
+// morphology of boundary-layer elements, and it is anchored DETERMINISTICALLY in
+// brick/world space (position-hash cells, the hash01_position style): the same run
+// renders the same field every frame (loops do not shimmer) and the geostationary and
+// top-down views agree exactly (both sample by fractional brick coordinates).
+//
+// HONESTY CONTRACT (each point is test-pinned):
+//   - SUBTRACT-ONLY: sigma' <= sigma everywhere; sigma = 0 stays 0 — the erosion never
+//     ADDS cloud where the model has none.
+//   - The remap pins d = 1 to m = 1: the interior of an optically thick core (at its
+//     neighbourhood max) is byte-UNTOUCHED; erosion lives where the local extinction is
+//     low relative to its neighbourhood (edges, trilinear tent flanks) — which is what
+//     GRANULATES a blocky cell into grains instead of merely feathering its outline.
+//   - AMPLITUDE = the unresolved-variance fraction of a k^-5/3 spectrum integrated
+//     from the model's effective resolution (~7 dx, Skamarock 2004) down to the finest
+//     represented scale, normalised toward the observed all-scale fractional standard
+//     deviation of cloud condensate ~0.75 (Shonk et al. 2010, QJRMS 136, Tripleclouds)
+//     and CAPPED so the field-mean tau reduction stays within the ~0.7 plane-parallel
+//     correction bound (Cahalan et al. 1994, JAS 51) — it can never over-thin. On a
+//     250 m run the amplitude is naturally small (~0.17 — the model already resolves
+//     the texture); on a 2-3 km run it is strong (~0.44-0.48).
+//   - SPECIES/HEIGHT GATED: full strength only on LIQUID extinction in the boundary
+//     layer (below ~4 km), fading to zero by ~7 km; ice anvils and cirrus are left
+//     alone (their edges already render correctly; cirrus inhomogeneity is a separate,
+//     weaker regime — Hogan & Kew 2005, QJRMS 131).
+//   - SCOPING: display products only (VisibleRgb, the GeoColor day half, the Sandwich
+//     visible base). Raw-Kelvin thermal products (IR/WV) march the separate IrVolume
+//     and are byte-identical by construction; the raw-reflectance bands and derived
+//     fields default OFF (quantitative outputs must reflect model skill, not display
+//     texturing) — see `api::RenderParams::granulation`.
+//
+// HONEST LIMITATION (McICA/COSP precedent — a SUB-GRID VARIABILITY representation,
+// not stochastic cloud placement): erosion can only carve what the model put there.
+// It breaks up cell-scale blobs and band edges; it cannot recreate distinct sub-km
+// elements deep inside a 20 km SOLID overcast slab (whose interior is honestly at its
+// neighbourhood max and stays untouched).
+//
+// The eroded field is applied at the SAMPLER level ([`DecodedVolume::sample_granulated`])
+// and the same [`Granulation`] value is threaded to the view march, the secondary sun
+// march ([`MarchConfig::granulation`]) AND the sun-OD map accumulation
+// ([`accumulate_sun_od_granulated`]), so every march of one composite samples the SAME
+// eroded field (clouds, their self-shadows and their ground shadows stay consistent).
+// The occupancy mip is built from the UN-ERODED field — erosion only reduces extinction,
+// so the mip stays conservative. `tau_up` (an ingest-time column integral) is NOT eroded
+// (it feeds only the cloud-ambient attenuation; a documented second-order approximation).
+
+/// The three Worley octave cell scales (m): base ~1 km down to ~250 m (Wood & Field
+/// 2011 element scales; the finest octave is [`GRAN_MIN_SCALE_M`], the render-scale
+/// floor of the spectrum integral).
+pub const GRAN_OCTAVE_SCALES_M: [f64; 3] = [1000.0, 500.0, 250.0];
+/// Octave AMPLITUDE weights following the k^-5/3 energy-spectrum envelope: the band
+/// standard deviation scales as lambda^(1/3), so `w_i = lambda_i^(1/3) / sum` =
+/// cbrt(1000)/S, cbrt(500)/S, cbrt(250)/S with S = 24.2366105 (literals — cbrt is not
+/// const and libm bit-variation must not enter the deterministic field).
+pub const GRAN_OCTAVE_WEIGHTS: [f64; 3] = [0.412_598_7, 0.327_480_0, 0.259_921_3];
+/// Per-octave hash salts (arbitrary, fixed — part of the deterministic anchoring).
+pub const GRAN_OCTAVE_SALTS: [u32; 3] = [0x51A7_C0DE, 0x9BD2_A0E5, 0x2F63_D19B];
+/// The finest represented granulation scale (m) — the lower limit of the k^-5/3
+/// variance integral and the smallest octave cell.
+pub const GRAN_MIN_SCALE_M: f64 = 250.0;
+/// The outer reference scale (m) of the unresolved-variance normalisation: the
+/// GCM-gridbox scale at which the Shonk et al. (2010) fractional standard deviation
+/// ~0.75 was estimated. The amplitude asymptotes toward [`GRAN_SHONK_FSD`] (then the
+/// Cahalan cap) as the model grid coarsens toward it.
+pub const GRAN_SPECTRUM_OUTER_M: f64 = 100_000.0;
+/// The observed all-scale fractional standard deviation of cloud condensate (Shonk
+/// et al. 2010, QJRMS 136: the global Tripleclouds estimate).
+pub const GRAN_SHONK_FSD: f64 = 0.75;
+/// A model's EFFECTIVE resolution in grid cells (Skamarock 2004, MWR 132: kinetic-energy
+/// spectra of WRF forecasts decay below ~7 dx).
+pub const SKAMAROCK_EFFECTIVE_RES_CELLS: f64 = 7.0;
+/// The plane-parallel correction bound (Cahalan et al. 1994, JAS 51: the effective
+/// optical depth of inhomogeneous stratocumulus ~0.7x the mean): the field-mean tau
+/// reduction of the erosion must stay within `1 - 0.7`; the amplitude cap and the
+/// tail-shaped erosion field keep it there (test-pinned).
+pub const CAHALAN_TAU_FACTOR: f64 = 0.7;
+/// The amplitude cap enforcing the Cahalan bound: for a zero-gap binary medium at
+/// fractional standard deviation `s`, the subtract-only realisation keeps `1/(1+s^2)`
+/// of the mean; `s = sqrt(1/0.7 - 1) = 0.655` is the bound, capped below it at 0.6.
+pub const GRAN_AMP_CAP: f64 = 0.6;
+/// The erosion-threshold gain: `e = amplitude/GRAN_AMP_CAP * gate * noise`, so the
+/// erosion threshold reaches full carve (1.0) exactly at the Cahalan-limit amplitude.
+pub const GRAN_EROSION_GAIN: f64 = 1.0 / GRAN_AMP_CAP;
+/// Erosion-threshold ceiling (keeps the remap denominator `1 - e` well-conditioned).
+pub const GRAN_EROSION_MAX: f64 = 0.98;
+/// Full granulation strength at/below this MSL height (m): the boundary-layer liquid
+/// regime (spec: "strong on boundary-layer liquid below ~4 km").
+pub const GRAN_HEIGHT_FULL_M: f64 = 4000.0;
+/// Zero granulation at/above this MSL height (m): mid/high cloud (supercooled decks,
+/// anvils, cirrus) is left alone (Hogan & Kew 2005). Smoothstep between the two.
+pub const GRAN_HEIGHT_ZERO_M: f64 = 7000.0;
+/// The tail-shaping window on the raw octave-Worley value: the erosion field is
+/// `smoothstep(GRAN_CARVE_LO, GRAN_CARVE_HI, W)`, i.e. zero over the low-W GRAIN
+/// interiors (most of the field survives untouched) and 1 over the high-W Voronoi
+/// BORDER network (the carved gaps between grains) — the grain/gap bimodality that
+/// makes the erosion granulate instead of uniformly dimming, and what keeps the mean
+/// reduction inside the Cahalan bound (the eroded area fraction is the W-tail).
+pub const GRAN_CARVE_LO: f64 = 0.52;
+/// See [`GRAN_CARVE_LO`].
+pub const GRAN_CARVE_HI: f64 = 0.62;
+/// INTERIOR-PROTECTION window on the RELATIVE density `d` (round-1 QA lever): the
+/// erosion threshold is scaled by `1 - smoothstep(GRAN_INTERIOR_LO,
+/// GRAN_INTERIOR_HI, d)`, so a sample at `d >= GRAN_INTERIOR_HI` never erodes and
+/// only genuinely boundary-relative samples (`d <= GRAN_INTERIOR_LO`: trilinear
+/// tent flanks, band edges) see the full threshold. WITHOUT this, the ordinary
+/// cell-to-cell LWC variability INSIDE a wide solid stratus deck (relative density
+/// ~0.75-1 against the local max) read as "edge" and the pure remap peppered the
+/// deck with dark pinholes (the round-1 1974 frame). Erosion is for boundaries;
+/// deck interiors stay solid — consistent with the documented honest limitation.
+pub const GRAN_INTERIOR_LO: f64 = 0.45;
+/// See [`GRAN_INTERIOR_LO`].
+pub const GRAN_INTERIOR_HI: f64 = 0.75;
+
+/// Sub-grid granulation parameters carried by [`MarchConfig::granulation`] and
+/// [`accumulate_sun_od_granulated`]. `None` anywhere = the feature fully off
+/// (byte-identical to the pre-granulation render).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Granulation {
+    /// The erosion amplitude in `[0, GRAN_AMP_CAP]` — the unresolved fractional
+    /// standard deviation for the model grid (see [`granulation_amplitude`]).
+    pub amplitude: f64,
+}
+
+impl Granulation {
+    /// The granulation for a model grid spacing `dx_m` (m): the dx-derived amplitude.
+    /// `Granulation::for_grid(250.0).amplitude` is ~0.17 (a 250 m run — near-neutral);
+    /// `for_grid(3000.0)` is ~0.44 (a 3 km run — strong).
+    pub fn for_grid(dx_m: f64) -> Self {
+        Self {
+            amplitude: granulation_amplitude(dx_m),
+        }
+    }
+}
+
+/// A clamped smoothstep of `t` (0 below 0, 1 above 1, C1 in between).
+#[inline]
+fn smooth01(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The dx-derived granulation amplitude: the unresolved fractional standard deviation
+/// of a k^-5/3 spectrum. Variance between scales `[a, b]` of `E(k) ~ k^-5/3` is
+/// proportional to `b^(2/3) - a^(2/3)` (in wavelength terms), so the fraction of the
+/// all-scale (outer = [`GRAN_SPECTRUM_OUTER_M`]) variance the model leaves unresolved
+/// between its effective resolution `7 dx` (Skamarock 2004) and the finest represented
+/// scale [`GRAN_MIN_SCALE_M`] is `(lam_eff^(2/3) - lam_min^(2/3)) / (L^(2/3) -
+/// lam_min^(2/3))`; the amplitude is [`GRAN_SHONK_FSD`] x its square root, capped at
+/// [`GRAN_AMP_CAP`] (the Cahalan bound). Monotone in `dx`; ~0.17 at 250 m, ~0.29 at
+/// 1 km, ~0.44 at 3 km, capped from ~7.4 km up. Non-finite / non-positive `dx` -> 0.
+pub fn granulation_amplitude(dx_m: f64) -> f64 {
+    if !dx_m.is_finite() || dx_m <= 0.0 {
+        return 0.0;
+    }
+    let lam_eff = (SKAMAROCK_EFFECTIVE_RES_CELLS * dx_m).max(GRAN_MIN_SCALE_M);
+    let pow23 = |x: f64| x.powf(2.0 / 3.0);
+    let num = pow23(lam_eff) - pow23(GRAN_MIN_SCALE_M);
+    let den = pow23(GRAN_SPECTRUM_OUTER_M) - pow23(GRAN_MIN_SCALE_M);
+    let frac = (num / den).clamp(0.0, 1.0);
+    (GRAN_SHONK_FSD * frac.sqrt()).min(GRAN_AMP_CAP)
+}
+
+/// Deterministic cell hash to `[0, 1)` — the hash01_position-style integer avalanche
+/// over a 2-D noise-cell coordinate + salt (platform-stable pure function; the
+/// granulation anchor). Twin of `gran_cell_hash01` in `clouds.wgsl`.
+#[inline]
+fn gran_cell_hash01(ix: i64, iy: i64, salt: u32) -> f64 {
+    let mut h = (ix as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add((iy as u32).wrapping_mul(0x85EB_CA6B))
+        .wrapping_add(salt.wrapping_mul(0xC2B2_AE35));
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    h as f64 / 4_294_967_296.0
+}
+
+/// 2-D Worley (cellular) F1: the distance from `(qx, qy)` (in CELL units) to the
+/// nearest jittered feature point (one per integer cell, position hashed from the
+/// cell coordinate + salt), clamped to `[0, 1]`. ~0 at grain centres, high on the
+/// Voronoi border network between them.
+fn worley2_f1(qx: f64, qy: f64, salt: u32) -> f64 {
+    let bx = qx.floor() as i64;
+    let by = qy.floor() as i64;
+    let mut best = f64::INFINITY;
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            let cx = bx + dx;
+            let cy = by + dy;
+            let fx = cx as f64 + gran_cell_hash01(cx, cy, salt);
+            let fy = cy as f64 + gran_cell_hash01(cx, cy, salt ^ 0x68E3_1DA4);
+            let d2 = (qx - fx) * (qx - fx) + (qy - fy) * (qy - fy);
+            if d2 < best {
+                best = d2;
+            }
+        }
+    }
+    best.sqrt().clamp(0.0, 1.0)
+}
+
+/// The GRANULATION EROSION FIELD at a horizontal position (m) in the brick plane:
+/// the k^-5/3-weighted 3-octave Worley F1 ([`GRAN_OCTAVE_SCALES_M`] /
+/// [`GRAN_OCTAVE_WEIGHTS`]) tail-shaped through `smoothstep(GRAN_CARVE_LO,
+/// GRAN_CARVE_HI, W)` into `[0, 1]`: 0 over grain interiors (no erosion), 1 on the
+/// carved gap network. Pure and deterministic in the position (memoised per thread
+/// for the exact repeated `(u, v)` a nadir top-down column produces — a bit-exact
+/// cache, never an approximation).
+pub fn granulation_erosion_noise(u_m: f64, v_m: f64) -> f64 {
+    thread_local! {
+        static MEMO: std::cell::Cell<(u64, u64, f64)> =
+            const { std::cell::Cell::new((0, 0, -1.0)) };
+    }
+    let key = (u_m.to_bits(), v_m.to_bits());
+    let hit = MEMO.with(|m| m.get());
+    if hit.2 >= 0.0 && hit.0 == key.0 && hit.1 == key.1 {
+        return hit.2;
+    }
+    let mut w = 0.0f64;
+    for i in 0..GRAN_OCTAVE_SCALES_M.len() {
+        let lam = GRAN_OCTAVE_SCALES_M[i];
+        w += GRAN_OCTAVE_WEIGHTS[i] * worley2_f1(u_m / lam, v_m / lam, GRAN_OCTAVE_SALTS[i]);
+    }
+    let e = smooth01((w.clamp(0.0, 1.0) - GRAN_CARVE_LO) / (GRAN_CARVE_HI - GRAN_CARVE_LO));
+    MEMO.with(|m| m.set((key.0, key.1, e)));
+    e
+}
+
+/// The SPECIES/HEIGHT gate in `[0, 1]`: the LIQUID share of the sample's extinction
+/// times a smooth height ramp (1 at/below [`GRAN_HEIGHT_FULL_M`], 0 at/above
+/// [`GRAN_HEIGHT_ZERO_M`]). Ice-only samples and high cloud gate to exactly 0
+/// (byte-untouched); mixed-phase / mid-level liquid erodes weakly.
+pub fn granulation_gate(ext_liquid: f64, ext_ice: f64, ext_precip: f64, z_msl_m: f64) -> f64 {
+    let total = ext_liquid + ext_ice + ext_precip;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let liquid_frac = (ext_liquid / total).clamp(0.0, 1.0);
+    let height =
+        1.0 - smooth01((z_msl_m - GRAN_HEIGHT_FULL_M) / (GRAN_HEIGHT_ZERO_M - GRAN_HEIGHT_FULL_M));
+    liquid_frac * height
+}
+
+/// The INTERIOR-PROTECTION factor in `[0, 1]` for a relative density `d` (see
+/// [`GRAN_INTERIOR_LO`]): `1` at/below `GRAN_INTERIOR_LO` (a true boundary sample —
+/// full erosion), `0` at/above `GRAN_INTERIOR_HI` (interior variability of a solid
+/// deck — never eroded), a monotone smoothstep between.
+pub fn granulation_interior_protection(rel_density: f64) -> f64 {
+    1.0 - smooth01(
+        (rel_density.clamp(0.0, 1.0) - GRAN_INTERIOR_LO) / (GRAN_INTERIOR_HI - GRAN_INTERIOR_LO),
+    )
+}
+
+/// The remap-style EROSION MULTIPLIER `m in [0, 1]` for a sample at RELATIVE density
+/// `d = sigma / neighbourhood-max` under erosion threshold `e` (the Nubis density
+/// remap `d' = (d - e) / (1 - e)`, returned as the ratio `m = d'/d`): `m = 1` at
+/// `d = 1` for ANY `e` (interiors at their neighbourhood max are untouched), `m = 0`
+/// where `d <= e` (fully carved), monotone in both arguments, and `m <= 1` always
+/// (subtract-only). `e <= 0` -> 1 (the neutral no-op).
+pub fn granulation_multiplier(rel_density: f64, erosion: f64) -> f64 {
+    if erosion <= 0.0 {
+        return 1.0;
+    }
+    let d = rel_density.clamp(0.0, 1.0);
+    if d <= 0.0 {
+        return 1.0; // zero extinction: nothing to erode (callers skip this case)
+    }
+    let e = erosion.min(GRAN_EROSION_MAX);
+    (((d - e).max(0.0)) / (d * (1.0 - e))).clamp(0.0, 1.0)
+}
+
 /// Henyey-Greenstein phase (normalised to integrate to 1 over the sphere).
 #[inline]
 pub fn henyey_greenstein(cos_theta: f64, g: f64) -> f64 {
@@ -542,7 +833,29 @@ impl DecodedVolume {
     /// Trilinearly sample at fractional grid coords `(fi, fj, fk)`. Outside the brick
     /// (any axis out of `[0, n-1]`, or non-finite) returns zero extinction — the
     /// honest answer: no WRF cloud data there (design section 2 zero-extrapolation).
+    /// The RAW (un-granulated) field: identical to `sample_granulated(.., None)`.
+    #[inline]
     pub fn sample(&self, fi: f64, fj: f64, fk: f64) -> CloudSample {
+        self.sample_granulated(fi, fj, fk, None)
+    }
+
+    /// [`Self::sample`] with the optional sub-grid GRANULATION erosion applied (see the
+    /// granulation section at the top of this module). `None` is byte-identical to the
+    /// raw trilinear sample (same operations, same order — the off-flag anchor test pins
+    /// it). With `Some`, the three EXTINCTION channels are scaled by the remap-style
+    /// erosion multiplier ([`granulation_multiplier`]) of the sample's relative density
+    /// `d = total / (max total over its 8 trilinear-support corners)` under the
+    /// deterministic erosion field `e = amplitude/GRAN_AMP_CAP * gate *
+    /// interior_protection(d) * noise`; `tau_up` is never eroded (an ingest-time
+    /// column integral — documented approximation).
+    /// Subtract-only: the eroded sample never exceeds the raw one; zero stays zero.
+    pub fn sample_granulated(
+        &self,
+        fi: f64,
+        fj: f64,
+        fk: f64,
+        granulation: Option<Granulation>,
+    ) -> CloudSample {
         if !(fi.is_finite() && fj.is_finite() && fk.is_finite())
             || fi < 0.0
             || fj < 0.0
@@ -562,22 +875,86 @@ impl DecodedVolume {
         let ti = fi - i0 as f64;
         let tj = fj - j0 as f64;
         let tk = fk - k0 as f64;
+        // The 8 trilinear-support corners, in the exact order the lerp consumes them
+        // (c00 pair, c10 pair, c01 pair, c11 pair) — the lerp arithmetic below is
+        // bit-identical to the pre-granulation sampler.
+        let idx = [
+            self.cell(i0, j0, k0),
+            self.cell(i1, j0, k0),
+            self.cell(i0, j1, k0),
+            self.cell(i1, j1, k0),
+            self.cell(i0, j0, k1),
+            self.cell(i1, j0, k1),
+            self.cell(i0, j1, k1),
+            self.cell(i1, j1, k1),
+        ];
         let trilerp = |ch: &[f32]| -> f64 {
-            let g = |i: usize, j: usize, k: usize| ch[self.cell(i, j, k)] as f64;
-            let c00 = g(i0, j0, k0) * (1.0 - ti) + g(i1, j0, k0) * ti;
-            let c10 = g(i0, j1, k0) * (1.0 - ti) + g(i1, j1, k0) * ti;
-            let c01 = g(i0, j0, k1) * (1.0 - ti) + g(i1, j0, k1) * ti;
-            let c11 = g(i0, j1, k1) * (1.0 - ti) + g(i1, j1, k1) * ti;
+            let g = |n: usize| ch[idx[n]] as f64;
+            let c00 = g(0) * (1.0 - ti) + g(1) * ti;
+            let c10 = g(2) * (1.0 - ti) + g(3) * ti;
+            let c01 = g(4) * (1.0 - ti) + g(5) * ti;
+            let c11 = g(6) * (1.0 - ti) + g(7) * ti;
             let c0 = c00 * (1.0 - tj) + c10 * tj;
             let c1 = c01 * (1.0 - tj) + c11 * tj;
             c0 * (1.0 - tk) + c1 * tk
         };
-        CloudSample {
+        let mut s = CloudSample {
             ext_liquid: trilerp(&self.ext_liquid),
             ext_ice: trilerp(&self.ext_ice),
             ext_precip: trilerp(&self.ext_precip),
             tau_up: trilerp(&self.tau_up),
+        };
+        let Some(g) = granulation else {
+            return s;
+        };
+        if g.amplitude <= 0.0 {
+            return s;
         }
+        let total = s.total_ext();
+        if total <= 0.0 {
+            return s;
+        }
+        // Species/height gate (cheap) before the noise (the expensive part).
+        let z_msl = self.z_min_m + fk * self.dz_m;
+        let gate = granulation_gate(s.ext_liquid, s.ext_ice, s.ext_precip, z_msl);
+        if gate <= 0.0 {
+            return s;
+        }
+        // Relative density vs the trilinear-support neighbourhood max (convexity of the
+        // trilerp guarantees d <= 1; total > 0 guarantees corner_max > 0), and the
+        // interior protection — both cheap, both before the noise: a solid-deck
+        // interior sample (d >= GRAN_INTERIOR_HI) skips the noise entirely.
+        let mut corner_max = 0.0f64;
+        for &c in &idx {
+            let t = self.ext_liquid[c] as f64 + self.ext_ice[c] as f64 + self.ext_precip[c] as f64;
+            if t > corner_max {
+                corner_max = t;
+            }
+        }
+        if corner_max <= 0.0 {
+            return s;
+        }
+        let d = total / corner_max;
+        let protection = granulation_interior_protection(d);
+        if protection <= 0.0 {
+            return s;
+        }
+        // The deterministic erosion field, anchored in brick-plane metres (the same
+        // (fi, fj) — and so the same erosion — for a physical point regardless of the
+        // view/ray that sampled it).
+        let pitch = self.horiz_pitch_m.max(1.0);
+        let noise = granulation_erosion_noise(fi * pitch, fj * pitch);
+        let e = (g.amplitude * GRAN_EROSION_GAIN * gate * protection * noise).min(GRAN_EROSION_MAX);
+        if e <= 0.0 {
+            return s;
+        }
+        let m = granulation_multiplier(d, e);
+        if m < 1.0 {
+            s.ext_liquid *= m;
+            s.ext_ice *= m;
+            s.ext_precip *= m;
+        }
+        s
     }
 
     /// Top-of-brick ECEF radius (m).
@@ -869,6 +1246,22 @@ pub fn accumulate_sun_od_feathered(
     resolution: usize,
     feather_texels: f64,
 ) -> SunOdMap {
+    accumulate_sun_od_granulated(vol, georef, sun_ecef, resolution, feather_texels, None)
+}
+
+/// [`accumulate_sun_od_feathered`] over the optionally-GRANULATED extinction field:
+/// pass the SAME [`Granulation`] as [`MarchConfig::granulation`] so the ground cloud
+/// shadows come from the SAME eroded field the view/sun marches sample (a granulated
+/// cumulus field casts granulated shadows, not the solid blob's). `None` is
+/// byte-identical to [`accumulate_sun_od_feathered`].
+pub fn accumulate_sun_od_granulated(
+    vol: &DecodedVolume,
+    georef: &GridGeoref,
+    sun_ecef: [f64; 3],
+    resolution: usize,
+    feather_texels: f64,
+    granulation: Option<Granulation>,
+) -> SunOdMap {
     let resolution = resolution.max(1);
     let sun = norm3(sun_ecef);
     let (au, av) = perp_basis(sun);
@@ -950,7 +1343,7 @@ pub fn accumulate_sun_od_feathered(
                     let t = (step as f64 + 0.5) * ds;
                     let p = madd3(start, sun, -t);
                     let (fi, fj, fk, r) = ecef_to_brick(p, georef, vol.z_min_m, vol.dz_m);
-                    let ext = vol.sample(fi, fj, fk).total_ext();
+                    let ext = vol.sample_granulated(fi, fj, fk, granulation).total_ext();
                     if ext > 0.0 {
                         acc += ext * ds;
                         // Slant distance from this occluder sample down to the ground
@@ -1215,6 +1608,14 @@ pub struct MarchConfig {
     /// a hard cutoff. `0.0` = neutral no-op (no feather — set when there is no margin, so
     /// the render is byte-identical to before). Set by the render assembly from the margin.
     pub edge_feather_cells: f64,
+    /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the granulation section
+    /// at the top of this module). `None` (the [`MarchConfig::new`] default) = off,
+    /// byte-identical to the pre-granulation march. When `Some`, BOTH the primary view
+    /// march and the secondary sun march sample the eroded field
+    /// ([`DecodedVolume::sample_granulated`]); the render assembly must pass the SAME
+    /// value to [`accumulate_sun_od_granulated`] so the ground shadows agree — every
+    /// march of one composite samples the SAME eroded field.
+    pub granulation: Option<Granulation>,
 }
 
 impl MarchConfig {
@@ -1248,6 +1649,7 @@ impl MarchConfig {
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             topdown_cloud_norm: crate::topdown::TOPDOWN_CLOUD_NORM,
             edge_feather_cells: 0.0,
+            granulation: None,
         }
     }
 }
@@ -1341,10 +1743,15 @@ fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
     let mut ds = base;
     for _ in 0..n {
         // Sample within the segment (dist .. dist+ds) at the stratified offset,
-        // toward the sun.
+        // toward the sun. Samples the SAME (optionally granulated) field as the
+        // primary view march, so cloud self-shadowing matches the eroded cloud.
         let pp = madd3(p, scene.sun_ecef, dist + offset * ds);
         let (fi, fj, fk, _) = ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
-        tau += scene.vol.sample(fi, fj, fk).total_ext() * ds;
+        tau += scene
+            .vol
+            .sample_granulated(fi, fj, fk, cfg.granulation)
+            .total_ext()
+            * ds;
         dist += ds;
         ds *= growth;
     }
@@ -1367,7 +1774,11 @@ fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
             let pp = madd3(p, scene.sun_ecef, dist + offset * half);
             let (fi, fj, fk, _) =
                 ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
-            tau += scene.vol.sample(fi, fj, fk).total_ext() * half;
+            tau += scene
+                .vol
+                .sample_granulated(fi, fj, fk, cfg.granulation)
+                .total_ext()
+                * half;
             dist += half;
         }
     }
@@ -1444,7 +1855,9 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         }
         let pm = madd3(cam, view, t + 0.5 * ds);
         let (mi, mj, mk, rm) = ecef_to_brick(pm, scene.georef, vol.z_min_m, vol.dz_m);
-        let sample = vol.sample(mi, mj, mk);
+        // The (optionally granulated) view sample — the same eroded field the sun
+        // march and the sun-OD map read (MarchConfig::granulation).
+        let sample = vol.sample_granulated(mi, mj, mk, scene.cfg.granulation);
         let sigma_t = sample.total_ext();
         if sigma_t <= 0.0 {
             t += ds;
@@ -1645,9 +2058,17 @@ pub fn shade_cloud_pixel(
         None => [0.0, 0.0, 0.0, 0.0], // space
         // One frame exposure gains the whole composited radiance (surface + cloud)
         // uniformly; the per-scene highlight soft-clip keeps bright cloud tops from
-        // clamping to a flat white (the top-down/basemap appearance pass).
+        // clamping to a flat white (the top-down/basemap appearance pass). The low-sun
+        // illuminant correction sits at the same display seam as the surface/top-down
+        // paths (on-earth only; identity outside the 2-30 deg band) so the geo
+        // clouds-on product matches them — the lowsun-fix integration hand-off.
         Some(l_final) => radiance_to_rgba_softclip(
-            l_final,
+            crate::render::apply_low_sun_illuminant(
+                l_final,
+                px.on_earth,
+                px.sun_elev_deg as f64,
+                surf.luts,
+            ),
             surf.output_transform,
             surf.exposure,
             scene.cfg.cloud_softclip_knee,
@@ -3586,5 +4007,601 @@ mod tests {
             raw.occ_dist, feathered.occ_dist,
             "occ_dist is not feathered"
         );
+    }
+
+    // ── sub-grid cloud GRANULATION (edge-erosion detail noise) ─────────────────
+
+    #[test]
+    fn granulation_amplitude_follows_the_unresolved_spectrum_and_caps() {
+        // The dx-derived amplitude: near-zero on a 250 m run (the model already
+        // resolves the granulation-scale texture), strong on a 2-3 km run, monotone
+        // in dx, capped at the Cahalan-bound amplitude for very coarse grids, and 0
+        // for degenerate dx.
+        let a250 = granulation_amplitude(250.0);
+        let a1000 = granulation_amplitude(1000.0);
+        let a3000 = granulation_amplitude(3000.0);
+        println!("GRAN amplitude: dx250={a250:.4} dx1000={a1000:.4} dx3000={a3000:.4}");
+        assert!(
+            a250 > 0.0 && a250 < 0.2,
+            "250 m amplitude should be near-zero: {a250}"
+        );
+        assert!(a3000 > 0.4, "3 km amplitude should be strong: {a3000}");
+        assert!(
+            a3000 > 2.5 * a250,
+            "coarse grid must erode far more than fine: {a3000} vs {a250}"
+        );
+        let mut prev = 0.0f64;
+        for dx in [30.0, 100.0, 250.0, 500.0, 1000.0, 3000.0, 8000.0, 30000.0] {
+            let a = granulation_amplitude(dx);
+            assert!(
+                (0.0..=GRAN_AMP_CAP).contains(&a),
+                "amplitude {a} out of [0, cap] at dx {dx}"
+            );
+            assert!(a >= prev, "amplitude not monotone at dx {dx}: {a} < {prev}");
+            prev = a;
+        }
+        // The Cahalan-derived cap binds for very coarse grids.
+        assert_eq!(granulation_amplitude(50_000.0), GRAN_AMP_CAP);
+        // At/below the render-scale floor there is nothing unresolved to add.
+        assert_eq!(granulation_amplitude(30.0), 0.0);
+        assert_eq!(granulation_amplitude(0.0), 0.0);
+        assert_eq!(granulation_amplitude(-5.0), 0.0);
+        assert_eq!(granulation_amplitude(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn granulation_noise_is_deterministic_shaped_and_tail_distributed() {
+        // Determinism (the same brick-plane position always hashes to the same
+        // erosion — no shimmer between frames, and geo == top-down by construction
+        // since both sample by brick coordinates).
+        let a = granulation_erosion_noise(12_345.0, -6_789.0);
+        let b = granulation_erosion_noise(12_345.0, -6_789.0);
+        assert_eq!(a.to_bits(), b.to_bits(), "noise must be deterministic");
+        // Tail-shaped distribution over a 10 km field sampled at 62.5 m: values in
+        // [0, 1]; MOST of the field is exactly-zero grain interior (untouched cloud);
+        // a real minority is the fully-carved gap network; the mean is small (the
+        // Cahalan premise: the eroded area fraction is the W-tail).
+        let n = 160usize;
+        let (mut sum, mut carved, mut zero) = (0.0f64, 0usize, 0usize);
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        for y in 0..n {
+            for x in 0..n {
+                let e = granulation_erosion_noise(x as f64 * 62.5, y as f64 * 62.5);
+                assert!((0.0..=1.0).contains(&e), "noise {e} out of [0,1]");
+                sum += e;
+                if e >= 0.9 {
+                    carved += 1;
+                }
+                if e <= 0.0 {
+                    zero += 1;
+                }
+                min_v = min_v.min(e);
+                max_v = max_v.max(e);
+            }
+        }
+        let total = (n * n) as f64;
+        let mean = sum / total;
+        let carved_frac = carved as f64 / total;
+        let zero_frac = zero as f64 / total;
+        println!(
+            "GRAN noise: mean={mean:.4} carved_frac={carved_frac:.4} zero_frac={zero_frac:.4}"
+        );
+        assert!(max_v > 0.9 && min_v <= 0.0, "field should span grain..gap");
+        assert!(
+            mean > 0.03 && mean < 0.40,
+            "erosion-field mean {mean} outside the tail-shaped band"
+        );
+        assert!(
+            (0.02..0.45).contains(&carved_frac),
+            "carved-gap fraction {carved_frac} implausible"
+        );
+        assert!(
+            zero_frac > 0.30,
+            "most of the field should be untouched grain interior: {zero_frac}"
+        );
+    }
+
+    #[test]
+    fn granulation_multiplier_is_remap_subtract_only() {
+        // e = 0 is the neutral no-op; d = 1 (a sample AT its neighbourhood max — a
+        // thick-core / uniform-deck interior) is untouched for ANY erosion; d <= e is
+        // fully carved; monotone in both arguments; never above 1 (subtract-only).
+        assert_eq!(granulation_multiplier(0.7, 0.0), 1.0);
+        for &e in &[0.0, 0.1, 0.3, 0.6, 0.98, 1.5] {
+            assert_eq!(
+                granulation_multiplier(1.0, e),
+                1.0,
+                "interior (d=1) must be untouched at e={e}"
+            );
+        }
+        assert_eq!(granulation_multiplier(0.3, 0.3), 0.0);
+        assert_eq!(granulation_multiplier(0.1, 0.5), 0.0);
+        let mut prev = 1.0f64;
+        for &e in &[0.0, 0.1, 0.2, 0.4, 0.6, 0.8] {
+            let m = granulation_multiplier(0.7, e);
+            assert!((0.0..=1.0).contains(&m), "m {m} out of range at e={e}");
+            assert!(m <= prev + 1e-12, "m must fall as erosion rises");
+            prev = m;
+        }
+        let mut prev = 0.0f64;
+        for &d in &[0.05, 0.2, 0.4, 0.6, 0.8, 1.0] {
+            let m = granulation_multiplier(d, 0.35);
+            assert!(m >= prev - 1e-12, "m must rise with relative density");
+            prev = m;
+        }
+    }
+
+    #[test]
+    fn granulation_off_and_zero_amplitude_are_byte_identical() {
+        // (a) The restructured sampler with granulation None reproduces the original
+        // trilinear formula BIT-FOR-BIT (an independent inline reference); (b) a zero
+        // amplitude is byte-identical to None (the off-flag anchor).
+        let (nx, ny, nz) = (12usize, 10usize, 8usize);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            let v = ((i * 7 + j * 13 + k * 3) % 5) as f64 * 1.0e-3;
+            let w = ((i + 2 * j) % 3) as f64 * 5.0e-4;
+            (v, w, if k % 2 == 0 { 2.0e-4 } else { 0.0 })
+        });
+        let cell = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
+        let reference = |ch: &[f32], fi: f64, fj: f64, fk: f64| -> f64 {
+            let i0 = fi.floor() as usize;
+            let j0 = fj.floor() as usize;
+            let k0 = fk.floor() as usize;
+            let i1 = (i0 + 1).min(nx - 1);
+            let j1 = (j0 + 1).min(ny - 1);
+            let k1 = (k0 + 1).min(nz - 1);
+            let (ti, tj, tk) = (fi - i0 as f64, fj - j0 as f64, fk - k0 as f64);
+            let g = |i: usize, j: usize, k: usize| ch[cell(i, j, k)] as f64;
+            let c00 = g(i0, j0, k0) * (1.0 - ti) + g(i1, j0, k0) * ti;
+            let c10 = g(i0, j1, k0) * (1.0 - ti) + g(i1, j1, k0) * ti;
+            let c01 = g(i0, j0, k1) * (1.0 - ti) + g(i1, j0, k1) * ti;
+            let c11 = g(i0, j1, k1) * (1.0 - ti) + g(i1, j1, k1) * ti;
+            let c0 = c00 * (1.0 - tj) + c10 * tj;
+            let c1 = c01 * (1.0 - tj) + c11 * tj;
+            c0 * (1.0 - tk) + c1 * tk
+        };
+        let amp0 = Some(Granulation { amplitude: 0.0 });
+        let mut probes = 0usize;
+        for pi in 0..23 {
+            for pj in 0..19 {
+                let fi = pi as f64 * (nx - 1) as f64 / 22.0;
+                let fj = pj as f64 * (ny - 1) as f64 / 18.0;
+                let fk = ((pi * 19 + pj) % 29) as f64 * (nz - 1) as f64 / 28.0;
+                let s = vol.sample(fi, fj, fk);
+                assert_eq!(
+                    s.ext_liquid.to_bits(),
+                    reference(&vol.ext_liquid, fi, fj, fk).to_bits(),
+                    "sampler drifted from the reference trilerp at ({fi},{fj},{fk})"
+                );
+                assert_eq!(
+                    s.ext_ice.to_bits(),
+                    reference(&vol.ext_ice, fi, fj, fk).to_bits()
+                );
+                assert_eq!(
+                    s.tau_up.to_bits(),
+                    reference(&vol.tau_up, fi, fj, fk).to_bits()
+                );
+                let z = vol.sample_granulated(fi, fj, fk, amp0);
+                assert_eq!(z.ext_liquid.to_bits(), s.ext_liquid.to_bits());
+                assert_eq!(z.ext_ice.to_bits(), s.ext_ice.to_bits());
+                assert_eq!(z.ext_precip.to_bits(), s.ext_precip.to_bits());
+                assert_eq!(z.tau_up.to_bits(), s.tau_up.to_bits());
+                probes += 1;
+            }
+        }
+        assert!(probes > 400);
+    }
+
+    #[test]
+    fn granulation_is_subtract_only_and_zero_stays_zero() {
+        // Over a scattered low-liquid popcorn field at the STRONGEST amplitude, the
+        // eroded sample never exceeds the raw one in ANY channel, tau_up is never
+        // touched, clear air stays clear, and the erosion is live somewhere.
+        let (nx, ny, nz) = (20usize, 20usize, 12usize);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            let blob = (i % 5 == 2) && (j % 4 == 1) && (2..7).contains(&k);
+            if blob {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let gran = Some(Granulation {
+            amplitude: GRAN_AMP_CAP,
+        });
+        let mut strictly_less = 0usize;
+        let (mut p, mut q, mut r) = (0.13f64, 0.37f64, 0.71f64);
+        for _ in 0..12_000 {
+            // A deterministic low-discrepancy walk over the volume.
+            p = (p + 0.618_033_988_749_895).fract();
+            q = (q + 0.414_213_562_373_095).fract();
+            r = (r + 0.324_717_957_244_746).fract();
+            let fi = p * (nx - 1) as f64;
+            let fj = q * (ny - 1) as f64;
+            let fk = r * (nz - 1) as f64;
+            let raw = vol.sample(fi, fj, fk);
+            let ero = vol.sample_granulated(fi, fj, fk, gran);
+            assert!(
+                ero.ext_liquid <= raw.ext_liquid,
+                "liquid grew at ({fi},{fj},{fk})"
+            );
+            assert!(ero.ext_ice <= raw.ext_ice);
+            assert!(ero.ext_precip <= raw.ext_precip);
+            assert_eq!(ero.tau_up.to_bits(), raw.tau_up.to_bits(), "tau_up eroded");
+            if raw.total_ext() <= 0.0 {
+                assert_eq!(ero.total_ext(), 0.0, "erosion added cloud to clear air");
+            } else if ero.total_ext() < raw.total_ext() {
+                strictly_less += 1;
+            }
+        }
+        assert!(
+            strictly_less > 50,
+            "the erosion should be live on a coarse-grid liquid field: {strictly_less}"
+        );
+    }
+
+    #[test]
+    fn granulation_gates_ice_and_high_liquid() {
+        // The species/height gate: ice-only cloud (anvils/cirrus) and liquid above
+        // the boundary-layer band are byte-untouched at ANY amplitude; the same blob
+        // as low liquid granulates. Plus the gate function's own anchors.
+        assert_eq!(granulation_gate(1.0e-2, 0.0, 0.0, 2000.0), 1.0);
+        assert_eq!(granulation_gate(0.0, 1.0e-2, 0.0, 2000.0), 0.0);
+        assert_eq!(granulation_gate(0.0, 0.0, 1.0e-2, 2000.0), 0.0);
+        assert_eq!(granulation_gate(1.0e-2, 0.0, 0.0, 8000.0), 0.0);
+        assert_eq!(granulation_gate(0.0, 0.0, 0.0, 1000.0), 0.0);
+        let mixed = granulation_gate(5.0e-3, 5.0e-3, 0.0, 2000.0);
+        assert!((mixed - 0.5).abs() < 1e-12, "mixed-phase gate {mixed}");
+        let mut prev = 1.0f64;
+        for &z in &[3000.0, 4500.0, 5500.0, 6500.0, 7500.0] {
+            let g = granulation_gate(1.0e-2, 0.0, 0.0, z);
+            assert!(g <= prev + 1e-12, "height gate must fall with z");
+            prev = g;
+        }
+
+        let gran = Some(Granulation {
+            amplitude: GRAN_AMP_CAP,
+        });
+        let blob = |lo: usize, hi: usize| {
+            move |i: usize, j: usize, k: usize| {
+                if (6..14).contains(&i) && (6..14).contains(&j) && (lo..hi).contains(&k) {
+                    (0.0, 1.5e-2, 0.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
+            }
+        };
+        let (nx, ny, nz) = (20usize, 20usize, 40usize);
+        // Ice-only, low: byte-identical.
+        let ice = build_volume(nx, ny, nz, 250.0, 3000.0, blob(2, 8));
+        // High liquid (k 30..36 -> 7.5-9 km MSL, above the zero height): byte-identical.
+        let high = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if (6..14).contains(&i) && (6..14).contains(&j) && (30..36).contains(&k) {
+                (1.5e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        // Low liquid: granulated.
+        let low = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if (6..14).contains(&i) && (6..14).contains(&j) && (2..8).contains(&k) {
+                (1.5e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let mut low_changed = 0usize;
+        for pi in 0..40 {
+            for pj in 0..40 {
+                let fi = 5.0 + pi as f64 * 0.25;
+                let fj = 5.0 + pj as f64 * 0.25;
+                for &fk in &[3.5f64, 5.1, 31.5, 33.2] {
+                    for (vol, changed) in [(&ice, false), (&high, false), (&low, true)] {
+                        let raw = vol.sample(fi, fj, fk);
+                        let ero = vol.sample_granulated(fi, fj, fk, gran);
+                        if !changed {
+                            assert_eq!(
+                                ero.total_ext().to_bits(),
+                                raw.total_ext().to_bits(),
+                                "gated volume must be byte-untouched at ({fi},{fj},{fk})"
+                            );
+                        } else if ero.total_ext() < raw.total_ext() {
+                            low_changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            low_changed > 20,
+            "low liquid should granulate: {low_changed} changed samples"
+        );
+    }
+
+    #[test]
+    fn granulation_carves_gaps_within_the_cahalan_tau_bound() {
+        // ONE blocky cell of boundary-layer liquid on a 3 km grid — the popcorn-cu
+        // defect case. The erosion must GRANULATE its trilinear tent (carve real gaps
+        // AND keep real grains at the SAME relative density — not a uniform ring
+        // feather), while the sigma-weighted field mean stays within the Cahalan
+        // plane-parallel bound (never over-thinned).
+        let (nx, ny, nz) = (16usize, 16usize, 8usize);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if i == 8 && j == 8 && k == 3 {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let run = |amplitude: f64| -> (f64, f64, f64, f64) {
+            let gran = Some(Granulation { amplitude });
+            let peak = vol.sample(8.0, 8.0, 3.0).total_ext();
+            let (mut sum_raw, mut sum_ero) = (0.0f64, 0.0f64);
+            let mut m_min = f64::INFINITY;
+            let mut grains = 0usize;
+            let mut n_cloudy = 0usize;
+            let (mut band_min, mut band_max) = (f64::INFINITY, f64::NEG_INFINITY);
+            for pi in 0..99 {
+                for pj in 0..99 {
+                    let fi = 7.02 + pi as f64 * 0.02;
+                    let fj = 7.02 + pj as f64 * 0.02;
+                    let raw = vol.sample(fi, fj, 3.0).total_ext();
+                    let ero = vol.sample_granulated(fi, fj, 3.0, gran).total_ext();
+                    sum_raw += raw;
+                    sum_ero += ero;
+                    if raw > 0.0 {
+                        n_cloudy += 1;
+                        let m = ero / raw;
+                        m_min = m_min.min(m);
+                        if m > 0.95 {
+                            grains += 1;
+                        }
+                        // The fixed relative-density band d in [0.4, 0.5]: a pure edge
+                        // feather would give one multiplier here; granulation varies it.
+                        let d = raw / peak;
+                        if (0.4..0.5).contains(&d) {
+                            band_min = band_min.min(m);
+                            band_max = band_max.max(m);
+                        }
+                    }
+                }
+            }
+            let ratio = sum_ero / sum_raw;
+            let grain_frac = grains as f64 / n_cloudy as f64;
+            println!(
+                "GRAN tent amp={amplitude:.3}: mean-tau ratio={ratio:.4} m_min={m_min:.4} \
+                 grain_frac={grain_frac:.4} band m range=[{band_min:.3}, {band_max:.3}]"
+            );
+            (ratio, m_min, grain_frac, band_max - band_min)
+        };
+        // The 3 km amplitude (the spec's named strong case).
+        let (ratio, m_min, grain_frac, band_range) = run(granulation_amplitude(3000.0));
+        assert!(
+            ratio >= CAHALAN_TAU_FACTOR,
+            "field-mean tau reduction over-thins the Cahalan bound: {ratio}"
+        );
+        assert!(ratio < 0.995, "the erosion should actually erode: {ratio}");
+        assert!(m_min < 0.05, "gaps must carve to ~clear: m_min {m_min}");
+        assert!(
+            grain_frac > 0.3,
+            "grains must survive untouched: {grain_frac}"
+        );
+        assert!(
+            band_range > 0.5,
+            "at fixed relative density the multiplier must vary grain-to-gap \
+             (granulation, not an outline feather): range {band_range}"
+        );
+        // The extreme (cap) amplitude stays near the bound too (documented margin).
+        let (ratio_cap, ..) = run(GRAN_AMP_CAP);
+        assert!(
+            ratio_cap >= CAHALAN_TAU_FACTOR - 0.08,
+            "cap-amplitude mean-tau ratio {ratio_cap} far below the Cahalan bound"
+        );
+    }
+
+    #[test]
+    fn granulation_interior_protection_shields_solid_deck_variability() {
+        // The round-1 QA pepper defect: ordinary cell-to-cell LWC variability inside
+        // a WIDE solid liquid deck read as "edge" under the pure remap and peppered
+        // the deck with pinholes. The interior-protection window must leave such a
+        // deck byte-UNTOUCHED (its interior relative density stays >= GRAN_INTERIOR_HI)
+        // while a single-cell popcorn tent still granulates.
+        assert_eq!(granulation_interior_protection(1.0), 0.0);
+        assert_eq!(granulation_interior_protection(GRAN_INTERIOR_HI), 0.0);
+        assert_eq!(granulation_interior_protection(GRAN_INTERIOR_LO), 1.0);
+        assert_eq!(granulation_interior_protection(0.2), 1.0);
+        let mut prev = 1.0f64;
+        for &d in &[0.3, 0.45, 0.55, 0.65, 0.75, 0.9, 1.0] {
+            let p = granulation_interior_protection(d);
+            assert!((0.0..=1.0).contains(&p));
+            assert!(p <= prev + 1e-12, "protection must fall with density");
+            prev = p;
+        }
+
+        let (nx, ny, nz) = (24usize, 24usize, 10usize);
+        // A wide deck with +/-10% deterministic cell-to-cell variability, k 2..6
+        // (boundary-layer liquid — the granulation target regime by gate).
+        let deck = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if (2..6).contains(&k) {
+                let v = 1.0 + 0.1 * (((i * 5 + j * 11 + k) % 7) as f64 / 3.0 - 1.0);
+                (2.0e-2 * v, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let gran = Some(Granulation {
+            amplitude: GRAN_AMP_CAP,
+        });
+        // Sample the deck INTERIOR (well inside every horizontal edge): byte-untouched.
+        for pi in 0..30 {
+            for pj in 0..30 {
+                let fi = 4.0 + pi as f64 * 0.5;
+                let fj = 4.0 + pj as f64 * 0.5;
+                for &fk in &[3.0f64, 3.5, 4.2] {
+                    let raw = deck.sample(fi, fj, fk);
+                    let ero = deck.sample_granulated(fi, fj, fk, gran);
+                    assert_eq!(
+                        ero.total_ext().to_bits(),
+                        raw.total_ext().to_bits(),
+                        "deck interior peppered at ({fi},{fj},{fk}): d = {}",
+                        raw.total_ext()
+                            / deck.sample(fi.floor(), fj.floor(), fk.floor()).total_ext()
+                    );
+                }
+            }
+        }
+        // The single-cell popcorn tent still granulates (the protection must not
+        // disable the feature).
+        let tent = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if i == 12 && j == 12 && k == 3 {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let mut changed = 0usize;
+        for pi in 0..60 {
+            for pj in 0..60 {
+                let fi = 11.05 + pi as f64 * 0.032;
+                let fj = 11.05 + pj as f64 * 0.032;
+                let raw = tent.sample(fi, fj, 3.0);
+                let ero = tent.sample_granulated(fi, fj, 3.0, gran);
+                if ero.total_ext() < raw.total_ext() {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 100,
+            "the popcorn tent must still granulate under interior protection: {changed}"
+        );
+    }
+
+    #[test]
+    fn granulation_is_live_deterministic_and_consistent_across_marches() {
+        // The eroded field must be what the PRIMARY march, the SECONDARY sun march
+        // and the SUN-OD map all sample: marching with granulation can only RAISE the
+        // view transmittance (subtract-only), the sun-OD map can only fall, both are
+        // deterministic, and two identically-built volumes agree bit-for-bit (which
+        // is exactly the geo == top-down agreement: both views sample the same
+        // sampler at the same brick coordinates).
+        let (nx, ny, nz) = (24usize, 24usize, 16usize);
+        let build = || {
+            build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+                if (8..14).contains(&i) && (8..14).contains(&j) && (2..8).contains(&k) {
+                    (1.5e-2, 0.0, 0.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
+            })
+        };
+        let vol = build();
+        let vol2 = build();
+        let gran = Some(Granulation::for_grid(3000.0));
+        // Sample-level agreement across identically-built volumes (the view-agnostic
+        // determinism statement).
+        for &(fi, fj, fk) in &[
+            (8.3f64, 9.7f64, 3.2f64),
+            (10.1, 8.6, 5.5),
+            (12.9, 13.4, 2.1),
+        ] {
+            let a = vol.sample_granulated(fi, fj, fk, gran);
+            let b = vol2.sample_granulated(fi, fj, fk, gran);
+            assert_eq!(a.ext_liquid.to_bits(), b.ext_liquid.to_bits());
+            assert_eq!(a.ext_ice.to_bits(), b.ext_ice.to_bits());
+            assert_eq!(a.ext_precip.to_bits(), b.ext_precip.to_bits());
+        }
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let (luts, sky_sh) = shared_luts();
+        let center = brick_to_ecef(&georef, 11.0, 11.0, 5.0, 0.0, 250.0).unwrap();
+        let up = norm3(center);
+        let (east, _) = perp_basis(up);
+        let e = 40.0f64.to_radians();
+        let sun = norm3(add3(scl3(up, e.sin()), scl3(east, e.cos())));
+        // The sun-OD map over the eroded field never exceeds the raw one.
+        let od_off = accumulate_sun_od(&vol, &georef, sun, 48);
+        let od_on =
+            accumulate_sun_od_granulated(&vol, &georef, sun, 48, SUN_OD_EDGE_FEATHER_TEXELS, gran);
+        let mut od_less = 0usize;
+        for (a, b) in od_on.od.iter().zip(od_off.od.iter()) {
+            assert!(a <= b, "granulated sun-OD grew: {a} > {b}");
+            if a < b {
+                od_less += 1;
+            }
+        }
+        assert!(od_less > 0, "the granulated sun-OD map should differ");
+        // The march: granulation can only raise the view transmittance; at least one
+        // ray differs (the feature is live end-to-end); the march is deterministic.
+        let cam = CameraGeometry::from_sub_lon(-100.0);
+        let base_cfg = MarchConfig {
+            sun_march_jitter_amp: 0.0,
+            ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+        };
+        let scene_off = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &od_off,
+            georef: &georef,
+            luts,
+            sky_sh,
+            sun_ecef: sun,
+            cfg: base_cfg,
+        };
+        let scene_on = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &od_on,
+            georef: &georef,
+            luts,
+            sky_sh,
+            sun_ecef: sun,
+            cfg: MarchConfig {
+                granulation: gran,
+                ..base_cfg
+            },
+        };
+        let mut any_differ = false;
+        for &(gi, gj) in &[(9.0f64, 9.0f64), (10.5, 11.5), (11.0, 9.5), (12.5, 12.0)] {
+            let target = brick_to_ecef(&georef, gi, gj, 0.0, 0.0, 250.0).unwrap();
+            let view = norm3([
+                target[0] - cam.camera[0],
+                target[1] - cam.camera[1],
+                target[2] - cam.camera[2],
+            ]);
+            let m_off = march_cloud(&scene_off, cam.camera, view);
+            let m_on = march_cloud(&scene_on, cam.camera, view);
+            // Subtract-only through the march — VALID ONLY when the un-granulated
+            // march did NOT hit the transmittance-floor early exit: past the floor
+            // the thicker march STOPS integrating while the thinner one continues,
+            // so both are "effectively opaque" but their sub-floor values are not
+            // ordered (both marches share the step trajectory otherwise — the mip,
+            // not the sample, sizes the steps). The sampler-level subtract-only
+            // invariant is pinned exactly in its own test.
+            if m_off.transmittance > base_cfg.transmittance_floor {
+                assert!(
+                    m_on.transmittance >= m_off.transmittance - 1e-12,
+                    "granulation must not thicken a ray: {} < {}",
+                    m_on.transmittance,
+                    m_off.transmittance
+                );
+            }
+            if (m_on.transmittance - m_off.transmittance).abs() > 1e-9
+                || m_on.inscatter != m_off.inscatter
+            {
+                any_differ = true;
+            }
+            let m_on2 = march_cloud(&scene_on, cam.camera, view);
+            assert_eq!(
+                m_on.transmittance.to_bits(),
+                m_on2.transmittance.to_bits(),
+                "the granulated march must be deterministic"
+            );
+            for c in 0..3 {
+                assert_eq!(m_on.inscatter[c].to_bits(), m_on2.inscatter[c].to_bits());
+            }
+        }
+        assert!(any_differ, "granulation should be live through the march");
     }
 }

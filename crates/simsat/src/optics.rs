@@ -39,29 +39,57 @@ pub const EARTH_RADIUS_M: f64 = 6_370_000.0;
 
 /// A single hydrometeor class with its band-averaged effective radius.
 ///
-/// Effective radii (design section 4): cloud liquid 10 um, ice/snow 40 um,
-/// rain/graupel 1 mm. Larger particles -> smaller extinction per unit mass, so
-/// precip reads as a translucent gray veil rather than cauliflower.
+/// Effective radii (design section 4 + the SSB v3 snow-optics fix): cloud liquid
+/// 10 um, cloud ice 40 um, snow 150 um (its OWN optics — no longer cloud-ice
+/// optics), rain/graupel 1 mm. Larger particles -> smaller extinction per unit
+/// mass, so precipitation-sized species read as a translucent veil rather than
+/// cauliflower. Only the PRODUCT `rho_particle * r_eff` enters the
+/// geometric-optics extinction (see [`extinction_coefficient`]), and the code
+/// convention fixes `rho_particle = rho_w`, so every class radius here is the
+/// rho_w-NORMALIZED effective radius `(rho_particle / rho_w) * r_particle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HydrometeorClass {
-    /// Cloud liquid water (WRF `QCLOUD`). r_e = 10 um.
+    /// Cloud liquid water (WRF `QCLOUD`). r_e = 10 um (the canonical continental
+    /// droplet value; mass extinction 3/(2 rho_w r_e) = 150 m^2 kg^-1).
     CloudLiquid,
-    /// Cloud ice (WRF `QICE`). r_e = 40 um.
+    /// Cloud ice (WRF `QICE`): SMALL pristine crystals. r_e = 40 um rho_w-normalized
+    /// (~44 um at rho_ice = 917 — the large end of the standard 25-40+ um cirrus
+    /// range; mass extinction 37.5 m^2 kg^-1). Verified against the same
+    /// geometric-optics framework as the v3 snow fix: `3/(2 rho_i r_e)` at 30-44 um
+    /// of solid ice spans 41-55 m^2 kg^-1, so the M0 value stands.
     Ice,
-    /// Snow (WRF `QSNOW`). r_e = 40 um — shares ice optics (merged into ext_ice).
+    /// Snow (WRF `QSNOW`): precipitation-sized AGGREGATES (D ~ 0.5-3 mm at bulk
+    /// densities ~50-200 kg m^-3), NOT small crystals. rho_w-normalized
+    /// r_e = 150 um (equivalently ~1.5 mm aggregates near 100 kg m^-3 bulk
+    /// density) -> visible mass extinction 3/(2 rho_w r_e) = 10 m^2 kg^-1, the
+    /// honest mass-weighted aggregate value: falling-snow visibility studies give
+    /// ~10-15 m^2 kg^-1 (Rasmussen et al. 1999, J. Appl. Meteor.), aggregate
+    /// area-mass power laws (Mitchell 1996, JAS) give ~20-30 for 1-2 mm
+    /// aggregates, and CRTM/RTTOV-style forward operators treat snow as its own
+    /// large-particle class (effective sizes of hundreds of um), well below
+    /// small-ice extinction per unit mass. Before SSB v3, snow shared cloud-ice
+    /// optics (37.5 m^2 kg^-1) inside `ext_ice`, inflating snow's visible
+    /// extinction 3.75x — anvil plates and stratiform shields rendered
+    /// blindingly thick (the "clouds too thick" defect). Snow now enters
+    /// `ext_precip` at this beta (see `ingest.rs`).
     Snow,
-    /// Rain (WRF `QRAIN`). r_e = 1 mm.
+    /// Rain (WRF `QRAIN`). r_e = 1 mm (raindrops 0.5-2 mm; mass extinction
+    /// 1.5 m^2 kg^-1).
     Rain,
-    /// Graupel (WRF `QGRAUP`). r_e = 1 mm — shares precip optics (merged into ext_precip).
+    /// Graupel (WRF `QGRAUP`). r_e = 1 mm shared with rain (rho_w-normalized
+    /// ~0.5-0.7 mm would be exact for 2-3 mm graupel at rho ~ 450 kg m^-3; the
+    /// shared value is a documented, bounded simplification).
     Graupel,
 }
 
 impl HydrometeorClass {
-    /// Effective particle radius `r_e` (m) for this class.
+    /// Effective particle radius `r_e` (m) for this class (rho_w-normalized — see
+    /// the enum doc; only the product `rho_w * r_e` enters the optics).
     pub const fn effective_radius_m(self) -> f64 {
         match self {
             Self::CloudLiquid => 10.0e-6,
-            Self::Ice | Self::Snow => 40.0e-6,
+            Self::Ice => 40.0e-6,
+            Self::Snow => 150.0e-6,
             Self::Rain | Self::Graupel => 1.0e-3,
         }
     }
@@ -156,15 +184,62 @@ pub fn class_extinction(class: HydrometeorClass, rho_air: f64, q: f64) -> f64 {
 // liquid and ~1.87 for ice, so an anvil with a visible optical depth of even a
 // few units is IR-opaque (BT = cloud-top T), while thin cirrus (tau_vis << 1)
 // stays semi-transparent (BT between the cloud top and the surface) — both
-// unit-tested. Precip (rain/graupel, r_e = 1 mm) gets a much smaller mass
-// absorption (large particles absorb little per unit mass): ~7e-4 m^2/g, so
-// beta_abs/beta_vis ~ 0.47 — precip sits at warm low levels and reads as a mild
-// warm veil, never a cold top.
+// unit-tested. The large-particle species (rain/graupel at r_e = 1 mm, and — since
+// SSB v3 — snow aggregates at r_e = 150 um, all in the `ext_precip` channel) get a
+// much smaller mass absorption (large particles absorb little per unit mass): the
+// geometric-optics `3 Q_abs / (4 rho_w r_e)` with Q_abs ~ 0.93 (millimetric
+// ice/water particles are opaque internal absorbers at 10.3 um — the bulk e-folding
+// depth is a few um). Per unit VISIBLE extinction that is beta_abs/beta_vis
+// ~ 0.47 for every large species, because Q_abs/Q_ext is SIZE-INDEPENDENT in the
+// geometric regime — which is why ONE per-channel recovery can carry the mixed
+// rain + graupel + snow channel. The shipped channel recovery uses the SNOW
+// coefficient (the channel's cold-relevant species) INCLUDING the documented
+// small-ice-spectrum factor [`IR_SNOW_SMALL_ICE_FACTOR`], i.e. ratio ~ 0.93;
+// for the rain/graupel share this over-absorbs 2x, which is BT-invisible where
+// rain lives (low, warm, T ~ T_sfc: what it absorbs it re-emits at nearly the
+// same temperature). A snow-dominated anvil plate is IR-opaque by sheer mass
+// (tau_vis ~ 20 -> tau_ir ~ 19 with the factor, BT = cloud-top T).
 
 /// IR (10.3 um) mass-absorption coefficient for cloud LIQUID (m^2 g^-1).
 pub const IR_MASS_ABS_LIQUID_M2_G: f64 = 0.15;
-/// IR (10.3 um) mass-absorption coefficient for ICE/snow (m^2 g^-1).
+/// IR (10.3 um) mass-absorption coefficient for small cloud ICE (m^2 g^-1).
 pub const IR_MASS_ABS_ICE_M2_G: f64 = 0.07;
+/// The PURE geometric-optics 10.3 um mass absorption of 150 um (rho_w-normalized)
+/// snow aggregates (m^2 g^-1): `3 Q_abs / (4 rho_w r_e)` with Q_abs ~= 0.93,
+/// i.e. an IR-absorption / visible-extinction ratio `Q_abs / Q_ext = 0.467`,
+/// the size-independent large-particle value rain/graupel share.
+pub const IR_MASS_ABS_SNOW_GEOMETRIC_M2_G: f64 = 4.667e-3;
+
+/// Unresolved-size-spectrum compensation on snow's 10.3 um absorption
+/// (dimensionless, applied on top of the geometric aggregate value). WRF QSNOW —
+/// especially on coarse grids — physically includes small cloud-top ice crystals
+/// whose 10.3 um absorption per unit VISIBLE extinction exceeds the pure
+/// 150-um-aggregate geometric limit; band-averaged fast-RT operators carry
+/// exactly this kind of gray compensation rather than resolving the spectrum.
+/// Factor 2.0 was chosen in an orchestrator-reviewed A/B on the Michael
+/// hurricane IR (geometric vs 2x vs 3x): pure geometric rendered the CDO canopy
+/// mid-grey (median BT 255 K) where a real major hurricane reads broadly cold;
+/// the compensation restores a cold canopy while keeping the eye / banding and
+/// the honestly graded anvil edges the snow-optics fix bought. VISIBLE optics
+/// are untouched by construction (this constant exists only in the IR/WV
+/// recovery).
+///
+/// SCIENCE-REVIEW FRAMING (2026-07-09, do not cite this factor as physics
+/// headroom): a fixed-size aggregate cannot exceed `Q_abs/Q_ext ~ 0.5`, so 2x
+/// is NOT within single-size geometric physics. It is equivalent to a ~7%
+/// small-ice mass fraction inside QSNOW, or to a Mitchell (1996) area-mass A/m
+/// in the 10-15 m^2/kg band — both plausible for cold anvil canopies. It is a
+/// documented STOPGAP for the real fix: Field et al. (2005) temperature-
+/// dependent snow size (the UPP `EFFR('S')` moment math), which makes cold
+/// snow small in BOTH bands simultaneously and retires this factor to 1.0
+/// (queued as the next brick-format rev; see notes/next-level-wave.md).
+pub const IR_SNOW_SMALL_ICE_FACTOR: f64 = 2.0;
+
+/// IR (10.3 um) mass-absorption coefficient for SNOW (m^2 g^-1): the geometric
+/// aggregate value times the documented small-ice-spectrum factor. This is the
+/// coefficient `ir.rs` applies to the ENTIRE `ext_precip` channel (see
+/// `cloud_ir_absorption` for why the channel follows its cold-relevant species).
+pub const IR_MASS_ABS_SNOW_M2_G: f64 = IR_SNOW_SMALL_ICE_FACTOR * IR_MASS_ABS_SNOW_GEOMETRIC_M2_G;
 /// IR (10.3 um) mass-absorption coefficient for PRECIP (rain/graupel) (m^2 g^-1).
 /// Large particles (r_e = 1 mm) absorb little per unit mass at 10.3 um; this is
 /// the geometric-optics order `~ 3 Q_abs / (4 rho_w r_e)` for a large absorbing
@@ -266,7 +341,8 @@ impl HydrometeorClass {
     pub const fn ir_mass_absorption_m2_g(self) -> f64 {
         match self {
             Self::CloudLiquid => IR_MASS_ABS_LIQUID_M2_G,
-            Self::Ice | Self::Snow => IR_MASS_ABS_ICE_M2_G,
+            Self::Ice => IR_MASS_ABS_ICE_M2_G,
+            Self::Snow => IR_MASS_ABS_SNOW_M2_G,
             Self::Rain | Self::Graupel => IR_MASS_ABS_PRECIP_M2_G,
         }
     }
@@ -483,9 +559,89 @@ mod tests {
     fn effective_radii_match_design_table() {
         assert_eq!(HydrometeorClass::CloudLiquid.effective_radius_m(), 10.0e-6);
         assert_eq!(HydrometeorClass::Ice.effective_radius_m(), 40.0e-6);
-        assert_eq!(HydrometeorClass::Snow.effective_radius_m(), 40.0e-6);
+        // SSB v3 snow-optics fix: snow is a precipitation-sized aggregate with its
+        // OWN rho_w-normalized effective radius, no longer sharing cloud-ice optics.
+        assert_eq!(HydrometeorClass::Snow.effective_radius_m(), 150.0e-6);
         assert_eq!(HydrometeorClass::Rain.effective_radius_m(), 1.0e-3);
         assert_eq!(HydrometeorClass::Graupel.effective_radius_m(), 1.0e-3);
+    }
+
+    /// SSB v3: the per-species VISIBLE mass-extinction coefficients are locked —
+    /// `k = 3/(2 rho_w r_e)`: liquid 150, ice 37.5, snow 10, rain/graupel
+    /// 1.5 m^2 kg^-1 — with the physical per-unit-mass ordering
+    /// liquid > ice > snow > rain (smaller particles extinguish more per gram).
+    #[test]
+    fn visible_mass_extinction_per_species_locked_and_ordered() {
+        // class_extinction at rho_air = 1 kg/m^3, q = 1 g/kg gives k * 1e-3 (m^-1),
+        // i.e. the mass-extinction coefficient scaled by the 1 g/m^3 concentration.
+        let k = |class: HydrometeorClass| class_extinction(class, 1.0, 1.0e-3) * 1.0e3;
+        let liquid = k(HydrometeorClass::CloudLiquid);
+        let ice = k(HydrometeorClass::Ice);
+        let snow = k(HydrometeorClass::Snow);
+        let rain = k(HydrometeorClass::Rain);
+        let graupel = k(HydrometeorClass::Graupel);
+        assert!((liquid - 150.0).abs() < 1e-9, "liquid k={liquid}");
+        assert!((ice - 37.5).abs() < 1e-9, "ice k={ice}");
+        assert!((snow - 10.0).abs() < 1e-9, "snow k={snow}");
+        assert!((rain - 1.5).abs() < 1e-9, "rain k={rain}");
+        assert!((graupel - 1.5).abs() < 1e-9, "graupel k={graupel}");
+        assert!(
+            liquid > ice && ice > snow && snow > rain && rain > 0.0,
+            "per-unit-mass ordering violated: {liquid} > {ice} > {snow} > {rain} > 0"
+        );
+        // The defect factor this fix removes: snow under the old shared-ice optics
+        // carried exactly ice/snow = 3.75x too much visible extinction per gram.
+        assert!(((ice / snow) - 3.75).abs() < 1e-9);
+    }
+
+    /// SSB v3 + the IR lever round: snow's 10.3 um absorption per unit VISIBLE
+    /// extinction is the size-independent geometric large-particle ratio
+    /// `Q_abs/Q_ext ~ 0.467` (== rain/graupel — the identity that lets ONE
+    /// per-channel recovery carry the mixed rain+graupel+snow `ext_precip`
+    /// channel) times the NAMED unresolved-size-spectrum compensation
+    /// [`IR_SNOW_SMALL_ICE_FACTOR`]. Still well below small-ice's tuned 1.87 per
+    /// unit extinction AND per unit mass, yet a thick snow plate goes IR-opaque
+    /// by mass.
+    #[test]
+    fn snow_ir_absorption_matches_the_large_particle_ratio() {
+        let ext = 6.67e-3; // a realistic snow-plate visible extinction (m^-1)
+        let snow_ratio = ir_absorption_from_ext(HydrometeorClass::Snow, ext) / ext;
+        let rain_ratio = ir_absorption_from_ext(HydrometeorClass::Rain, ext) / ext;
+        let ice_ratio = ir_absorption_from_ext(HydrometeorClass::Ice, ext) / ext;
+        // The constant IS the documented product: factor x geometric aggregate value
+        // (factor x Q_abs/Q_ext x k_vis in per-unit-extinction terms).
+        const {
+            assert!(IR_SNOW_SMALL_ICE_FACTOR == 2.0);
+            assert!(
+                IR_MASS_ABS_SNOW_M2_G == IR_SNOW_SMALL_ICE_FACTOR * IR_MASS_ABS_SNOW_GEOMETRIC_M2_G
+            );
+        };
+        assert!(
+            (snow_ratio - IR_SNOW_SMALL_ICE_FACTOR * 0.4667).abs() < 2e-3,
+            "snow ratio {snow_ratio}"
+        );
+        // The geometric identity with rain survives underneath the named factor.
+        assert!(
+            (snow_ratio - IR_SNOW_SMALL_ICE_FACTOR * rain_ratio).abs() < 2e-3,
+            "snow {snow_ratio} != factor x rain {rain_ratio}: the channel identity"
+        );
+        assert!(snow_ratio < ice_ratio, "snow must absorb less per unit ext");
+        // Per unit MASS: snow 9.33e-3 m^2/g still well below ice 0.07 m^2/g
+        // (const-asserted, matching the WV coefficient-ordering guard pattern).
+        const {
+            assert!(IR_MASS_ABS_SNOW_M2_G < IR_MASS_ABS_ICE_M2_G / 5.0);
+        };
+        // IR-opacity by mass survives: a 2 kg/m^2 snow water path over a 3 km plate
+        // (M = 0.667 g/m^3 -> tau_vis = 10 m^2/kg * 2 kg/m^2 = 20) has
+        // tau_ir = 0.933 * 20 ~ 19 >> 1 -> transmittance ~ 0.
+        let m_g_m3 = 0.667; // g/m^3
+        let beta_vis = 10.0 * (m_g_m3 / 1000.0); // k * M_kg = 6.67e-3 m^-1
+        let beta_ir = ir_absorption_from_ext(HydrometeorClass::Snow, beta_vis);
+        let tau_ir = beta_ir * 3000.0;
+        assert!(
+            tau_ir > 8.0,
+            "thick snow plate not IR-opaque: tau_ir {tau_ir}"
+        );
     }
 
     #[test]

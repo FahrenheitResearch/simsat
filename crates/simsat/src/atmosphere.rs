@@ -72,9 +72,18 @@ pub const OZONE_ABSORPTION: [f64; 3] = [
     1.881e-6 * OZONE_STRENGTH,
     0.085e-6 * OZONE_STRENGTH,
 ];
-/// Multiplier on the base Hillaire ozone absorption (M2 twilight pass). The Chappuis
-/// band supports ~1.3-1.5x; 1.45 shifts the terminator + deep-twilight residual
-/// bluer/cooler without retuning Rayleigh. `1.0` reproduces the pre-tuning ozone.
+/// Multiplier on the base Hillaire ozone absorption (M2 twilight pass). 1.45
+/// shifts the terminator + deep-twilight residual bluer/cooler without retuning
+/// Rayleigh. `1.0` reproduces the pre-tuning ozone.
+///
+/// SCIENCE-REVIEW PROVENANCE (2026-07-09): 1.45x is NOT cross-section
+/// uncertainty (the Chappuis band is well measured) — numerically it is a
+/// ~435 DU equivalent ozone column, an extreme high-latitude-spring value
+/// (a typical central-US column is ~300-330 DU, which the base coefficients
+/// reproduce). It is kept as the APPROVED DUSK STYLIZATION, not cited physics;
+/// the low-sun green deficit it creates at sunrise is corrected on the display
+/// side (illuminant gains derived from the same transmittance LUT). A future
+/// wave may expose OZONE_DU as a scene knob like AOD.
 pub const OZONE_STRENGTH: f64 = 1.45;
 /// Ozone tent-profile centre altitude (m).
 pub const OZONE_CENTER_M: f64 = 25_000.0;

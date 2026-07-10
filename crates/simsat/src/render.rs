@@ -89,19 +89,50 @@ pub const FLAT_ALBEDO_SRGB: f32 = 0.30;
 /// ground still slightly hazy vs the vivid GOES true-color references).
 pub const AERIAL_VEIL_DAY_SCALE: f64 = 0.40;
 
-/// Sun-elevation gate (deg) for [`AERIAL_VEIL_DAY_SCALE`]: NO veil reduction at/below
-/// LO (twilight and the terminator keep their FULL physical in-scatter — the M2
-/// twilight tuning is preserved by construction, since it all lives below this
-/// elevation) ramping to the full daytime reduction at/above HI. Chosen so the whole
-/// twilight/terminator band (sun <= ~6 deg) is byte-unchanged and only daylight
-/// de-hazes.
+/// Sun-elevation gate (deg) shared by the DAYTIME calibration ramp family
+/// ([`day_lerp_ramp`]: land day gain, ground lift, water day term, cloud-shadow floor,
+/// top-down cloud norm): identity at/below LO (twilight and the terminator keep the M2
+/// tuning by construction) ramping to the full daytime value at/above HI.
+///
+/// NOTE (low-sun visible pass): the aerial-perspective VEIL is NO LONGER a member of
+/// this family — it has its own SUNRISE ramp ([`aerial_veil_scale`], constants below).
+/// The 20-deg hard veil gate was backwards vs operational practice: satpy/pyspectral
+/// REDUCE the Rayleigh correction approaching the terminator rather than disabling it,
+/// so the sunrise band (2-20 deg) was rendering the FULL blue airlight over a nearly
+/// unlit surface — the reported flat navy ground.
 pub const AERIAL_VEIL_ELEV_LO_DEG: f64 = 20.0;
-/// Upper end of the veil-reduction elevation ramp (deg). See [`AERIAL_VEIL_ELEV_LO_DEG`].
+/// Upper end of the daytime calibration ramp (deg). See [`AERIAL_VEIL_ELEV_LO_DEG`].
 /// WS2 QA: `40 -> 30` — at a sun elevation of 30 deg (mid-morning) the ramp used to sit
 /// at half, leaving the ground half-veiled/half-lifted ("murky"); full daytime treatment
 /// now arrives by 30 deg. Frames at/above 40 deg are byte-identical (both ramps
 /// saturated); the twilight band (<= 20 deg) is byte-identical as before.
 pub const AERIAL_VEIL_ELEV_HI_DEG: f64 = 30.0;
+
+// ── sunrise-band veil ramp (low-sun visible pass; the navy-ground fix) ─────────
+//
+// Real true-color products Rayleigh-correct at ALL solar angles, tapering the
+// correction near the terminator (satpy/pyspectral `reduce_rayleigh` idiom) — they
+// never render the full molecular airlight over a dawn surface. Our veil de-haze was
+// hard-gated OFF below 20 deg, so the whole 2-20 deg sunrise band showed the raw blue
+// in-scatter sheet over a nearly unlit ground: a flat navy frame (the phase-1
+// `en_td_e5_cloudsoff` probe: the entire clear ground within ~0.01 display luminance,
+// R/B ~0.7-0.84 vs the near-black near-neutral real-GOES dawn ground). The fix is a
+// TWO-SEGMENT ramp: full physical veil at/below the terminator gate (the approved
+// dusk/twilight band stays byte-identical), smoothly reducing toward the daytime
+// de-haze across the sunrise band, and holding the daytime value from there up
+// (daytime frames at/above [`AERIAL_VEIL_ELEV_HI_DEG`] are byte-identical since both
+// old and new ramps sit at [`AERIAL_VEIL_DAY_SCALE`] there).
+
+/// TERMINATOR gate (deg) of the sunrise veil ramp: at/below this sun elevation the
+/// veil is exactly `1.0` (the full physical airlight — the twilight/terminator glow
+/// and the whole approved below-horizon dusk band are byte-identical by construction).
+pub const VEIL_TERMINATOR_ELEV_DEG: f64 = 2.0;
+/// Upper end (deg) of the sunrise veil ramp: the full daytime de-haze
+/// ([`AERIAL_VEIL_DAY_SCALE`]) is in place by this elevation and held above it.
+/// Chosen inside the science-review band ("toward the daytime 0.40 by ~15-20 deg");
+/// at 5 deg the smoothstep leaves a small residual de-haze (veil ~0.9 — the satpy
+/// reduced-but-not-disabled behavior the review asked to evaluate).
+pub const VEIL_SUNRISE_ELEV_HI_DEG: f64 = 16.0;
 
 /// Land-albedo VIBRANCY: a luminance-preserving saturation boost applied to the Blue
 /// Marble LAND texel (in linear RGB, before shading) so vegetation reads as the vivid
@@ -407,11 +438,13 @@ impl Default for SurfacePixel {
 /// The shared sun-gated daytime calibration RAMP for the true-color levers: linearly
 /// interpolate from `1.0` at/below [`AERIAL_VEIL_ELEV_LO_DEG`] (the whole twilight/
 /// terminator band, kept byte-identical by construction) to `day_value` at/above
-/// [`AERIAL_VEIL_ELEV_HI_DEG`] (full daytime), via the same monotone smoothstep. Both
-/// [`aerial_veil_scale`] and [`land_day_gain`] are this one family — only `day_value`
-/// differs. At the NEUTRAL `day_value = 1.0` it is exactly `1.0` at every elevation
-/// (`1.0 - t * 0.0`): the identity no-op that proves each sun-gated lever is a clean
-/// parameterization of the shipped radiance path (used by the refinement sanity tests).
+/// [`AERIAL_VEIL_ELEV_HI_DEG`] (full daytime), via the same monotone smoothstep.
+/// [`land_day_gain`], [`ground_day_lift`], and the water/cloud-shadow day gates are
+/// this one family — only `day_value` differs. (The aerial VEIL left the family in the
+/// low-sun visible pass: [`aerial_veil_scale`] now rides its own sunrise ramp.) At the
+/// NEUTRAL `day_value = 1.0` it is exactly `1.0` at every elevation (`1.0 - t * 0.0`):
+/// the identity no-op that proves each sun-gated lever is a clean parameterization of
+/// the shipped radiance path (used by the refinement sanity tests).
 #[inline]
 pub(crate) fn day_lerp_ramp(sun_elev_deg: f64, day_value: f64) -> f64 {
     let t = atmosphere::smoothstep(
@@ -422,12 +455,21 @@ pub(crate) fn day_lerp_ramp(sun_elev_deg: f64, day_value: f64) -> f64 {
     1.0 - t * (1.0 - day_value)
 }
 
-/// Daytime aerial-perspective veil scale at a sun elevation (deg): `1.0` at/below
-/// [`AERIAL_VEIL_ELEV_LO_DEG`] (twilight untouched) ramping to [`AERIAL_VEIL_DAY_SCALE`]
-/// at/above [`AERIAL_VEIL_ELEV_HI_DEG`] (full daytime de-haze). Monotone via smoothstep.
+/// Aerial-perspective veil scale at a sun elevation (deg) — the SUNRISE ramp (low-sun
+/// visible pass): `1.0` at/below [`VEIL_TERMINATOR_ELEV_DEG`] (the full physical
+/// airlight; the approved dusk/twilight band byte-identical by construction), smoothly
+/// reducing to [`AERIAL_VEIL_DAY_SCALE`] at/above [`VEIL_SUNRISE_ELEV_HI_DEG`] and
+/// holding it from there up (daytime at/above [`AERIAL_VEIL_ELEV_HI_DEG`] is
+/// byte-identical to the pre-fix ramp, which also sat at the day scale there).
+/// Monotone (non-increasing) via smoothstep. See the sunrise-veil module note.
 #[inline]
 pub fn aerial_veil_scale(sun_elev_deg: f64) -> f64 {
-    day_lerp_ramp(sun_elev_deg, AERIAL_VEIL_DAY_SCALE)
+    let t = atmosphere::smoothstep(
+        VEIL_TERMINATOR_ELEV_DEG,
+        VEIL_SUNRISE_ELEV_HI_DEG,
+        sun_elev_deg,
+    );
+    1.0 - t * (1.0 - AERIAL_VEIL_DAY_SCALE)
 }
 
 /// LAND daytime brightness gain at a sun elevation (deg): `1.0` at/below
@@ -470,6 +512,155 @@ pub fn effective_cloud_shadow(shadow: f64, sun_elev_deg: f64) -> f64 {
             sun_elev_deg,
         );
     f + (1.0 - f) * s
+}
+
+// ── low-sun ILLUMINANT CORRECTION (sunrise/dawn visible pass; the cast fix) ─────
+//
+// At sun elevations of ~2-20 deg the direct solar beam reaching a cloud has crossed a
+// long grazing atmosphere path: Rayleigh strips blue AND the Chappuis-band ozone
+// (OZONE_STRENGTH 1.45, the approved dusk stylization — see atmosphere.rs) eats a bite
+// out of GREEN. Every sunlit pixel is lit by that same tinted illuminant (the octave
+// multi-scatter sum multiplies the ONE reddened t_sun), so low cloud renders khaki/tan
+// and thick high cloud — where the blue sky ambient is a comparable share — renders
+// mauve/lavender (phase-1 diagnosis, notes/lowsun-visible-notes.md: cloud G/B 0.94-1.01
+// vs the real-GOES sunrise reference 1.16). Real true-color products remove the
+// illuminant tint by DIVIDING by the atmosphere-model transmittance (MODIS CREFL;
+// GeoColor and satpy/pyspectral do the equivalent Rayleigh/illuminant correction), so
+// the correction is derived from the SAME atmosphere model by construction and can
+// never desynchronize from an ozone/AOD retune.
+//
+// Ours mirrors that, correcting exactly the DIAGNOSED defect: per displayed pixel,
+// the GREEN channel is restored to the RAYLEIGH LINE of OUR OWN transmittance-LUT
+// direct-sun illuminant sampled at a reference cloud altitude for the pixel's sun
+// elevation. In reflectance space (`rho = pi L / E_sun`) the solar irradiance cancels
+// per channel, so the rho-space illuminant color is exactly the transmittance triple
+// `t_sun`. Under a pure lambda^-4 (Rayleigh + gray-aerosol) atmosphere the LOG
+// transmittances of the three bands are collinear in the Rayleigh coefficients; the
+// Chappuis ozone term is what pulls ln(t_G) BELOW that line (the green dip). The gain
+// restores it: `g_G = t_G_rayleigh / t_G` with
+// `ln t_G_rayleigh = lerp(ln t_R, ln t_B, a)`, `a = (beta_G - beta_R)/(beta_B -
+// beta_R)` from `atmosphere::RAYLEIGH_SCATTERING` — both the sample and the expected
+// value come from the same atmosphere model, so an ozone/AOD retune flows through
+// automatically. The R-B (warm) axis is DELIBERATELY preserved: the real-GOES sunrise
+// reference keeps R/B ~1.19 on dawn cloud, and the round-2 A/B measured that a FULL
+// unit-luminance white balance (dividing by the whole illuminant color) overshoots to
+// BLUE (Enderlin e5 cloud G/B 0.971 -> 0.893, R/B 1.146 -> 0.940 — worse than
+// baseline on the acceptance axis) because the blue sky ambient is the second
+// illuminant of the two-illuminant mix (phase-1 section 3): neutralizing the direct's
+// warm slope double-blues the mix. The gains triple is renormalized to unit Rec.709
+// luminance (a UNIFORM scale, ratio-preserving), so a pixel of the illuminant color
+// keeps its display luminance — the approved medians cannot move. The correction is
+// DISPLAY-side (the raw-bands product stays physical) and is tapered with named
+// satpy-idiom gates: identity at/below the terminator gate (the approved dusk band
+// byte-identical by construction), full correction across the sunrise band, identity
+// again by full daytime (the LUT green dip is negligible up there anyway).
+
+/// Reference CLOUD-TOP altitude (m) at which the low-sun illuminant color is sampled
+/// from the transmittance LUT. Science-review band ~6-8 km: the mid/upper-tropospheric
+/// deck the correction targets. LOWER clouds at low sun sit under a redder illuminant
+/// than the reference (they keep a warm residual — matching the real product, which
+/// leaves dawn stratus warm-tinted); higher anvils see slightly less.
+pub const ILLUM_REF_CLOUD_ALT_M: f64 = 7_000.0;
+/// Correction taper IN gate (deg): identity at/below (the amber terminator and the
+/// whole approved below-horizon dusk band are byte-identical by construction).
+pub const ILLUM_CORR_IN_LO_DEG: f64 = 2.0;
+/// Correction taper IN gate (deg): the full correction is in place at/above this
+/// elevation. The science-review guidance ("full correction ~8-10 deg") was written
+/// for the full-white-balance form; the shipped GREEN-RESTORATION form preserves the
+/// warm terminator axis by construction (equal R/B gains), so an earlier full
+/// engagement cannot cool the amber — and the round-2 Michael real-dawn frame
+/// (centre sun 3.4 deg, the reported defect band) measured only w = 0.16 under the
+/// 8-deg gate, leaving the mauve CDO nearly uncorrected. 5.0 puts real sunrise
+/// scenes (3-5 deg) under a meaningful-to-full correction while the <= 2 deg dusk
+/// band stays exactly identity.
+pub const ILLUM_CORR_IN_HI_DEG: f64 = 5.0;
+/// Correction taper OUT gate (deg): the correction starts easing off here...
+pub const ILLUM_CORR_OUT_LO_DEG: f64 = 20.0;
+/// ...and is identity again at/above this elevation (full daytime byte-identical by
+/// construction; the residual LUT gains up here are ~1 anyway).
+pub const ILLUM_CORR_OUT_HI_DEG: f64 = 30.0;
+
+/// The low-sun correction WEIGHT `[0,1]` at a sun elevation (deg): a smoothstep taper
+/// in across [`ILLUM_CORR_IN_LO_DEG`]..[`ILLUM_CORR_IN_HI_DEG`], a plateau at `1.0`
+/// through the sunrise band, and a smoothstep taper out across
+/// [`ILLUM_CORR_OUT_LO_DEG`]..[`ILLUM_CORR_OUT_HI_DEG`]. Exactly `0.0` at/below the IN
+/// gate and at/above the OUT gate (the byte-identity guarantees).
+#[inline]
+pub fn low_sun_illuminant_weight(sun_elev_deg: f64) -> f64 {
+    atmosphere::smoothstep(ILLUM_CORR_IN_LO_DEG, ILLUM_CORR_IN_HI_DEG, sun_elev_deg)
+        * (1.0 - atmosphere::smoothstep(ILLUM_CORR_OUT_LO_DEG, ILLUM_CORR_OUT_HI_DEG, sun_elev_deg))
+}
+
+/// LUT-DERIVED per-band gains of the low-sun illuminant correction at a sun elevation
+/// (deg). `[1, 1, 1]` outside the correction band (weight 0). Inside: the direct-sun
+/// transmittance triple `t` is sampled from OUR OWN LUT at [`ILLUM_REF_CLOUD_ALT_M`];
+/// the GREEN gain restores `t_G` to the Rayleigh log-line between the measured `t_R`
+/// and `t_B` (removing the Chappuis ozone green dip — the diagnosed khaki/mauve
+/// driver); the triple is renormalized to unit Rec.709 luminance by a UNIFORM scale
+/// (so the R/B warm axis is preserved EXACTLY and the illuminant's display luminance
+/// is unchanged); and the result is blended toward identity by
+/// [`low_sun_illuminant_weight`]. NEVER baked numbers: a retune of ozone/AOD/Rayleigh
+/// flows through the LUT into these gains automatically (the CREFL
+/// same-atmosphere-model property). See the module note for why the full white
+/// balance was measured and rejected.
+pub fn low_sun_illuminant_gains(sun_elev_deg: f64, luts: &AtmosphereLuts) -> [f64; 3] {
+    let w = low_sun_illuminant_weight(sun_elev_deg);
+    if w <= 0.0 {
+        return [1.0, 1.0, 1.0];
+    }
+    let mu = (sun_elev_deg.to_radians()).sin();
+    let t = atmosphere::sample_transmittance(
+        &luts.transmittance,
+        atmosphere::R_GROUND_M + ILLUM_REF_CLOUD_ALT_M,
+        mu,
+    );
+    let degenerate = |v: f64| !v.is_finite() || v <= 0.0;
+    if t.iter().any(|&c| degenerate(c)) {
+        return [1.0, 1.0, 1.0]; // degenerate illuminant: no correction
+    }
+    // Rayleigh-expected green: the lambda^-4 log-line between the measured R and B.
+    let ray = atmosphere::RAYLEIGH_SCATTERING;
+    let a = (ray[1] - ray[0]) / (ray[2] - ray[0]);
+    let t_g_rayleigh = ((1.0 - a) * t[0].ln() + a * t[2].ln()).exp();
+    // Restore green no lower than measured (the correction only ever ADDS green back).
+    let g_green = (t_g_rayleigh / t[1]).max(1.0);
+    // Unit-luminance renormalization: a UNIFORM scale (ratio-preserving) that keeps
+    // the corrected illuminant's Rec.709 luminance equal to the raw illuminant's.
+    let y = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let y_raw = y(t);
+    let y_corr = y([t[0], t[1] * g_green, t[2]]);
+    if degenerate(y_raw) || degenerate(y_corr) {
+        return [1.0, 1.0, 1.0];
+    }
+    let s = y_raw / y_corr;
+    [
+        1.0 + w * (s - 1.0),
+        1.0 + w * (s * g_green - 1.0),
+        1.0 + w * (s - 1.0),
+    ]
+}
+
+/// Apply the low-sun illuminant correction to a composited top-of-atmosphere LINEAR
+/// radiance, per band (gains on `L` == gains on `rho`, since `E_sun` is a per-channel
+/// constant). ON-EARTH pixels only (`on_earth = false` returns the input unchanged —
+/// the off-earth limb keeps its physical color). Called at the display seam of every
+/// visible RGB path, on the FINAL composited radiance (surface + cloud + airlight),
+/// immediately before the tonemap: [`shade_surface`] (geo clouds-off), the top-down
+/// RGB path (`topdown.rs`), and the geo clouds-on composite (`clouds.rs`
+/// `shade_cloud_pixel` — the one-line integration call site). The raw-bands /
+/// reflectance products do NOT call this (physical, pre-display).
+#[inline]
+pub fn apply_low_sun_illuminant(
+    l_toa: [f64; 3],
+    on_earth: bool,
+    sun_elev_deg: f64,
+    luts: &AtmosphereLuts,
+) -> [f64; 3] {
+    if !on_earth {
+        return l_toa;
+    }
+    let g = low_sun_illuminant_gains(sun_elev_deg, luts);
+    [l_toa[0] * g[0], l_toa[1] * g[1], l_toa[2] * g[2]]
 }
 
 /// The PHYSICAL reflectance ceiling the bounded highlight shoulder maps to display
@@ -578,25 +769,110 @@ fn reflect(incident: [f64; 3], normal: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+// ── ABI SYNTHETIC-GREEN display mode (prototype; OFF by default) ────────────────
+//
+// Real GOES-R "true color" has NO green band: the display green is SYNTHESIZED as a
+// weighted blend, G_display = 0.45*Red + 0.45*Blue + 0.10*veggie-NIR (Bah, Gunshor &
+// Schmit 2018, the CIMSS "simple hybrid green"). An arithmetic consequence: any hue on
+// the green-magenta axis is impossible in the real product — khaki (G excess over the
+// R-B line) and mauve (G deficit) casts CANNOT occur, at any solar angle. Our G channel
+// is a real radiative band, which is more physical but is exactly what lets the
+// low-sun ozone green-dip show as khaki/mauve. This mode reproduces the product
+// arithmetic (our G stands in for the 10% veggie-NIR term) as a DISPLAY-mode option
+// for A/B judgment: the orchestrator decides default / option / drop. NOTE the
+// G/B ~1.10-1.20 acceptance band of the real-GOES sunrise reference is itself a
+// synthesized-green PRODUCT artifact (provenance, not physical cloud color).
+//
+// Mechanism: a process-global display switch (default OFF = byte-identical), set by
+// the `render_frame` `synthetic-green=on` QA flag before rendering. A process-global
+// (the `ir::tsk_fallback_engaged` precedent) rather than a `FrameContext` field /
+// `OutputTransform` variant because the studio's settings + pickers match the enum
+// exhaustively outside this pass's footprint; if the mode is adopted the switch can be
+// promoted to a real studio-visible option. The WGSL twins mirror the math behind a
+// module const (`SYNTHETIC_GREEN_MODE = 0.0` = off) — flip both together on adoption.
+
+/// Synthesized-green weight of the RED reflectance (Bah et al. 2018).
+pub const SYN_GREEN_W_RED: f64 = 0.45;
+/// Synthesized-green weight of our native GREEN reflectance (stand-in for the 10%
+/// veggie-NIR term of the real product).
+pub const SYN_GREEN_W_GREEN: f64 = 0.10;
+/// Synthesized-green weight of the BLUE reflectance (Bah et al. 2018).
+pub const SYN_GREEN_W_BLUE: f64 = 0.45;
+
+static SYNTHETIC_GREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the ABI synthetic-green display mode process-wide (default OFF).
+/// QA/prototype switch — see the module note above.
+pub fn set_synthetic_green(on: bool) {
+    SYNTHETIC_GREEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the ABI synthetic-green display mode is enabled (default `false`).
+pub fn synthetic_green_enabled() -> bool {
+    SYNTHETIC_GREEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Replace the green of a display reflectance triple with the ABI synthesized green
+/// `G' = 0.45*R + 0.45*B + 0.10*G` (Bah et al. 2018; our G is the veggie stand-in).
+/// Applied to the exposure-scaled reflectance BEFORE the highlight desaturation, i.e.
+/// at the same point of the chain where the real product builds its green from the
+/// (corrected) band reflectances. R and B are untouched.
+#[inline]
+pub fn synthesize_abi_green(rho: [f64; 3]) -> [f64; 3] {
+    [
+        rho[0],
+        SYN_GREEN_W_RED * rho[0] + SYN_GREEN_W_GREEN * rho[1] + SYN_GREEN_W_BLUE * rho[2],
+        rho[2],
+    ]
+}
+
 /// Convert an internal reflectance factor `rho` (per band) to display `[0,1]` via
 /// the selected output transform (twin of the WGSL `output_transform`). For the ABI
 /// product path this is `stretch(desaturate(rho))` — the M2 twilight-pass display
 /// transform (highlight desaturation on the reflectance vector, then the toe-lifted
 /// per-channel sqrt stretch; see `atmosphere::desaturate_highlights` /
 /// `atmosphere::abi_reflectance_stretch`). The debug path stays a plain sRGB gamma.
+/// Reads the process-global synthetic-green switch and delegates to the pure
+/// [`output_transform_with`] (tested directly, so no test ever toggles the global).
 fn apply_output_transform(
     rho: [f64; 3],
     transform: OutputTransform,
     softclip_knee: f64,
     softclip_max: f64,
 ) -> [f32; 3] {
+    output_transform_with(
+        rho,
+        transform,
+        softclip_knee,
+        softclip_max,
+        synthetic_green_enabled(),
+    )
+}
+
+/// The PURE output transform behind [`apply_output_transform`]: `synthetic_green`
+/// selects the ABI synthesized-green display mode explicitly (see
+/// [`synthesize_abi_green`]). `false` reproduces the shipped transform byte-for-byte.
+fn output_transform_with(
+    rho: [f64; 3],
+    transform: OutputTransform,
+    softclip_knee: f64,
+    softclip_max: f64,
+    synthetic_green: bool,
+) -> [f32; 3] {
     match transform {
         OutputTransform::AbiReflectance => {
-            // Highlight desaturation (M2 twilight pass), THEN the bounded highlight
+            // Optional synthesized green FIRST (the real product computes its display
+            // green from the corrected band reflectances before any stretch), then
+            // highlight desaturation (M2 twilight pass), THEN the bounded highlight
             // soft-clip (bright tops keep structure; the desaturate-then-shoulder ORDER
             // is load-bearing — swapping it shifts the -2 deg amber anvils), THEN the
             // toe-lifted sqrt stretch. The soft-clip is strictly identity below its knee,
             // so the desaturated daytime/twilight below the knee is byte-unchanged.
+            let rho = if synthetic_green {
+                synthesize_abi_green(rho)
+            } else {
+                rho
+            };
             let desat = atmosphere::desaturate_highlights(rho);
             let mut out = [0.0f32; 3];
             for c in 0..3 {
@@ -869,10 +1145,11 @@ pub fn surface_toa_radiance(
             ctx.raymarch_steps,
             true,
         );
-        // True-color veil reduction (refinement pass): scale down the additive daytime
-        // in-scatter haze laid over the surface (a Rayleigh correction; twilight is
-        // untouched because the scale is 1.0 below AERIAL_VEIL_ELEV_LO_DEG). The surface
-        // transmittance is left intact. Off-earth limb in-scatter (above) is never scaled.
+        // SUNRISE veil ramp (low-sun visible pass): scale down the additive in-scatter
+        // haze laid over the surface (a Rayleigh correction; the terminator band is
+        // untouched because the scale is 1.0 at/below VEIL_TERMINATOR_ELEV_DEG). The
+        // surface transmittance is left intact. Off-earth limb in-scatter (above) is
+        // never scaled.
         let veil = aerial_veil_scale(px.sun_elev_deg as f64);
         l_toa = combine_aerial_veil(l_surf, sc.transmittance, sc.inscatter, veil);
     }
@@ -959,7 +1236,12 @@ pub fn shade_surface(ctx: &FrameContext, px: &SurfacePixel) -> [f32; 4] {
     // paths pass their per-scene `MarchConfig` value); the tonemap bakes the soft-clip.
     match surface_toa_radiance(ctx, px, 1.0, GROUND_DAY_LIFT) {
         None => [0.0, 0.0, 0.0, 0.0],
-        Some(l_toa) => radiance_to_rgba(l_toa, ctx.output_transform, ctx.exposure),
+        Some(l_toa) => {
+            // Low-sun illuminant correction at the display seam (on-earth only; the
+            // limb keeps its physical color). Identity outside the 2-30 deg band.
+            let l = apply_low_sun_illuminant(l_toa, px.on_earth, px.sun_elev_deg as f64, ctx.luts);
+            radiance_to_rgba(l, ctx.output_transform, ctx.exposure)
+        }
     }
 }
 
@@ -1677,10 +1959,12 @@ mod tests {
     fn refinement_levers_are_identity_no_ops() {
         // (a) Each lever at its NEUTRAL value reproduces the pre-refinement surface output.
 
-        // Veil + land-day-gain are ONE daytime ramp family; at the neutral day_value 1.0 the
-        // ramp is exactly 1.0 at every elevation (no daytime change), and the two shipping
-        // levers ARE members of that family (only their day_value differs). Both also stay
-        // exactly 1.0 through the whole twilight/terminator band (<= LO) by construction.
+        // Land-day-gain is a member of the daytime ramp family; at the neutral
+        // day_value 1.0 the ramp is exactly 1.0 at every elevation (no daytime change).
+        // The VEIL is no longer a family member (the low-sun sunrise ramp — tested in
+        // sunrise_veil_ramp_extends_the_dehaze_into_the_sunrise_band); here we pin only
+        // that at/above the daytime gate it still equals the family value (daytime
+        // byte-identity) and that the terminator band keeps the full physical veil.
         for &elev in &[-10.0f64, 0.0, 10.0, 20.0, 25.0, 40.0, 60.0, 90.0] {
             assert_eq!(
                 day_lerp_ramp(elev, 1.0),
@@ -1688,18 +1972,22 @@ mod tests {
                 "neutral daytime ramp must be identity at elev {elev}"
             );
             assert_eq!(
-                aerial_veil_scale(elev),
-                day_lerp_ramp(elev, AERIAL_VEIL_DAY_SCALE),
-                "the veil scale is the shared day ramp at AERIAL_VEIL_DAY_SCALE"
-            );
-            assert_eq!(
                 land_day_gain(elev),
                 day_lerp_ramp(elev, LAND_DAY_GAIN),
                 "the land day gain is the shared day ramp at LAND_DAY_GAIN"
             );
+            if elev >= AERIAL_VEIL_ELEV_HI_DEG {
+                assert_eq!(
+                    aerial_veil_scale(elev),
+                    day_lerp_ramp(elev, AERIAL_VEIL_DAY_SCALE),
+                    "full daytime veil must still equal the day-ramp value (byte-identity)"
+                );
+            }
             if elev <= AERIAL_VEIL_ELEV_LO_DEG {
-                assert_eq!(aerial_veil_scale(elev), 1.0, "twilight veil untouched");
                 assert_eq!(land_day_gain(elev), 1.0, "twilight land gain untouched");
+            }
+            if elev <= VEIL_TERMINATOR_ELEV_DEG {
+                assert_eq!(aerial_veil_scale(elev), 1.0, "terminator veil untouched");
             }
         }
 
@@ -2305,5 +2593,261 @@ mod tests {
             cloud_shadowed > ambient_only * 1.02,
             "the shadow floor must keep direct fill: shadowed {cloud_shadowed} vs ambient-only {ambient_only}"
         );
+    }
+
+    // ── low-sun visible pass (phase 2): sunrise veil ramp, LUT-derived illuminant
+    // correction, ABI synthetic-green prototype ──
+
+    #[test]
+    fn low_sun_constants_lock() {
+        // The named satpy/CREFL-idiom gates of the low-sun pass (twilight-tuning
+        // constants-lock pattern): changing any of these renegotiates the approved
+        // dusk/daytime byte-identity guarantees and must be a conscious decision.
+        assert_eq!(VEIL_TERMINATOR_ELEV_DEG, 2.0);
+        assert_eq!(VEIL_SUNRISE_ELEV_HI_DEG, 16.0);
+        assert_eq!(ILLUM_REF_CLOUD_ALT_M, 7_000.0);
+        assert_eq!(ILLUM_CORR_IN_LO_DEG, 2.0);
+        assert_eq!(ILLUM_CORR_IN_HI_DEG, 5.0);
+        assert_eq!(ILLUM_CORR_OUT_LO_DEG, 20.0);
+        assert_eq!(ILLUM_CORR_OUT_HI_DEG, 30.0);
+        assert_eq!(SYN_GREEN_W_RED, 0.45);
+        assert_eq!(SYN_GREEN_W_GREEN, 0.10);
+        assert_eq!(SYN_GREEN_W_BLUE, 0.45);
+        // The synthesized-green weights are a convex combination (sum 1), so a grey
+        // stays grey through the synthesis.
+        assert!((SYN_GREEN_W_RED + SYN_GREEN_W_GREEN + SYN_GREEN_W_BLUE - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn sunrise_veil_ramp_extends_the_dehaze_into_the_sunrise_band() {
+        // Terminator band (<= +2 deg): the FULL physical veil — the approved dusk
+        // sweep 0/-2/-4 is byte-identical by construction.
+        for &e in &[-6.0f64, -4.0, -2.0, 0.0, 1.0, VEIL_TERMINATOR_ELEV_DEG] {
+            assert_eq!(aerial_veil_scale(e), 1.0, "full veil at elev {e}");
+        }
+        // Full daytime de-haze in place at/above the sunrise HI and held from there up
+        // — at/above AERIAL_VEIL_ELEV_HI_DEG this equals the pre-fix ramp value, so
+        // daytime (sun 30+) is byte-identical.
+        for &e in &[VEIL_SUNRISE_ELEV_HI_DEG, 20.0, 30.0, 45.0, 90.0] {
+            assert_eq!(
+                aerial_veil_scale(e),
+                AERIAL_VEIL_DAY_SCALE,
+                "daytime de-haze at elev {e}"
+            );
+        }
+        // Monotone non-increasing across the ramp.
+        let mut prev = f64::INFINITY;
+        for i in 0..=100 {
+            let e = -5.0 + 40.0 * i as f64 / 100.0;
+            let v = aerial_veil_scale(e);
+            assert!(v <= prev + 1e-12, "not monotone at {e}: {v} > {prev}");
+            assert!((AERIAL_VEIL_DAY_SCALE..=1.0).contains(&v));
+            prev = v;
+        }
+        // The science-review "residual de-haze at ~5 deg" evaluation: the smoothstep
+        // leaves veil ~0.9 at 5 deg (reduced-but-not-disabled, the satpy idiom).
+        let v5 = aerial_veil_scale(5.0);
+        assert!(
+            (0.85..0.97).contains(&v5),
+            "5-deg residual de-haze out of band: {v5}"
+        );
+    }
+
+    #[test]
+    fn low_sun_illuminant_gains_are_identity_outside_the_band() {
+        let (_params, luts, _sky) = shared_optics();
+        // At/below the IN gate (the amber terminator + the whole below-horizon dusk
+        // band) and at/above the OUT gate (full daytime): gains are EXACTLY [1,1,1],
+        // so those approved looks are byte-identical by construction.
+        for &e in &[-10.0f64, -4.0, -2.0, 0.0, ILLUM_CORR_IN_LO_DEG] {
+            assert_eq!(low_sun_illuminant_gains(e, luts), [1.0, 1.0, 1.0], "at {e}");
+            assert_eq!(low_sun_illuminant_weight(e), 0.0, "weight at {e}");
+        }
+        for &e in &[ILLUM_CORR_OUT_HI_DEG, 45.0, 90.0] {
+            assert_eq!(low_sun_illuminant_gains(e, luts), [1.0, 1.0, 1.0], "at {e}");
+            assert_eq!(low_sun_illuminant_weight(e), 0.0, "weight at {e}");
+        }
+        // apply_low_sun_illuminant: off-earth pixels are returned unchanged (the limb
+        // keeps its physical color) even inside the band.
+        let l = [3.0, 4.0, 5.0];
+        assert_eq!(apply_low_sun_illuminant(l, false, 6.0, luts), l);
+        // Inside the band an on-earth pixel IS corrected.
+        assert_ne!(apply_low_sun_illuminant(l, true, 6.0, luts), l);
+    }
+
+    #[test]
+    fn low_sun_illuminant_gains_correct_the_green_deficit() {
+        let (_params, luts, _sky) = shared_optics();
+        // The full-correction plateau spans the sunrise band.
+        for &e in &[ILLUM_CORR_IN_HI_DEG, 10.0, 15.0, ILLUM_CORR_OUT_LO_DEG] {
+            assert_eq!(low_sun_illuminant_weight(e), 1.0, "plateau at {e}");
+        }
+        // In the sunrise band the LUT illuminant carries the Chappuis ozone GREEN DIP
+        // (phase-1 diagnosis), so the gains must RAISE green, preserve the R-B warm
+        // axis EXACTLY (equal R and B gains — the reference keeps dawn cloud warm),
+        // and pull both down slightly (the unit-luminance renormalization).
+        for &e in &[5.0f64, 8.0, 12.0] {
+            let g = low_sun_illuminant_gains(e, luts);
+            assert!(g[1] > 1.0, "green gain at {e}: {g:?}");
+            assert_eq!(g[0], g[2], "R and B gains must be equal at {e}: {g:?}");
+            assert!(g[0] < 1.0, "renormalization scale at {e}: {g:?}");
+            assert!(g[1] > g[0], "green must rise relative to R/B at {e}: {g:?}");
+        }
+        // LUMINANCE PRESERVATION (the property that protects the approved medians): at
+        // full weight the corrected illuminant keeps its Rec.709 luminance exactly —
+        // the green dip is repaired in chroma, not brightness. And the corrected green
+        // sits ON the Rayleigh log-line between the (rescaled) R and B channels.
+        let e = 10.0;
+        assert_eq!(low_sun_illuminant_weight(e), 1.0);
+        let t = atmosphere::sample_transmittance(
+            &luts.transmittance,
+            atmosphere::R_GROUND_M + ILLUM_REF_CLOUD_ALT_M,
+            e.to_radians().sin(),
+        );
+        let g = low_sun_illuminant_gains(e, luts);
+        let y = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let corrected = [t[0] * g[0], t[1] * g[1], t[2] * g[2]];
+        assert!(
+            (y(corrected) / y(t) - 1.0).abs() < 1e-12,
+            "luminance not preserved: {} vs {}",
+            y(corrected),
+            y(t)
+        );
+        // R/B ratio preserved exactly through the correction.
+        assert!(
+            (corrected[0] / corrected[2] - t[0] / t[2]).abs() < 1e-12,
+            "warm axis must be preserved"
+        );
+        // Green on the Rayleigh line: ln(G) = lerp(ln(R), ln(B), a) of the CORRECTED
+        // triple (the uniform scale shifts all three logs equally, so the collinearity
+        // holds for the corrected triple exactly when the restoration is applied).
+        let ray = atmosphere::RAYLEIGH_SCATTERING;
+        let a = (ray[1] - ray[0]) / (ray[2] - ray[0]);
+        let expected_ln_g = (1.0 - a) * corrected[0].ln() + a * corrected[2].ln();
+        assert!(
+            (corrected[1].ln() - expected_ln_g).abs() < 1e-9,
+            "corrected green must sit on the Rayleigh log-line: {} vs {expected_ln_g}",
+            corrected[1].ln()
+        );
+    }
+
+    #[test]
+    fn synthetic_green_mode_is_off_by_default_and_kills_green_axis_casts() {
+        // OFF by default: the shipped output is byte-identical.
+        assert!(!synthetic_green_enabled());
+        // A grey triple passes through the synthesis unchanged (weights sum to 1).
+        let grey = synthesize_abi_green([0.4, 0.4, 0.4]);
+        for c in 0..3 {
+            assert!((grey[c] - 0.4).abs() < 1e-15, "grey drifted: {grey:?}");
+        }
+        // The green-magenta axis is arithmetically collapsed: G' - mid = 0.1*(G - mid)
+        // with mid = (R+B)/2, i.e. the G deviation from the R-B line shrinks exactly
+        // 10x — a mauve (G below the line, the phase-1 lavender CDO) rises toward it,
+        // a green-excess triple falls toward it, and R/B are untouched (the R>B warm
+        // SLOPE of a khaki is the illuminant gains' job, not the synthesis').
+        for probe in [[0.534f64, 0.421, 0.444], [0.30, 0.40, 0.28]] {
+            let syn = synthesize_abi_green(probe);
+            let mid = 0.5 * (probe[0] + probe[2]);
+            assert!(
+                (syn[1] - mid - 0.1 * (probe[1] - mid)).abs() < 1e-12,
+                "G deviation must shrink 10x: {syn:?} vs {probe:?}"
+            );
+            assert_eq!(syn[0], probe[0]);
+            assert_eq!(syn[2], probe[2]);
+        }
+        let mauve = [0.534, 0.421, 0.444];
+        assert!(
+            synthesize_abi_green(mauve)[1] > mauve[1],
+            "mauve G must rise toward the R-B line"
+        );
+        // The pure transform with the flag OFF is byte-identical to the shipped chain;
+        // with the flag ON it equals the shipped chain fed the synthesized triple
+        // (the synthesis happens BEFORE desaturation, as the real product computes its
+        // display green from band reflectances before any stretch). Testing through
+        // the pure function so no test ever toggles the process-global.
+        for rho in [[0.2, 0.15, 0.18], [0.9, 0.7, 0.8], [0.05, 0.04, 0.06]] {
+            let off = output_transform_with(
+                rho,
+                OutputTransform::AbiReflectance,
+                CLOUD_SOFTCLIP_KNEE,
+                RHO_HIGHLIGHT_MAX,
+                false,
+            );
+            let baseline = apply_output_transform(
+                rho,
+                OutputTransform::AbiReflectance,
+                CLOUD_SOFTCLIP_KNEE,
+                RHO_HIGHLIGHT_MAX,
+            );
+            assert_eq!(off, baseline, "flag off must be the shipped transform");
+            let on = output_transform_with(
+                rho,
+                OutputTransform::AbiReflectance,
+                CLOUD_SOFTCLIP_KNEE,
+                RHO_HIGHLIGHT_MAX,
+                true,
+            );
+            let pre = output_transform_with(
+                synthesize_abi_green(rho),
+                OutputTransform::AbiReflectance,
+                CLOUD_SOFTCLIP_KNEE,
+                RHO_HIGHLIGHT_MAX,
+                false,
+            );
+            assert_eq!(on, pre, "synthesis composes before desaturation");
+        }
+    }
+
+    /// DIAGNOSTIC (low-sun visible pass, phase 1) — not a gate test; run by name:
+    /// `cargo test -p simsat --release diag_low_sun -- --ignored --nocapture`.
+    /// Prints the exact transmittance-LUT direct-sun color at cloud-sample altitudes
+    /// for sunrise-band sun elevations, plus the SH sky-ambient irradiance color at an
+    /// up normal — the two colors every cloud march sample mixes
+    /// (`s_sun ~ e_sun * t_sun`, `s_amb ~ e_sky / pi`). The R/B ratios here bound the
+    /// physics warm cast BEFORE any display transform.
+    #[test]
+    #[ignore]
+    fn diag_low_sun_transmittance_table() {
+        let (_params, luts, sky_sh) = shared_optics();
+        let e_sun = SOLAR_IRRADIANCE_RGB;
+        println!("== direct-sun transmittance color t_sun (LUT) ==");
+        println!("alt_km elev_deg      tR      tG      tB   t_R/B  (e*t)_R/B");
+        for &alt_km in &[0.0f64, 1.0, 2.0, 5.0, 10.0] {
+            for &elev in &[0.0f64, 2.0, 5.0, 8.0, 12.0, 20.0, 30.0] {
+                let mu = elev.to_radians().sin();
+                let t = atmosphere::sample_transmittance(
+                    &luts.transmittance,
+                    atmosphere::R_GROUND_M + alt_km * 1000.0 + 1.0,
+                    mu,
+                );
+                let rb = if t[2] > 0.0 { t[0] / t[2] } else { f64::NAN };
+                let erb = if t[2] > 0.0 {
+                    (e_sun[0] * t[0]) / (e_sun[2] * t[2])
+                } else {
+                    f64::NAN
+                };
+                println!(
+                    "{alt_km:6.1} {elev:8.1} {:7.4} {:7.4} {:7.4} {rb:7.3} {erb:10.3}",
+                    t[0], t[1], t[2]
+                );
+            }
+        }
+        println!("== SH sky ambient irradiance color at an up normal ==");
+        println!("elev_deg      eR      eG      eB   e_R/B");
+        for &elev in &[0.0f64, 2.0, 5.0, 8.0, 12.0, 20.0, 30.0] {
+            let e = elev.to_radians();
+            let sun_enu = [0.0, e.cos(), e.sin()];
+            let up = [0.0, 0.0, 1.0];
+            let irr = sky_sh.irradiance(elev, up, sun_enu, up);
+            let rb = if irr[2] > 0.0 {
+                irr[0] / irr[2]
+            } else {
+                f64::NAN
+            };
+            println!(
+                "{elev:8.1} {:7.4} {:7.4} {:7.4} {rb:7.3}",
+                irr[0], irr[1], irr[2]
+            );
+        }
     }
 }

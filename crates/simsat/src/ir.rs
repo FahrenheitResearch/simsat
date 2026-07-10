@@ -90,9 +90,10 @@ pub struct IrVolume {
     pub horiz_pitch_m: f64,
     /// Cloud-liquid visible extinction (m^-1).
     pub ext_liquid: Vec<f32>,
-    /// Ice (QICE+QSNOW) visible extinction (m^-1).
+    /// Small-ice (QICE) visible extinction (m^-1). Since SSB v3 snow lives in
+    /// `ext_precip` at its own aggregate optics.
     pub ext_ice: Vec<f32>,
-    /// Precip (QRAIN+QGRAUP) visible extinction (m^-1).
+    /// Large-particle (QRAIN+QGRAUP+QSNOW) visible extinction (m^-1).
     pub ext_precip: Vec<f32>,
     /// Absolute temperature (K), decoded from the f16-Celsius Texture B.
     pub temperature_k: Vec<f32>,
@@ -263,14 +264,22 @@ impl IrVolume {
     }
 
     /// The 10.3 um cloud absorption coefficient (m^-1) of a sample: the sum over the
-    /// three classes of `optics::ir_absorption_from_ext` (liquid, ice, precip). Ice
-    /// carries QICE+QSNOW (ice mass absorption); precip carries QRAIN+QGRAUP (precip
-    /// mass absorption).
+    /// three channels of `optics::ir_absorption_from_ext`. Ice carries QICE only
+    /// (small-ice mass absorption). Precip carries QRAIN+QGRAUP+QSNOW; ONE
+    /// per-channel recovery can carry the mix because every large-particle species
+    /// shares the size-independent geometric ratio `beta_abs/beta_vis = Q_abs/Q_ext
+    /// ~ 0.467` (SSB v3 snow-optics fix), and the channel uses the SNOW class — its
+    /// cold-relevant species — which folds in the documented unresolved-size-
+    /// spectrum factor (`optics::IR_SNOW_SMALL_ICE_FACTOR`). For the rain/graupel
+    /// share that factor over-absorbs ~2x, which is BT-invisible where rain lives
+    /// (low and warm, T ~ T_sfc: what it absorbs it re-emits at nearly the same
+    /// temperature); where the channel is COLD-relevant (anvils, canopies, shields)
+    /// it is snow.
     #[inline]
     pub fn cloud_ir_absorption(&self, s: &IrSample) -> f64 {
         ir_absorption_from_ext(HydrometeorClass::CloudLiquid, s.ext_liquid)
             + ir_absorption_from_ext(HydrometeorClass::Ice, s.ext_ice)
-            + ir_absorption_from_ext(HydrometeorClass::Rain, s.ext_precip)
+            + ir_absorption_from_ext(HydrometeorClass::Snow, s.ext_precip)
     }
 
     /// Top-of-brick ECEF radius (m).
@@ -739,6 +748,84 @@ mod tests {
             m.surface_transmittance < 1.0e-3,
             "anvil not opaque: surface_transmittance {}",
             m.surface_transmittance
+        );
+    }
+
+    /// SSB v3 snow-optics survival proof: a snow-dominated plate at the CORRECTED
+    /// (3.75x lower) visible extinction, carried in `ext_precip` with the
+    /// large-particle IR ratio (~0.467), is STILL IR-opaque by sheer mass — its BT
+    /// is the cold plate temperature, not the warm ground (the M6 proof standard
+    /// survives the fix). A thin snow veil is honestly semi-transparent.
+    #[test]
+    fn snow_plate_at_corrected_optics_stays_ir_opaque() {
+        let (nx, ny, nz) = (24, 24, 40);
+        let dz = 250.0;
+        let plate_t = 225.0f64;
+        let tsk = 300.0f32;
+        // 0.667 g/m^3 of snow over the TOP 3 km of the brick (k 28..nz; like the
+        // M6 thick-anvil test the plate reaches the brick top, so the soft
+        // trilinear top shoulder blends plate-temperature air, not warm clear air
+        // — at this LOW corrected extinction a 250 m warm shoulder would
+        // otherwise pull the emission-weighted BT ~10 K warm, a finite-voxel
+        // sampling artifact, not physics). SWP ~ 2 kg/m^2, a realistic thick
+        // plate: post-fix beta = 10 m^2/kg * 6.67e-4 kg/m^3 = 6.67e-3 m^-1
+        // -> tau_vis ~ 20, tau_ir ~ 0.933 * 20 ~ 19 with the small-ice-spectrum
+        // factor (x~1.6 more on the slant).
+        let snow_ext = 6.67e-3;
+        let plate = |ext: f64| {
+            move |_: usize, _: usize, k: usize| {
+                if k >= 28 {
+                    (0.0, 0.0, ext, plate_t, 0.0)
+                } else {
+                    (0.0, 0.0, 0.0, 280.0, 0.0)
+                }
+            }
+        };
+        let georef = test_georef(nx, ny, 3000.0);
+        let mut cfg = IrConfig::band13();
+        cfg.wv_continuum = false;
+        let cam = CameraGeometry::from_sub_lon(-100.0);
+        let march_bt = |ext: f64| {
+            let vol = build_ir_volume(nx, ny, nz, dz, 3000.0, tsk, plate(ext));
+            let mip = mip_for(&vol);
+            let scene = IrScene {
+                vol: &vol,
+                mip: &mip,
+                georef: &georef,
+                cfg,
+            };
+            let view = nadir_ray(
+                &georef,
+                &cam,
+                (nx - 1) as f64 / 2.0,
+                (ny - 1) as f64 / 2.0,
+                dz,
+            );
+            let m = march_ir(&scene, cam.camera, view).unwrap();
+            (m.brightness_temperature(cfg.wavelength_m), m)
+        };
+        let (bt_thick, m_thick) = march_bt(snow_ext);
+        assert!(
+            (bt_thick - plate_t).abs() < 2.0,
+            "thick snow plate BT {bt_thick} != plate T {plate_t}"
+        );
+        assert!(
+            m_thick.surface_transmittance < 0.01,
+            "thick snow plate not IR-opaque: transmittance {}",
+            m_thick.surface_transmittance
+        );
+        // A THIN snow veil (tau_vis ~ 0.3 -> tau_ir ~ 0.28 vertical with the
+        // factor): semi-transparent, the BT sits strictly BETWEEN the plate
+        // temperature and the skin temperature.
+        let (bt_thin, m_thin) = march_bt(1.0e-4);
+        assert!(
+            bt_thin > plate_t + 20.0 && bt_thin < tsk as f64 - 2.0,
+            "thin snow veil BT {bt_thin} not between plate {plate_t} and TSK {tsk}"
+        );
+        assert!(
+            m_thin.surface_transmittance > 0.5,
+            "thin veil should transmit most of the ground: {}",
+            m_thin.surface_transmittance
         );
     }
 

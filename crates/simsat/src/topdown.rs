@@ -39,8 +39,8 @@ use crate::camera::topdown_nadir_ray;
 use crate::clouds::{CloudScene, ground_cloud_shadow, march_cloud};
 use crate::ir::{IrScene, march_ir_bt};
 use crate::render::{
-    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, day_lerp_ramp,
-    radiance_to_rgba_softclip, reflectance_from_radiance, surface_toa_radiance,
+    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, apply_low_sun_illuminant,
+    day_lerp_ramp, radiance_to_rgba_softclip, reflectance_from_radiance, surface_toa_radiance,
 };
 
 /// TOP-DOWN CLOUD NORMALIZATION — a sun-gated multiplier on the top-down (near-nadir)
@@ -139,12 +139,18 @@ pub fn render_topdown_frame_rgba(
                 ) {
                     // A map pixel is on-earth; None only if the ray misses the shell / padding.
                     None => [0.0, 0.0, 0.0, 0.0],
-                    Some(l) => radiance_to_rgba_softclip(
-                        l,
-                        surf.output_transform,
-                        surf.exposure,
-                        softclip_knee,
-                    ),
+                    Some((l, sun_elev_deg)) => {
+                        // Low-sun illuminant correction at the display seam (every map
+                        // pixel is on-earth); identity outside the 2-30 deg band. The
+                        // raw-bands path below does NOT apply it (physical product).
+                        let l = apply_low_sun_illuminant(l, true, sun_elev_deg as f64, surf.luts);
+                        radiance_to_rgba_softclip(
+                            l,
+                            surf.output_transform,
+                            surf.exposure,
+                            softclip_knee,
+                        )
+                    }
                 };
                 for &v in &rgba {
                     row.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
@@ -178,9 +184,10 @@ pub fn render_topdown_frame_reflectance(
             let mut row = vec![0.0f32; nx * 3];
             for px in 0..nx {
                 // The RAW-bands product is physical: no top-down cloud normalization
-                // (target 1.0 = neutral). The ground lift lives in `surface_toa_radiance`
+                // (target 1.0 = neutral) and NO low-sun illuminant correction (that is
+                // display-side). The ground lift lives in `surface_toa_radiance`
                 // and applies to the reflectance too (like the existing LAND_DAY_GAIN).
-                if let Some(l) =
+                if let Some((l, _sun_elev)) =
                     topdown_pixel_radiance(surf, scene, lat, lon, nx, px, py, &assemble, 1.0)
                 {
                     let rho = reflectance_from_radiance(l);
@@ -194,9 +201,11 @@ pub fn render_topdown_frame_reflectance(
 }
 
 /// The composited top-of-atmosphere LINEAR RADIANCE of one top-down map pixel (surface +
-/// cloud, no front airlight — see the module note), before any tonemap/exposure. `None`
-/// for a non-finite/padding pixel or a ray that misses the shell. The shared numerator of
-/// BOTH the top-down RGB product (-> [`radiance_to_rgba_softclip`]) and the raw-bands product (->
+/// cloud, no front airlight — see the module note), before any tonemap/exposure, PLUS the
+/// pixel's sun elevation (deg — the low-sun illuminant correction's per-pixel input at
+/// the RGB display seam). `None` for a non-finite/padding pixel or a ray that misses the
+/// shell. The shared numerator of BOTH the top-down RGB product (->
+/// [`radiance_to_rgba_softclip`]) and the raw-bands product (->
 /// [`reflectance_from_radiance`]); a pure extraction of the former per-pixel body, so the
 /// RGB output is byte-identical.
 #[allow(clippy::too_many_arguments)]
@@ -210,7 +219,7 @@ fn topdown_pixel_radiance(
     py: usize,
     assemble: &(impl Fn(usize, usize) -> SurfacePixel + Sync),
     cloud_norm_target: f64,
-) -> Option<[f64; 3]> {
+) -> Option<([f64; 3], f32)> {
     let idx = py * nx + px;
     let (la, lo) = (lat[idx], lon[idx]);
     if !la.is_finite() || !lo.is_finite() {
@@ -230,25 +239,26 @@ fn topdown_pixel_radiance(
         None => 1.0,
     };
     let l_toa = surface_toa_radiance(&ctx, &pixel, shadow, ground_lift)?;
+    let elev = pixel.sun_elev_deg;
     match scene {
         Some(sc) => {
             let m = march_cloud(sc, cam, view);
             if m.transmittance >= 1.0 && m.inscatter == [0.0; 3] {
-                Some(l_toa)
+                Some((l_toa, elev))
             } else {
                 // TOP-DOWN CLOUD NORMALIZATION: sun-gated per-pixel scale on the cloud's
                 // OWN radiance only (the surface behind, `l_toa * T_cloud`, is untouched).
                 // At the neutral `cloud_norm_target = 1.0` (the raw-bands path) or at
                 // twilight the factor is 1.0 -> byte-identical to the un-normalized cloud.
-                let norm = topdown_cloud_norm(pixel.sun_elev_deg as f64, cloud_norm_target);
+                let norm = topdown_cloud_norm(elev as f64, cloud_norm_target);
                 let mut lf = [0.0f64; 3];
                 for (c, out) in lf.iter_mut().enumerate() {
                     *out = l_toa[c] * m.transmittance + norm * m.inscatter[c];
                 }
-                Some(lf)
+                Some((lf, elev))
             }
         }
-        None => Some(l_toa),
+        None => Some((l_toa, elev)),
     }
 }
 

@@ -126,6 +126,7 @@ pub mod horizon;
 pub mod ingest;
 pub mod ir;
 pub mod ir_enhance;
+pub mod log;
 pub mod optics;
 pub mod platform;
 pub mod render;
@@ -146,7 +147,15 @@ pub mod wv;
 /// v2 (M0/M1-review fixes): the vertical resample is integral-conserving (brick
 /// extinction/qvapor content changed vs v1 point-sampling), and `ManifestTimestep`
 /// gained a full-datetime `key` (was `hhmm`-only, which collided across days).
-pub const SSB_FORMAT_VERSION: u32 = 2;
+///
+/// v3 (the snow-optics fix): QSNOW moved OUT of `ext_ice` (where it shared
+/// cloud-ice optics, inflating snow's visible extinction 3.75x — the "clouds too
+/// thick" defect) and INTO `ext_precip` at its own aggregate beta (rho_w-normalized
+/// r_e = 150 um, 10 m^2 kg^-1); `tau_up` is recomputed from the corrected total.
+/// The channel SET and layout are unchanged — only the extinction CONTENT — but a
+/// v2 brick renders wrong optical depths, so v2 caches are refused on read and
+/// re-ingested from the source wrfout.
+pub const SSB_FORMAT_VERSION: u32 = 3;
 
 /// Four-byte magic at the head of every `.ssb` brick file: `SSB` + format epoch.
 pub const SSB_MAGIC: [u8; 4] = *b"SSB1";
@@ -156,8 +165,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssb_format_version_is_v2() {
-        assert_eq!(SSB_FORMAT_VERSION, 2);
+    fn ssb_format_version_is_v3() {
+        // v3 = the snow-optics fix (extinction CONTENT changed; see the const doc).
+        assert_eq!(SSB_FORMAT_VERSION, 3);
     }
 
     #[test]

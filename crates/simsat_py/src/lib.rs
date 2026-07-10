@@ -37,6 +37,10 @@
 //! [`apply_thread_cap`]) and returns honesty metadata on the [`Georef`]
 //! (`time_is_fallback`, `ground_source`, `ground_status`), with `UserWarning`s raised
 //! on a fabricated-date or downgraded-ground render ([`warn_downgrades`]).
+//!
+//! The binding is QUIET BY DEFAULT: the engine's diagnostic stderr lines (ingest
+//! progress / warnings) are disabled at module init unless `SIMSAT_LOG=1`; flip at
+//! runtime with [`set_verbose`]. Honesty metadata / `UserWarning`s are unaffected.
 
 use numpy::ndarray::{Array2, Array3};
 use numpy::{IntoPyArray, PyArray2, PyArray3};
@@ -654,6 +658,33 @@ fn render_cloud_optical_depth<'py>(
     )
 }
 
+/// Enable or disable the engine's diagnostic stderr lines (ingest progress / warnings)
+/// for this process at runtime.
+///
+/// The binding is SILENT BY DEFAULT — a library must not chatter uninvited — so the
+/// engine's diagnostic sink is disabled at `import simsat` unless the `SIMSAT_LOG`
+/// environment variable is truthy (`1`/`true`). Call `simsat.set_verbose(True)` to see
+/// the lines (they go to STDERR), `set_verbose(False)` to silence them again.
+///
+/// This gates DIAGNOSTIC chatter only. Render-honesty surfacing is data, not logs, and
+/// is unaffected: `georef.time_is_fallback` / `ground_source` / `ground_status` and
+/// their `UserWarning`s are raised regardless of this switch.
+#[pyfunction]
+fn set_verbose(enabled: bool) {
+    simsat_engine::log::set_enabled(enabled);
+}
+
+/// `SIMSAT_LOG` truthiness: `1` or `true` (case-insensitive) opts the process into the
+/// engine's diagnostic stderr lines at import time.
+fn env_verbose_opt_in() -> bool {
+    std::env::var("SIMSAT_LOG")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────────
 
 /// Shared body for the three derived-field bindings: parse args, run
@@ -983,6 +1014,11 @@ fn parse_enhancement(v: &str) -> PyResult<IrEnhancement> {
 /// The `simsat` Python module.
 #[pymodule]
 fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // QUIET BY DEFAULT (module init): disable the engine's diagnostic stderr sink for
+    // this process unless SIMSAT_LOG opts in. The engine defaults the sink ON so the
+    // CLI/studio are untouched; the LIBRARY personality is silent. Runtime flip:
+    // simsat.set_verbose(True/False).
+    simsat_engine::log::set_enabled(env_verbose_opt_in());
     m.add(
         "__doc__",
         "SimSat — physically-based simulated visible/IR satellite imagery from WRF output. \
@@ -1004,6 +1040,7 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_precipitable_water, m)?)?;
     m.add_function(wrap_pyfunction!(render_cloud_top_temp, m)?)?;
     m.add_function(wrap_pyfunction!(render_cloud_optical_depth, m)?)?;
+    m.add_function(wrap_pyfunction!(set_verbose, m)?)?;
     m.add_class::<Georef>()?;
     Ok(())
 }

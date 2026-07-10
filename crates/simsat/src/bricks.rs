@@ -6,10 +6,12 @@
 //!
 //! Payload channels (Texture A) are four log-quantized u8 3-D channels with
 //! per-volume scales in the header: `ext_liquid` (cloud-liquid extinction, m^-1,
-//! from `QCLOUD`), `ext_ice` (ice extinction, `QICE + QSNOW` merged, shared
-//! optics), `ext_precip` (precip extinction, `QRAIN + QGRAUP` merged), and
-//! `tau_up` (cumulative optical depth from brick-top down to each level,
-//! precomputed at ingest; feeds cloud ambient, the IR fast path, and shadows).
+//! from `QCLOUD`), `ext_ice` (small-ice extinction, `QICE` only since SSB v3),
+//! `ext_precip` (the large-particle extinction: `QRAIN + QGRAUP` at rain optics
+//! plus — since SSB v3, the snow-optics fix — `QSNOW` at its own aggregate beta;
+//! each species converts at its own optics before the sum), and `tau_up`
+//! (cumulative optical depth from brick-top down to each level, precomputed at
+//! ingest; feeds cloud ambient, the IR fast path, and shadows).
 //!
 //! The QVAPOR channel (owner decision 6 — a full channel now, for a later 6.2 um
 //! water-vapor IR band) is its OWN fifth log-quantized u8 channel, `qvapor`
@@ -761,7 +763,23 @@ impl RunManifest {
         projection: ManifestProjection,
     ) -> Result<Self, BrickError> {
         if path.is_file() {
-            let manifest = Self::load(path)?;
+            let manifest = match Self::load(path) {
+                Ok(m) => m,
+                // An OLD-FORMAT manifest found during INGEST is a regenerable cache
+                // being re-populated by a newer build: SUPERSEDE it with a fresh
+                // manifest instead of erroring (the v2 -> v3 self-heal; owner-reported
+                // "Render failed: unsupported .ssb version: 2"). The old-format .ssb
+                // files alongside it are refused by `read_ssb` and re-ingested per
+                // timestep through the same path; only the READ paths (a cached
+                // run.json open) keep the hard remedy-bearing refusal, because there
+                // is no source wrfout there to re-ingest from.
+                Err(BrickError::UnsupportedManifestVersion { .. }) => {
+                    return Ok(Self::new_manifest(
+                        run_id, nx, ny, nz, z_min_m, dz_m, planes_2d, projection,
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             let p = &manifest.projection;
             let shape_ok = p.map_proj == projection.map_proj
                 && p.truelat1_deg == projection.truelat1_deg
@@ -796,7 +814,25 @@ impl RunManifest {
             }
             return Ok(manifest);
         }
-        Ok(Self {
+        Ok(Self::new_manifest(
+            run_id, nx, ny, nz, z_min_m, dz_m, planes_2d, projection,
+        ))
+    }
+
+    /// A fresh empty manifest at the CURRENT format version (the no-existing-manifest
+    /// and the superseded-old-format paths of [`Self::load_or_new`]).
+    #[allow(clippy::too_many_arguments)]
+    fn new_manifest(
+        run_id: &str,
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        z_min_m: f64,
+        dz_m: f64,
+        planes_2d: Vec<String>,
+        projection: ManifestProjection,
+    ) -> Self {
+        Self {
             format_version: SSB_FORMAT_VERSION,
             run_id: run_id.to_string(),
             nx,
@@ -810,7 +846,7 @@ impl RunManifest {
             planes_2d,
             projection,
             timesteps: Vec::new(),
-        })
+        }
     }
 
     /// Register (or replace, by full-datetime `key`) a timestep and keep the list
@@ -1184,6 +1220,51 @@ mod tests {
             RunManifest::load(&path),
             Err(BrickError::UnsupportedManifestVersion { found: 0, .. })
         ));
+        // The v3 snow-optics bump: a v2 manifest (schema-compatible, but its bricks
+        // carry the inflated pre-fix snow extinction) is refused the same way — the
+        // remedy is a re-ingest from the source wrfout, never a silent reuse.
+        std::fs::write(
+            &path,
+            r#"{ "format_version": 2, "run_id": "pre_snow_fix" }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RunManifest::load(&path),
+            Err(BrickError::UnsupportedManifestVersion { found: 2, .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The v2 -> v3 INGEST self-heal (owner-reported "Render failed: unsupported .ssb
+    /// version: 2"): `load_or_new` SUPERSEDES an old-format manifest with a fresh one
+    /// at the current version instead of propagating the read refusal — during ingest
+    /// the source wrfout is present, so the regenerable cache regenerates. The READ
+    /// paths (`RunManifest::load` direct, a cached run.json open) keep the hard
+    /// remedy-bearing refusal, covered by the test above.
+    #[test]
+    fn load_or_new_supersedes_an_old_format_manifest() {
+        let dir = temp_dir();
+        let path = RunManifest::path(&dir, "old_run");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{ "format_version": 2, "run_id": "old_run" }"#).unwrap();
+        let manifest = RunManifest::load_or_new(
+            &path,
+            "old_run",
+            100,
+            80,
+            40,
+            0.0,
+            250.0,
+            vec![],
+            test_projection(),
+        )
+        .expect("an old-format manifest must be superseded, not refused, during ingest");
+        assert_eq!(manifest.format_version, SSB_FORMAT_VERSION);
+        assert!(
+            manifest.timesteps.is_empty(),
+            "fresh manifest, no timesteps"
+        );
+        assert_eq!(manifest.nx, 100);
         std::fs::remove_dir_all(&dir).ok();
     }
 

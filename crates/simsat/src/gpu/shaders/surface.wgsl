@@ -70,6 +70,27 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 const CLOUD_SOFTCLIP_KNEE: f32 = 0.75;   // identity below; bounded Mobius shoulder above
 const RHO_HIGHLIGHT_MAX: f32 = 1.05;     // physical reflectance ceiling -> display 1.0
 const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daytime water-body albedo scale (twilight anchor = u.p1.y)
+// Low-sun visible pass (twins of render.rs): the SUNRISE veil ramp (satpy-idiom — the
+// Rayleigh de-haze is reduced toward the terminator, never hard-disabled at 20 deg)
+// and the LUT-derived low-sun ILLUMINANT correction (GREEN RESTORATION: the green of
+// OUR OWN transmittance-LUT direct-sun illuminant at a reference cloud altitude is
+// restored to its Rayleigh log-line, removing the Chappuis ozone green dip that
+// rendered dawn cloud khaki/mauve; the R-B warm axis is preserved and the triple is
+// unit-luminance renormalized — see render.rs low_sun_illuminant_gains).
+const VEIL_TERMINATOR_ELEV: f32 = 2.0;   // full physical veil at/below (dusk band byte-identical)
+const VEIL_SUNRISE_ELEV_HI: f32 = 16.0;  // full daytime de-haze in place at/above
+const ILLUM_REF_CLOUD_ALT: f32 = 7000.0; // reference cloud altitude (m) of the illuminant sample
+const ILLUM_CORR_IN_LO: f32 = 2.0;       // identity at/below (dusk band byte-identical)
+const ILLUM_CORR_IN_HI: f32 = 5.0;       // full correction at/above (green-restoration form; twin of render.rs)
+const ILLUM_CORR_OUT_LO: f32 = 20.0;     // taper-off start
+const ILLUM_CORR_OUT_HI: f32 = 30.0;     // identity at/above (daytime byte-identical)
+// ABI SYNTHETIC-GREEN display mode (prototype, twin of render.rs set_synthetic_green):
+// G' = 0.45*R + 0.45*B + 0.10*G (Bah et al. 2018). OFF (0.0) by default — flip together
+// with the CPU process-global if the mode is adopted.
+const SYNTHETIC_GREEN_MODE: f32 = 0.0;
+const SYN_GREEN_W_RED: f32 = 0.45;
+const SYN_GREEN_W_GREEN: f32 = 0.10;
+const SYN_GREEN_W_BLUE: f32 = 0.45;
 
 struct Uniforms {
     cam: vec4<f32>,   // xyz camera ECEF, w R_ground
@@ -313,6 +334,47 @@ fn land_day_gain(sun_elev: f32) -> f32 {
     return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
+// SUNRISE veil ramp (twin of render::aerial_veil_scale, low-sun visible pass): the full
+// physical veil at/below the terminator gate, smoothly reducing to the daytime de-haze
+// by VEIL_SUNRISE_ELEV_HI and held above (daytime byte-identical: the old ramp also sat
+// at AERIAL_VEIL_DAY_SCALE at/above AERIAL_VEIL_ELEV_HI).
+fn aerial_veil_scale(sun_elev: f32) -> f32 {
+    return 1.0 - smoothstep(VEIL_TERMINATOR_ELEV, VEIL_SUNRISE_ELEV_HI, sun_elev) * (1.0 - AERIAL_VEIL_DAY_SCALE);
+}
+
+// LUT-derived low-sun illuminant gains (twin of render::low_sun_illuminant_gains):
+// restore the GREEN of the reference-altitude direct-sun transmittance to its
+// Rayleigh log-line (removing the Chappuis ozone green dip), preserve the R-B warm
+// axis exactly, renormalize to unit Rec.709 luminance (uniform scale), taper to
+// identity outside the 2-30 deg sunrise band.
+fn low_sun_illuminant_gains(sun_elev: f32) -> vec3<f32> {
+    let w = smoothstep(ILLUM_CORR_IN_LO, ILLUM_CORR_IN_HI, sun_elev)
+        * (1.0 - smoothstep(ILLUM_CORR_OUT_LO, ILLUM_CORR_OUT_HI, sun_elev));
+    if (w <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let mu = sin(sun_elev * DEG2RAD);
+    let t = sample_transmittance(R_GROUND + ILLUM_REF_CLOUD_ALT, mu);
+    if (min(t.x, min(t.y, t.z)) <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let a = (RAYLEIGH_SCA.y - RAYLEIGH_SCA.x) / (RAYLEIGH_SCA.z - RAYLEIGH_SCA.x);
+    let t_g_ray = exp((1.0 - a) * log(t.x) + a * log(t.z));
+    let g_green = max(t_g_ray / t.y, 1.0);
+    let lum = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let y_raw = dot(t, lum);
+    let y_corr = dot(vec3<f32>(t.x, t.y * g_green, t.z), lum);
+    if (y_raw <= 0.0 || y_corr <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let s = y_raw / y_corr;
+    return vec3<f32>(
+        1.0 + w * (s - 1.0),
+        1.0 + w * (s * g_green - 1.0),
+        1.0 + w * (s - 1.0),
+    );
+}
+
 // Unpolarised Fresnel reflectance, air -> medium of relative index n, at cos incidence.
 fn fresnel_unpolarized(cos_i: f32, n: f32) -> f32 {
     if (n <= 0.0) {
@@ -427,11 +489,21 @@ fn soft_clip_highlight(x: f32, knee: f32, x_max: f32) -> f32 {
 
 fn output_transform(rho: vec3<f32>) -> vec3<f32> {
     if (u.p1.w < 0.5) {
-        // ABI-like reflectance factor: desaturate highlights, then the bounded highlight
+        // ABI-like reflectance factor: OPTIONAL synthesized green (the prototype ABI
+        // display-green arithmetic, module const off by default — twin of the CPU
+        // process-global), then desaturate highlights, then the bounded highlight
         // soft-clip (WS2 — the desaturate-then-shoulder ORDER matches the CPU path), then
         // the toe-lifted sqrt. This pass runs at implicit exposure 1.0 -> the shoulder
         // bound is RHO_HIGHLIGHT_MAX (the CPU seam derives exposure * RHO_HIGHLIGHT_MAX).
-        let ds = desaturate_highlights(rho);
+        var rr = rho;
+        if (SYNTHETIC_GREEN_MODE > 0.5) {
+            rr = vec3<f32>(
+                rho.x,
+                SYN_GREEN_W_RED * rho.x + SYN_GREEN_W_GREEN * rho.y + SYN_GREEN_W_BLUE * rho.z,
+                rho.z,
+            );
+        }
+        let ds = desaturate_highlights(rr);
         let sc = vec3<f32>(
             soft_clip_highlight(ds.x, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
             soft_clip_highlight(ds.y, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
@@ -561,11 +633,15 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (t_ground > t_enter) {
         let p_start = cam + view * t_enter;
         let sc = raymarch(p_start, view, sun_ecef, t_ground - t_enter);
-        // True-color daytime veil reduction (refinement pass): scale the additive
-        // surface in-scatter; twilight (below AERIAL_VEIL_ELEV_LO) is untouched.
-        let veil = 1.0 - smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (1.0 - AERIAL_VEIL_DAY_SCALE);
+        // SUNRISE veil ramp (low-sun visible pass): scale the additive surface
+        // in-scatter; the terminator band (<= VEIL_TERMINATOR_ELEV) keeps the full
+        // physical veil, daytime keeps the refinement de-haze.
+        let veil = aerial_veil_scale(sun_elev);
         l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
     }
-    let rho = PI * l_toa / max(e_sun, vec3<f32>(1e-6));
+    // Low-sun illuminant correction at the display seam (on-earth pixels only; the
+    // off-earth limb above keeps its physical color). Identity outside 2-30 deg.
+    let illum = low_sun_illuminant_gains(sun_elev);
+    let rho = illum * PI * l_toa / max(e_sun, vec3<f32>(1e-6));
     return vec4<f32>(output_transform(rho), 1.0);
 }

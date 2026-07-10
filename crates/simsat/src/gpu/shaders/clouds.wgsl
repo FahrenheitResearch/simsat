@@ -68,6 +68,21 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 // itself (the CPU paths derive x_max = exposure * RHO_HIGHLIGHT_MAX at their seam).
 const CLOUD_SOFTCLIP_KNEE: f32 = 0.75;   // identity below; bounded Mobius shoulder above
 const RHO_HIGHLIGHT_MAX: f32 = 1.05;     // physical reflectance ceiling -> display 1.0
+// Low-sun visible pass (twins of render.rs; see surface.wgsl for the full notes):
+// the SUNRISE veil ramp + the LUT-derived low-sun ILLUMINANT correction.
+const VEIL_TERMINATOR_ELEV: f32 = 2.0;   // full physical veil at/below (dusk band byte-identical)
+const VEIL_SUNRISE_ELEV_HI: f32 = 16.0;  // full daytime de-haze in place at/above
+const ILLUM_REF_CLOUD_ALT: f32 = 7000.0; // reference cloud altitude (m) of the illuminant sample
+const ILLUM_CORR_IN_LO: f32 = 2.0;       // identity at/below (dusk band byte-identical)
+const ILLUM_CORR_IN_HI: f32 = 5.0;       // full correction at/above (green-restoration form; twin of render.rs)
+const ILLUM_CORR_OUT_LO: f32 = 20.0;     // taper-off start
+const ILLUM_CORR_OUT_HI: f32 = 30.0;     // identity at/above (daytime byte-identical)
+// ABI SYNTHETIC-GREEN display mode (prototype; OFF by default — twin of the CPU
+// process-global render::set_synthetic_green; flip together on adoption).
+const SYNTHETIC_GREEN_MODE: f32 = 0.0;
+const SYN_GREEN_W_RED: f32 = 0.45;
+const SYN_GREEN_W_GREEN: f32 = 0.10;
+const SYN_GREEN_W_BLUE: f32 = 0.45;
 const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daytime water-body albedo scale (twilight anchor = u.p1.y)
 
 // Cloud optics — MUST match clouds.rs.
@@ -97,6 +112,34 @@ const OCTAVE_PHASE_SCALE: f32 = 0.5;
 const OCTAVE_BRIGHTNESS_SCALE: f32 = 0.85;
 // Sun disk angular DIAMETER (rad) = 0.533 deg — the ground-shadow penumbra widener.
 const SUN_ANG_DIAM: f32 = 0.0093026;  // tan is ~= this at 0.533 deg
+
+// Sub-grid cloud GRANULATION (edge-erosion detail noise) — MUST match the clouds.rs
+// granulation section (constants, hash, Worley octaves, gate, remap multiplier).
+// DEFERRED-ACTIVATION mirror (the M4/M5-GPU family): the math is mirrored and
+// naga-validated, but GRAN_AMPLITUDE is a shader constant 0.0 so this twin's output
+// is byte-unchanged until the GPU cloud-pass activation wires the per-frame
+// amplitude (clouds.rs Granulation::amplitude, dx-derived) as a uniform. NOTE for
+// the activation: sun_od.wgsl (the sun-OD compute twin) must receive the SAME
+// erosion so the ground shadows match — the CPU path threads one Granulation value
+// through the view march, sun march and sun-OD accumulation.
+const GRAN_AMPLITUDE: f32 = 0.0;      // activation: uniform = Granulation::amplitude
+const GRAN_AMP_CAP: f32 = 0.6;        // Cahalan-bound amplitude cap (clouds.rs GRAN_AMP_CAP)
+const GRAN_EROSION_MAX: f32 = 0.98;
+const GRAN_HEIGHT_FULL_M: f32 = 4000.0;
+const GRAN_HEIGHT_ZERO_M: f32 = 7000.0;
+const GRAN_CARVE_LO: f32 = 0.52;
+const GRAN_CARVE_HI: f32 = 0.62;
+const GRAN_INTERIOR_LO: f32 = 0.45; // interior protection window on the relative density
+const GRAN_INTERIOR_HI: f32 = 0.75; // (solid-deck variability never erodes; clouds.rs twin)
+const GRAN_SCALE0_M: f32 = 1000.0;    // Worley octave cell scales (k^-5/3 envelope)
+const GRAN_SCALE1_M: f32 = 500.0;
+const GRAN_SCALE2_M: f32 = 250.0;
+const GRAN_W0: f32 = 0.4125987;       // lambda^(1/3) weights, normalised (clouds.rs)
+const GRAN_W1: f32 = 0.3274800;
+const GRAN_W2: f32 = 0.2599213;
+const GRAN_SALT0: u32 = 0x51A7C0DEu;
+const GRAN_SALT1: u32 = 0x9BD2A0E5u;
+const GRAN_SALT2: u32 = 0x2F63D19Bu;
 
 struct Uniforms {
     // --- surface (M2, layout verbatim from surface.wgsl) ---
@@ -353,6 +396,42 @@ fn land_day_gain(sun_elev: f32) -> f32 {
     return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
+// SUNRISE veil ramp (twin of render::aerial_veil_scale / surface.wgsl).
+fn aerial_veil_scale(sun_elev: f32) -> f32 {
+    return 1.0 - smoothstep(VEIL_TERMINATOR_ELEV, VEIL_SUNRISE_ELEV_HI, sun_elev) * (1.0 - AERIAL_VEIL_DAY_SCALE);
+}
+
+// LUT-derived low-sun illuminant gains (twin of render::low_sun_illuminant_gains /
+// surface.wgsl): restore GREEN to the Rayleigh log-line (the ozone dip), preserve the
+// R-B warm axis, unit-luminance renormalize, taper to identity outside 2-30 deg.
+fn low_sun_illuminant_gains(sun_elev: f32) -> vec3<f32> {
+    let w = smoothstep(ILLUM_CORR_IN_LO, ILLUM_CORR_IN_HI, sun_elev)
+        * (1.0 - smoothstep(ILLUM_CORR_OUT_LO, ILLUM_CORR_OUT_HI, sun_elev));
+    if (w <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let mu = sin(sun_elev * DEG2RAD);
+    let t = sample_transmittance(R_GROUND + ILLUM_REF_CLOUD_ALT, mu);
+    if (min(t.x, min(t.y, t.z)) <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let a = (RAYLEIGH_SCA.y - RAYLEIGH_SCA.x) / (RAYLEIGH_SCA.z - RAYLEIGH_SCA.x);
+    let t_g_ray = exp((1.0 - a) * log(t.x) + a * log(t.z));
+    let g_green = max(t_g_ray / t.y, 1.0);
+    let lum = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let y_raw = dot(t, lum);
+    let y_corr = dot(vec3<f32>(t.x, t.y * g_green, t.z), lum);
+    if (y_raw <= 0.0 || y_corr <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let s = y_raw / y_corr;
+    return vec3<f32>(
+        1.0 + w * (s - 1.0),
+        1.0 + w * (s * g_green - 1.0),
+        1.0 + w * (s - 1.0),
+    );
+}
+
 fn fresnel_unpolarized(cos_i: f32, n: f32) -> f32 {
     if (n <= 0.0) {
         return 0.0;
@@ -461,13 +540,27 @@ fn soft_clip_highlight(x: f32, knee: f32, x_max: f32) -> f32 {
     return knee + span * a / (a + span * (w - a) / w);
 }
 
+fn synthesize_abi_green(rho: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        rho.x,
+        SYN_GREEN_W_RED * rho.x + SYN_GREEN_W_GREEN * rho.y + SYN_GREEN_W_BLUE * rho.z,
+        rho.z,
+    );
+}
+
 fn output_transform(rho: vec3<f32>) -> vec3<f32> {
     if (u.p1.w < 0.5) {
-        // ABI-like reflectance factor: desaturate highlights, then the bounded highlight
-        // soft-clip (WS2 — the desaturate-then-shoulder ORDER matches the CPU path), then
-        // the toe-lifted sqrt. This pass runs at implicit exposure 1.0 -> the shoulder
-        // bound is RHO_HIGHLIGHT_MAX (the CPU seam derives exposure * RHO_HIGHLIGHT_MAX).
-        let ds = desaturate_highlights(rho);
+        // ABI-like reflectance factor: OPTIONAL synthesized green (prototype, module
+        // const off by default — twin of the CPU process-global), then desaturate
+        // highlights, then the bounded highlight soft-clip (WS2 — the desaturate-then-
+        // shoulder ORDER matches the CPU path), then the toe-lifted sqrt. This pass
+        // runs at implicit exposure 1.0 -> the shoulder bound is RHO_HIGHLIGHT_MAX
+        // (the CPU seam derives exposure * RHO_HIGHLIGHT_MAX).
+        var rr = rho;
+        if (SYNTHETIC_GREEN_MODE > 0.5) {
+            rr = synthesize_abi_green(rho);
+        }
+        let ds = desaturate_highlights(rr);
         let sc = vec3<f32>(
             soft_clip_highlight(ds.x, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
             soft_clip_highlight(ds.y, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
@@ -530,8 +623,143 @@ fn ecef_to_brick(p: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(fi, fj, fk);
 }
 
+// ── sub-grid cloud GRANULATION (twin of the clouds.rs granulation section) ──
+
+// Deterministic cell hash to [0, 1) (twin of clouds.rs gran_cell_hash01 — the
+// hash01_position-style integer avalanche; u32 arithmetic wraps in WGSL).
+fn gran_cell_hash01(ix: i32, iy: i32, salt: u32) -> f32 {
+    var h: u32 = bitcast<u32>(ix) * 0x9E3779B9u
+        + bitcast<u32>(iy) * 0x85EBCA6Bu
+        + salt * 0xC2B2AE35u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7FEB352Du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846CA68Bu;
+    h = h ^ (h >> 16u);
+    return f32(h) / 4294967296.0;
+}
+
+// 2-D Worley F1 in cell units, clamped to [0, 1] (twin of clouds.rs worley2_f1).
+fn gran_worley_f1(qx: f32, qy: f32, salt: u32) -> f32 {
+    let bx = i32(floor(qx));
+    let by = i32(floor(qy));
+    var best = 1.0e30;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let cx = bx + dx;
+            let cy = by + dy;
+            let fx = f32(cx) + gran_cell_hash01(cx, cy, salt);
+            let fy = f32(cy) + gran_cell_hash01(cx, cy, salt ^ 0x68E31DA4u);
+            let d2 = (qx - fx) * (qx - fx) + (qy - fy) * (qy - fy);
+            best = min(best, d2);
+        }
+    }
+    return clamp(sqrt(best), 0.0, 1.0);
+}
+
+// The tail-shaped erosion field at a brick-plane position (m) — twin of
+// clouds.rs granulation_erosion_noise (k^-5/3-weighted octaves + smoothstep tail).
+fn gran_erosion_noise(u_m: f32, v_m: f32) -> f32 {
+    var w = GRAN_W0 * gran_worley_f1(u_m / GRAN_SCALE0_M, v_m / GRAN_SCALE0_M, GRAN_SALT0);
+    w = w + GRAN_W1 * gran_worley_f1(u_m / GRAN_SCALE1_M, v_m / GRAN_SCALE1_M, GRAN_SALT1);
+    w = w + GRAN_W2 * gran_worley_f1(u_m / GRAN_SCALE2_M, v_m / GRAN_SCALE2_M, GRAN_SALT2);
+    return smoothstep(GRAN_CARVE_LO, GRAN_CARVE_HI, clamp(w, 0.0, 1.0));
+}
+
+// Species/height gate (twin of clouds.rs granulation_gate): liquid share x a smooth
+// boundary-layer height ramp.
+fn gran_gate(ext_liquid: f32, ext_ice: f32, ext_precip: f32, z_msl_m: f32) -> f32 {
+    let total = ext_liquid + ext_ice + ext_precip;
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    let liquid_frac = clamp(ext_liquid / total, 0.0, 1.0);
+    let height = 1.0 - smoothstep(GRAN_HEIGHT_FULL_M, GRAN_HEIGHT_ZERO_M, z_msl_m);
+    return liquid_frac * height;
+}
+
+// Interior protection (twin of clouds.rs granulation_interior_protection): 1 at/
+// below GRAN_INTERIOR_LO (true boundary), 0 at/above GRAN_INTERIOR_HI (deck interior).
+fn gran_interior_protection(rel_density: f32) -> f32 {
+    return 1.0 - smoothstep(GRAN_INTERIOR_LO, GRAN_INTERIOR_HI, clamp(rel_density, 0.0, 1.0));
+}
+
+// Remap-style erosion multiplier (twin of clouds.rs granulation_multiplier):
+// m = (d - e)+ / (d (1 - e)); 1 at d = 1 (interiors untouched), 0 where d <= e.
+fn gran_multiplier(rel_density: f32, erosion: f32) -> f32 {
+    if (erosion <= 0.0) {
+        return 1.0;
+    }
+    let d = clamp(rel_density, 0.0, 1.0);
+    if (d <= 0.0) {
+        return 1.0;
+    }
+    let e = min(erosion, GRAN_EROSION_MAX);
+    return clamp(max(d - e, 0.0) / (d * (1.0 - e)), 0.0, 1.0);
+}
+
+// Apply the granulation erosion to a decoded volume sample at brick coords `b`
+// (twin of clouds.rs DecodedVolume::sample_granulated). The CPU's relative-density
+// neighbourhood is the 8 trilinear-support corners; here they are 8 unfiltered
+// textureLoads decoded to total extinction. tau_up (s.w) is never eroded. With
+// GRAN_AMPLITUDE = 0.0 this is a byte-identical no-op (the deferred activation
+// wires the real amplitude; the anchor scale mirrors the CPU min(dx, dy) — for a
+// MAP_PROJ 6 lat/lon grid the activation must convert degrees to metres).
+fn granulate(s: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
+    if (GRAN_AMPLITUDE <= 0.0) {
+        return s;
+    }
+    let total = s.x + s.y + s.z;
+    if (total <= 0.0) {
+        return s;
+    }
+    let z_msl = u.vert.x + b.z * u.vert.y;
+    let gate = gran_gate(s.x, s.y, s.z, z_msl);
+    if (gate <= 0.0) {
+        return s;
+    }
+    let hi = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+    let i0 = clamp(vec3<i32>(floor(b)), vec3<i32>(0), hi);
+    let i1 = min(i0 + vec3<i32>(1), hi);
+    var corner_max = 0.0;
+    for (var ck: i32 = 0; ck <= 1; ck = ck + 1) {
+        for (var cj: i32 = 0; cj <= 1; cj = cj + 1) {
+            for (var ci: i32 = 0; ci <= 1; ci = ci + 1) {
+                let p = vec3<i32>(
+                    select(i0.x, i1.x, ci == 1),
+                    select(i0.y, i1.y, cj == 1),
+                    select(i0.z, i1.z, ck == 1),
+                );
+                let t = textureLoad(volume, p, 0);
+                let tot = decode_channel(t.r, u.ql.x, u.ql.y)
+                    + decode_channel(t.g, u.ql.z, u.ql.w)
+                    + decode_channel(t.b, u.qp.x, u.qp.y);
+                corner_max = max(corner_max, tot);
+            }
+        }
+    }
+    if (corner_max <= 0.0) {
+        return s;
+    }
+    let d = total / corner_max;
+    let protection = gran_interior_protection(d);
+    if (protection <= 0.0) {
+        return s;
+    }
+    let pitch = max(min(u.geo0.w, u.geo1.z), 1.0);
+    let noise = gran_erosion_noise(b.x * pitch, b.y * pitch);
+    let e = min(GRAN_AMPLITUDE / GRAN_AMP_CAP * gate * protection * noise, GRAN_EROSION_MAX);
+    if (e <= 0.0) {
+        return s;
+    }
+    let m = gran_multiplier(d, e);
+    return vec4<f32>(s.x * m, s.y * m, s.z * m, s.w);
+}
+
 // Trilinear volume sample (hardware filtering on the codes, then decode — see the
-// header note). Returns (ext_liquid, ext_ice, ext_precip, tau_up) in m^-1.
+// header note). Returns (ext_liquid, ext_ice, ext_precip, tau_up) in m^-1, through
+// the (deferred, amplitude-0) granulation erosion so the M5-GPU activation samples
+// the SAME eroded field everywhere this function is called (view + sun marches).
 fn sample_volume(b: vec3<f32>) -> vec4<f32> {
     if (b.x < 0.0 || b.y < 0.0 || b.z < 0.0
         || b.x > u.dims.x - 1.0 || b.y > u.dims.y - 1.0 || b.z > u.dims.z - 1.0) {
@@ -539,12 +767,13 @@ fn sample_volume(b: vec3<f32>) -> vec4<f32> {
     }
     let uvw = vec3<f32>((b.x + 0.5) / u.dims.x, (b.y + 0.5) / u.dims.y, (b.z + 0.5) / u.dims.z);
     let t = textureSampleLevel(volume, samp, uvw, 0.0);
-    return vec4<f32>(
+    let raw = vec4<f32>(
         decode_channel(t.r, u.ql.x, u.ql.y),
         decode_channel(t.g, u.ql.z, u.ql.w),
         decode_channel(t.b, u.qp.x, u.qp.y),
         decode_channel(t.a, u.qp.z, u.qp.w),
     );
+    return granulate(raw, b);
 }
 
 // GUARD BAND (WS1, twin of clouds.rs OccupancyMip::maxext_at): a probe within one
@@ -1064,8 +1293,9 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
     var l_toa = l_surf;
     if (t_ground > t_enter) {
         let sc = raymarch(cam + view * t_enter, view, sun_ecef, t_ground - t_enter);
-        // True-color daytime veil reduction (refinement pass); twilight untouched.
-        let veil = 1.0 - smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (1.0 - AERIAL_VEIL_DAY_SCALE);
+        // SUNRISE veil ramp (low-sun visible pass): the terminator band keeps the full
+        // physical veil, daytime keeps the refinement de-haze.
+        let veil = aerial_veil_scale(sun_elev);
         l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
     }
     return l_toa;
@@ -1098,10 +1328,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         shadow = penumbral_shadow(cam + view * gnd.x);
     }
     let l_toa = surface_radiance(coord, view, shadow);
+    // Low-sun illuminant correction at the display seam (on-earth pixels only; the
+    // limb above keeps its physical color) — twin of the CPU shade_cloud_pixel /
+    // shade_surface seam. Identity outside the 2-30 deg band.
+    let illum = low_sun_illuminant_gains(textureLoad(lut_light, coord, 0).w);
 
     if (u.sod_e.w < 0.5) {
         // Clouds disabled: the M2 surface unchanged.
-        let rho = PI * l_toa / max(e_sun, vec3<f32>(1e-6));
+        let rho = illum * PI * l_toa / max(e_sun, vec3<f32>(1e-6));
         return vec4<f32>(output_transform(rho), 1.0);
     }
 
@@ -1114,6 +1348,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Front airlight weighted by (1 - T_cloud) to avoid double-counting the front
     // segment already inside l_toa's full-column airlight (FINDING 4).
     let l_final = l_toa * m.transmittance + ap.a * m.inscatter + ap.rgb * (1.0 - m.transmittance);
-    let rho = PI * l_final / max(e_sun, vec3<f32>(1e-6));
+    let rho = illum * PI * l_final / max(e_sun, vec3<f32>(1e-6));
     return vec4<f32>(output_transform(rho), 1.0);
 }

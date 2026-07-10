@@ -628,6 +628,12 @@ struct SimSatStudioApp {
     clouds_enabled: bool,
     multiscatter: bool,
     beer_powder: bool,
+    /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the clouds.rs
+    /// granulation section). ON by default — the studio renders the DISPLAY product,
+    /// matching the api's product scoping (raw-Kelvin thermal modes never granulate
+    /// regardless). The amplitude is dx-derived, so a fine (250 m) run is near-neutral
+    /// and a coarse (2-3 km) run granulates strongly. Session-scoped (not persisted).
+    granulation: bool,
     step_quality: StepQuality,
     /// Display-side exposure gain applied before the ABI stretch (see
     /// `render::radiance_to_rgba`). Affects the clouds-on CPU composite (surface +
@@ -742,6 +748,8 @@ impl SimSatStudioApp {
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
             // scatter buildup, so powder-on would double-darken (design M5 decision).
             beer_powder: false,
+            // Sub-grid granulation ON by default (the display-product scoping).
+            granulation: true,
             // Offline (384 steps, full quality) is the default so the displayed AND
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.
@@ -1453,6 +1461,7 @@ impl SimSatStudioApp {
             clouds_enabled: self.clouds_enabled,
             multiscatter: self.multiscatter,
             beer_powder: self.beer_powder,
+            granulation: self.granulation,
             step_quality: self.step_quality,
             exposure: self.exposure as f64,
             // Fake-sun what-if override: Some((elev_deg, az_deg)) when on, else the file's
@@ -2433,6 +2442,14 @@ impl SimSatStudioApp {
                                      the forward-scatter buildup it used to fake, so leaving it \
                                      on double-darkens.",
                                 );
+                            ui.checkbox(&mut self.granulation, "Granulation (sub-grid detail)")
+                                .on_hover_text(
+                                    "Edge-erosion detail noise: carves the unresolved sub-km \
+                                     texture of boundary-layer cumulus (Worley octaves, \
+                                     subtract-only — never adds cloud). Amplitude follows the \
+                                     model grid: near-neutral on a 250 m run, strong on 2-3 km. \
+                                     Ice anvils/cirrus and thermal IR are untouched.",
+                                );
                             ui.label("Steps:");
                             egui::ComboBox::from_id_salt("stepq")
                                 .selected_text(match self.step_quality {
@@ -3298,6 +3315,10 @@ struct AtmoSettings {
     /// M5 Wrenninge multi-scatter octaves on/off (the A/B knob: DEFAULT_OCTAVES vs 1).
     multiscatter: bool,
     beer_powder: bool,
+    /// Sub-grid cloud GRANULATION (edge-erosion detail noise): when on, the visible
+    /// cloud march + sun march + sun-OD map all sample the SAME dx-amplitude eroded
+    /// field (clouds.rs granulation section). Thermal modes never granulate.
+    granulation: bool,
     step_quality: StepQuality,
     /// Display-side exposure gain (before the ABI stretch) for the CPU composite.
     exposure: f64,
@@ -3390,7 +3411,23 @@ fn prepare_render(
             let brick_path = bricks::run_dir(&cache_dir, &run_id).join(
                 bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm),
             );
-            if !brick_path.is_file() {
+            // A cached brick counts only if it actually DECODES: an old-format or
+            // corrupt .ssb (e.g. a v2 brick after the v3 snow-optics bump — the
+            // owner-reported "Render failed: unsupported .ssb version: 2") is a
+            // cache MISS with the wrfout right here as the source of truth, so
+            // re-ingest instead of surfacing the decode error.
+            let peeked = if brick_path.is_file() {
+                match bricks::read_ssb(&brick_path) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        status(&format!("Cached brick unusable ({e}); re-ingesting..."));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if peeked.is_none() {
                 status(&format!("Ingesting timestep {ts_index}..."));
                 let mut config = IngestConfig::new(cache_dir.clone());
                 config.run_id = Some(run_id.clone());
@@ -3405,7 +3442,7 @@ fn prepare_render(
                 geom.time_iso,
                 geom.hhmm,
                 run_id,
-                None,
+                peeked,
             )
         }
         JobKind::Cached {
@@ -3420,7 +3457,19 @@ fn prepare_render(
                 return Err(format!("brick not found: {}", brick_path.display()));
             }
             status("Decoding brick...");
-            let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+            // A cached-run open has no source wrfout to re-ingest from, so an
+            // old-format brick keeps the hard refusal — but with the remedy spelled
+            // out instead of the raw decode error.
+            let brick = bricks::read_ssb(&brick_path).map_err(|e| match e {
+                bricks::BrickError::UnsupportedVersion(v) => format!(
+                    "this cached run's bricks are an older format (.ssb v{v}; this \
+                     build reads v{}). The cache is regenerable: open the ORIGINAL \
+                     wrfout (Open menu) to re-ingest, or delete the run's cache \
+                     directory.",
+                    simsat::SSB_FORMAT_VERSION
+                ),
+                e => format!("read brick: {e}"),
+            })?;
             let georef = GridGeoref::from_params_center(&params, brick.nx, brick.ny)
                 .map_err(|e| format!("georef: {e}"))?;
             (
@@ -3857,10 +3906,32 @@ fn prepare_render(
         });
         hits.horizon = Some(horizon_hit);
         let horizon_map: &HorizonMap = &horizon_arc;
-        status("Marching clouds...");
+        // Sub-grid cloud GRANULATION (edge-erosion detail noise): ONE Option threaded
+        // through the sun-OD accumulation AND MarchConfig (view + sun marches), so every
+        // march of this composite samples the SAME eroded field. Off = byte-identical to
+        // the pre-granulation render. dx-derived amplitude (near-neutral at 250 m).
+        let granulation = if atmo.granulation {
+            Some(clouds::Granulation::for_grid(horiz_pitch_m))
+        } else {
+            None
+        };
+        match granulation {
+            Some(g) => status(&format!(
+                "Marching clouds (granulation amp {:.2})...",
+                g.amplitude
+            )),
+            None => status("Marching clouds..."),
+        }
         let vol = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
         let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
-        let sun_od = clouds::accumulate_sun_od(&vol, &georef, sun_ecef, SUN_OD_RESOLUTION);
+        let sun_od = clouds::accumulate_sun_od_granulated(
+            &vol,
+            &georef,
+            sun_ecef,
+            SUN_OD_RESOLUTION,
+            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            granulation,
+        );
         let scan_rect = clouds::scan_rect_of(&raster.scan);
         let froxel = atmosphere::build_aerial_froxel(
             luts,
@@ -3885,6 +3956,9 @@ fn prepare_render(
             // instead of the hard glassy domain-edge cut seen in the QA frames.
             // Mirrors api.rs's wiring of the same engine function.
             edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, nx, ny),
+            // Sub-grid granulation: the SAME value the sun-OD map above was
+            // accumulated with (one eroded field per composite).
+            granulation,
             ..MarchConfig::new(atmo.step_quality, vol.voxel_pitch_m())
         };
         let scene = clouds::CloudScene {

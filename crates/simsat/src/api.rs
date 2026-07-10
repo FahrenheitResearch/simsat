@@ -174,6 +174,17 @@ pub struct RenderParams {
     /// Composite volumetric clouds (visible only; `false` = surface-only, geostationary
     /// QA). Top-down and the bands product always composite clouds.
     pub clouds: bool,
+    /// Sub-grid cloud GRANULATION (edge-erosion detail noise — see the granulation
+    /// section of [`crate::clouds`]). `None` (the default) = the PRODUCT SCOPING:
+    /// ON for the DISPLAY products ([`Product::VisibleRgb`], and through it the
+    /// GeoColor day half and the Sandwich visible base), OFF for the quantitative
+    /// raw-reflectance [`Product::VisibleBands`]. The raw-Kelvin thermal products
+    /// ([`Product::Ir`] / [`Product::WaterVapor`]) and [`Product::Derived`] never
+    /// granulate — they read the un-eroded brick by construction, so quantitative BT
+    /// verification always reflects model skill, not display texturing. `Some(bool)`
+    /// forces the visible-family behavior either way. Recorded on
+    /// [`RenderResult::granulation`] (the what-if-label pattern).
+    pub granulation: Option<bool>,
     /// Optional synthetic sun override (visible only).
     pub sun_override: Option<SunOverride>,
     /// Brick cache root (read/write) + seasonal Blue Marble cache.
@@ -222,6 +233,7 @@ impl RenderParams {
             multiscatter: true,
             steps: StepQuality::Offline,
             clouds: true,
+            granulation: None,
             sun_override: None,
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
@@ -412,6 +424,11 @@ pub struct RenderResult {
     /// fallback progress — previously discarded by a no-op callback). Empty when
     /// nothing noteworthy happened.
     pub ground_status: Vec<String>,
+    /// TRUE when sub-grid cloud GRANULATION (edge-erosion detail noise) was applied to
+    /// this frame's cloud field (see [`RenderParams::granulation`] for the product
+    /// scoping). Recorded like the fake-sun what-if label so a consumer can see the
+    /// display texturing was active; always `false` for the thermal / derived products.
+    pub granulation: bool,
 }
 
 /// Resolved scene inputs (a wrfout ingest-if-needed, or a cached run.json).
@@ -527,7 +544,35 @@ fn render_visible_scene(
     // M4/M5 cloud volume + scene.
     let vol = DecodedVolume::from_brick(brick, horiz_pitch_m);
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
-    let sun_od = clouds::accumulate_sun_od(&vol, georef, sun_ecef, SUN_OD_RESOLUTION);
+    // Sub-grid cloud GRANULATION (edge-erosion detail noise): default ON for the
+    // DISPLAY product (VisibleRgb — and through it the GeoColor day half / Sandwich
+    // visible base), OFF for the quantitative raw-reflectance bands. The SAME Option
+    // feeds the sun-OD accumulation AND rides MarchConfig into the view + sun marches,
+    // so every march of this composite samples ONE eroded field.
+    let gran_on = params
+        .granulation
+        .unwrap_or(matches!(product, Product::VisibleRgb));
+    let granulation = if gran_on {
+        Some(clouds::Granulation::for_grid(horiz_pitch_m))
+    } else {
+        None
+    };
+    if let Some(g) = granulation {
+        // The what-if-label pattern: the display texturing is logged, never silent.
+        crate::log_line!(
+            "simsat api: cloud granulation ON (sub-grid edge erosion; dx {horiz_pitch_m:.0} m \
+             -> amplitude {:.3})",
+            g.amplitude
+        );
+    }
+    let sun_od = clouds::accumulate_sun_od_granulated(
+        &vol,
+        georef,
+        sun_ecef,
+        SUN_OD_RESOLUTION,
+        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+        granulation,
+    );
     let scan_rect = scan_rect_of(&raster.scan);
     let froxel = atmosphere::build_aerial_froxel(
         &luts,
@@ -544,6 +589,7 @@ fn render_visible_scene(
         } else {
             1
         },
+        granulation,
         ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
     };
     // Appearance-pass wiring: the EDGE FEATHER activates only under a zoom-out margin
@@ -683,6 +729,7 @@ fn render_visible_scene(
         time_is_fallback,
         ground_source: Some(ground_source),
         ground_status,
+        granulation: gran_on,
     })
 }
 
@@ -769,6 +816,8 @@ fn render_ir_scene(
         time_is_fallback,
         ground_source: None,
         ground_status: Vec::new(),
+        // The raw-Kelvin thermal march reads the un-eroded brick by construction.
+        granulation: false,
     })
 }
 
@@ -847,6 +896,8 @@ fn render_geocolor_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         time_is_fallback: vis.time_is_fallback,
         ground_source: vis.ground_source,
         ground_status: vis.ground_status,
+        // The day half is the visible product; the IR night half never granulates.
+        granulation: vis.granulation,
     })
 }
 
@@ -912,6 +963,8 @@ fn render_sandwich_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         time_is_fallback: vis.time_is_fallback,
         ground_source: vis.ground_source,
         ground_status: vis.ground_status,
+        // The visible base carries the granulation; the IR overlay never granulates.
+        granulation: vis.granulation,
     })
 }
 
@@ -991,6 +1044,8 @@ fn render_derived_scene(
         time_is_fallback,
         ground_source: None,
         ground_status: Vec::new(),
+        // Derived fields are per-column brick integrals — never granulated.
+        granulation: false,
     })
 }
 
@@ -1407,7 +1462,7 @@ fn resolve_wrfout(params: &RenderParams) -> Result<SceneSource, String> {
             _ => false,
         };
         if !fresh {
-            eprintln!(
+            crate::log_line!(
                 "simsat api: cached brick {} is STALE against {} (source bytes/mtime \
                  changed, or a pre-staleness-gate manifest); re-ingesting",
                 brick_path.display(),
@@ -2447,6 +2502,94 @@ mod tests {
             r.time_is_fallback,
             "a source with no valid time must flag the fabricated date"
         );
+    }
+
+    // ── sub-grid cloud granulation (edge-erosion detail noise) ───────────────────
+
+    /// The synthetic source with a scattered BOUNDARY-LAYER LIQUID popcorn-cu field
+    /// (single cloudy cells, k 2..7 ~ 0.5-1.75 km) — the granulation target regime.
+    fn low_liquid_source(nx: usize, ny: usize, nz: usize, dx: f64) -> SceneSource {
+        let mut src = synthetic_source(nx, ny, nz, dx);
+        let n2 = nx * ny;
+        let mut ext = vec![0f32; nx * ny * nz];
+        for k in 2..7.min(nz) {
+            for j in 0..ny {
+                for i in 0..nx {
+                    if i % 4 == 1 && j % 3 == 1 {
+                        ext[k * n2 + j * nx + i] = 1.5e-2;
+                    }
+                }
+            }
+        }
+        let (lq, codes) = crate::bricks::encode_log_channel(&ext);
+        src.brick.ext_liquid = codes;
+        src.brick.quant.0.insert("ext_liquid".to_string(), lq);
+        src
+    }
+
+    #[test]
+    fn granulation_scopes_by_product_and_is_live_in_the_display_rgb() {
+        // Default product scoping: the DISPLAY VisibleRgb granulates (flag recorded on
+        // the result) and the pixels actually change vs a forced-off render; the
+        // quantitative bands / thermal / derived products default OFF.
+        let src = low_liquid_source(24, 24, 16, 3000.0);
+        let p = synthetic_params(ViewMode::TopDownMap); // daylight, granulation None
+        let on = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert!(
+            on.granulation,
+            "VisibleRgb must granulate by default (display product)"
+        );
+        let mut p_off = p.clone();
+        p_off.granulation = Some(false);
+        let off = render_visible_scene(&src, &p_off, Product::VisibleRgb).unwrap();
+        assert!(!off.granulation, "the explicit override must win");
+        let (rgb_on, rgb_off) = match (&on.data, &off.data) {
+            (FrameData::Visible { rgb: a, .. }, FrameData::Visible { rgb: b, .. }) => (a, b),
+            other => panic!("expected Visible frames, got {other:?}"),
+        };
+        assert_ne!(
+            rgb_on, rgb_off,
+            "granulation should visibly change a coarse-grid liquid cu field"
+        );
+
+        let bands = render_visible_scene(&src, &p, Product::VisibleBands).unwrap();
+        assert!(
+            !bands.granulation,
+            "the quantitative raw-reflectance bands must default OFF"
+        );
+        let ir = render_ir_scene(&src, &p, IrConfig::band13()).unwrap();
+        assert!(!ir.granulation, "raw-Kelvin IR never granulates");
+        let derived = render_derived_scene(&src, &p, DerivedField::CloudOpticalDepth).unwrap();
+        assert!(!derived.granulation, "derived fields never granulate");
+    }
+
+    #[test]
+    fn ir_bt_is_byte_identical_with_granulation_requested() {
+        // The raw-Kelvin contract: requesting granulation cannot touch a thermal
+        // product — the BT plane is byte-identical whether the flag is forced on or
+        // off (the IR march reads the un-eroded brick by construction), so
+        // quantitative BT verification always reflects model skill.
+        let src = low_liquid_source(20, 20, 16, 3000.0);
+        let mut p_on = synthetic_params(ViewMode::TopDownMap);
+        p_on.granulation = Some(true);
+        let mut p_off = p_on.clone();
+        p_off.granulation = Some(false);
+        let r_on = render_ir_scene(&src, &p_on, IrConfig::band13()).unwrap();
+        let r_off = render_ir_scene(&src, &p_off, IrConfig::band13()).unwrap();
+        let bt = |r: &RenderResult| match &r.data {
+            FrameData::Ir { bt_kelvin, .. } => bt_kelvin.clone(),
+            other => panic!("expected Ir, got {other:?}"),
+        };
+        let (a, b) = (bt(&r_on), bt(&r_off));
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "IR BT must be byte-identical with granulation available"
+            );
+        }
+        assert!(!r_on.granulation && !r_off.granulation);
     }
 
     #[test]

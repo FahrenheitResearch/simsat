@@ -249,7 +249,7 @@ fn wrf_projection_params(wrf: &WrfFile) -> WrfProjectionParams {
     let map_proj = match wrf.global_attr_i32("MAP_PROJ") {
         Ok(v) => v,
         Err(_) => {
-            eprintln!(
+            crate::log_line!(
                 "simsat ingest: WARNING — global attribute MAP_PROJ is missing; \
                  assuming Lambert conformal (1). Georeferencing may be wrong if the \
                  file is not a Lambert-projected wrfout."
@@ -760,6 +760,16 @@ fn beta_from_q(q: &[f32], rho: &[f32], effective_radius_m: f64) -> Vec<f32> {
         .collect()
 }
 
+/// Add a second species' extinction into an existing beta buffer at its OWN
+/// effective radius. Extinctions add linearly, so a shared brick channel can carry
+/// several species as long as each converts at its own optics before the sum (the
+/// SSB v3 snow-optics fix: QSNOW joins ext_precip at the snow aggregate beta).
+fn add_beta_from_q(beta: &mut [f32], q: &[f32], rho: &[f32], effective_radius_m: f64) {
+    for ((b, &qi), &ri) in beta.iter_mut().zip(q.iter()).zip(rho.iter()) {
+        *b += optics::extinction_coefficient(ri as f64, qi as f64, effective_radius_m) as f32;
+    }
+}
+
 /// Add a brick-resolution extinction channel into the running `beta_total`
 /// (for `tau_up`) and quantize it to a log u8 channel.
 fn accumulate_and_encode(beta_total: &mut [f32], ext: &[f32]) -> (bricks::LogQuant, Vec<u8>) {
@@ -823,11 +833,14 @@ fn read_geometry<R: GeomReader>(wrf: &R, timestep: usize) -> Result<GridGeometry
                 (xlong[c] - lon0[c]).abs() as f64,
             );
             if dlat > 1.0e-6 || dlon > 1.0e-6 {
-                eprintln!(
+                crate::log_line!(
                     "simsat ingest: moving nest detected — domain centre moved \
                      ({:.4}, {:.4}) -> ({:.4}, {:.4}) between t0 and t{timestep}; \
                      the georef is anchored per-timestep",
-                    lat0[c], lon0[c], xlat[c], xlong[c]
+                    lat0[c],
+                    lon0[c],
+                    xlat[c],
+                    xlong[c]
                 );
             }
         }
@@ -1008,16 +1021,16 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         );
         accumulate_and_encode(&mut beta_total, &ext)
     };
-    // ext_ice = QICE + QSNOW (shared optics).
+    // ext_ice = QICE only (small pristine ice). SSB v3 snow-optics fix: QSNOW no
+    // longer shares cloud-ice optics here — sharing them inflated snow's visible
+    // extinction 3.75x wherever QSNOW dominates (anvil plates, stratiform shields,
+    // deep decks), the "clouds too thick" defect. Snow now enters ext_precip below
+    // at its own aggregate beta (see `optics::HydrometeorClass::Snow`).
     let (qi, ext_ice) = {
-        let mut qsum =
-            read_3d_opt(&wrf, "QICE", nz, ny, nx, t)?.unwrap_or_else(|| vec![0f32; ncell]);
-        if let Some(qsnow) = read_3d_opt(&wrf, "QSNOW", nz, ny, nx, t)? {
-            for (a, b) in qsum.iter_mut().zip(qsnow.iter()) {
-                *a += *b;
-            }
-        }
-        let beta = beta_from_q(&qsum, &rho, HydrometeorClass::Ice.effective_radius_m());
+        let beta = match read_3d_opt(&wrf, "QICE", nz, ny, nx, t)? {
+            Some(q) => beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m()),
+            None => vec![0f32; ncell],
+        };
         let ext = resample_volume_conservative(
             &beta,
             &z,
@@ -1032,16 +1045,35 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         );
         accumulate_and_encode(&mut beta_total, &ext)
     };
-    // ext_precip = QRAIN + QGRAUP (shared optics).
+    // ext_precip = QRAIN + QGRAUP (rain optics) + QSNOW (snow aggregate optics).
+    // The channel is the LARGE-PARTICLE class: extinctions add linearly, so each
+    // species converts at its OWN beta before the sum, and the single
+    // per-unit-extinction IR recovery `ir.rs` applies to this channel (ratio
+    // ~0.467) stays exact for all three because Q_abs/Q_ext is size-independent
+    // in the geometric regime (see the optics.rs IR table). The visible march is
+    // untouched: it consumes total extinction, and ext_ice + ext_precip already
+    // share the ice phase lobe.
     let (qp, ext_precip) = {
-        let mut qsum =
-            read_3d_opt(&wrf, "QRAIN", nz, ny, nx, t)?.unwrap_or_else(|| vec![0f32; ncell]);
+        let mut beta = match read_3d_opt(&wrf, "QRAIN", nz, ny, nx, t)? {
+            Some(q) => beta_from_q(&q, &rho, HydrometeorClass::Rain.effective_radius_m()),
+            None => vec![0f32; ncell],
+        };
         if let Some(qgraup) = read_3d_opt(&wrf, "QGRAUP", nz, ny, nx, t)? {
-            for (a, b) in qsum.iter_mut().zip(qgraup.iter()) {
-                *a += *b;
-            }
+            add_beta_from_q(
+                &mut beta,
+                &qgraup,
+                &rho,
+                HydrometeorClass::Graupel.effective_radius_m(),
+            );
         }
-        let beta = beta_from_q(&qsum, &rho, HydrometeorClass::Rain.effective_radius_m());
+        if let Some(qsnow) = read_3d_opt(&wrf, "QSNOW", nz, ny, nx, t)? {
+            add_beta_from_q(
+                &mut beta,
+                &qsnow,
+                &rho,
+                HydrometeorClass::Snow.effective_radius_m(),
+            );
+        }
         let ext = resample_volume_conservative(
             &beta,
             &z,
@@ -1183,7 +1215,7 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
 
     let wall = start.elapsed();
     let peak_rss_bytes = platform::peak_rss_bytes();
-    eprintln!(
+    crate::log_line!(
         "simsat ingest: run={run_id} dims={nx}x{ny}x{nz_brick} wall={:.2}s peak_rss={} ssb_bytes={ssb_bytes}",
         wall.as_secs_f64(),
         peak_rss_bytes
@@ -1332,6 +1364,57 @@ mod tests {
         let beta = beta_from_q(&q, &rho, HydrometeorClass::CloudLiquid.effective_radius_m());
         assert!((beta[0] - 0.15).abs() < 1e-6);
         assert_eq!(beta[1], 0.0);
+    }
+
+    /// SSB v3 snow-optics fix, the synthetic two-layer proof: through the real
+    /// ingest kernels (`beta_from_q`/`add_beta_from_q` + `integrate_tau_up_column`),
+    /// an equal-mass SNOW column now carries exactly r_snow/r_ice = 3.75x LESS
+    /// visible optical depth than a cloud-ice column, while the cloud-ice column
+    /// itself is byte-unchanged from the M0 constant (beta = 0.0375 m^-1 at
+    /// 1 g/kg, rho_air = 1) — the convective core (QICE/QCLOUD-dominated) look is
+    /// preserved and only snow-dominated regions thin.
+    #[test]
+    fn snow_layer_tau_drops_vs_ice_optics_and_ice_is_unchanged() {
+        let nz = 10;
+        let dz = 250.0;
+        let q = vec![1.0e-3f32; nz]; // 1 g/kg through the whole column
+        let rho = vec![1.0f32; nz];
+        let ice_beta = beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m());
+        // The snow column enters through the SAME accumulation path the ingest
+        // uses for ext_precip (rain absent -> zero base, snow added on top).
+        let mut snow_beta = vec![0.0f32; nz];
+        add_beta_from_q(
+            &mut snow_beta,
+            &q,
+            &rho,
+            HydrometeorClass::Snow.effective_radius_m(),
+        );
+        // Cloud-ice extinction is UNCHANGED from M0: 1.5*1*1e-3/(1000*40e-6).
+        assert!(
+            (ice_beta[0] - 0.0375).abs() < 1e-7,
+            "ice beta {}",
+            ice_beta[0]
+        );
+        // Snow extinction is its own aggregate beta: 1.5*1*1e-3/(1000*150e-6).
+        assert!(
+            (snow_beta[0] - 0.01).abs() < 1e-7,
+            "snow beta {}",
+            snow_beta[0]
+        );
+        let to_f64 = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+        let ice_tau = integrate_tau_up_column(&to_f64(&ice_beta), dz);
+        let snow_tau = integrate_tau_up_column(&to_f64(&snow_beta), dz);
+        // Surface-level column optical depths: 9 trapezoid steps of beta*dz
+        // (tolerances allow the f32 channel quantization of beta).
+        assert!((ice_tau[0] - 84.375).abs() < 1e-4, "ice tau {}", ice_tau[0]);
+        assert!(
+            (snow_tau[0] - 22.5).abs() < 1e-4,
+            "snow tau {}",
+            snow_tau[0]
+        );
+        // The fix factor: the equal-mass snow layer is exactly 3.75x thinner than
+        // it was under the old shared-ice-optics treatment (which produced ice_tau).
+        assert!(((ice_tau[0] / snow_tau[0]) - 3.75).abs() < 1e-5);
     }
 
     #[test]
