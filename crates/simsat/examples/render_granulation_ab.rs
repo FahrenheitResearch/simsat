@@ -36,14 +36,20 @@
 //!   crop=<X,Y,W,H>      OPTIONAL pixel rect; writes zoomed crops of both frames.
 //!   zoom=<N>            Crop nearest-neighbour magnification 1..=8 (default 4).
 //!   ir=<b>              on|off — the IR byte-identity proof (default on).
+//!   coherence-map=<p>   OPTIONAL (run.json input only): write the round-2
+//!                       deck-coherence gate as a grayscale PNG (white = open /
+//!                       granulate, black = closed deck; north-up like the top-down
+//!                       frame) + print a GRANCOH stats line — the tuning diagnostic
+//!                       for GRAN_COHERENCE_* / GRAN_PROTECT_*.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use image::RgbImage;
+use image::{GrayImage, RgbImage};
 use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams, SunOverride};
+use simsat::bricks::{self, RunManifest};
 use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
-use simsat::clouds::{StepQuality, granulation_amplitude};
+use simsat::clouds::{DecodedVolume, GranCoherence, StepQuality, granulation_amplitude};
 use simsat::ingest;
 use simsat::render::DEFAULT_EXPOSURE;
 use simsat::topdown;
@@ -77,6 +83,7 @@ struct Opts {
     crop: Option<(usize, usize, usize, usize)>,
     zoom: usize,
     ir_check: bool,
+    coherence_map: Option<PathBuf>,
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -90,6 +97,11 @@ fn run(args: &[String]) -> Result<(), String> {
         std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
     );
     topdown::configure_global_rayon(threads);
+
+    // The round-2 deck-coherence tuning diagnostic (independent of the A/B pair).
+    if let Some(path) = &opts.coherence_map {
+        write_coherence_map(&opts.input, opts.timestep, path)?;
+    }
 
     let params_at = |granulation: bool| -> RenderParams {
         let mut p = RenderParams::new(opts.input.clone());
@@ -230,6 +242,61 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Write the round-2 DECK-COHERENCE gate field ([`GranCoherence`]) of a cached
+/// brick as a grayscale PNG (white = open / granulate, black = closed deck),
+/// row-flipped to north-up so it registers with the top-down frame, and print a
+/// `GRANCOH` stats line. Requires a `run.json` input (the brick must already be
+/// ingested — render the A/B pair once first for a wrfout input).
+fn write_coherence_map(input: &Path, timestep: usize, out: &Path) -> Result<(), String> {
+    let manifest = RunManifest::load(input)
+        .map_err(|e| format!("coherence-map needs a run.json input: {e}"))?;
+    let cache_dir = input
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or("coherence-map: run.json has no cache root above it")?;
+    let ts = manifest.timesteps.get(timestep).ok_or_else(|| {
+        format!(
+            "timestep {timestep} out of range (run has {} timesteps)",
+            manifest.timesteps.len()
+        )
+    })?;
+    let brick_path = bricks::run_dir(&cache_dir, &manifest.run_id).join(&ts.file);
+    let brick = bricks::read_ssb(&brick_path)
+        .map_err(|e| format!("read brick {}: {e}", brick_path.display()))?;
+    let p = &manifest.projection;
+    let pitch = if p.map_proj == 6 {
+        p.dx_m.min(p.dy_m) * 111_195.0
+    } else {
+        p.dx_m.min(p.dy_m)
+    };
+    let (nx, ny) = (brick.nx, brick.ny);
+    let vol = DecodedVolume::from_brick(&brick, pitch);
+    let coh = GranCoherence::build(&vol);
+    let (open, partial, closed) = coh.stats();
+    println!(
+        "GRANCOH dims={nx}x{ny} open={open} partial={partial} closed={closed} \
+         open_frac={:.4} closed_frac={:.4}",
+        open as f64 / (nx * ny) as f64,
+        closed as f64 / (nx * ny) as f64,
+    );
+    let mut img = GrayImage::new(nx as u32, ny as u32);
+    for y in 0..ny {
+        let j = ny - 1 - y; // north-up, like the top-down frame
+        for x in 0..nx {
+            let g = coh.gate_at(x as f64, j as f64);
+            img.put_pixel(x as u32, y as u32, image::Luma([(g * 255.0).round() as u8]));
+        }
+    }
+    img.save(out)
+        .map_err(|e| format!("write {}: {e}", out.display()))?;
+    eprintln!(
+        "render_granulation_ab: wrote coherence map {} ({nx}x{ny})",
+        out.display()
+    );
+    Ok(())
+}
+
 fn write_png(path: &str, rgb: &[u8], nx: usize, ny: usize) -> Result<(), String> {
     let img = RgbImage::from_raw(nx as u32, ny as u32, rgb.to_vec())
         .ok_or_else(|| format!("bad frame dims {nx}x{ny}"))?;
@@ -291,6 +358,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         crop: None,
         zoom: 4,
         ir_check: true,
+        coherence_map: None,
     };
     for arg in args {
         let (key, value) = arg
@@ -364,6 +432,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 opts.zoom = z;
             }
             "ir" => opts.ir_check = parse_bool(value)?,
+            "coherence-map" => opts.coherence_map = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown key `{key}`")),
         }
     }
@@ -390,6 +459,6 @@ fn print_usage() {
          [sat=goes-east] [timestep=0] [view=topdown] [resolution=native] [margin=0.0] \
          [steps=offline] [sun-elev=deg] [sun-az=deg] [exposure={DEFAULT_EXPOSURE}] \
          [cache=dir] [bluemarble=path] [bluemarble-month=MM] [bluemarble-download=on] \
-         [threads=N] [crop=X,Y,W,H] [zoom=4] [ir=on]"
+         [threads=N] [crop=X,Y,W,H] [zoom=4] [ir=on] [coherence-map=path.png]"
     );
 }

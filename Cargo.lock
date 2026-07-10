@@ -4949,11 +4949,12 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simsat"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "eframe",
  "flate2",
+ "grib-core",
  "image",
  "naga",
  "netcrust",
@@ -4970,7 +4971,7 @@ dependencies = [
 
 [[package]]
 name = "simsat_studio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "image",

@@ -19,6 +19,7 @@ use eframe::egui_wgpu::wgpu;
 
 use crate::bluemarble::BlueMarbleCrop;
 use crate::camera::SurfaceRaster;
+use crate::frame::{GridGeoref, MapProjection};
 use crate::render::FLAT_ALBEDO_SRGB;
 use crate::solar::SolarFrame;
 
@@ -88,10 +89,10 @@ pub struct SurfaceUniforms {
 }
 
 impl SurfaceUniforms {
-    /// Pack into the 144-byte std140 uniform buffer the WGSL `Uniforms` expects
-    /// (9 vec4, each `xyz` + a `w` scalar).
-    pub fn to_bytes(&self) -> [u8; 144] {
-        let vec4s: [[f32; 4]; 9] = [
+    /// The 9 packed vec4s of the WGSL surface `Uniforms` (also the first 9 vec4s of
+    /// the cloud pass's superset uniform — see [`CloudFrameInputs`]).
+    pub fn to_vec4s(&self) -> [[f32; 4]; 9] {
+        [
             [self.cam[0], self.cam[1], self.cam[2], self.r_ground],
             [self.sun[0], self.sun[1], self.sun[2], self.r_top],
             [self.ex[0], self.ex[1], self.ex[2], self.x_min],
@@ -111,7 +112,13 @@ impl SurfaceUniforms {
                 self.ambient_n,
                 0.0,
             ],
-        ];
+        ]
+    }
+
+    /// Pack into the 144-byte std140 uniform buffer the WGSL `Uniforms` expects
+    /// (9 vec4, each `xyz` + a `w` scalar).
+    pub fn to_bytes(&self) -> [u8; 144] {
+        let vec4s = self.to_vec4s();
         let mut out = [0u8; 144];
         for (i, v) in vec4s.iter().flatten().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -294,11 +301,11 @@ impl SurfaceResources {
         queue.write_buffer(&uniforms, 0, &uniform_bytes);
 
         // Per-pixel LUT textures (Rgba32Float, textureLoad).
-        let lut_geo = self.upload_rgba32f(device, queue, w, h, inputs.lut_geo, "lut-geo");
-        let lut_light = self.upload_rgba32f(device, queue, w, h, inputs.lut_light, "lut-light");
+        let lut_geo = upload_rgba32f(device, queue, w, h, inputs.lut_geo, "lut-geo");
+        let lut_light = upload_rgba32f(device, queue, w, h, inputs.lut_light, "lut-light");
 
         // Atmosphere LUT textures (Rgba32Float, manual-bilinear via textureLoad).
-        let transmittance_tex = self.upload_rgba32f(
+        let transmittance_tex = upload_rgba32f(
             device,
             queue,
             256,
@@ -306,7 +313,7 @@ impl SurfaceResources {
             inputs.transmittance_lut,
             "transmittance",
         );
-        let multiscatter_tex = self.upload_rgba32f(
+        let multiscatter_tex = upload_rgba32f(
             device,
             queue,
             32,
@@ -314,7 +321,7 @@ impl SurfaceResources {
             inputs.multiscatter_lut,
             "multiscatter",
         );
-        let ambient_tex = self.upload_rgba32f(
+        let ambient_tex = upload_rgba32f(
             device,
             queue,
             inputs.ambient_n.max(1),
@@ -324,7 +331,7 @@ impl SurfaceResources {
         );
 
         // Domain textures (normals + landmask), always present.
-        let normal_tex = self.upload_rgba8(
+        let normal_tex = upload_rgba8(
             device,
             queue,
             inputs.nx,
@@ -332,7 +339,7 @@ impl SurfaceResources {
             inputs.normals_rgba,
             "normals",
         );
-        let landmask_tex = self.upload_r8(
+        let landmask_tex = upload_r8(
             device,
             queue,
             inputs.nx,
@@ -343,12 +350,10 @@ impl SurfaceResources {
 
         // Blue Marble crop (or a 1x1 gray dummy when absent).
         let bm_tex = match inputs.bluemarble {
-            Some(bm) => {
-                self.upload_rgba8(device, queue, bm.width, bm.height, &bm.rgba, "bluemarble")
-            }
+            Some(bm) => upload_rgba8(device, queue, bm.width, bm.height, &bm.rgba, "bluemarble"),
             None => {
                 let gray = (FLAT_ALBEDO_SRGB * 255.0) as u8;
-                self.upload_rgba8(device, queue, 1, 1, &[gray, gray, gray, 255], "bm-dummy")
+                upload_rgba8(device, queue, 1, 1, &[gray, gray, gray, 255], "bm-dummy")
             }
         };
 
@@ -498,142 +503,138 @@ impl SurfaceResources {
             rgba,
         }
     }
+}
 
-    fn upload_rgba32f(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        data: &[f32],
-        label: &str,
-    ) -> wgpu::Texture {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let bytes: &[u8] = bytemuck_f32(data);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        tex
-    }
+fn upload_rgba32f(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    data: &[f32],
+    label: &str,
+) -> wgpu::Texture {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: &[u8] = bytemuck_f32(data);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 16),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex
+}
 
-    fn upload_rgba8(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-        label: &str,
-    ) -> wgpu::Texture {
-        self.upload_bytes(
-            device,
-            queue,
-            w,
-            h,
-            data,
-            wgpu::TextureFormat::Rgba8Unorm,
-            4,
-            label,
-        )
-    }
+fn upload_rgba8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    label: &str,
+) -> wgpu::Texture {
+    upload_bytes(
+        device,
+        queue,
+        w,
+        h,
+        data,
+        wgpu::TextureFormat::Rgba8Unorm,
+        4,
+        label,
+    )
+}
 
-    fn upload_r8(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-        label: &str,
-    ) -> wgpu::Texture {
-        self.upload_bytes(
-            device,
-            queue,
-            w,
-            h,
-            data,
-            wgpu::TextureFormat::R8Unorm,
-            1,
-            label,
-        )
-    }
+fn upload_r8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    label: &str,
+) -> wgpu::Texture {
+    upload_bytes(
+        device,
+        queue,
+        w,
+        h,
+        data,
+        wgpu::TextureFormat::R8Unorm,
+        1,
+        label,
+    )
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn upload_bytes(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-        format: wgpu::TextureFormat,
-        bytes_per_texel: u32,
-        label: &str,
-    ) -> wgpu::Texture {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * bytes_per_texel),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        tex
-    }
+#[allow(clippy::too_many_arguments)]
+fn upload_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    format: wgpu::TextureFormat,
+    bytes_per_texel: u32,
+    label: &str,
+) -> wgpu::Texture {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * bytes_per_texel),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex
 }
 
 /// Reinterpret an `&[f32]` as `&[u8]` (little-endian target; wgpu uploads LE).
@@ -876,6 +877,992 @@ impl CloudVolumeResources {
     }
 }
 
+// ── GPU cloud-pass ACTIVATION (feat/gpu-clouds) ────────────────────────────────
+//
+// The long-deferred M5-GPU activation: [`CloudPassResources`] dispatches the
+// naga-validated `sun_od.wgsl` compute over the uploaded [`CloudVolumeResources`]
+// volume and then runs the `clouds.wgsl` full-screen cloud-march pass offscreen with
+// readback — the SAME output contract as the CPU composite's RGBA. The CPU path
+// (`clouds::render_cloud_frame_rgba`) remains the shipping default, the stored-frame
+// path, and the parity ground truth; this is the EXPERIMENTAL interactive preview
+// behind the studio's "GPU clouds" toggle, validated by the owner's A/B + the
+// in-studio parity instrument (the nodes are headless — here we can only compile,
+// naga-validate, and unit-test the pure packing/planning math below).
+//
+// TDR SAFETY (the M8 concern, minimally): one submit is never unbounded. The sun-OD
+// compute is dispatched in ROW BANDS of at most [`SUN_OD_MAX_SAMPLES_PER_SUBMIT`]
+// texel-samples (the shader reads its band's row offset from `vert.w`), and the cloud
+// fragment pass renders in SCISSOR BANDS of at most [`CLOUD_TILE_MAX_PIXELS`] pixels,
+// each band its own command submission, so a large raster cannot hang the device
+// past a watchdog on an iGPU.
+
+/// Cap on `dim * n_steps * rows` texel-samples per sun-OD compute submit (~32M).
+pub const SUN_OD_MAX_SAMPLES_PER_SUBMIT: u64 = 32 * 1024 * 1024;
+/// Cap on pixels marched per cloud-pass submit (one scissor band), 1M.
+pub const CLOUD_TILE_MAX_PIXELS: u64 = 1 << 20;
+
+/// Split `total` rows into `(offset, count)` bands of at most `step` rows.
+/// Covers every row exactly once, in order; `step` is clamped to >= 1.
+pub fn row_bands(total: u32, step: u32) -> Vec<(u32, u32)> {
+    let step = step.max(1);
+    let mut out = Vec::new();
+    let mut y = 0u32;
+    while y < total {
+        let rows = step.min(total - y);
+        out.push((y, rows));
+        y += rows;
+    }
+    out
+}
+
+/// Rows per sun-OD compute band for a `dim`-square map marching `n_steps` samples per
+/// texel: bounded by [`SUN_OD_MAX_SAMPLES_PER_SUBMIT`], floored at one workgroup (8
+/// rows), rounded down to the 8-row workgroup height so bands never overlap.
+pub fn sun_od_band_rows(dim: u32, n_steps: u32) -> u32 {
+    let per_row = (dim.max(1) as u64) * (n_steps.max(1) as u64);
+    let rows = (SUN_OD_MAX_SAMPLES_PER_SUBMIT / per_row.max(1)).clamp(8, dim.max(8) as u64) as u32;
+    (rows / 8).max(1) * 8
+}
+
+/// Rows per cloud-pass scissor band for a raster `width` px wide: bounded by
+/// [`CLOUD_TILE_MAX_PIXELS`] pixels per submit, floored at one row.
+pub fn cloud_tile_rows(width: u32) -> u32 {
+    (CLOUD_TILE_MAX_PIXELS / width.max(1) as u64).max(1) as u32
+}
+
+// Small [f64; 3] helpers (twins of the private clouds.rs ones — clouds.rs is owned by
+// a parallel workstream, so the GPU planner carries its own copies).
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm3(a: [f64; 3]) -> [f64; 3] {
+    let l = dot3(a, a).sqrt();
+    if l > 0.0 {
+        [a[0] / l, a[1] / l, a[2] / l]
+    } else {
+        a
+    }
+}
+
+/// The four `geo0..geo3` uniform quads of the WGSL WRF projection forward
+/// (`clouds.wgsl` / `sun_od.wgsl` `project` + `ecef_to_brick`). `GridGeoref`'s anchor
+/// fields are private, so the anchor is RE-DERIVED at grid index (0, 0) from the pub
+/// surface: `plane_uv(0,0)` gives the plane coords of cell (0,0) and the unit steps
+/// give `dx`/`dy` — an equivalent anchoring (`fi = (u - u00) / dx`), tested against
+/// `georef.forward` below.
+#[derive(Debug, Clone, Copy)]
+pub struct GeoQuads {
+    pub geo0: [f32; 4],
+    pub geo1: [f32; 4],
+    pub geo2: [f32; 4],
+    pub geo3: [f32; 4],
+}
+
+/// Build [`GeoQuads`] from a georef (see the struct doc). The WGSL projection kinds:
+/// 0 = Lambert, 1 = polar stereographic, 2 = Mercator, 3 = geographic lat/lon.
+pub fn geo_quads(georef: &GridGeoref) -> GeoQuads {
+    let (u00, v00) = georef.plane_uv(0.0, 0.0);
+    let (u10, _) = georef.plane_uv(1.0, 0.0);
+    let (_, v01) = georef.plane_uv(0.0, 1.0);
+    let dx = u10 - u00;
+    let dy = v01 - v00;
+    let (kind, cm, lambert_n, lambert_f, ps_k, merc_scale, south) = match georef.projection() {
+        MapProjection::Lambert {
+            n,
+            f,
+            stand_lon_deg,
+        } => (0.0, stand_lon_deg, n, f, 0.0, 0.0, 0.0),
+        MapProjection::PolarStereographic {
+            k,
+            central_meridian_deg,
+            south_pole,
+        } => (
+            1.0,
+            central_meridian_deg,
+            0.0,
+            0.0,
+            k,
+            0.0,
+            if south_pole { 1.0 } else { 0.0 },
+        ),
+        MapProjection::Mercator {
+            scale,
+            central_meridian_deg,
+        } => (2.0, central_meridian_deg, 0.0, 0.0, 0.0, scale, 0.0),
+        MapProjection::LatLon {
+            central_meridian_deg,
+        } => (3.0, central_meridian_deg, 0.0, 0.0, 0.0, 0.0, 0.0),
+        // The rotated lat-lon grid (GRIB RRFS) has NO WGSL forward — the GPU cloud
+        // pass cannot march such a brick. Kind -1 is an explicit unsupported
+        // sentinel; callers must gate on [`projection_supported`] and stay on the
+        // CPU path (the studio does).
+        MapProjection::RotatedLatLon { .. } => (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    };
+    GeoQuads {
+        geo0: [kind, 0.0, 0.0, dx as f32],
+        geo1: [u00 as f32, v00 as f32, dy as f32, cm as f32],
+        geo2: [
+            lambert_n as f32,
+            lambert_f as f32,
+            ps_k as f32,
+            merc_scale as f32,
+        ],
+        geo3: [south, 0.0, 0.0, 0.0],
+    }
+}
+
+/// Whether the WGSL projection forward implements this georef's projection — the
+/// GPU cloud/sun-OD passes only speak Lambert / polar stereographic / Mercator /
+/// geographic lat/lon. A rotated lat-lon (GRIB RRFS) brick must render on the CPU
+/// path; [`geo_quads`] packs the explicit -1 unsupported sentinel for it.
+pub fn projection_supported(georef: &GridGeoref) -> bool {
+    !matches!(georef.projection(), MapProjection::RotatedLatLon { .. })
+}
+
+/// The sun-OD dispatch plan: the sun-aligned orthographic frame + extents + step
+/// schedule, mirroring the geometry half of `clouds::accumulate_sun_od_granulated`
+/// (whose `SunOdMap` frame fields are private — the GPU pipeline computes its own,
+/// self-consistent frame, and the SAME values feed both `sun_od.wgsl` and the
+/// `clouds.wgsl` `sod_*` sampler uniforms, so producer and consumer always agree).
+#[derive(Debug, Clone, Copy)]
+pub struct SunOdPlan {
+    pub center: [f64; 3],
+    pub au: [f64; 3],
+    pub av: [f64; 3],
+    pub sun: [f64; 3],
+    pub u_min: f64,
+    pub u_max: f64,
+    pub v_min: f64,
+    pub v_max: f64,
+    pub s_start: f64,
+    pub s_len: f64,
+    /// Along-sun samples per texel (0 for a degenerate plan -> an all-zero map).
+    pub n_steps: usize,
+    pub ds: f64,
+    /// Square map side (texels).
+    pub dim: usize,
+}
+
+/// Plan the sun-OD map for a brick + sun direction (the CPU-geometry mirror; see
+/// [`SunOdPlan`]). `resolution` is the square map side (the studio uses 512).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_sun_od(
+    georef: &GridGeoref,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    z_min_m: f64,
+    dz_m: f64,
+    voxel_pitch_m: f64,
+    sun_ecef: [f64; 3],
+    resolution: usize,
+) -> SunOdPlan {
+    use crate::atmosphere::R_GROUND_M;
+    let resolution = resolution.max(1);
+    let sun = norm3(sun_ecef);
+    // perp_basis twin (clouds.rs private): a right-handed basis perpendicular to sun.
+    let seed = if sun[2].abs() < 0.9 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let au = norm3(cross3(seed, sun));
+    let av = cross3(sun, au);
+    let ci = (nx.saturating_sub(1)) as f64 / 2.0;
+    let cj = (ny.saturating_sub(1)) as f64 / 2.0;
+    let ck = (nz.saturating_sub(1)) as f64 / 2.0;
+    let center = crate::clouds::brick_to_ecef(georef, ci, cj, ck, z_min_m, dz_m)
+        .unwrap_or([R_GROUND_M, 0.0, 0.0]);
+
+    let (mut u_min, mut u_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut v_min, mut v_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut s_min, mut s_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &ki in &[0.0, (nz.saturating_sub(1)) as f64] {
+        for &ji in &[0.0, (ny.saturating_sub(1)) as f64] {
+            for &ii in &[0.0, (nx.saturating_sub(1)) as f64] {
+                if let Some(p) = crate::clouds::brick_to_ecef(georef, ii, ji, ki, z_min_m, dz_m) {
+                    let d = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+                    let (u, v, s) = (dot3(d, au), dot3(d, av), dot3(d, sun));
+                    u_min = u_min.min(u);
+                    u_max = u_max.max(u);
+                    v_min = v_min.min(v);
+                    v_max = v_max.max(v);
+                    s_min = s_min.min(s);
+                    s_max = s_max.max(s);
+                }
+            }
+        }
+    }
+    if !(u_min.is_finite() && v_min.is_finite() && s_min.is_finite()) {
+        // Degenerate (projection failed at every corner): an all-zero map, the same
+        // contract as the CPU's degenerate SunOdMap.
+        return SunOdPlan {
+            center,
+            au,
+            av,
+            sun,
+            u_min: -1.0,
+            u_max: 1.0,
+            v_min: -1.0,
+            v_max: 1.0,
+            s_start: 0.0,
+            s_len: 0.0,
+            n_steps: 0,
+            ds: 1.0,
+            dim: resolution,
+        };
+    }
+    let pitch = voxel_pitch_m.max(1.0);
+    let margin = pitch * 4.0;
+    let s_start = s_max + margin;
+    let s_len = (s_max - s_min) + 2.0 * margin;
+    let n_steps = ((s_len / pitch).ceil() as usize).clamp(1, 1024);
+    let ds = s_len / n_steps as f64;
+    SunOdPlan {
+        center,
+        au,
+        av,
+        sun,
+        u_min,
+        u_max,
+        v_min,
+        v_max,
+        s_start,
+        s_len,
+        n_steps,
+        ds,
+        dim: resolution,
+    }
+}
+
+/// The march/appearance parameters of one GPU cloud render (the `MarchConfig` slice
+/// the shader consumes; the GPU path always uses the INTERACTIVE schedule — see the
+/// `clouds.wgsl` schedule note).
+#[derive(Debug, Clone, Copy)]
+pub struct CloudMarchParams {
+    pub coarse_step_m: f32,
+    pub fine_step_m: f32,
+    pub max_steps: f32,
+    /// Display exposure gain (`u.m1.x`; the CPU `radiance_to_rgba_softclip` seam).
+    pub exposure: f32,
+    /// Multi-scatter octave count (`u.m1.y`; 6 or 1 from the studio A/B).
+    pub octaves: f32,
+    pub beer_powder: bool,
+    pub ground_albedo: f32,
+    pub transmittance_floor: f32,
+    /// Zoom-out-margin edge-feather band (cells; 0 = no margin, the no-op).
+    pub edge_feather_cells: f32,
+    /// The sun-gated whole-surface daytime lift (`render::GROUND_DAY_LIFT` default).
+    pub ground_day_lift: f32,
+}
+
+/// The CPU-side inputs of one GPU cloud-composited render: the surface-pass inputs
+/// (raster LUTs, ground/domain textures, atmosphere LUTs, packed surface uniforms)
+/// plus the cloud volume, quant scales, projection quads, march params, sun-OD plan,
+/// froxel and SH-ambient uploads.
+pub struct CloudFrameInputs<'a> {
+    pub surface: SurfaceFrameInputs<'a>,
+    /// Brick dims + Texture A (`clouds::pack_texture_a`) + occupancy mip.
+    pub vol_nx: u32,
+    pub vol_ny: u32,
+    pub vol_nz: u32,
+    pub texture_a: &'a [u8],
+    pub occ_dims: (u32, u32, u32),
+    pub occupancy: &'a [u8],
+    /// LogQuant scales: `ext_liquid vmin,vmax ; ext_ice vmin,vmax`.
+    pub ql: [f32; 4],
+    /// LogQuant scales: `ext_precip vmin,vmax ; tau_up vmin,vmax`.
+    pub qp: [f32; 4],
+    /// Brick vertical extent + shell radii (m).
+    pub z_min_m: f32,
+    pub dz_m: f32,
+    pub r_top_m: f32,
+    pub r_bottom_m: f32,
+    pub voxel_pitch_m: f32,
+    pub geo: GeoQuads,
+    pub march: CloudMarchParams,
+    pub sun_od: SunOdPlan,
+    /// Aerial-perspective froxel (`atmosphere::AerialFroxel`): `dim^3 * 4` f32 RGBA,
+    /// index `4*((z*dim + y)*dim + x)` — uploaded as a `dim^3` Rgba32Float 3-D texture.
+    pub froxel_dim: u32,
+    pub froxel_data: &'a [f32],
+    /// SH-2 sky-ambient table (`SkyShTable::to_rgba_f32`): 9 coef columns x `sh_rows`
+    /// elevation rows of RGBA f32 (binding 14). Row count must equal the scalar
+    /// ambient LUT's entry count (both come from the same table).
+    pub sh_rows: u32,
+    pub sh_data: &'a [f32],
+    /// The scan-angle rect the froxel was built over (`x_min, x_max, y_min, y_max`).
+    pub scan_rect: [f32; 4],
+}
+
+/// The 25 packed vec4s of the WGSL cloud `Uniforms` (the surface 9 + the cloud 16),
+/// in declaration order. Kept as a pure function so the layout is unit-testable on
+/// the headless nodes.
+pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 25] {
+    let s = inputs.surface.uniforms.to_vec4s();
+    let m = &inputs.march;
+    let so = &inputs.sun_od;
+    let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    let (c, au, av) = (f3(so.center), f3(so.au), f3(so.av));
+    [
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        s[7],
+        s[8],
+        // dims: nx, ny, nz, voxel_pitch
+        [
+            inputs.vol_nx as f32,
+            inputs.vol_ny as f32,
+            inputs.vol_nz as f32,
+            inputs.voxel_pitch_m,
+        ],
+        // vert: z_min, dz, r_top(brick), r_bottom(brick)
+        [
+            inputs.z_min_m,
+            inputs.dz_m,
+            inputs.r_top_m,
+            inputs.r_bottom_m,
+        ],
+        inputs.geo.geo0,
+        inputs.geo.geo1,
+        inputs.geo.geo2,
+        inputs.geo.geo3,
+        inputs.ql,
+        inputs.qp,
+        // m0: coarse_step_m, fine_step_m, max_steps, unused
+        [m.coarse_step_m, m.fine_step_m, m.max_steps, 0.0],
+        // m1: exposure, octaves, beer_powder, ground_albedo
+        [
+            m.exposure,
+            m.octaves,
+            if m.beer_powder { 1.0 } else { 0.0 },
+            m.ground_albedo,
+        ],
+        // sod_c: sun_od centre xyz, transmittance_floor
+        [c[0], c[1], c[2], m.transmittance_floor],
+        // sod_u: au xyz, u_min
+        [au[0], au[1], au[2], so.u_min as f32],
+        // sod_v: av xyz, u_max
+        [av[0], av[1], av[2], so.u_max as f32],
+        // sod_e: v_min, v_max, sunod_dim, clouds_enabled (this path is clouds-on)
+        [so.v_min as f32, so.v_max as f32, so.dim as f32, 1.0],
+        // frx: the froxel scan rect
+        inputs.scan_rect,
+        // frx2: froxel_dim, edge_feather_cells, ground_day_lift, unused
+        [
+            inputs.froxel_dim as f32,
+            m.edge_feather_cells,
+            m.ground_day_lift,
+            0.0,
+        ],
+    ]
+}
+
+/// The 13 packed vec4s of the WGSL `SunOdUniforms` for one row band (`ty_offset` is
+/// the band's first row — the TDR chunking offset in `vert.w`).
+pub fn sun_od_uniform_quads(inputs: &CloudFrameInputs, ty_offset: u32) -> [[f32; 4]; 13] {
+    let so = &inputs.sun_od;
+    let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    let (c, au, av, sun) = (f3(so.center), f3(so.au), f3(so.av), f3(so.sun));
+    [
+        [c[0], c[1], c[2], 0.0],
+        [au[0], au[1], au[2], so.u_min as f32],
+        [av[0], av[1], av[2], so.u_max as f32],
+        [sun[0], sun[1], sun[2], so.v_min as f32],
+        // extent: v_max, s_start, s_len, n_steps
+        [
+            so.v_max as f32,
+            so.s_start as f32,
+            so.s_len as f32,
+            so.n_steps as f32,
+        ],
+        // dims: nx, ny, nz, map_dim
+        [
+            inputs.vol_nx as f32,
+            inputs.vol_ny as f32,
+            inputs.vol_nz as f32,
+            so.dim as f32,
+        ],
+        // vert: z_min, dz, ds, ty_offset (row-band)
+        [inputs.z_min_m, inputs.dz_m, so.ds as f32, ty_offset as f32],
+        inputs.geo.geo0,
+        inputs.geo.geo1,
+        inputs.geo.geo2,
+        inputs.geo.geo3,
+        inputs.ql,
+        inputs.qp,
+    ]
+}
+
+/// Flatten packed vec4 quads to little-endian bytes for a uniform upload.
+pub fn quads_to_bytes(quads: &[[f32; 4]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(quads.len() * 16);
+    for v in quads.iter().flatten() {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// GPU resources of the ACTIVATED cloud pass: the `sun_od.wgsl` compute pipeline +
+/// the `clouds.wgsl` full-screen march pipeline (created once; per-frame textures and
+/// bind groups are built in [`CloudPassResources::render`]).
+pub struct CloudPassResources {
+    cloud_pipeline: wgpu::RenderPipeline,
+    cloud_bgl: wgpu::BindGroupLayout,
+    sunod_pipeline: wgpu::ComputePipeline,
+    sunod_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl CloudPassResources {
+    /// One-time GPU setup (call from the app constructor with the wgpu device).
+    pub fn init(device: &wgpu::Device) -> Self {
+        let cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("simsat-clouds"),
+            source: wgpu::ShaderSource::Wgsl(CLOUDS_WGSL.into()),
+        });
+        let sunod_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("simsat-sun-od"),
+            source: wgpu::ShaderSource::Wgsl(SUN_OD_WGSL.into()),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("simsat-clouds-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let tex2d = |binding: u32, filterable: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let tex3d = |binding: u32, filterable: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D3,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let cloud_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("simsat-clouds-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex2d(1, false), // lut_geo
+                tex2d(2, false), // lut_light
+                tex2d(3, true),  // bm_tex
+                tex2d(4, true),  // normal_tex
+                tex2d(5, true),  // landmask_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                tex2d(7, false),  // transmittance_lut
+                tex2d(8, false),  // multiscatter_lut
+                tex2d(9, false),  // ambient_lut (scalar; layout-bound, shader-legacy)
+                tex3d(10, true),  // volume (Rgba8Unorm, hardware trilinear)
+                tex3d(11, true),  // occupancy (R8Unorm, hardware trilinear)
+                tex2d(12, false), // sun_od (R32Float)
+                tex3d(13, false), // froxel (Rgba32Float)
+                tex2d(14, false), // sh_ambient (Rgba32Float)
+                tex2d(15, false), // sun_od_dist (R32Float)
+            ],
+        });
+        let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("simsat-clouds-pl"),
+            bind_group_layouts: &[Some(&cloud_bgl)],
+            immediate_size: 0,
+        });
+        let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("simsat-clouds-pipeline"),
+            layout: Some(&cloud_pl),
+            vertex: wgpu::VertexState {
+                module: &cloud_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cloud_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: OFFSCREEN_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sunod_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("simsat-sun-od-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let sunod_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("simsat-sun-od-pl"),
+            bind_group_layouts: &[Some(&sunod_bgl)],
+            immediate_size: 0,
+        });
+        let sunod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("simsat-sun-od-pipeline"),
+            layout: Some(&sunod_pl),
+            module: &sunod_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            cloud_pipeline,
+            cloud_bgl,
+            sunod_pipeline,
+            sunod_bgl,
+            sampler,
+        }
+    }
+
+    /// Render one cloud-composited frame: upload the volume, run the banded sun-OD
+    /// compute, run the tiled cloud fragment pass offscreen, and read it back — the
+    /// same RGBA output contract as the CPU composite (`clouds::render_cloud_frame_rgba`).
+    pub fn render(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        inputs: &CloudFrameInputs,
+    ) -> RenderedFrame {
+        let (w, h) = (inputs.surface.width.max(1), inputs.surface.height.max(1));
+
+        // The 3-D cloud volume + occupancy mip (the M4 upload machinery, first live use).
+        let volume = CloudVolumeResources::new(
+            device,
+            inputs.vol_nx.max(1),
+            inputs.vol_ny.max(1),
+            inputs.vol_nz.max(1),
+            inputs.occ_dims,
+        );
+        volume.upload(queue, inputs.texture_a, inputs.occupancy);
+
+        // Sun-OD map targets (od + occluder distance), storage-written then sampled.
+        let dim = inputs.sun_od.dim.max(1) as u32;
+        let sunod_usage =
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+        let make_sunod_tex = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: dim,
+                    height: dim,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: sunod_usage,
+                view_formats: &[],
+            })
+        };
+        let sun_od_tex = make_sunod_tex("simsat-sun-od");
+        let sun_od_dist_tex = make_sunod_tex("simsat-sun-od-dist");
+
+        // Banded sun-OD compute: one submit per row band (TDR bound). Each band gets
+        // its own small uniform buffer carrying the band's row offset in vert.w.
+        let sun_od_view = sun_od_tex.create_view(&Default::default());
+        let sun_od_dist_view = sun_od_dist_tex.create_view(&Default::default());
+        let vol_view = volume.volume_view();
+        let band_rows = sun_od_band_rows(dim, inputs.sun_od.n_steps as u32);
+        for (y0, rows) in row_bands(dim, band_rows) {
+            let quads = sun_od_uniform_quads(inputs, y0);
+            let bytes = quads_to_bytes(&quads);
+            let ub = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("simsat-sun-od-uniforms"),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&ub, 0, &bytes);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("simsat-sun-od-bg"),
+                layout: &self.sunod_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ub.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&vol_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&sun_od_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&sun_od_dist_view),
+                    },
+                ],
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("simsat-sun-od-encoder"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("simsat-sun-od-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.sunod_pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(dim.div_ceil(8), rows.div_ceil(8), 1);
+            }
+            queue.submit([encoder.finish()]);
+        }
+
+        // Per-frame 2-D textures (shared shapes with the surface pass).
+        let s = &inputs.surface;
+        let lut_geo = upload_rgba32f(device, queue, w, h, s.lut_geo, "lut-geo");
+        let lut_light = upload_rgba32f(device, queue, w, h, s.lut_light, "lut-light");
+        let transmittance_tex =
+            upload_rgba32f(device, queue, 256, 64, s.transmittance_lut, "transmittance");
+        let multiscatter_tex =
+            upload_rgba32f(device, queue, 32, 32, s.multiscatter_lut, "multiscatter");
+        let ambient_tex = upload_rgba32f(
+            device,
+            queue,
+            s.ambient_n.max(1),
+            1,
+            s.ambient_lut,
+            "ambient",
+        );
+        let normal_tex = upload_rgba8(device, queue, s.nx, s.ny, s.normals_rgba, "normals");
+        let landmask_tex = upload_r8(device, queue, s.nx, s.ny, s.landmask_r8, "landmask");
+        let bm_tex = match s.bluemarble {
+            Some(bm) => upload_rgba8(device, queue, bm.width, bm.height, &bm.rgba, "bluemarble"),
+            None => {
+                let gray = (FLAT_ALBEDO_SRGB * 255.0) as u8;
+                upload_rgba8(device, queue, 1, 1, &[gray, gray, gray, 255], "bm-dummy")
+            }
+        };
+
+        // Froxel (3-D Rgba32Float) + the SH-2 sky-ambient table (9 x rows Rgba32Float).
+        let fdim = inputs.froxel_dim.max(1);
+        let froxel_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("simsat-froxel"),
+            size: wgpu::Extent3d {
+                width: fdim,
+                height: fdim,
+                depth_or_array_layers: fdim,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &froxel_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck_f32(inputs.froxel_data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(fdim * 16),
+                rows_per_image: Some(fdim),
+            },
+            wgpu::Extent3d {
+                width: fdim,
+                height: fdim,
+                depth_or_array_layers: fdim,
+            },
+        );
+        let sh_tex = upload_rgba32f(
+            device,
+            queue,
+            9,
+            inputs.sh_rows.max(1),
+            inputs.sh_data,
+            "sh-ambient",
+        );
+
+        // The 400-byte packed cloud uniform.
+        let quads = cloud_uniform_quads(inputs);
+        let uniform_bytes = quads_to_bytes(&quads);
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simsat-clouds-uniforms"),
+            size: uniform_bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniforms, 0, &uniform_bytes);
+
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("simsat-clouds-bg"),
+            layout: &self.cloud_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view(&lut_geo)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view(&lut_light)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&view(&bm_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&view(&normal_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&view(&landmask_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&view(&transmittance_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&view(&multiscatter_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&view(&ambient_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&volume.volume_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&volume.occupancy_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&sun_od_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&view(&froxel_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&view(&sh_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&sun_od_dist_view),
+                },
+            ],
+        });
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("simsat-clouds-target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&Default::default());
+
+        // Tiled cloud pass: one scissor band per submit (TDR bound). The first band
+        // clears the whole target; later bands load it back.
+        for (i, (y0, rows)) in row_bands(h, cloud_tile_rows(w)).into_iter().enumerate() {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("simsat-clouds-encoder"),
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("simsat-clouds-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if i == 0 {
+                                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.cloud_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_scissor_rect(0, y0, w, rows);
+                pass.draw(0..3, 0..1);
+            }
+            queue.submit([encoder.finish()]);
+        }
+
+        // Readback (256-byte aligned rows), then wait like the surface pass.
+        let unpadded_bpr = w * 4;
+        let padded_bpr = align_up(unpadded_bpr, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simsat-clouds-readback"),
+            size: (padded_bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("simsat-clouds-readback-encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = rx.recv();
+
+        let mut rgba = Vec::with_capacity((unpadded_bpr * h) as usize);
+        {
+            let data = readback.slice(..).get_mapped_range();
+            for row in 0..h {
+                let start = (row * padded_bpr) as usize;
+                let end = start + unpadded_bpr as usize;
+                rgba.extend_from_slice(&data[start..end]);
+            }
+        }
+        readback.unmap();
+
+        RenderedFrame {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1973,354 @@ mod tests {
         assert_eq!(align_up(256, 256), 256);
         assert_eq!(align_up(257, 256), 512);
         assert_eq!(align_up(800 * 4, 256), 3328);
+    }
+
+    /// A test-fixture `SurfaceUniforms` with recognizable values.
+    fn test_surface_uniforms() -> SurfaceUniforms {
+        SurfaceUniforms {
+            cam: [1.0, 2.0, 3.0],
+            r_ground: 6_370_000.0,
+            sun: [0.0, 0.0, 1.0],
+            r_top: 6_470_000.0,
+            ex: [-1.0, 0.0, 0.0],
+            x_min: -0.01,
+            ey: [0.0, 1.0, 0.0],
+            y_max: 0.02,
+            ez: [0.0, 0.0, 1.0],
+            pitch_x: 2.8e-5,
+            solar: [180.0, 188.0, 196.0],
+            pitch_y: 2.8e-5,
+            mie_sca: 7.5e-5,
+            mie_ext: 8.3e-5,
+            mie_g: 0.8,
+            pw_ratio: 1.0,
+            bm_present: 1.0,
+            water_scale: 0.55,
+            flat_albedo: 0.3,
+            output_transform: 0.0,
+            ambient_elev_min: -20.0,
+            ambient_elev_max: 90.0,
+            ambient_n: 48.0,
+        }
+    }
+
+    /// A test-fixture `CloudFrameInputs` over empty texture slices (the packers only
+    /// read the scalar fields).
+    fn test_cloud_inputs<'a>(uniforms: SurfaceUniforms) -> CloudFrameInputs<'a> {
+        CloudFrameInputs {
+            surface: SurfaceFrameInputs {
+                width: 4,
+                height: 4,
+                lut_geo: &[],
+                lut_light: &[],
+                nx: 2,
+                ny: 2,
+                normals_rgba: &[],
+                landmask_r8: &[],
+                bluemarble: None,
+                transmittance_lut: &[],
+                multiscatter_lut: &[],
+                ambient_lut: &[],
+                ambient_n: 48,
+                uniforms,
+            },
+            vol_nx: 80,
+            vol_ny: 60,
+            vol_nz: 40,
+            texture_a: &[],
+            occ_dims: (10, 8, 5),
+            occupancy: &[],
+            ql: [1.0e-6, 1.0e-2, 2.0e-6, 2.0e-2],
+            qp: [3.0e-6, 3.0e-2, 4.0e-4, 40.0],
+            z_min_m: 100.0,
+            dz_m: 250.0,
+            r_top_m: 6_380_000.0,
+            r_bottom_m: 6_370_100.0,
+            voxel_pitch_m: 500.0,
+            geo: GeoQuads {
+                geo0: [0.0, 0.0, 0.0, 4000.0],
+                geo1: [-1.0e6, -2.0e6, 4000.0, -97.5],
+                geo2: [0.7, 1.9, 0.0, 0.0],
+                geo3: [0.0, 0.0, 0.0, 0.0],
+            },
+            march: CloudMarchParams {
+                coarse_step_m: 1000.0,
+                fine_step_m: 250.0,
+                max_steps: 192.0,
+                exposure: 1.6,
+                octaves: 6.0,
+                beer_powder: false,
+                ground_albedo: 0.3,
+                transmittance_floor: 0.003,
+                edge_feather_cells: 3.2,
+                ground_day_lift: 2.0,
+            },
+            sun_od: SunOdPlan {
+                center: [6.37e6, 1000.0, 2000.0],
+                au: [0.0, 1.0, 0.0],
+                av: [0.0, 0.0, 1.0],
+                sun: [1.0, 0.0, 0.0],
+                u_min: -50_000.0,
+                u_max: 50_000.0,
+                v_min: -40_000.0,
+                v_max: 40_000.0,
+                s_start: 60_000.0,
+                s_len: 120_000.0,
+                n_steps: 240,
+                ds: 500.0,
+                dim: 512,
+            },
+            froxel_dim: 32,
+            froxel_data: &[],
+            sh_rows: 48,
+            sh_data: &[],
+            scan_rect: [-0.01, 0.01, -0.008, 0.008],
+        }
+    }
+
+    #[test]
+    fn cloud_uniform_quads_pack_the_wgsl_layout() {
+        let inputs = test_cloud_inputs(test_surface_uniforms());
+        let quads = cloud_uniform_quads(&inputs);
+        assert_eq!(quads.len(), 25);
+        // The first 9 quads are the surface uniforms verbatim.
+        assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
+        assert_eq!(quads[8], [-20.0, 90.0, 48.0, 0.0]);
+        // dims: nx, ny, nz, voxel_pitch.
+        assert_eq!(quads[9], [80.0, 60.0, 40.0, 500.0]);
+        // vert: z_min, dz, r_top, r_bottom.
+        assert_eq!(quads[10], [100.0, 250.0, 6_380_000.0, 6_370_100.0]);
+        // m0 + m1: the march schedule and exposure/octaves/powder/albedo.
+        assert_eq!(quads[17], [1000.0, 250.0, 192.0, 0.0]);
+        assert_eq!(quads[18], [1.6, 6.0, 0.0, 0.3]);
+        // sod_c.w = transmittance floor; sod_e = extents + dim + clouds-enabled.
+        assert_eq!(quads[19][3], 0.003);
+        assert_eq!(quads[22], [-40_000.0, 40_000.0, 512.0, 1.0]);
+        // frx2: froxel dim, edge feather, ground lift.
+        assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.0]);
+        // 25 vec4 = 400 bytes, little-endian f32s in order.
+        let bytes = quads_to_bytes(&quads);
+        assert_eq!(bytes.len(), 400);
+        assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
+        assert_eq!(
+            f32::from_le_bytes(bytes[9 * 16..9 * 16 + 4].try_into().unwrap()),
+            80.0
+        );
+    }
+
+    #[test]
+    fn sun_od_uniform_quads_pack_the_wgsl_layout() {
+        let inputs = test_cloud_inputs(test_surface_uniforms());
+        let quads = sun_od_uniform_quads(&inputs, 64);
+        assert_eq!(quads.len(), 13);
+        // center / au / av / sun with the frame extents in the w lanes.
+        assert_eq!(quads[0], [6.37e6, 1000.0, 2000.0, 0.0]);
+        assert_eq!(quads[1], [0.0, 1.0, 0.0, -50_000.0]);
+        assert_eq!(quads[2], [0.0, 0.0, 1.0, 50_000.0]);
+        assert_eq!(quads[3], [1.0, 0.0, 0.0, -40_000.0]);
+        // extent: v_max, s_start, s_len, n_steps.
+        assert_eq!(quads[4], [40_000.0, 60_000.0, 120_000.0, 240.0]);
+        // dims: brick dims + map dim.
+        assert_eq!(quads[5], [80.0, 60.0, 40.0, 512.0]);
+        // vert: z_min, dz, ds, ty_offset (the TDR row-band offset).
+        assert_eq!(quads[6], [100.0, 250.0, 500.0, 64.0]);
+        // 13 vec4 = 208 bytes.
+        assert_eq!(quads_to_bytes(&quads).len(), 208);
+    }
+
+    /// A Rust twin of the WGSL `project` + `ecef_to_brick` anchor arithmetic, driven
+    /// by the PACKED `GeoQuads` values (f32, like the shader reads them).
+    fn wgsl_forward_twin(q: &GeoQuads, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+        let kind = (q.geo0[0] + 0.5) as i32;
+        let cm = q.geo1[3] as f64;
+        let r: f64 = 6_370_000.0;
+        let pi = std::f64::consts::PI;
+        let phi = lat_deg.clamp(-89.999, 89.999).to_radians();
+        let mut dlon = lon_deg - cm;
+        dlon -= 360.0 * ((dlon + 180.0) / 360.0).floor();
+        let dlon_r = dlon.to_radians();
+        let (u, v) = match kind {
+            0 => {
+                let n = q.geo2[0] as f64;
+                let f = q.geo2[1] as f64;
+                let rho = r * f / (pi * 0.25 + phi * 0.5).tan().powf(n);
+                let theta = n * dlon_r;
+                (rho * theta.sin(), -rho * theta.cos())
+            }
+            1 => {
+                let k = q.geo2[2] as f64;
+                if q.geo3[0] > 0.5 {
+                    let rho = 2.0 * r * k * (pi * 0.25 + phi * 0.5).tan();
+                    (rho * dlon_r.sin(), rho * dlon_r.cos())
+                } else {
+                    let rho = 2.0 * r * k * (pi * 0.25 - phi * 0.5).tan();
+                    (rho * dlon_r.sin(), -rho * dlon_r.cos())
+                }
+            }
+            2 => {
+                let scale = q.geo2[3] as f64;
+                (
+                    r * scale * dlon_r,
+                    r * scale * (pi * 0.25 + phi * 0.5).tan().ln(),
+                )
+            }
+            _ => (dlon, lat_deg.clamp(-89.999, 89.999)),
+        };
+        let fi = q.geo0[1] as f64 + (u - q.geo1[0] as f64) / q.geo0[3] as f64;
+        let fj = q.geo0[2] as f64 + (v - q.geo1[1] as f64) / q.geo1[2] as f64;
+        (fi, fj)
+    }
+
+    #[test]
+    fn geo_quads_reproduce_georef_forward() {
+        // The WGSL projection twin driven by the packed quads must reproduce
+        // `georef.forward` for every projection kind (f32 packing tolerance).
+        let cases: Vec<(GridGeoref, &str)> = vec![
+            (
+                GridGeoref::new(
+                    MapProjection::lambert(30.0, 60.0, -97.5),
+                    99.0,
+                    99.0,
+                    39.0,
+                    -97.5,
+                    4000.0,
+                    4000.0,
+                ),
+                "lambert",
+            ),
+            (
+                GridGeoref::new(
+                    MapProjection::polar_stereographic(60.0, -150.0, false),
+                    50.0,
+                    40.0,
+                    64.0,
+                    -150.0,
+                    3000.0,
+                    3000.0,
+                ),
+                "polar",
+            ),
+            (
+                GridGeoref::new(
+                    MapProjection::mercator(20.0, -80.0),
+                    60.0,
+                    60.0,
+                    25.0,
+                    -80.0,
+                    2000.0,
+                    2000.0,
+                ),
+                "mercator",
+            ),
+            (
+                GridGeoref::new(
+                    MapProjection::LatLon {
+                        central_meridian_deg: -97.5,
+                    },
+                    30.0,
+                    30.0,
+                    39.0,
+                    -97.5,
+                    0.03,
+                    0.03,
+                ),
+                "latlon",
+            ),
+        ];
+        for (georef, name) in &cases {
+            let q = geo_quads(georef);
+            for &(lat, lon) in &[(38.2, -99.1), (40.7, -96.0), (36.5, -98.4)] {
+                // Shift the probe near each projection's own domain.
+                let (lat, lon) = match *name {
+                    "polar" => (lat + 25.0, lon - 52.0),
+                    "mercator" => (lat - 13.0, lon + 18.0),
+                    _ => (lat, lon),
+                };
+                let (fi_ref, fj_ref) = georef.forward(lat, lon);
+                let (fi, fj) = wgsl_forward_twin(&q, lat, lon);
+                assert!(
+                    (fi - fi_ref).abs() < 1.0e-2 && (fj - fj_ref).abs() < 1.0e-2,
+                    "{name} at ({lat}, {lon}): twin ({fi}, {fj}) vs georef ({fi_ref}, {fj_ref})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_sun_od_covers_the_brick_corners() {
+        let georef = GridGeoref::new(
+            MapProjection::lambert(30.0, 60.0, -97.5),
+            3.5,
+            3.5,
+            39.0,
+            -97.5,
+            4000.0,
+            4000.0,
+        );
+        let (nx, ny, nz) = (8usize, 8usize, 4usize);
+        let (z_min, dz, pitch) = (100.0, 500.0, 4000.0);
+        let sun = [0.5f64, -0.3, 0.8];
+        let plan = plan_sun_od(&georef, nx, ny, nz, z_min, dz, pitch, sun, 512);
+        assert_eq!(plan.dim, 512);
+        assert!(plan.n_steps >= 1 && plan.n_steps <= 1024);
+        assert!((plan.ds * plan.n_steps as f64 - plan.s_len).abs() < 1.0e-6 * plan.s_len);
+        // Orthonormal sun frame.
+        assert!((dot3(plan.sun, plan.sun) - 1.0).abs() < 1.0e-9);
+        assert!(dot3(plan.sun, plan.au).abs() < 1.0e-9);
+        assert!(dot3(plan.sun, plan.av).abs() < 1.0e-9);
+        assert!(dot3(plan.au, plan.av).abs() < 1.0e-9);
+        // Every brick corner projects inside the (u, v) extents.
+        for &ki in &[0.0, (nz - 1) as f64] {
+            for &ji in &[0.0, (ny - 1) as f64] {
+                for &ii in &[0.0, (nx - 1) as f64] {
+                    let p = crate::clouds::brick_to_ecef(&georef, ii, ji, ki, z_min, dz).unwrap();
+                    let d = [
+                        p[0] - plan.center[0],
+                        p[1] - plan.center[1],
+                        p[2] - plan.center[2],
+                    ];
+                    let (u, v) = (dot3(d, plan.au), dot3(d, plan.av));
+                    assert!(u >= plan.u_min - 1.0e-6 && u <= plan.u_max + 1.0e-6);
+                    assert!(v >= plan.v_min - 1.0e-6 && v <= plan.v_max + 1.0e-6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_bands_cover_every_row_exactly_once() {
+        let bands = row_bands(100, 32);
+        assert_eq!(bands, vec![(0, 32), (32, 32), (64, 32), (96, 4)]);
+        assert_eq!(row_bands(8, 8), vec![(0, 8)]);
+        assert_eq!(row_bands(0, 8), Vec::<(u32, u32)>::new());
+        // Contiguity + exact coverage for an awkward pair.
+        let bands = row_bands(513, 64);
+        let mut next = 0u32;
+        for (y0, rows) in &bands {
+            assert_eq!(*y0, next);
+            next += rows;
+        }
+        assert_eq!(next, 513);
+    }
+
+    #[test]
+    fn tdr_band_sizes_stay_bounded() {
+        // Sun-OD: rows * dim * n_steps never exceeds the per-submit sample cap, rows
+        // are a positive multiple of the 8-row workgroup height.
+        for &(dim, n_steps) in &[(512u32, 1024u32), (512, 240), (1024, 1024), (16, 1)] {
+            let rows = sun_od_band_rows(dim, n_steps);
+            assert!(rows >= 8 && rows.is_multiple_of(8), "rows {rows}");
+            assert!(
+                rows as u64 * dim as u64 * n_steps as u64 <= SUN_OD_MAX_SAMPLES_PER_SUBMIT,
+                "dim {dim} steps {n_steps} rows {rows}"
+            );
+        }
+        // Cloud tiles: rows * width never exceeds the pixel cap; at least one row.
+        for &w in &[1u32, 800, 4096, 5000] {
+            let rows = cloud_tile_rows(w);
+            assert!(rows >= 1);
+            assert!(rows as u64 * w as u64 <= CLOUD_TILE_MAX_PIXELS.max(w as u64));
+        }
     }
 
     #[test]

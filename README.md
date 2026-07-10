@@ -41,10 +41,21 @@ supercell case and Hurricane Michael), thumbnailed for the README.
 - **Derived fields** — precipitable water (mm), cloud-top temperature (K), and
   cloud optical depth as raw `f32` map-registered arrays.
 
-Two camera modes for every product: the **from-space geostationary view**
-(GOES-East / GOES-West / Himawari presets, CGMS fixed-grid scan geometry) and a
-**top-down map view** registered to the WRF domain's own projection (drops
-straight onto matplotlib/cartopy axes).
+Three camera modes: the **from-space geostationary view** (GOES-East /
+GOES-West / Himawari presets, CGMS fixed-grid scan geometry), a **top-down map
+view** registered to the WRF domain's own projection (drops straight onto
+matplotlib/cartopy axes), and a **free perspective camera** (arbitrary
+eye/look/FOV through the same physics — angled 3-D storm shots and flyovers;
+interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
+`render_perspective` in Python). A **web map layer** product renders the cloud
+field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
+shadow layer) for Mapbox-class basemaps.
+
+New in v0.1.2: **operational-model ingest** — NOAA **HRRR** native-level GRIB2
+(`wrfnat`) opens directly in the studio/CLI/Python exactly like a wrfout;
+**RRFS** (rotated lat-lon, `natlev`) ingests via the CLI with a regional crop.
+Plus an experimental opt-in GPU cloud renderer (preview-only; stored frames
+always use the tested CPU path).
 
 ## Quickstart (desktop app)
 

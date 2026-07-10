@@ -21,6 +21,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use simsat::camera::{MAX_AXIS, PerspectiveCamera};
+
 /// A calendar valid-time parsed from a wrfout filename or a `Times` string. Field
 /// order (year..second) makes the derived `Ord` chronological, so a `Vec<SeqItem>`
 /// sorts into time order directly.
@@ -598,6 +600,103 @@ pub fn classify_dropped(paths: &[PathBuf], is_dir: &dyn Fn(&Path) -> bool) -> Op
     }
 }
 
+// ── perspective orbit camera (studio Perspective (3-D) view) ──────────────────
+
+/// The studio's orbit parameterization of the engine's free perspective camera:
+/// instead of raw eye coordinates, the owner drags an orbit AROUND THE DOMAIN
+/// CENTRE — azimuth (compass direction the camera sits FROM the centre), tilt
+/// (elevation above the horizontal, seen from the centre), slant range from the
+/// centre, horizontal FOV, and the output dims. Pure data; the mapping to a
+/// [`PerspectiveCamera`] is [`orbit_to_camera`], node-tested below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrbitParams {
+    /// Compass bearing FROM the domain centre TO the camera position (deg;
+    /// 0 = the camera sits north of the centre, 180 = south of it looking north).
+    pub az_deg: f64,
+    /// Camera elevation above the horizontal as seen from the centre (deg;
+    /// clamped [`ORBIT_TILT_MIN_DEG`]..[`ORBIT_TILT_MAX_DEG`] — near-90 is
+    /// overhead, small values are a low oblique).
+    pub tilt_deg: f64,
+    /// Slant range from the domain centre to the eye (km); clamped at render to
+    /// [`orbit_range_bounds_m`] of the domain diagonal.
+    pub range_km: f64,
+    /// Horizontal field of view (deg); clamped 15..120 (the engine allows 1..160).
+    pub fov_deg: f64,
+    /// Output image dims (px); each clamped 2..=`MAX_AXIS`.
+    pub width: usize,
+    pub height: usize,
+}
+
+pub const ORBIT_TILT_MIN_DEG: f64 = 5.0;
+pub const ORBIT_TILT_MAX_DEG: f64 = 85.0;
+pub const ORBIT_FOV_MIN_DEG: f64 = 15.0;
+pub const ORBIT_FOV_MAX_DEG: f64 = 120.0;
+
+/// The engine's spherical-earth radius convention (owner decision 5; matches
+/// `camera.rs`/`frame.rs` R = 6.37e6).
+const EARTH_RADIUS_M: f64 = 6.37e6;
+
+/// Sane orbit-range clamps for a domain of diagonal `domain_diag_m`: 0.3x..5x the
+/// diagonal (a tiny-domain floor keeps the bounds positive and ordered).
+pub fn orbit_range_bounds_m(domain_diag_m: f64) -> (f64, f64) {
+    let d = if domain_diag_m.is_finite() {
+        domain_diag_m.max(1_000.0)
+    } else {
+        1_000.0
+    };
+    (0.3 * d, 5.0 * d)
+}
+
+/// Map an orbit around the domain centre to the engine's free perspective camera.
+///
+/// Geometry (spherical earth, R = 6.37e6): the slant range splits into an eye
+/// altitude `range*sin(tilt)` and a ground offset `range*cos(tilt)`; the ground
+/// offset is walked as a GREAT-CIRCLE arc from the centre along the azimuth
+/// bearing (standard destination-point formula), so the eye sits `range*sin(tilt)`
+/// above the sphere at that point. The look-at is the domain centre at ground
+/// level (h = 0). At tilt near 90 the eye is (nearly) overhead; azimuth 180 puts
+/// the camera south of the centre looking north. All parameters are clamped here
+/// (range to the domain-derived bounds, tilt/fov/dims to the documented ranges),
+/// so the returned camera always passes the engine's `validate()`.
+pub fn orbit_to_camera(
+    o: &OrbitParams,
+    center_lat_deg: f64,
+    center_lon_deg: f64,
+    domain_diag_m: f64,
+) -> PerspectiveCamera {
+    let (lo, hi) = orbit_range_bounds_m(domain_diag_m);
+    let range_m = if (o.range_km * 1000.0).is_finite() {
+        (o.range_km * 1000.0).clamp(lo, hi)
+    } else {
+        hi.min(lo.max(300_000.0))
+    };
+    let tilt = o
+        .tilt_deg
+        .clamp(ORBIT_TILT_MIN_DEG, ORBIT_TILT_MAX_DEG)
+        .to_radians();
+    let az = o.az_deg.rem_euclid(360.0).to_radians();
+    let fov_deg = o.fov_deg.clamp(ORBIT_FOV_MIN_DEG, ORBIT_FOV_MAX_DEG);
+    let alt_m = range_m * tilt.sin();
+    let ground_m = range_m * tilt.cos();
+    // Great-circle destination point: from the centre, bearing `az`, arc `ground_m`.
+    let (lat1, lon1) = (center_lat_deg.to_radians(), center_lon_deg.to_radians());
+    let ang = ground_m / EARTH_RADIUS_M;
+    let lat2 = (lat1.sin() * ang.cos() + lat1.cos() * ang.sin() * az.cos()).asin();
+    let lon2 =
+        lon1 + (az.sin() * ang.sin() * lat1.cos()).atan2(ang.cos() - lat1.sin() * lat2.sin());
+    PerspectiveCamera {
+        eye_lat_deg: lat2.to_degrees(),
+        eye_lon_deg: (lon2.to_degrees() + 540.0).rem_euclid(360.0) - 180.0,
+        eye_alt_m: alt_m,
+        look_lat_deg: center_lat_deg,
+        look_lon_deg: center_lon_deg,
+        look_alt_m: 0.0,
+        fov_deg,
+        width: o.width.clamp(2, MAX_AXIS),
+        height: o.height.clamp(2, MAX_AXIS),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1096,107 @@ mod tests {
             classify_dropped(&many, &dir),
             Some(DropOpen::Sequence(many.clone()))
         );
+    }
+
+    // ── perspective orbit camera ─────────────────────────────────────────────
+
+    fn orbit(az: f64, tilt: f64, range_km: f64) -> OrbitParams {
+        OrbitParams {
+            az_deg: az,
+            tilt_deg: tilt,
+            range_km,
+            fov_deg: 45.0,
+            width: 1280,
+            height: 720,
+        }
+    }
+
+    /// Straight-line ECEF distance between the eye and the look-at point.
+    fn eye_look_distance_m(cam: &PerspectiveCamera) -> f64 {
+        let e = simsat::camera::geodetic_to_ecef(cam.eye_lat_deg, cam.eye_lon_deg, cam.eye_alt_m);
+        let l =
+            simsat::camera::geodetic_to_ecef(cam.look_lat_deg, cam.look_lon_deg, cam.look_alt_m);
+        ((e[0] - l[0]).powi(2) + (e[1] - l[1]).powi(2) + (e[2] - l[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn orbit_near_vertical_tilt_puts_the_eye_overhead() {
+        // Tilt 90 clamps to ORBIT_TILT_MAX_DEG (85): the eye sits (nearly) over the
+        // centre at altitude ~range*sin(85), and the camera validates + has a basis.
+        let cam = orbit_to_camera(&orbit(0.0, 90.0, 300.0), 44.5, -100.2, 300_000.0);
+        let expect_alt = 300_000.0 * ORBIT_TILT_MAX_DEG.to_radians().sin();
+        assert!(
+            (cam.eye_alt_m - expect_alt).abs() < 1.0,
+            "alt {}",
+            cam.eye_alt_m
+        );
+        assert!(
+            (cam.eye_lat_deg - 44.5).abs() < 0.3,
+            "lat {}",
+            cam.eye_lat_deg
+        );
+        assert!(
+            (cam.eye_lon_deg - -100.2).abs() < 0.3,
+            "lon {}",
+            cam.eye_lon_deg
+        );
+        assert_eq!(
+            (cam.look_lat_deg, cam.look_lon_deg, cam.look_alt_m),
+            (44.5, -100.2, 0.0)
+        );
+        assert!(cam.validate().is_ok());
+        assert!(cam.basis().is_ok());
+        // The straight eye->centre distance is the slant range (within curvature 1%).
+        let d = eye_look_distance_m(&cam);
+        assert!((d - 300_000.0).abs() / 300_000.0 < 0.01, "distance {d}");
+    }
+
+    #[test]
+    fn orbit_azimuth_180_places_the_camera_south_of_the_centre() {
+        // Azimuth 180 = the camera sits SOUTH of the centre (looking north): the eye
+        // latitude drops by ~ground_offset/R and the longitude is unchanged; the eye
+        // altitude is range*sin(tilt).
+        let cam = orbit_to_camera(&orbit(180.0, 30.0, 300.0), 44.5, -100.2, 300_000.0);
+        let ground_deg = (300_000.0 * 30.0_f64.to_radians().cos() / 6.37e6).to_degrees();
+        assert!(
+            (cam.eye_lat_deg - (44.5 - ground_deg)).abs() < 0.01,
+            "lat {} vs {}",
+            cam.eye_lat_deg,
+            44.5 - ground_deg
+        );
+        assert!(
+            (cam.eye_lon_deg - -100.2).abs() < 1e-6,
+            "lon {}",
+            cam.eye_lon_deg
+        );
+        let expect_alt = 300_000.0 * 30.0_f64.to_radians().sin();
+        assert!(
+            (cam.eye_alt_m - expect_alt).abs() < 1.0,
+            "alt {}",
+            cam.eye_alt_m
+        );
+        assert!(cam.validate().is_ok());
+    }
+
+    #[test]
+    fn orbit_range_and_dims_clamp_to_the_domain_bounds() {
+        // Bounds are 0.3x..5x the domain diagonal; an out-of-range request clamps and
+        // the eye->centre distance tracks the clamped range. Dims clamp to 2..=MAX_AXIS.
+        let diag = 100_000.0;
+        let (lo, hi) = orbit_range_bounds_m(diag);
+        assert_eq!((lo, hi), (30_000.0, 500_000.0));
+        let near = orbit_to_camera(&orbit(90.0, 45.0, 5.0), 44.5, -100.2, diag);
+        let d_near = eye_look_distance_m(&near);
+        assert!((d_near - lo).abs() / lo < 0.01, "near distance {d_near}");
+        let mut far_orbit = orbit(90.0, 45.0, 10_000.0);
+        far_orbit.width = 100_000;
+        far_orbit.height = 0;
+        let far = orbit_to_camera(&far_orbit, 44.5, -100.2, diag);
+        let d_far = eye_look_distance_m(&far);
+        // The flat range->(alt, ground-arc) split deviates from the straight chord as
+        // the arc grows (earth curvature): ~1.4% at a 500 km range / 45 deg tilt.
+        assert!((d_far - hi).abs() / hi < 0.02, "far distance {d_far}");
+        assert_eq!((far.width, far.height), (MAX_AXIS, 2));
+        assert!(far.validate().is_ok());
     }
 }

@@ -35,12 +35,14 @@
 
 use rayon::prelude::*;
 
+use crate::atmosphere::OutputTransform;
 use crate::camera::topdown_nadir_ray;
 use crate::clouds::{CloudScene, ground_cloud_shadow, march_cloud};
 use crate::ir::{IrScene, march_ir_bt};
 use crate::render::{
     CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, apply_low_sun_illuminant,
-    day_lerp_ramp, radiance_to_rgba_softclip, reflectance_from_radiance, surface_toa_radiance,
+    day_lerp_ramp, effective_cloud_shadow, radiance_to_rgba_softclip, reflectance_from_radiance,
+    surface_toa_radiance,
 };
 
 /// TOP-DOWN CLOUD NORMALIZATION — a sun-gated multiplier on the top-down (near-nadir)
@@ -297,6 +299,296 @@ pub fn render_topdown_ir_bt_frame(
     rows.into_iter().flatten().collect()
 }
 
+// ── cloud LAYER render (the web-map compositing product) ──────────────────────
+
+/// The NATIVE (Lambert-map-raster) cloud layer pair one top-down render produces —
+/// the cloud field ONLY (no Blue Marble, no surface, no atmosphere veil on the
+/// ground: the HOST map is the ground) plus the ground cloud-shadow multiply field.
+/// Both share the same raster (they came from ONE set of marches per pixel), so a
+/// host that composites shadow-multiply-then-cloud-over gets registered layers.
+/// [`crate::web_layer`] reprojects this onto a Web-Mercator delivery grid.
+#[derive(Debug, Clone)]
+pub struct CloudLayerFrame {
+    pub nx: usize,
+    pub ny: usize,
+    /// PREMULTIPLIED-alpha RGBA (`nx*ny*4`, row 0 = north): the color channels hold
+    /// the TONEMAPPED CLOUD-ONLY RADIANCE — the additive term of the shipped
+    /// composite `L = L_bg*T_cloud + L_cloud` — and alpha = `1 - T_cloud` (the view
+    /// transmittance the march computes). "Premultiplied" in the compositing sense:
+    /// a host composites `src + dst*(1 - a)`; the color is NOT numerically
+    /// multiplied by alpha (it already IS the additive term). Convert with
+    /// [`crate::web_layer::unpremultiply_rgba`] for straight-alpha hosts/PNG.
+    pub rgba_premul: Vec<u8>,
+    /// The ground cloud-shadow MULTIPLY field (`nx*ny`, `[0,1]`, 1.0 = no shadow):
+    /// the EFFECTIVE shadow the shipped surface pass consumes
+    /// ([`effective_cloud_shadow`] of the penumbral sun-OD shadow — floored +
+    /// day-gated identically to the shipped ground), so a host multiplying its
+    /// basemap by this field shadows it exactly as our own ground is shadowed.
+    /// Out-of-coverage pixels are `1.0` (neutral).
+    pub shadow: Vec<f32>,
+}
+
+/// Render the TOP-DOWN CLOUD LAYER (cloud field only + ground shadow) for a map
+/// raster — the web-map compositing product. Per pixel: a nadir ray
+/// ([`topdown_nadir_ray`]) through the SAME [`march_cloud`] the shipped composite
+/// uses; alpha = `1 - T_cloud`; the cloud color is the cloud's own in-scattered
+/// radiance through the SAME display seam as the shipped top-down product (the
+/// sun-gated top-down cloud normalization, the low-sun illuminant correction, and
+/// the exposure + softclip tonemap) — so where the cloud is opaque the layer matches
+/// the shipped composite pixel-for-pixel.
+///
+/// ILLUMINATION HONESTY (documented decision): the cloud radiance is physical — the
+/// M5 multi-octave sun term plus the SH sky ambient, whose ground-bounce component
+/// assumes OUR ground albedo (`MarchConfig::ground_albedo`), not the host basemap's.
+/// That second-order ambient mismatch is the honest price of compositing over a
+/// ground we did not render; the sun-lit term (which dominates any visible cloud)
+/// is unaffected. The tonemap is display-nonlinear, so host compositing in display
+/// space approximates the linear-radiance composite — exact at alpha 0 and 1,
+/// closest in between for the near-nadir view this layer is defined for.
+///
+/// The shadow plane is [`CloudLayerFrame::shadow`] (the surface-consumed effective
+/// shadow); it is computed for EVERY on-map pixel, including clear ones (a clear
+/// pixel can still sit in another cloud's shadow — that is the point of the layer).
+/// Rows in parallel (rayon).
+pub fn render_cloud_layer_frame(
+    scene: &CloudScene,
+    output_transform: OutputTransform,
+    exposure: f64,
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    ny: usize,
+) -> CloudLayerFrame {
+    let sun = scene.sun_ecef;
+    let rows: Vec<(Vec<u8>, Vec<f32>)> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut rgba_row = vec![0u8; nx * 4];
+            let mut shadow_row = vec![1.0f32; nx];
+            for (px, shadow_px) in shadow_row.iter_mut().enumerate() {
+                let idx = py * nx + px;
+                let (la, lo) = (lat[idx], lon[idx]);
+                if !la.is_finite() || !lo.is_finite() {
+                    continue; // padding: transparent + neutral shadow
+                }
+                let (cam, view) = topdown_nadir_ray(la as f64, lo as f64);
+                // Per-pixel sun elevation (local up . ECEF sun) — drives the shadow
+                // day gate, the cloud-norm sun gate, and the illuminant correction.
+                let (lar, lor) = ((la as f64).to_radians(), (lo as f64).to_radians());
+                let up = [lar.cos() * lor.cos(), lar.cos() * lor.sin(), lar.sin()];
+                let mu = up[0] * sun[0] + up[1] * sun[1] + up[2] * sun[2];
+                let elev = mu.clamp(-1.0, 1.0).asin().to_degrees();
+
+                // The ground shadow field (computed for clear pixels too).
+                let raw_shadow = ground_cloud_shadow(scene, cam, view);
+                *shadow_px = effective_cloud_shadow(raw_shadow, elev) as f32;
+
+                let m = march_cloud(scene, cam, view);
+                let alpha = (1.0 - m.transmittance).clamp(0.0, 1.0);
+                if alpha <= 0.0 && m.inscatter == [0.0; 3] {
+                    continue; // clear: fully transparent (the shadow still applies)
+                }
+                // The cloud's OWN radiance through the shipped display seam (see the
+                // fn doc). The norm is the same sun-gated per-pixel factor the
+                // composited top-down product applies to its cloud term.
+                let norm = topdown_cloud_norm(elev, scene.cfg.topdown_cloud_norm);
+                let l = [
+                    norm * m.inscatter[0],
+                    norm * m.inscatter[1],
+                    norm * m.inscatter[2],
+                ];
+                let l = apply_low_sun_illuminant(l, true, elev, scene.luts);
+                let disp = radiance_to_rgba_softclip(
+                    l,
+                    output_transform,
+                    exposure,
+                    scene.cfg.cloud_softclip_knee,
+                );
+                let o = px * 4;
+                for c in 0..3 {
+                    rgba_row[o + c] = (disp[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+                rgba_row[o + 3] = (alpha * 255.0).round() as u8;
+            }
+            (rgba_row, shadow_row)
+        })
+        .collect();
+    let mut rgba_premul = Vec::with_capacity(nx * ny * 4);
+    let mut shadow = Vec::with_capacity(nx * ny);
+    for (r, s) in rows {
+        rgba_premul.extend_from_slice(&r);
+        shadow.extend_from_slice(&s);
+    }
+    CloudLayerFrame {
+        nx,
+        ny,
+        rgba_premul,
+        shadow,
+    }
+}
+
+// ── free PERSPECTIVE render (tier 2: the angled-3D hero shot) ──────────────────
+
+/// Render a FULL-COMPOSITE frame (surface + atmosphere + clouds over our Blue Marble
+/// ground — the hero-shot product) through a free [`PerspectiveBasis`] camera: the
+/// SAME ray-agnostic marches as the geostationary/top-down products, fed the pinhole
+/// ray fan ([`PerspectiveBasis::pixel_ray`]) instead of scan-angle/nadir rays.
+///
+/// CONTRACT: `surf.cam.camera` MUST already be the camera EYE (`basis.eye`) — the
+/// surface march integrates aerial perspective along `ctx.cam.camera + t*view_dir`,
+/// so the eye is set ONCE per frame by the caller (no per-pixel context clone; one
+/// eye, unlike the per-pixel nadir cameras of the top-down path). `assemble` supplies
+/// the per-pixel surface state from the PERSPECTIVE raster
+/// ([`crate::camera::build_perspective_raster`]): ground pixels carry the Blue
+/// Marble/terrain/sun state at the ray's earth intersection, sky pixels are
+/// `on_earth = false` and composite the existing limb/space handling (a ray that
+/// grazes the atmosphere shell renders the limb; one that misses it entirely is
+/// space, alpha 0). Near-horizon sky rays can still cross the CLOUD shell — the
+/// cloud march runs for every ray, so elevated cloud rises honestly above the limb.
+///
+/// DOCUMENTED DIVERGENCE (the top-down precedent): the froxel camera->cloud front
+/// airlight is omitted — the aerial-perspective froxel is built for the geostationary
+/// scan camera and does not describe a free eye. The surface term keeps its FULL
+/// per-ray eye->ground aerial perspective (integrated inside `surface_toa_radiance`
+/// along the actual slant ray), so the ground haze is honest; only the extra airlight
+/// IN FRONT OF the cloud body is dropped: `L = L_toa * T_cloud + L_cloud`.
+///
+/// PARALLAX HONESTY: high cloud displaces against the ground with the view geometry
+/// (the rays are true 3-D lines through the volume) — physical and intended; this is
+/// the 3D look. The camera pose is recorded by the caller (api `Georef::camera_pose`
+/// + the render log). Rows in parallel (rayon).
+pub fn render_perspective_frame_rgba(
+    surf: &FrameContext,
+    scene: Option<&CloudScene>,
+    basis: &crate::camera::PerspectiveBasis,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+) -> Vec<u8> {
+    let (nx, ny) = (basis.width, basis.height);
+    let ground_lift = scene
+        .map(|s| s.cfg.ground_day_lift)
+        .unwrap_or(GROUND_DAY_LIFT);
+    let softclip_knee = scene
+        .map(|s| s.cfg.cloud_softclip_knee)
+        .unwrap_or(CLOUD_SOFTCLIP_KNEE);
+    let rows: Vec<Vec<u8>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = Vec::with_capacity(nx * 4);
+            for px in 0..nx {
+                let view = basis.pixel_ray(px, py);
+                let mut pixel = assemble(px, py);
+                pixel.view_dir = view;
+                let shadow = match scene {
+                    Some(sc) => ground_cloud_shadow(sc, basis.eye, view),
+                    None => 1.0,
+                };
+                let rgba = match surface_toa_radiance(surf, &pixel, shadow, ground_lift) {
+                    None => [0.0, 0.0, 0.0, 0.0], // space beyond the atmosphere
+                    Some(l_toa) => {
+                        let l = match scene {
+                            Some(sc) => {
+                                let m = march_cloud(sc, basis.eye, view);
+                                if m.transmittance >= 1.0 && m.inscatter == [0.0; 3] {
+                                    l_toa
+                                } else {
+                                    // No froxel front airlight (see the fn doc); the
+                                    // cloud radiance is the geo product's neutral one
+                                    // (the top-down cloud norm is a nadir mechanism).
+                                    [
+                                        l_toa[0] * m.transmittance + m.inscatter[0],
+                                        l_toa[1] * m.transmittance + m.inscatter[1],
+                                        l_toa[2] * m.transmittance + m.inscatter[2],
+                                    ]
+                                }
+                            }
+                            None => l_toa,
+                        };
+                        // The same display seam as the geo composite: illuminant
+                        // correction on-earth only (the limb keeps its physical
+                        // color), then the exposure + softclip tonemap.
+                        let l = apply_low_sun_illuminant(
+                            l,
+                            pixel.on_earth,
+                            pixel.sun_elev_deg as f64,
+                            surf.luts,
+                        );
+                        radiance_to_rgba_softclip(
+                            l,
+                            surf.output_transform,
+                            surf.exposure,
+                            softclip_knee,
+                        )
+                    }
+                };
+                for &v in &rgba {
+                    row.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
+/// Render the CLOUD-LAYER-ONLY variant through a free perspective camera: the cloud
+/// field alone as PREMULTIPLIED-alpha RGBA (`width*height*4`; color = the tonemapped
+/// cloud radiance, alpha = `1 - T_cloud` — the [`CloudLayerFrame`] semantics), for
+/// compositing over a HOST 3-D map rendered with a matching camera. No ground-shadow
+/// plane is produced for the perspective variant (a screen-space multiply layer only
+/// describes shadows on OUR ground raster; a host 3-D scene shades its own terrain) —
+/// the nadir [`render_cloud_layer_frame`] product is the shadow-bearing one.
+///
+/// The per-pixel display-seam sun elevation is evaluated at the CLOUD'S OWN position
+/// (the march's transmittance-weighted centroid along the ray) rather than a ground
+/// point — a sky-crossing ray has no ground point, and the illuminant correction
+/// belongs to the cloud being lit. Rows in parallel (rayon).
+pub fn render_perspective_cloud_layer(
+    scene: &CloudScene,
+    basis: &crate::camera::PerspectiveBasis,
+    output_transform: OutputTransform,
+    exposure: f64,
+) -> Vec<u8> {
+    let (nx, ny) = (basis.width, basis.height);
+    let sun = scene.sun_ecef;
+    let rows: Vec<Vec<u8>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = vec![0u8; nx * 4];
+            for px in 0..nx {
+                let view = basis.pixel_ray(px, py);
+                let m = march_cloud(scene, basis.eye, view);
+                let alpha = (1.0 - m.transmittance).clamp(0.0, 1.0);
+                if alpha <= 0.0 && m.inscatter == [0.0; 3] {
+                    continue; // clear/space: fully transparent
+                }
+                // Sun elevation at the cloud centroid (local up . ECEF sun).
+                let p = [
+                    basis.eye[0] + view[0] * m.mean_t_m,
+                    basis.eye[1] + view[1] * m.mean_t_m,
+                    basis.eye[2] + view[2] * m.mean_t_m,
+                ];
+                let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1.0);
+                let mu = (p[0] * sun[0] + p[1] * sun[1] + p[2] * sun[2]) / r;
+                let elev = mu.clamp(-1.0, 1.0).asin().to_degrees();
+                let l = apply_low_sun_illuminant(m.inscatter, true, elev, scene.luts);
+                let disp = radiance_to_rgba_softclip(
+                    l,
+                    output_transform,
+                    exposure,
+                    scene.cfg.cloud_softclip_knee,
+                );
+                let o = px * 4;
+                for c in 0..3 {
+                    row[o + c] = (disp[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+                row[o + 3] = (alpha * 255.0).round() as u8;
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
 // ── integration output helpers (canvas letterbox + rayon thread cap) ──────────
 
 /// The placement of a `sw x sh` image letterboxed (aspect-preserved) into a `tw x th`
@@ -398,7 +690,7 @@ mod tests {
         AtmosphereLuts, AtmosphereParams, CameraGeometry, OutputTransform, SkyShTable,
         sun_enu_to_ecef,
     };
-    use crate::camera::build_map_raster;
+    use crate::camera::{PerspectiveCamera, build_map_raster, build_perspective_raster};
     use crate::clouds::{
         CloudScene, DecodedVolume, MarchConfig, OccupancyMip, StepQuality, accumulate_sun_od,
     };
@@ -890,6 +1182,370 @@ mod tests {
         assert!(
             (centre2 as f64 - cloud_top as f64).abs() < 2.0,
             "anvil top-down IR BT {centre2} != cloud-top T {cloud_top}"
+        );
+    }
+
+    // ── cloud LAYER render (the web-map compositing product) ──────────────────
+
+    #[test]
+    fn cloud_layer_clear_volume_is_fully_transparent_and_unshadowed() {
+        let (nx, ny, nz) = (16, 16, 24);
+        let georef = test_georef(nx, ny, 3000.0);
+        let map = build_map_raster(&georef, nx, ny, nx, ny, 0.0).unwrap();
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 16);
+        let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, _| (0.0, 0.0, 0.0));
+        let mip = OccupancyMip::build(&vol, 4);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 32);
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+        };
+        let layer = render_cloud_layer_frame(
+            &scene,
+            OutputTransform::AbiReflectance,
+            crate::render::DEFAULT_EXPOSURE,
+            &map.lat,
+            &map.lon,
+            nx,
+            ny,
+        );
+        assert_eq!(layer.rgba_premul.len(), nx * ny * 4);
+        assert_eq!(layer.shadow.len(), nx * ny);
+        // A clear volume is a fully TRANSPARENT layer (exact zeros — a host
+        // compositing it changes nothing) and a fully NEUTRAL shadow layer.
+        assert!(
+            layer.rgba_premul.iter().all(|&v| v == 0),
+            "clear layer must be exactly transparent"
+        );
+        assert!(
+            layer.shadow.iter().all(|&s| s == 1.0),
+            "clear layer must cast no shadow"
+        );
+    }
+
+    #[test]
+    fn cloud_layer_thick_cloud_is_opaque_lit_and_casts_shadow() {
+        let (nx, ny, nz) = (16, 16, 24);
+        let georef = test_georef(nx, ny, 3000.0);
+        let map = build_map_raster(&georef, nx, ny, nx, ny, 0.0).unwrap();
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 16);
+        let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
+        // A thick liquid cloud in the middle levels of the CENTRE 6x6 cells only —
+        // covered pixels must be near-opaque and lit; far pixels exactly transparent.
+        let lo = nx / 2 - 3;
+        let hi = nx / 2 + 3;
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            let mid = nz / 2..nz / 2 + 6;
+            if (lo..hi).contains(&i) && (lo..hi).contains(&j) && mid.contains(&k) {
+                (3.0e-3, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let mip = OccupancyMip::build(&vol, 4);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 64);
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+        };
+        let layer = render_cloud_layer_frame(
+            &scene,
+            OutputTransform::AbiReflectance,
+            crate::render::DEFAULT_EXPOSURE,
+            &map.lat,
+            &map.lon,
+            nx,
+            ny,
+        );
+        // The domain-centre pixel: covered, optically thick (OD = 6 cells * 250 m *
+        // 3e-3 = 4.5 -> alpha ~ 0.99) and sun-lit (positive tonemapped color).
+        let c = ((ny / 2) * nx + nx / 2) * 4;
+        assert!(
+            layer.rgba_premul[c + 3] > 240,
+            "thick cloud alpha {} not near-opaque",
+            layer.rgba_premul[c + 3]
+        );
+        assert!(
+            layer.rgba_premul[c] > 0 && layer.rgba_premul[c + 1] > 0,
+            "overhead-sun cloud should be lit: {:?}",
+            &layer.rgba_premul[c..c + 4]
+        );
+        // The cloud casts a real shadow under an overhead sun (the centre column).
+        assert!(
+            layer.shadow[(ny / 2) * nx + nx / 2] < 0.9,
+            "no ground shadow under a thick overhead cloud: {}",
+            layer.shadow[(ny / 2) * nx + nx / 2]
+        );
+        // A far corner pixel (outside the cloud + its shadow) is exactly transparent
+        // with a neutral shadow.
+        let far = (nx + 1) * 4;
+        assert_eq!(
+            &layer.rgba_premul[far..far + 4],
+            &[0, 0, 0, 0],
+            "clear pixel not transparent"
+        );
+        assert!(
+            layer.shadow[nx + 1] > 0.99,
+            "clear far pixel should be unshadowed: {}",
+            layer.shadow[nx + 1]
+        );
+    }
+
+    // ── free perspective render (tier 2) ───────────────────────────────────────
+
+    /// An oblique perspective camera 150 km over the test domain's south, looking at
+    /// the domain-centre ground point (45 N, -100 E) with a WIDE fov, so ONE frame
+    /// spans all three ray classes: ground hits (bottom), atmosphere-grazing limb
+    /// (mid), and space above the shell (top — the 150 km eye sits above the 100 km
+    /// atmosphere, so upward rays miss it entirely).
+    fn oblique_camera() -> PerspectiveCamera {
+        PerspectiveCamera {
+            eye_lat_deg: 43.0,
+            eye_lon_deg: -100.0,
+            eye_alt_m: 150_000.0,
+            look_lat_deg: 45.0,
+            look_lon_deg: -100.0,
+            look_alt_m: 0.0,
+            fov_deg: 100.0,
+            width: 96,
+            height: 96,
+        }
+    }
+
+    /// The raster-driven assemble for a perspective frame: ground pixels are lit
+    /// flat land under an overhead sun; sky pixels are the off-earth default.
+    fn perspective_assemble(
+        raster: &crate::camera::SurfaceRaster,
+    ) -> impl Fn(usize, usize) -> SurfacePixel + Sync + '_ {
+        move |px: usize, py: usize| {
+            let idx = py * raster.nx + px;
+            if raster.lat[idx].is_finite() {
+                SurfacePixel {
+                    on_earth: true,
+                    base_srgb: [FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB],
+                    normal_enu: [0.0, 0.0, 1.0],
+                    sun_enu: [0.0, 0.0, 1.0],
+                    sun_elev_deg: 90.0,
+                    is_water: false,
+                    ..Default::default()
+                }
+            } else {
+                SurfacePixel::default() // sky/space: off-earth
+            }
+        }
+    }
+
+    #[test]
+    fn perspective_full_composite_has_ground_limb_and_space() {
+        let (nx, ny, nz) = (16, 16, 24);
+        let georef = test_georef(nx, ny, 3000.0);
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 16);
+        let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
+        let cam = oblique_camera();
+        let basis = cam.basis().expect("valid camera");
+        let raster = build_perspective_raster(&basis, &georef, nx, ny);
+        let mut surf = overhead_surf(&luts, &params, &sky_sh, sun_ecef);
+        surf.cam.camera = basis.eye; // the perspective contract: the eye, set once
+
+        let frame =
+            render_perspective_frame_rgba(&surf, None, &basis, perspective_assemble(&raster));
+        assert_eq!(frame.len(), cam.width * cam.height * 4);
+        // Top-centre (row 0): SPACE (the ray leaves the 150 km eye upward, above the
+        // shell).
+        let top = (cam.width / 2) * 4;
+        assert_eq!(frame[top + 3], 0, "top-centre should be space (alpha 0)");
+        // Bottom-centre: lit ground (opaque + bright under the overhead sun).
+        let bot = ((cam.height - 1) * cam.width + cam.width / 2) * 4;
+        assert_eq!(frame[bot + 3], 255, "bottom-centre should be on earth");
+        assert!(
+            frame[bot] > 0 && frame[bot + 1] > 0,
+            "daytime perspective ground should be lit: {:?}",
+            &frame[bot..bot + 4]
+        );
+        // Some opaque pixel with NO ground hit exists (the atmosphere-grazing limb).
+        let mut limb = 0usize;
+        for py in 0..cam.height {
+            for px in 0..cam.width {
+                let idx = py * cam.width + px;
+                if !raster.lat[idx].is_finite() && frame[idx * 4 + 3] == 255 {
+                    limb += 1;
+                }
+            }
+        }
+        assert!(
+            limb > 0,
+            "an oblique wide-fov frame must contain limb pixels"
+        );
+        // The clear-cloud composite is byte-identical to surface-only (regression
+        // anchor: adding the cloud machinery must not perturb a clear scene).
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, _| (0.0, 0.0, 0.0));
+        let mip = OccupancyMip::build(&vol, 4);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 32);
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+        };
+        let with_clear = render_perspective_frame_rgba(
+            &surf,
+            Some(&scene),
+            &basis,
+            perspective_assemble(&raster),
+        );
+        assert_eq!(
+            with_clear, frame,
+            "a clear cloud volume must not change the perspective frame"
+        );
+    }
+
+    #[test]
+    fn perspective_cloud_changes_covered_pixels_with_parallax_geometry() {
+        // A thick mid-level slab over the whole domain: the oblique perspective frame
+        // must differ from the clear frame where rays cross the slab (the rays are
+        // true 3-D lines — the slab is hit on the slant, which IS the parallax).
+        let (nx, ny, nz) = (16, 16, 24);
+        let georef = test_georef(nx, ny, 3000.0);
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 16);
+        let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
+        let cam = oblique_camera();
+        let basis = cam.basis().unwrap();
+        let raster = build_perspective_raster(&basis, &georef, nx, ny);
+        let mut surf = overhead_surf(&luts, &params, &sky_sh, sun_ecef);
+        surf.cam.camera = basis.eye;
+        let clear =
+            render_perspective_frame_rgba(&surf, None, &basis, perspective_assemble(&raster));
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, k| {
+            if (nz / 2..nz / 2 + 6).contains(&k) {
+                (3.0e-3, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let mip = OccupancyMip::build(&vol, 4);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 32);
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+        };
+        let cloudy = render_perspective_frame_rgba(
+            &surf,
+            Some(&scene),
+            &basis,
+            perspective_assemble(&raster),
+        );
+        let differ = cloudy
+            .iter()
+            .zip(clear.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(differ > 0, "the slab did not change any perspective pixel");
+    }
+
+    #[test]
+    fn perspective_cloud_layer_only_is_transparent_clear_and_opaque_cloudy() {
+        let (nx, ny, nz) = (16, 16, 24);
+        let georef = test_georef(nx, ny, 3000.0);
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 16);
+        let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
+        let cam = oblique_camera();
+        let basis = cam.basis().unwrap();
+        // Clear: the layer is exactly transparent everywhere.
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, _| (0.0, 0.0, 0.0));
+        let mip = OccupancyMip::build(&vol, 4);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 32);
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+        };
+        let layer = render_perspective_cloud_layer(
+            &scene,
+            &basis,
+            OutputTransform::AbiReflectance,
+            crate::render::DEFAULT_EXPOSURE,
+        );
+        assert_eq!(layer.len(), cam.width * cam.height * 4);
+        assert!(
+            layer.iter().all(|&v| v == 0),
+            "a clear perspective layer must be exactly transparent"
+        );
+        // Cloudy: the slab is crossed on the slant toward the look point.
+        let vol2 = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, k| {
+            if (nz / 2..nz / 2 + 6).contains(&k) {
+                (3.0e-3, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let mip2 = OccupancyMip::build(&vol2, 4);
+        let sun_od2 = accumulate_sun_od(&vol2, &georef, sun_ecef, 32);
+        let scene2 = CloudScene {
+            vol: &vol2,
+            mip: &mip2,
+            sun_od: &sun_od2,
+            georef: &georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg: MarchConfig::new(StepQuality::Offline, vol2.voxel_pitch_m()),
+        };
+        let layer2 = render_perspective_cloud_layer(
+            &scene2,
+            &basis,
+            OutputTransform::AbiReflectance,
+            crate::render::DEFAULT_EXPOSURE,
+        );
+        let max_alpha = layer2.chunks_exact(4).map(|p| p[3]).max().unwrap();
+        assert!(
+            max_alpha > 200,
+            "the slant ray through a thick slab should be near-opaque: {max_alpha}"
+        );
+        // Space rays (top-centre) never carry cloud (the shell is below the eye's
+        // upward rays): exactly transparent.
+        let top = (cam.width / 2) * 4;
+        assert_eq!(
+            &layer2[top..top + 4],
+            &[0, 0, 0, 0],
+            "a space ray must stay transparent"
         );
     }
 }

@@ -17,7 +17,7 @@ maturin develop --release
 The wheel is `abi3` (built against the CPython stable ABI), so ONE wheel works on any
 CPython >= 3.8 — no per-version rebuild. `numpy` is the only runtime dependency.
 
-## The nine render functions
+## The eleven render functions
 
 Each takes a wrfout file OR a cached `run.json` as `input` (a wrfout is ingested to a
 cached brick on first use, and the cache re-ingests automatically if the wrfout is
@@ -34,6 +34,8 @@ re-written over the same path) and returns `(array(s), georef)`:
 | `render_precipitable_water(input, ...)` | `H x W` float32 mm | RAW precipitable water (column-integrated vapor); `colormap=True` adds a basic RGB |
 | `render_cloud_top_temp(input, ...)` | `H x W` float32 KELVIN | RAW cloud-top temperature at the visible tau~1 level (`NaN` = clear); `colormap=True` as above |
 | `render_cloud_optical_depth(input, ...)` | `H x W` float32 | RAW total-column visible cloud optical depth (clear = 0); `colormap=True` as above |
+| `render_cloud_layer(input, ...)` | `(H x W x 4 uint8, H x W float32, geo)` | the WEB-MAP cloud layer pair: cloud-only RGBA (straight alpha; `premultiplied=True` for the additive form) + the ground cloud-shadow MULTIPLY layer, on a Web-Mercator grid with `geo.mercator_corners` for a Mapbox ImageSource (top-down by definition; no ground is rendered — the host map is the ground) |
+| `render_perspective(input, eye=(lat,lon,alt_m), look=(lat,lon,alt_m), fov=40, size=(1280,720), ...)` | `H x W x 3` uint8 | a FREE-PERSPECTIVE frame: an eye/look/fov pinhole camera through the same marches — the angled-3D flyover product (full composite over the Blue Marble ground; sky rays composite the atmosphere limb). `cloud_layer_only=True` returns `H x W x 4` uint8 (the cloud field alone, premultiplied alpha) for a host 3-D map with a matching camera. `geo.camera_pose` always carries the camera; a FLYOVER is N calls along your own eye/look path |
 
 Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default), `margin=0.0`
@@ -74,7 +76,7 @@ and their `UserWarning`s) is data, not logs, and is always active.
 |---|---|
 | `geo.view` | `'topdown'` or `'geo'` |
 | `geo.extent` | `(x0, x1, y0, y1)` for `imshow` (row 0 = north; use `origin='upper'`) |
-| `geo.extent_kind` | `'projection_meters'` (topdown) or `'lonlat_degrees'` (geo) |
+| `geo.extent_kind` | `'projection_meters'` (topdown), `'lonlat_degrees'` (geo), or `'webmercator_meters'` (cloud layer) |
 | `geo.proj4` | a PROJ.4 string EXACTLY consistent with the extent's CRS |
 | `geo.proj_kind` | `'lcc'` / `'stere'` / `'merc'` / `'latlon'` |
 | `geo.crs_params` | dict of the PROJ keys + the raw WRF attributes |
@@ -82,6 +84,8 @@ and their `UserWarning`s) is data, not logs, and is always active.
 | `geo.time_is_fallback` | `True` when the source had no parseable valid time and the render used the fabricated fallback date 2004-06-21 12:00 UT (the sun position / ground season are then NOT the run's real conditions) |
 | `geo.ground_source` | `'2km'` / `'8km-fallback'` / `'flat-albedo'` / `'single-file'` / `'none'` — where the visible ground pixels came from (`'none'` for thermal / derived products) |
 | `geo.ground_status` | list of ground-resolution status lines (downloads / fallbacks) |
+| `geo.mercator_corners` | `render_cloud_layer` only: the four `(lon, lat)` image corners in the Mapbox ImageSource `coordinates` order (NW, NE, SE, SW); `None` for other products |
+| `geo.camera_pose` | `render_perspective` only: the camera dict (`eye_lat`/`eye_lon`/`eye_alt_m`/`look_lat`/`look_lon`/`look_alt_m`/`fov_deg`/`width`/`height`); `geo.view` reads `'perspective'`. `None` for other products |
 
 Honesty behavior: a fabricated-date or downgraded-ground render also raises a Python
 `UserWarning`; and a `bluemarble=<file>` that fails to load is a hard `RuntimeError`
@@ -117,3 +121,67 @@ pw, geo = simsat.render_precipitable_water(wrfout, threads=1)
 
 Pass `view="geo"` for the from-space geostationary view. See the repo's
 `notes/wrf-runner-glue.md` for the full WRF-Runner integration.
+
+## Compositing the cloud layer over a Mapbox GL map
+
+`render_cloud_layer` produces exactly what a Mapbox GL (or MapLibre GL) `image` source
+needs: a north-up Web-Mercator-aligned RGBA image + its four corner lon/lats. Export the
+arrays to PNGs (straight alpha — the default) and wire them up like this.
+
+> UNTESTED-BY-US: the snippet below is written from Mapbox GL JS API knowledge, not from
+> a run we performed against a live Mapbox map — validate in your own map before relying
+> on it. The in-process composite proof (`web_layer::composite_over_basemap` / the
+> `render_frame product=cloud-layer composite-out=` PNG) is what we verified.
+
+```python
+import imageio.v3 as iio
+rgba, shadow, geo = simsat.render_cloud_layer(wrfout, sat="goes-east")
+iio.imwrite("clouds.png", rgba)                                   # straight-alpha RGBA
+iio.imwrite("clouds_shadow.png", (shadow * 255).astype("uint8"))  # 255 = no shadow
+print(geo.mercator_corners)  # [(lon,lat) NW, NE, SE, SW] -> paste/serve to the map
+```
+
+```js
+// Mapbox GL JS (or MapLibre): the shadow layer multiplies the basemap, then the cloud
+// layer composites over it. `coordinates` is the ImageSource order: NW, NE, SE, SW.
+const corners = [[lonNW, latNW], [lonNE, latNE], [lonSE, latSE], [lonSW, latSW]];
+map.addSource('simsat-shadow', { type: 'image', url: 'clouds_shadow.png', coordinates: corners });
+map.addLayer({
+  id: 'simsat-shadow', type: 'raster', source: 'simsat-shadow',
+  paint: { 'raster-opacity': 1.0 },
+});
+map.addSource('simsat-clouds', { type: 'image', url: 'clouds.png', coordinates: corners });
+map.addLayer({
+  id: 'simsat-clouds', type: 'raster', source: 'simsat-clouds',
+  paint: { 'raster-opacity': 1.0, 'raster-fade-duration': 0 },
+});
+```
+
+NOTE on the multiply blend: core Mapbox GL raster layers composite source-over only —
+a grayscale shadow PNG drawn source-over will WASH the basemap toward gray, not darken
+it. Hosts that support blend modes (MapLibre >= 3 style `raster-...` extensions, deck.gl
+`BitmapLayer` with `parameters: {blend: true, blendFunc: [GL.DST_COLOR, GL.ZERO]}`, or
+any custom-layer/canvas pipeline) should use a true MULTIPLY for `clouds_shadow.png`.
+Where only source-over is available, an acceptable stand-in is an INVERTED shadow
+(`1 - shadow`) as a black image with alpha = darkness: `rgba_shadow = [0, 0, 0,
+(1 - shadow) * 255]` drawn source-over — that is mathematically the same darkening as
+the multiply for a black overlay. The animation loop is N timesteps -> N image pairs ->
+`source.updateImage({url, coordinates})` per frame.
+
+## Perspective flyovers
+
+A flyover is N independent `render_perspective` calls along YOUR camera path — there is
+deliberately no path-scripting DSL (each frame is one render; script the path in Python):
+
+```python
+import numpy as np
+for i, t in enumerate(np.linspace(0.0, 1.0, 120)):
+    eye = (36.5 + 1.5 * t, -98.5 + 1.0 * t, 150_000 - 50_000 * t)  # your own path
+    rgb, geo = simsat.render_perspective(
+        wrfout, eye=eye, look=(39.0, -97.5, 0.0), fov=45, size=(1280, 720)
+    )
+    iio.imwrite(f"flyover_{i:04d}.png", rgb)
+```
+
+Parallax of high cloud against the ground is physical (true 3-D rays) — that is the 3D
+look. `geo.camera_pose` records the camera on every frame.

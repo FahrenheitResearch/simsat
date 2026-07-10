@@ -28,6 +28,13 @@
 //!   cloud optical depth (dimensionless; clear = 0).
 //!   These three DERIVED-FIELD functions return raw physical scalar arrays for plotting with
 //!   your own colormaps; `colormap=True` adds a basic `H x W x 3` uint8 colormap image too.
+//! - [`render_cloud_layer`] -> `(H x W x 4 uint8, H x W float32, Georef)` — the WEB-MAP
+//!   cloud layer pair (cloud-only RGBA + ground-shadow multiply layer) on a Web-Mercator
+//!   grid with Mapbox ImageSource corner lon/lats on `georef.mercator_corners`.
+//! - [`render_perspective`] -> `(H x W x 3 uint8, Georef)` — a FREE-PERSPECTIVE frame
+//!   (eye/look/fov pinhole camera through the same marches; the angled-3D flyover
+//!   product); `cloud_layer_only=True` -> `(H x W x 4 uint8, Georef)` cloud field only.
+//!   The camera rides on `georef.camera_pose`.
 //!
 //! Default `view='topdown'` (map-registered, north-up — the natural fit for a top-down
 //! Lambert map); `view='geo'` gives the from-space geostationary view.
@@ -57,6 +64,7 @@ use simsat_engine::clouds::StepQuality;
 use simsat_engine::derived::DerivedField;
 use simsat_engine::ir_enhance::IrEnhancement;
 use simsat_engine::topdown::{configure_global_rayon, effective_thread_count};
+use simsat_engine::web_layer;
 use simsat_engine::wv::WvBand;
 
 /// The georeference returned with every frame: the projection params, an `extent` for
@@ -112,6 +120,18 @@ pub struct Georef {
     ground_source: String,
     #[pyo3(get)]
     ground_status: Vec<String>,
+    /// The four image corner `(lon, lat)` pairs in the Mapbox GL ImageSource
+    /// `coordinates` order (top-left/NW, top-right/NE, bottom-right/SE,
+    /// bottom-left/SW). Only set by `render_cloud_layer` (the Web-Mercator delivery);
+    /// `None` for every other product.
+    #[pyo3(get)]
+    mercator_corners: Option<Vec<(f64, f64)>>,
+    /// The free-perspective camera pose dict (`eye_lat`/`eye_lon`/`eye_alt_m`/
+    /// `look_lat`/`look_lon`/`look_alt_m`/`fov_deg`/`width`/`height`) — only set by
+    /// `render_perspective` (a perspective frame always states its camera); `None`
+    /// for every other product.
+    #[pyo3(get)]
+    camera_pose: Option<Py<PyDict>>,
 }
 
 #[pymethods]
@@ -658,6 +678,208 @@ fn render_cloud_optical_depth<'py>(
     )
 }
 
+/// Render the WEB-MAP CLOUD LAYER pair (the Mapbox-class compositing product): the
+/// CLOUD FIELD ONLY as an RGBA image plus the ground cloud-shadow MULTIPLY layer, both
+/// on a north-up Web-Mercator (EPSG:3857) grid a web map can place directly.
+///
+/// Returns `(rgba, shadow, georef)`:
+///   rgba: numpy `H x W x 4` uint8 (row 0 = north). STRAIGHT alpha by default (what a
+///       PNG / browser / Mapbox raster source expects: composite `src*a + dst*(1-a)`).
+///       Pass `premultiplied=True` for the engine's premultiplied array (composite
+///       `src + dst*(1-a)` — the physically-exact additive form; see the simsat
+///       `web_layer` docs for the difference on thin bright wisps).
+///   shadow: numpy `H x W` float32 in `[0, 1]` — multiply your basemap by it
+///       (1.0 = no shadow; out-of-domain = 1.0).
+///   georef: `extent` in EPSG:3857 metres (`extent_kind='webmercator_meters'`,
+///       `proj4` = the standard 3857 string) and `mercator_corners` = the four
+///       `(lon, lat)` corner pairs in the Mapbox ImageSource `coordinates` order
+///       (NW, NE, SE, SW).
+///
+/// TOP-DOWN by definition (there is no `view=` — the host map is the ground; no Blue
+/// Marble is rendered). The sun / exposure / steps / multiscatter controls drive the
+/// cloud march exactly like `render_visible_rgb`. Datum note: lat/lon are on the WRF
+/// sphere fed through standard EPSG:3857 — the usual WRF-on-a-web-map approximation.
+#[pyfunction]
+#[pyo3(signature = (
+    input, *, sat="goes-east", timestep=0, margin=0.0, exposure=None, multiscatter=true,
+    steps="offline", sun_elev=None, sun_az=None, cache=None, premultiplied=false,
+    threads=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn render_cloud_layer<'py>(
+    py: Python<'py>,
+    input: String,
+    sat: &str,
+    timestep: usize,
+    margin: f64,
+    exposure: Option<f64>,
+    multiscatter: bool,
+    steps: &str,
+    sun_elev: Option<f64>,
+    sun_az: Option<f64>,
+    cache: Option<String>,
+    premultiplied: bool,
+    threads: Option<usize>,
+) -> PyResult<(
+    Bound<'py, PyArray3<u8>>,
+    Bound<'py, PyArray2<f32>>,
+    Georef,
+)> {
+    let mut params = RenderParams::new(PathBuf::from(&input));
+    params.satellite = parse_sat(sat)?;
+    params.timestep = timestep;
+    params.margin_frac = parse_margin(margin)?;
+    if let Some(e) = exposure {
+        params.exposure = e;
+    }
+    params.multiscatter = multiscatter;
+    params.steps = parse_steps(steps)?;
+    params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
+        Some(SunOverride {
+            elev_deg: sun_elev,
+            az_deg: sun_az,
+        })
+    } else {
+        None
+    };
+    if let Some(c) = cache {
+        params.cache = PathBuf::from(c);
+    }
+    // No ground is rendered (the host map is the ground) — never touch the Blue Marble.
+    params.bluemarble = BlueMarble::FlatAlbedo;
+    apply_thread_cap(threads);
+    let result = render_or_err(py, params, Product::CloudLayer)?;
+    warn_downgrades(py, &result, true);
+    let (ny, nx) = (result.ny, result.nx);
+    let geo = build_georef(py, &result)?;
+    let (rgba_premul, shadow) = match result.data {
+        FrameData::CloudLayer {
+            rgba_premul,
+            shadow,
+        } => (rgba_premul, shadow),
+        _ => return Err(runtime_err("expected a cloud-layer frame")),
+    };
+    let rgba = if premultiplied {
+        rgba_premul
+    } else {
+        web_layer::unpremultiply_rgba(&rgba_premul)
+    };
+    let rgba_arr = Array3::from_shape_vec((ny, nx, 4), rgba)
+        .map_err(|e| runtime_err(&format!("rgba reshape: {e}")))?
+        .into_pyarray(py);
+    let shadow_arr = Array2::from_shape_vec((ny, nx), shadow)
+        .map_err(|e| runtime_err(&format!("shadow reshape: {e}")))?
+        .into_pyarray(py);
+    Ok((rgba_arr, shadow_arr, geo))
+}
+
+/// Render a FREE-PERSPECTIVE frame (the angled-3D "flyover" product): a pinhole camera
+/// at `eye=(lat, lon, alt_m)` looking at `look=(lat, lon, alt_m)` with a HORIZONTAL
+/// field of view `fov` (deg) over a `size=(width, height)` image, fed through the SAME
+/// surface + cloud marches as every other product.
+///
+/// Returns `(rgb, georef)` — the FULL COMPOSITE over the Blue Marble ground (numpy
+/// `H x W x 3` uint8; sky rays composite the atmosphere limb, space is black). With
+/// `cloud_layer_only=True` it instead returns `(rgba, georef)` — the CLOUD FIELD ONLY
+/// as premultiplied-alpha `H x W x 4` uint8 (alpha = 1 - cloud transmittance), for
+/// compositing over a host 3-D map rendered with a matching camera.
+///
+/// `georef.camera_pose` always carries the camera dict (a perspective frame states its
+/// camera — the what-if discipline); `georef.lat`/`lon` are the per-pixel GROUND
+/// intersections (NaN for sky rays) — a perspective frame is a picture, not a map, so
+/// use the mesh for georeferencing rather than the extent. Parallax displacement of
+/// high cloud against the ground is physical and intended (the 3D look). A FLYOVER is
+/// simply N calls along your own eye/look path (each frame is an independent render).
+#[pyfunction]
+#[pyo3(signature = (
+    input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0, exposure=None,
+    multiscatter=true, steps="offline", clouds=true, cloud_layer_only=false,
+    sun_elev=None, sun_az=None, cache=None, bluemarble=None, bluemarble_month=None,
+    bluemarble_download=true, threads=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn render_perspective<'py>(
+    py: Python<'py>,
+    input: String,
+    eye: (f64, f64, f64),
+    look: (f64, f64, f64),
+    fov: f64,
+    size: (usize, usize),
+    timestep: usize,
+    exposure: Option<f64>,
+    multiscatter: bool,
+    steps: &str,
+    clouds: bool,
+    cloud_layer_only: bool,
+    sun_elev: Option<f64>,
+    sun_az: Option<f64>,
+    cache: Option<String>,
+    bluemarble: Option<String>,
+    bluemarble_month: Option<u32>,
+    bluemarble_download: bool,
+    threads: Option<usize>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let mut params = RenderParams::new(PathBuf::from(&input));
+    params.timestep = timestep;
+    if let Some(e) = exposure {
+        params.exposure = e;
+    }
+    params.multiscatter = multiscatter;
+    params.steps = parse_steps(steps)?;
+    params.clouds = clouds;
+    params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
+        Some(SunOverride {
+            elev_deg: sun_elev,
+            az_deg: sun_az,
+        })
+    } else {
+        None
+    };
+    if let Some(c) = cache {
+        params.cache = PathBuf::from(c);
+    }
+    params.bluemarble = match bluemarble {
+        Some(path) => BlueMarble::SingleFile(PathBuf::from(path)),
+        None => BlueMarble::Seasonal {
+            month_override: bluemarble_month,
+            download: bluemarble_download,
+        },
+    };
+    params.perspective = Some(simsat_engine::camera::PerspectiveCamera {
+        eye_lat_deg: eye.0,
+        eye_lon_deg: eye.1,
+        eye_alt_m: eye.2,
+        look_lat_deg: look.0,
+        look_lon_deg: look.1,
+        look_alt_m: look.2,
+        fov_deg: fov,
+        width: size.0,
+        height: size.1,
+    });
+    apply_thread_cap(threads);
+    let result = render_or_err(py, params, Product::Perspective { cloud_layer_only })?;
+    warn_downgrades(py, &result, true);
+    let (ny, nx) = (result.ny, result.nx);
+    let geo = build_georef(py, &result)?;
+    let (rgb, rgba) = match result.data {
+        FrameData::Visible { rgb, rgba } => (rgb, rgba),
+        _ => return Err(runtime_err("expected a perspective (visible) frame")),
+    };
+    let geo_obj = Bound::new(py, geo)?;
+    let tuple = if cloud_layer_only {
+        let arr = Array3::from_shape_vec((ny, nx, 4), rgba)
+            .map_err(|e| runtime_err(&format!("perspective rgba reshape: {e}")))?
+            .into_pyarray(py);
+        PyTuple::new(py, [arr.into_any(), geo_obj.into_any()])?
+    } else {
+        let arr = Array3::from_shape_vec((ny, nx, 3), rgb)
+            .map_err(|e| runtime_err(&format!("perspective rgb reshape: {e}")))?
+            .into_pyarray(py);
+        PyTuple::new(py, [arr.into_any(), geo_obj.into_any()])?
+    };
+    Ok(tuple.into_any())
+}
+
 /// Enable or disable the engine's diagnostic stderr lines (ingest progress / warnings)
 /// for this process at runtime.
 ///
@@ -818,10 +1040,33 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
     let extent_kind = match g.extent_kind {
         ExtentKind::ProjectionMeters => "projection_meters",
         ExtentKind::LonLatDegrees => "lonlat_degrees",
+        ExtentKind::WebMercatorMeters => "webmercator_meters",
     };
     let crs_params = build_crs_params(py, g)?;
+    let camera_pose = match &g.camera_pose {
+        Some(c) => {
+            let d = PyDict::new(py);
+            d.set_item("eye_lat", c.eye_lat_deg)?;
+            d.set_item("eye_lon", c.eye_lon_deg)?;
+            d.set_item("eye_alt_m", c.eye_alt_m)?;
+            d.set_item("look_lat", c.look_lat_deg)?;
+            d.set_item("look_lon", c.look_lon_deg)?;
+            d.set_item("look_alt_m", c.look_alt_m)?;
+            d.set_item("fov_deg", c.fov_deg)?;
+            d.set_item("width", c.width)?;
+            d.set_item("height", c.height)?;
+            Some(d.unbind())
+        }
+        None => None,
+    };
     Ok(Georef {
-        view: g.view.slug().to_string(),
+        // A perspective frame is its own view kind (internally it reuses the geo
+        // extent semantics; the pose dict is the discriminator).
+        view: if g.camera_pose.is_some() {
+            "perspective".to_string()
+        } else {
+            g.view.slug().to_string()
+        },
         extent: (g.extent[0], g.extent[1], g.extent[2], g.extent[3]),
         extent_kind: extent_kind.to_string(),
         proj4: g.proj4(),
@@ -836,6 +1081,10 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
             .map(|s| s.slug().to_string())
             .unwrap_or_else(|| "none".to_string()),
         ground_status: result.ground_status.clone(),
+        mercator_corners: g
+            .mercator_corners_lonlat
+            .map(|c| c.iter().map(|p| (p[0], p[1])).collect()),
+        camera_pose,
     })
 }
 
@@ -1028,7 +1277,11 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
          + imshow extent + lat/lon mesh + render-honesty metadata: time_is_fallback, \
          ground_source, ground_status). The three derived-field functions return RAW physical \
          scalar arrays (mm / Kelvin / dimensionless) to plot with your own colormaps. Every \
-         function takes threads= (per-process rayon cap; the FIRST render call's value wins).",
+         function takes threads= (per-process rayon cap; the FIRST render call's value wins). \
+         render_cloud_layer returns the web-map cloud + shadow layer pair on a Web-Mercator \
+         grid (georef.mercator_corners = the Mapbox ImageSource corner lon/lats). \
+         render_perspective renders a free eye/look/fov pinhole camera (full composite, or \
+         cloud_layer_only=True for the cloud field alone; georef.camera_pose = the camera).",
     )?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(render_visible_rgb, m)?)?;
@@ -1040,6 +1293,8 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_precipitable_water, m)?)?;
     m.add_function(wrap_pyfunction!(render_cloud_top_temp, m)?)?;
     m.add_function(wrap_pyfunction!(render_cloud_optical_depth, m)?)?;
+    m.add_function(wrap_pyfunction!(render_cloud_layer, m)?)?;
+    m.add_function(wrap_pyfunction!(render_perspective, m)?)?;
     m.add_function(wrap_pyfunction!(set_verbose, m)?)?;
     m.add_class::<Georef>()?;
     Ok(())

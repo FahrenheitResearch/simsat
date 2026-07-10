@@ -88,10 +88,35 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// SimSat-internal `map_proj` code for a ROTATED lat-lon grid (GRIB2 grid
+/// template 3.1 — the RRFS North America native grid). WRF itself expresses a
+/// rotated pole as `MAP_PROJ = 6` plus `POLE_LAT`/`POLE_LON` attributes, but
+/// adding pole fields to [`WrfProjectionParams`] would break every existing
+/// struct-literal construction site (api.rs / the studio, owned by parallel
+/// agents this wave), so the rotated pole rides in the EXISTING
+/// unused-for-lat-lon fields instead: **`truelat1_deg` = the rotated NORTH
+/// pole's geographic latitude, `truelat2_deg` = its longitude** (RRFS: 35.0 /
+/// 67.0, from the GRIB south pole at (-35, 247)). `dx_m`/`dy_m` are METRES
+/// (rotated-degree spacing x [`ROTATED_LATLON_M_PER_DEG`]) so every
+/// metre-based consumer — the cloud-march horizontal pitch, top-down plane
+/// extents — works through the generic [`GridGeoref`] interface unchanged.
+/// No existing producer emits 203 and no existing arm changed, so every
+/// existing projection is byte-identical by construction. The manifest
+/// persists these fields verbatim (`ManifestProjection` is field-for-field),
+/// so a cached RRFS run round-trips exactly.
+pub const MAP_PROJ_ROTATED_LATLON: i32 = 203;
+
+/// Metres per degree of rotated-grid arc on the WRF sphere: `R * pi / 180`
+/// (~111,177 m). The [`MapProjection::RotatedLatLon`] plane is rotated
+/// lat/lon SCALED to metres by this constant — see [`MAP_PROJ_ROTATED_LATLON`].
+pub const ROTATED_LATLON_M_PER_DEG: f64 = R_EARTH * PI / 180.0;
+
 /// WRF projection attributes read from the file's globals (design section 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WrfProjectionParams {
-    /// `MAP_PROJ`: 1=Lambert, 2=polar stereographic, 3=Mercator, 6=lat/lon.
+    /// `MAP_PROJ`: 1=Lambert, 2=polar stereographic, 3=Mercator, 6=lat/lon;
+    /// [`MAP_PROJ_ROTATED_LATLON`] (203) = SimSat's rotated lat-lon (see its doc
+    /// for the field-reuse convention).
     pub map_proj: i32,
     pub truelat1_deg: f64,
     pub truelat2_deg: f64,
@@ -124,6 +149,21 @@ pub enum MapProjection {
     },
     /// Geographic lat/lon (cylindrical equidistant). Plane units are degrees.
     LatLon { central_meridian_deg: f64 },
+    /// Rotated lat-lon (GRIB2 template 3.1; the RRFS NA grid). Plane units are
+    /// METRES: rotated coordinates scaled by [`ROTATED_LATLON_M_PER_DEG`], so
+    /// metre-based consumers (march pitch, top-down extents) work unchanged.
+    /// The rotation math mirrors grib-core's `rotated_to_geographic` (COSMO
+    /// convention, rotation angle 0): with `alpha` the rotated NORTH pole's
+    /// geographic latitude and the rotated SOUTH pole at `south_pole_lon_deg`,
+    /// the transform is a rotation about the axis through the south-pole
+    /// meridian (unit-tested against grib-core's own grid math).
+    RotatedLatLon {
+        /// `sin`/`cos` of the rotated north pole's geographic latitude.
+        sin_alpha: f64,
+        cos_alpha: f64,
+        /// Longitude of the rotated SOUTH pole (deg), the reference meridian.
+        south_pole_lon_deg: f64,
+    },
 }
 
 impl MapProjection {
@@ -144,6 +184,7 @@ impl MapProjection {
             6 => Ok(Self::LatLon {
                 central_meridian_deg: p.stand_lon_deg,
             }),
+            MAP_PROJ_ROTATED_LATLON => Ok(Self::rotated_latlon(p.truelat1_deg, p.truelat2_deg)),
             other => Err(FrameError::UnsupportedProjection(other)),
         }
     }
@@ -199,6 +240,19 @@ impl MapProjection {
         }
     }
 
+    /// Rotated lat-lon from the rotated NORTH pole's geographic position
+    /// (see [`MAP_PROJ_ROTATED_LATLON`]; the pole at `(90, any)` degenerates to
+    /// an unrotated grid). The construction is deterministic in the two pole
+    /// values, so a manifest round-trip rebuilds the projection bit-identically.
+    pub fn rotated_latlon(pole_lat_deg: f64, pole_lon_deg: f64) -> Self {
+        let alpha = pole_lat_deg * DEG2RAD;
+        Self::RotatedLatLon {
+            sin_alpha: alpha.sin(),
+            cos_alpha: alpha.cos(),
+            south_pole_lon_deg: normalize_lon(pole_lon_deg + 180.0),
+        }
+    }
+
     /// Forward: geodetic `(lat, lon)` (deg) -> projection-plane `(u, v)`.
     pub fn project(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         match *self {
@@ -244,6 +298,25 @@ impl MapProjection {
                 normalize_lon(lon_deg - central_meridian_deg),
                 clamp_lat(lat_deg),
             ),
+            Self::RotatedLatLon {
+                sin_alpha,
+                cos_alpha,
+                south_pole_lon_deg,
+            } => {
+                // Geographic -> rotated: the exact inverse (transpose) of the
+                // grib-core `rotated_to_geographic` rotation about the Y axis
+                // of the south-pole-meridian frame.
+                let phi = clamp_lat(lat_deg) * DEG2RAD;
+                let dlon = normalize_lon(lon_deg - south_pole_lon_deg) * DEG2RAD;
+                let (sin_phi, cos_phi) = (phi.sin(), phi.cos());
+                let x = cos_phi * dlon.cos();
+                let y = cos_phi * dlon.sin();
+                let z = sin_phi;
+                let rlat = (-x * cos_alpha + z * sin_alpha).clamp(-1.0, 1.0).asin();
+                let rlon = y.atan2(x * sin_alpha + z * cos_alpha);
+                // Plane = rotated angle (rad) * R == rotated degrees * M_PER_DEG.
+                (rlon * R_EARTH, rlat * R_EARTH)
+            }
         }
     }
 
@@ -309,6 +382,27 @@ impl MapProjection {
             Self::LatLon {
                 central_meridian_deg,
             } => Some((clamp_lat(v), normalize_lon(u + central_meridian_deg))),
+            Self::RotatedLatLon {
+                sin_alpha,
+                cos_alpha,
+                south_pole_lon_deg,
+            } => {
+                // Rotated -> geographic: grib-core's `rotated_to_geographic`
+                // formulas verbatim (rotation angle 0), plane metres -> radians.
+                let rlon = u / R_EARTH;
+                let rlat = v / R_EARTH;
+                let (sin_rlat, cos_rlat) = (rlat.sin(), rlat.cos());
+                let (sin_rlon, cos_rlon) = (rlon.sin(), rlon.cos());
+                let lat = (sin_rlat * sin_alpha + cos_rlat * cos_rlon * cos_alpha)
+                    .clamp(-1.0, 1.0)
+                    .asin();
+                let lon = (cos_rlat * sin_rlon)
+                    .atan2(cos_rlat * cos_rlon * sin_alpha - sin_rlat * cos_alpha);
+                Some((
+                    lat * RAD2DEG,
+                    normalize_lon(lon * RAD2DEG + south_pole_lon_deg),
+                ))
+            }
         }
     }
 }
@@ -791,5 +885,74 @@ mod tests {
             MapProjection::from_wrf(&params),
             Err(FrameError::UnsupportedProjection(99))
         );
+    }
+
+    #[test]
+    fn rotated_latlon_degenerate_pole_matches_plain_latlon() {
+        // A rotated grid whose north pole sits at the TRUE north pole with the
+        // south-pole meridian at 0 (pole_lon = -180) is an unrotated grid: the
+        // rotated coordinates ARE the geographic ones. Its plane differs from
+        // the plain LatLon plane only by the metres-per-degree scale.
+        let rot = MapProjection::rotated_latlon(90.0, -180.0);
+        let plain = MapProjection::LatLon {
+            central_meridian_deg: 0.0,
+        };
+        for &(lat, lon) in &[
+            (0.0f64, 0.0f64),
+            (38.5, -97.5),
+            (55.0, -113.0),
+            (-33.0, 151.2),
+            (70.0, 179.0),
+        ] {
+            let (ru, rv) = rot.project(lat, lon);
+            let (pu, pv) = plain.project(lat, lon);
+            assert!(
+                (ru / ROTATED_LATLON_M_PER_DEG - pu).abs() < 1e-9,
+                "u mismatch at ({lat}, {lon})"
+            );
+            assert!(
+                (rv / ROTATED_LATLON_M_PER_DEG - pv).abs() < 1e-9,
+                "v mismatch at ({lat}, {lon})"
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_latlon_round_trips_on_the_rrfs_pole() {
+        // The RRFS NA rotation: GRIB south pole (-35, 247) -> north pole (35, 67).
+        // from_wrf(203) reads the pole from the reused truelat fields (the
+        // MAP_PROJ_ROTATED_LATLON convention); project/unproject must round-trip,
+        // and the grid centre (rotated origin) must sit at geographic (55, -113).
+        let params = WrfProjectionParams {
+            map_proj: MAP_PROJ_ROTATED_LATLON,
+            truelat1_deg: 35.0,
+            truelat2_deg: 67.0,
+            stand_lon_deg: 0.0,
+            cen_lat_deg: 55.0,
+            cen_lon_deg: -113.0,
+            dx_m: 0.025 * ROTATED_LATLON_M_PER_DEG,
+            dy_m: 0.025 * ROTATED_LATLON_M_PER_DEG,
+        };
+        let proj = MapProjection::from_wrf(&params).unwrap();
+        // Rotated origin -> the NA domain centre.
+        let (lat, lon) = proj.unproject(0.0, 0.0).unwrap();
+        assert!((lat - 55.0).abs() < 1e-9, "origin lat {lat}");
+        assert!((lon - (-113.0)).abs() < 1e-9, "origin lon {lon}");
+        // Round trips across the domain (corners from the RRFS probe).
+        for &(la, lo) in &[
+            (55.0f64, -113.0f64),
+            (21.14, -122.72),
+            (41.48, 135.80),
+            (-1.61, -157.33),
+            (47.84, -60.92),
+        ] {
+            let (u, v) = proj.project(la, lo);
+            let (bla, blo) = proj.unproject(u, v).unwrap();
+            let dlon = normalize_lon(blo - lo);
+            assert!(
+                (bla - la).abs() < 1e-9 && dlon.abs() < 1e-9,
+                "round trip failed at ({la}, {lo}) -> ({bla}, {blo})"
+            );
+        }
     }
 }

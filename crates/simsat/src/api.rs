@@ -34,9 +34,9 @@ use crate::atmosphere::{
 use crate::bluemarble;
 use crate::bricks::{self, RunManifest, VolumeBrick};
 use crate::camera::{
-    GeoCamera, MAX_AXIS, ResolutionMode, SatellitePreset, SurfaceRaster, ViewMode,
-    build_map_raster, build_surface_raster_mode, extended_native_counts,
-    map_pixel_edge_index_bounds,
+    GeoCamera, MAX_AXIS, PerspectiveCamera, ResolutionMode, SatellitePreset, SurfaceRaster,
+    ViewMode, build_map_raster, build_perspective_raster, build_surface_raster_mode,
+    extended_native_counts, map_pixel_edge_index_bounds,
 };
 use crate::clouds::{
     self, CloudFrameStats, CloudScene, DecodedVolume, MarchConfig, OccupancyMip, StepQuality,
@@ -48,6 +48,7 @@ use crate::geocolor;
 use crate::gpu;
 use crate::horizon::HorizonMap;
 use crate::ingest::{self, IngestConfig};
+use crate::ingest_grib;
 use crate::ir::{self, IrConfig, IrScene, IrVolume};
 use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::render::{
@@ -57,6 +58,7 @@ use crate::render::{
 use crate::sandwich;
 use crate::solar::SolarFrame;
 use crate::topdown::{render_topdown_frame_reflectance, render_topdown_frame_rgba};
+use crate::web_layer;
 use crate::wv::WvBand;
 
 /// The sun optical-depth map resolution (matches the studio / `render_frame` constant).
@@ -105,6 +107,35 @@ pub enum Product {
     /// atmosphere / cloud / Blue Marble controls (like the thermal IR product). See
     /// [`crate::derived`] for the definitions + units + assumptions.
     Derived { field: DerivedField },
+    /// The web-map CLOUD LAYER pair (the broadcast-visuals / Mapbox-class integration):
+    /// the CLOUD FIELD ONLY as premultiplied-alpha RGBA (color = the tonemapped cloud
+    /// radiance through the shipped display seam; alpha = `1 - T_cloud`) plus the ground
+    /// cloud-shadow MULTIPLY layer (1.0 = no shadow), BOTH delivered on a north-up
+    /// Web-Mercator-aligned grid with the four corner lon/lats a Mapbox `ImageSource`
+    /// needs (on [`Georef::mercator_corners_lonlat`]; extent in EPSG:3857 metres,
+    /// [`ExtentKind::WebMercatorMeters`]). NO Blue Marble / surface / ground atmosphere —
+    /// the HOST map is the ground. TOP-DOWN by definition ([`RenderParams::view`] is
+    /// ignored); the sun / exposure / steps / multiscatter / margin / granulation
+    /// controls drive the cloud march like the visible product. Returned as
+    /// [`FrameData::CloudLayer`]. See [`crate::web_layer`] for the alpha model + datum
+    /// notes and [`crate::topdown::render_cloud_layer_frame`] for the render.
+    CloudLayer,
+    /// A FREE-PERSPECTIVE frame (the broadcast "angled 3D scene" product): the camera
+    /// on [`RenderParams::perspective`] (eye lat/lon/alt + look-at + horizontal FOV +
+    /// dims — REQUIRED for this product) feeds per-pixel pinhole rays through the SAME
+    /// surface + cloud marches. `cloud_layer_only = false` renders the FULL COMPOSITE
+    /// over our Blue Marble ground (the hero shot; sky rays composite the existing
+    /// limb/space handling); `true` renders the CLOUD FIELD ONLY as premultiplied-alpha
+    /// RGBA (alpha = `1 - T_cloud`) for compositing over a HOST 3-D map with a matching
+    /// camera (no ground-shadow plane — see
+    /// [`crate::topdown::render_perspective_cloud_layer`]). Returned as
+    /// [`FrameData::Visible`] (`rgba` carries the real alpha in both modes; for the
+    /// layer-only mode it is the premultiplied cloud image). The camera pose is
+    /// recorded on [`Georef::camera_pose`] + logged (the what-if labeling discipline);
+    /// [`RenderParams::view`] / `resolution` / `margin_frac` are ignored (the camera IS
+    /// the view). A FLYOVER is the caller rendering N frames along its own eye/look
+    /// path — no path scripting here.
+    Perspective { cloud_layer_only: bool },
 }
 
 /// The ground-texture source for a visible render.
@@ -214,6 +245,9 @@ pub struct RenderParams {
     /// ([`crate::topdown::TOPDOWN_CLOUD_NORM`]; `1.0` = no normalization). `None` (default)
     /// = the baked constant. The `render_frame` `topdown-cloudnorm=` knob sets it.
     pub topdown_cloud_norm: Option<f64>,
+    /// The free-perspective camera (eye / look-at / fov / dims) — REQUIRED by (and only
+    /// read by) [`Product::Perspective`]. `None` (the default) for every other product.
+    pub perspective: Option<PerspectiveCamera>,
 }
 
 impl RenderParams {
@@ -243,6 +277,7 @@ impl RenderParams {
             ground_gain: None,
             cloud_softclip: None,
             topdown_cloud_norm: None,
+            perspective: None,
         }
     }
 }
@@ -257,6 +292,12 @@ pub enum ExtentKind {
     /// Longitude/latitude DEGREES bounding box — the from-space geostationary frame's
     /// extent (place with `PlateCarree`, or prefer the lat/lon mesh via `pcolormesh`).
     LonLatDegrees,
+    /// EPSG:3857 Web Mercator METRES — the cloud-layer delivery grid's extent (its
+    /// rows/columns are exact constant-y/constant-x lines of EPSG:3857; a web map
+    /// places the image by [`Georef::mercator_corners_lonlat`] instead). See
+    /// [`crate::web_layer`] for the datum note (WRF-sphere lat/lon through the
+    /// standard 3857 formulas).
+    WebMercatorMeters,
 }
 
 /// The georeference returned with every frame: the projection params, an `extent` for
@@ -278,6 +319,15 @@ pub struct Georef {
     /// aligns to `top` (use `origin='upper'`). Units per [`ExtentKind`].
     pub extent: [f64; 4],
     pub extent_kind: ExtentKind,
+    /// The four image corner `[lon, lat]` pairs in the Mapbox GL `ImageSource`
+    /// `coordinates` order (top-left/NW, top-right/NE, bottom-right/SE,
+    /// bottom-left/SW). `Some` only for the Web-Mercator-delivered
+    /// [`Product::CloudLayer`]; `None` for every other product.
+    pub mercator_corners_lonlat: Option<[[f64; 2]; 4]>,
+    /// The free-perspective camera pose the frame was rendered with — `Some` only for
+    /// [`Product::Perspective`] (the what-if labeling discipline: a perspective frame
+    /// always carries its camera). `None` for every other product.
+    pub camera_pose: Option<PerspectiveCamera>,
 }
 
 impl Georef {
@@ -307,6 +357,12 @@ impl Georef {
     /// is not rectilinear in lon/lat, so prefer `pcolormesh(geo.lon, geo.lat, data)` there.
     pub fn proj4(&self) -> String {
         let r = crate::optics::EARTH_RADIUS_M;
+        if self.extent_kind == ExtentKind::WebMercatorMeters {
+            // The standard EPSG:3857 definition (the extent is on the 6378137 sphere).
+            return "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 \
+                    +k=1 +units=m +nadgrids=@null +no_defs"
+                .to_string();
+        }
         if self.extent_kind == ExtentKind::LonLatDegrees {
             return format!("+proj=longlat +R={r} +no_defs");
         }
@@ -352,6 +408,17 @@ pub enum FrameData {
         values: Vec<f32>,
         rgb: Option<Vec<u8>>,
         field: DerivedField,
+    },
+    /// The web-map CLOUD LAYER pair on the Web-Mercator delivery grid (`nx*ny` from the
+    /// [`RenderResult`]; row 0 = north): `rgba_premul` = the PREMULTIPLIED-alpha cloud
+    /// image (`nx*ny*4`; see [`crate::topdown::CloudLayerFrame`] for the exact
+    /// semantics; convert with [`crate::web_layer::unpremultiply_rgba`] for straight-
+    /// alpha delivery) and `shadow` = the ground cloud-shadow MULTIPLY field
+    /// (`nx*ny` f32 in `[0,1]`, 1.0 = no shadow; out-of-coverage = 1.0). The placement
+    /// corners ride on [`Georef::mercator_corners_lonlat`].
+    CloudLayer {
+        rgba_premul: Vec<u8>,
+        shadow: Vec<f32>,
     },
 }
 
@@ -458,6 +525,12 @@ pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, S
         // Derived scalar fields are a per-column brick computation resampled onto the raster
         // (no sun / atmosphere / cloud march).
         Product::Derived { field } => render_derived_scene(&src, params, field),
+        // The web-map cloud layer: cloud-only + ground shadow on a Web-Mercator grid.
+        Product::CloudLayer => render_cloud_layer_scene(&src, params),
+        // The free-perspective frame (full composite, or the cloud-layer-only variant).
+        Product::Perspective { cloud_layer_only } => {
+            render_perspective_scene(&src, params, cloud_layer_only)
+        }
     }
 }
 
@@ -698,6 +771,12 @@ fn render_visible_scene(
         }
         Product::Derived { .. } => {
             unreachable!("derived products are assembled by render_derived_scene")
+        }
+        Product::CloudLayer => {
+            unreachable!("the cloud layer is assembled by render_cloud_layer_scene")
+        }
+        Product::Perspective { .. } => {
+            unreachable!("perspective frames are assembled by render_perspective_scene")
         }
     };
 
@@ -1052,6 +1131,406 @@ fn render_derived_scene(
     })
 }
 
+// ── web-map cloud layer (cloud-only + ground shadow on a Web-Mercator grid) ─────
+
+/// Render the [`Product::CloudLayer`] pair. Assembles the SAME cloud scene the visible
+/// product marches (atmosphere LUTs + SH sky ambient + decoded volume + occupancy mip +
+/// granulated sun-OD map), renders the CLOUD-ONLY layer + the ground cloud-shadow field
+/// on the domain's native Lambert map raster
+/// ([`crate::topdown::render_cloud_layer_frame`] — no Blue Marble, no surface: the host
+/// map is the ground), then resamples both onto a north-up Web-Mercator delivery grid
+/// ([`crate::web_layer::reproject_cloud_layer`]) sized at ~native pitch over the
+/// raster's (margin-extended) geodetic bbox. TOP-DOWN by definition —
+/// [`RenderParams::view`] is ignored (documented on the Product). The returned
+/// [`Georef`] describes the MERCATOR grid: extent in EPSG:3857 metres, the per-pixel
+/// lat/lon mesh of that grid, and the Mapbox `ImageSource` corner lon/lats on
+/// [`Georef::mercator_corners_lonlat`]. NOTE [`RenderResult::raster`] is the NATIVE
+/// Lambert map raster the marches ran on (its dims differ from the delivered
+/// `nx`/`ny`, which are the Mercator grid's).
+fn render_cloud_layer_scene(
+    src: &SceneSource,
+    params: &RenderParams,
+) -> Result<RenderResult, String> {
+    let SceneSource {
+        brick,
+        georef,
+        params: proj,
+        time_iso,
+    } = src;
+    let (nx, ny) = (brick.nx, brick.ny);
+    let margin = params.margin_frac as f64;
+    let raster = build_map_raster(georef, nx, ny, nx, ny, margin)
+        .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
+        .as_surface_raster();
+
+    // Solar geometry + the single ECEF sun (the layer's clouds are sun-lit like the
+    // visible product; the sun override is honored for QA what-ifs).
+    let (time, time_is_fallback) = resolve_frame_time(time_iso.as_deref());
+    let solar = SolarFrame::new(time.year, time.month, time.day, time.ut);
+    let (sun_ecef, center_sun_elev) = resolve_frame_sun(params, &raster, &solar, proj);
+
+    // M2 atmosphere (sun transmittance + the SH sky ambient the cloud march reads).
+    let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
+    let atmo_params = AtmosphereParams {
+        aod: atmosphere::DEFAULT_AOD,
+        pw_ratio,
+        aerosol_swelling: 1.0,
+        ground_albedo: atmosphere::GROUND_ALBEDO,
+    };
+    let luts = AtmosphereLuts::build(&atmo_params);
+    let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
+
+    // M4/M5 cloud volume + scene (granulation scoping: the layer is a DISPLAY product —
+    // the same opt-in rule as VisibleRgb).
+    let horiz_pitch = horiz_pitch_m(proj);
+    let vol = DecodedVolume::from_brick(brick, horiz_pitch);
+    let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+    let gran_on = params.granulation.unwrap_or(false);
+    let granulation = if gran_on {
+        Some(clouds::Granulation::for_grid(horiz_pitch))
+    } else {
+        None
+    };
+    if let Some(g) = granulation {
+        crate::log_line!(
+            "simsat api: cloud-layer granulation ON (sub-grid edge erosion; dx \
+             {horiz_pitch:.0} m -> amplitude {:.3})",
+            g.amplitude
+        );
+    }
+    let sun_od = clouds::accumulate_sun_od_granulated(
+        &vol,
+        georef,
+        sun_ecef,
+        SUN_OD_RESOLUTION,
+        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+        granulation,
+    );
+    let mut cfg = MarchConfig {
+        beer_powder: false,
+        octaves: if params.multiscatter {
+            clouds::DEFAULT_OCTAVES
+        } else {
+            1
+        },
+        granulation,
+        ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
+    };
+    cfg.edge_feather_cells = clouds::edge_feather_cells_for_margin(margin, nx, ny);
+    if let Some(k) = params.cloud_softclip {
+        cfg.cloud_softclip_knee = k;
+    }
+    if let Some(n) = params.topdown_cloud_norm {
+        cfg.topdown_cloud_norm = n;
+    }
+    let scene = CloudScene {
+        vol: &vol,
+        mip: &mip,
+        sun_od: &sun_od,
+        georef,
+        luts: &luts,
+        sky_sh: &sky_sh,
+        sun_ecef,
+        cfg,
+    };
+
+    // 1. The native cloud layer + shadow on the Lambert map raster.
+    let native = crate::topdown::render_cloud_layer_frame(
+        &scene,
+        OutputTransform::AbiReflectance,
+        params.exposure,
+        &raster.lat,
+        &raster.lon,
+        raster.nx,
+        raster.ny,
+    );
+
+    // 2. The Web-Mercator delivery grid over the raster's geodetic bbox, ~native pitch.
+    let (la0, la1, lo0, lo1) = raster
+        .lat_lon_bbox()
+        .ok_or_else(|| "no on-earth pixels in the map raster".to_string())?;
+    let grid = web_layer::mercator_grid_for_bbox(
+        la0 as f64,
+        la1 as f64,
+        lo0 as f64,
+        lo1 as f64,
+        horiz_pitch,
+        MAX_AXIS,
+    )
+    .ok_or_else(|| "degenerate Web-Mercator grid for the domain bbox".to_string())?;
+    let (rgba_premul, shadow) =
+        web_layer::reproject_cloud_layer(&native, georef, nx, ny, margin, &grid);
+
+    // 3. The Mercator grid's georef: extent in 3857 metres + its per-pixel lat/lon mesh
+    //    (lat varies only by row, lon only by column — exact Mercator alignment) + the
+    //    Mapbox ImageSource corners.
+    let n_out = grid.nx * grid.ny;
+    let mut lat_mesh = vec![f32::NAN; n_out];
+    let mut lon_mesh = vec![f32::NAN; n_out];
+    let row_lat: Vec<f32> = (0..grid.ny)
+        .map(|py| grid.pixel_lonlat(0, py).0 as f32)
+        .collect();
+    let col_lon: Vec<f32> = (0..grid.nx)
+        .map(|px| grid.pixel_lonlat(px, 0).1 as f32)
+        .collect();
+    for (row, &la) in lat_mesh.chunks_exact_mut(grid.nx).zip(row_lat.iter()) {
+        row.fill(la);
+    }
+    for row in lon_mesh.chunks_exact_mut(grid.nx) {
+        row.copy_from_slice(&col_lon);
+    }
+    let georef_out = Georef {
+        view: ViewMode::TopDownMap,
+        projection: *proj,
+        nx: grid.nx,
+        ny: grid.ny,
+        lat: lat_mesh,
+        lon: lon_mesh,
+        extent: grid.extent_3857(),
+        extent_kind: ExtentKind::WebMercatorMeters,
+        mercator_corners_lonlat: Some(grid.corners_lonlat()),
+        camera_pose: None,
+    };
+    Ok(RenderResult {
+        nx: grid.nx,
+        ny: grid.ny,
+        data: FrameData::CloudLayer {
+            rgba_premul,
+            shadow,
+        },
+        georef: georef_out,
+        raster,
+        sun_elev_deg: center_sun_elev,
+        res_clamped: false,
+        cloud_stats: None,
+        time,
+        time_is_fallback,
+        // No ground pixels are rendered — the host map is the ground.
+        ground_source: None,
+        ground_status: Vec::new(),
+        granulation: gran_on,
+    })
+}
+
+// ── free-perspective frame (the angled-3D hero shot / host-3D cloud layer) ──────
+
+/// Render the [`Product::Perspective`] frame. Builds the pinhole basis from
+/// [`RenderParams::perspective`] (REQUIRED — a clear error otherwise), the per-pixel
+/// ground raster ([`build_perspective_raster`]: earth hits carry lat/lon + WRF `(i, j)`,
+/// sky rays stay `NaN`), then assembles the SAME scene the visible product marches
+/// (Blue Marble ground + terrain normals + horizon map + atmosphere LUTs + SH ambient +
+/// cloud volume/mip/sun-OD) and renders through
+/// [`crate::topdown::render_perspective_frame_rgba`] (full composite; honors
+/// [`RenderParams::clouds`]) or [`crate::topdown::render_perspective_cloud_layer`]
+/// (the cloud-only premultiplied variant). `view` / `resolution` / `margin_frac` are
+/// ignored — the camera IS the view (documented on the Product).
+///
+/// GEOREF: the lat/lon mesh is the per-pixel ground intersections (`NaN` sky) and the
+/// extent is the on-earth lon/lat bbox ([`ExtentKind::LonLatDegrees`] — like the
+/// geostationary frame, and like it NOT rectilinear: prefer the mesh for any
+/// georeferencing; a perspective frame is a picture, not a map). `Georef::view` reuses
+/// the [`ViewMode::Geostationary`] tag (a from-a-point-in-space perspective — the
+/// closest of the two view modes; consumers distinguish the product by
+/// [`Georef::camera_pose`], which is ALWAYS `Some` here). The camera pose is also
+/// logged — the what-if labeling discipline.
+fn render_perspective_scene(
+    src: &SceneSource,
+    params: &RenderParams,
+    cloud_layer_only: bool,
+) -> Result<RenderResult, String> {
+    let SceneSource {
+        brick,
+        georef,
+        params: proj,
+        time_iso,
+    } = src;
+    let (nx, ny) = (brick.nx, brick.ny);
+    let camera = params
+        .perspective
+        .ok_or_else(|| "Product::Perspective requires RenderParams::perspective".to_string())?;
+    let basis = camera.basis()?;
+    crate::log_line!("simsat api: PERSPECTIVE camera {}", camera.label());
+    let raster = build_perspective_raster(&basis, georef, nx, ny);
+
+    // Solar geometry + the ECEF sun (the sun override honored, as everywhere).
+    let (time, time_is_fallback) = resolve_frame_time(time_iso.as_deref());
+    let solar = SolarFrame::new(time.year, time.month, time.day, time.ut);
+    let use_sun_override = params
+        .sun_override
+        .is_some_and(|s| s.elev_deg.is_some() || s.az_deg.is_some());
+    let (sun_ecef, center_sun_elev) = resolve_frame_sun(params, &raster, &solar, proj);
+
+    // Ground texture (full composite only — the layer-only variant renders no ground).
+    let (bluemarble, ground_source, ground_status) = if cloud_layer_only {
+        (
+            None,
+            GroundSource::FlatAlbedo("cloud-layer-only".into()),
+            Vec::new(),
+        )
+    } else {
+        resolve_bluemarble(params, &raster, time.month, time.day)?
+    };
+
+    // Per-pixel LUTs over the perspective raster (sky pixels carry the space sentinel).
+    let (lut_geo, mut lut_light) = gpu::build_luts(&raster, bluemarble.as_ref(), nx, ny, &solar);
+    if use_sun_override {
+        override_light_lut(&mut lut_light, &raster, sun_ecef);
+    }
+
+    // Terrain + atmosphere + cloud scene (the visible product's assembly).
+    let normals = normals_from_hgt(&brick.hgt, nx, ny, proj.dx_m, proj.dy_m);
+    let horiz_pitch = horiz_pitch_m(proj);
+    let (dx_m_m, dy_m_m) = dx_dy_metres(proj);
+    let horizon_map = HorizonMap::build(&brick.hgt, nx, ny, dx_m_m, dy_m_m);
+    let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
+    let atmo_params = AtmosphereParams {
+        aod: atmosphere::DEFAULT_AOD,
+        pw_ratio,
+        aerosol_swelling: 1.0,
+        ground_albedo: atmosphere::GROUND_ALBEDO,
+    };
+    let luts = AtmosphereLuts::build(&atmo_params);
+    let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
+    let vol = DecodedVolume::from_brick(brick, horiz_pitch);
+    let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+    // Granulation scoping: a DISPLAY product (the same opt-in rule as VisibleRgb).
+    let gran_on = params.granulation.unwrap_or(false);
+    let granulation = if gran_on {
+        Some(clouds::Granulation::for_grid(horiz_pitch))
+    } else {
+        None
+    };
+    if let Some(g) = granulation {
+        crate::log_line!(
+            "simsat api: perspective granulation ON (sub-grid edge erosion; dx \
+             {horiz_pitch:.0} m -> amplitude {:.3})",
+            g.amplitude
+        );
+    }
+    let sun_od = clouds::accumulate_sun_od_granulated(
+        &vol,
+        georef,
+        sun_ecef,
+        SUN_OD_RESOLUTION,
+        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+        granulation,
+    );
+    let mut cfg = MarchConfig {
+        beer_powder: false,
+        octaves: if params.multiscatter {
+            clouds::DEFAULT_OCTAVES
+        } else {
+            1
+        },
+        granulation,
+        ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
+    };
+    if let Some(k) = params.cloud_softclip {
+        cfg.cloud_softclip_knee = k;
+    }
+    if let Some(g) = params.ground_gain {
+        cfg.ground_day_lift = g;
+    }
+    let scene = CloudScene {
+        vol: &vol,
+        mip: &mip,
+        sun_od: &sun_od,
+        georef,
+        luts: &luts,
+        sky_sh: &sky_sh,
+        sun_ecef,
+        cfg,
+    };
+    // The frame context: ONE camera — the EYE (the perspective render contract).
+    let mut cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
+    cam_geo.camera = basis.eye;
+    let surf = FrameContext {
+        luts: &luts,
+        params: &atmo_params,
+        sky_sh: &sky_sh,
+        cam: cam_geo,
+        sun_ecef,
+        output_transform: OutputTransform::AbiReflectance,
+        bm_present: bluemarble.is_some(),
+        water_scale: WATER_ALBEDO_SCALE as f64,
+        flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
+        raymarch_steps: 16,
+        exposure: params.exposure,
+    };
+    let assemble = make_assemble(
+        brick,
+        &lut_geo,
+        &lut_light,
+        bluemarble.as_ref(),
+        &normals,
+        &horizon_map,
+        raster.nx,
+        nx,
+        ny,
+    );
+
+    let rgba = if cloud_layer_only {
+        crate::topdown::render_perspective_cloud_layer(
+            &scene,
+            &basis,
+            OutputTransform::AbiReflectance,
+            params.exposure,
+        )
+    } else {
+        let persp_scene = if params.clouds { Some(&scene) } else { None };
+        crate::topdown::render_perspective_frame_rgba(&surf, persp_scene, &basis, assemble)
+    };
+    let rgb = rgba_to_rgb_black_space(&rgba, raster.nx, raster.ny);
+
+    // The perspective georef: the ground-intersection mesh + the on-earth lon/lat bbox.
+    let (extent, extent_kind) = match raster.lat_lon_bbox() {
+        Some((la0, la1, lo0, lo1)) => (
+            [lo0 as f64, lo1 as f64, la0 as f64, la1 as f64],
+            ExtentKind::LonLatDegrees,
+        ),
+        None => (
+            [
+                proj.cen_lon_deg,
+                proj.cen_lon_deg,
+                proj.cen_lat_deg,
+                proj.cen_lat_deg,
+            ],
+            ExtentKind::LonLatDegrees,
+        ),
+    };
+    let georef_out = Georef {
+        view: ViewMode::Geostationary,
+        projection: *proj,
+        nx: raster.nx,
+        ny: raster.ny,
+        lat: raster.lat.clone(),
+        lon: raster.lon.clone(),
+        extent,
+        extent_kind,
+        mercator_corners_lonlat: None,
+        camera_pose: Some(camera),
+    };
+    Ok(RenderResult {
+        nx: raster.nx,
+        ny: raster.ny,
+        data: FrameData::Visible { rgb, rgba },
+        georef: georef_out,
+        raster,
+        sun_elev_deg: center_sun_elev,
+        res_clamped: false,
+        cloud_stats: None,
+        time,
+        time_is_fallback,
+        ground_source: if cloud_layer_only {
+            None
+        } else {
+            Some(ground_source)
+        },
+        ground_status,
+        granulation: gran_on,
+    })
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────────
 
 /// Parse the source's ISO valid time into a [`FrameTime`]. When the time is absent or
@@ -1188,6 +1667,8 @@ fn build_georef(
         lon: raster.lon.clone(),
         extent,
         extent_kind,
+        mercator_corners_lonlat: None,
+        camera_pose: None,
     }
 }
 
@@ -1432,6 +1913,8 @@ fn resolve_source(params: &RenderParams) -> Result<SceneSource, String> {
         .unwrap_or(false);
     if is_json {
         resolve_cached(params)
+    } else if ingest_grib::is_grib_input(&params.input) {
+        resolve_grib(params)
     } else {
         resolve_wrfout(params)
     }
@@ -1479,6 +1962,65 @@ fn resolve_wrfout(params: &RenderParams) -> Result<SceneSource, String> {
         config.run_id = Some(run_id.clone());
         config.timestep = params.timestep;
         ingest::ingest_timestep(path, &config).map_err(|e| format!("ingest: {e}"))?;
+    }
+    let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    Ok(SceneSource {
+        brick,
+        georef,
+        params: geom.params,
+        time_iso: geom.time_iso,
+    })
+}
+
+/// GRIB2 sibling of [`resolve_wrfout`] (the deferred grib-ingest integration seam):
+/// probe carries the run-id + single valid time (a GRIB file is one forecast hour, so
+/// `timestep` must be 0), the same WS3 staleness gate guards the cached brick, and
+/// ingest goes through [`ingest_grib::ingest_grib_timestep`]. NOTE: no crop parameter is
+/// plumbed yet — an RRFS full-file open refuses with the crop remedy message (HRRR needs
+/// no crop); plumbing a crop field through `RenderParams` is the recorded open decision.
+fn resolve_grib(params: &RenderParams) -> Result<SceneSource, String> {
+    let path = &params.input;
+    if !path.is_file() {
+        return Err(format!("grib input not found: {}", path.display()));
+    }
+    if params.timestep != 0 {
+        return Err(format!(
+            "timestep {} out of range: a GRIB file carries a single valid time \
+             (forecast hours are separate files; use timestep 0)",
+            params.timestep
+        ));
+    }
+    let probe = ingest_grib::probe_grib(path).map_err(|e| format!("probe grib: {e}"))?;
+    let geom = ingest_grib::read_grib_geometry(path).map_err(|e| format!("read geometry: {e}"))?;
+    let georef = geom.georef().map_err(|e| format!("georef: {e}"))?;
+    let run_id = probe.default_run_id.clone();
+    let brick_file = bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm);
+    let brick_path = bricks::run_dir(&params.cache, &run_id).join(&brick_file);
+    let needs_ingest = if !brick_path.is_file() {
+        true
+    } else {
+        let (src_bytes, src_mtime) = ingest::source_identity(path);
+        let fresh = match (src_bytes, src_mtime) {
+            (Some(b), Some(m)) => RunManifest::load(&RunManifest::path(&params.cache, &run_id))
+                .ok()
+                .and_then(|man| man.timesteps.iter().find(|t| t.file == brick_file).cloned())
+                .is_some_and(|t| bricks::cache_entry_is_fresh(&t, b, m)),
+            _ => false,
+        };
+        if !fresh {
+            crate::log_line!(
+                "simsat api: cached grib brick {} is STALE against {}; re-ingesting",
+                brick_path.display(),
+                path.display()
+            );
+        }
+        !fresh
+    };
+    if needs_ingest {
+        let mut config = IngestConfig::new(params.cache.clone());
+        config.run_id = Some(run_id.clone());
+        ingest_grib::ingest_grib_timestep(path, &config)
+            .map_err(|e| format!("grib ingest: {e}"))?;
     }
     let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
     Ok(SceneSource {
@@ -2628,6 +3170,205 @@ mod tests {
                 );
             }
             other => panic!("expected Visible, got {other:?}"),
+        }
+    }
+
+    // ── web-map cloud layer (Product::CloudLayer) ──────────────────────────────
+
+    #[test]
+    fn cloud_layer_clear_scene_is_transparent_on_a_mercator_grid() {
+        // A CLEAR brick through Product::CloudLayer: the delivered pair is on a
+        // Web-Mercator grid (extent kind + EPSG:3857 proj4 + ordered Mapbox corners
+        // bracketing the domain), the cloud image is EXACTLY transparent, and the
+        // shadow layer exactly neutral — a host compositing it changes nothing.
+        let src = synthetic_source(24, 24, 24, 3000.0);
+        let p = synthetic_params(ViewMode::TopDownMap);
+        let res = render_cloud_layer_scene(&src, &p).unwrap();
+        let (nx, ny) = (res.nx, res.ny);
+        assert!(nx >= 2 && ny >= 2);
+        match &res.data {
+            FrameData::CloudLayer {
+                rgba_premul,
+                shadow,
+            } => {
+                assert_eq!(rgba_premul.len(), nx * ny * 4);
+                assert_eq!(shadow.len(), nx * ny);
+                assert!(
+                    rgba_premul.iter().all(|&v| v == 0),
+                    "a clear scene must deliver a fully transparent cloud layer"
+                );
+                assert!(
+                    shadow.iter().all(|&s| s == 1.0),
+                    "a clear scene must deliver a neutral shadow layer"
+                );
+            }
+            other => panic!("expected CloudLayer, got {other:?}"),
+        }
+        // The georef describes the Mercator delivery grid.
+        let g = &res.georef;
+        assert_eq!(g.extent_kind, ExtentKind::WebMercatorMeters);
+        assert_eq!((g.nx, g.ny), (nx, ny));
+        assert_eq!(g.lat.len(), nx * ny);
+        assert!(g.proj4().contains("6378137"), "{}", g.proj4());
+        let c = g.mercator_corners_lonlat.expect("mapbox corners");
+        assert!(c[0][0] < c[1][0], "TL lon < TR lon: {c:?}");
+        assert!(c[0][1] > c[3][1], "TL lat > BL lat: {c:?}");
+        // The corners bracket the domain centre (39 N, -97.5 E).
+        assert!(c[0][0] < -97.5 && c[1][0] > -97.5, "{c:?}");
+        assert!(c[0][1] > 39.0 && c[3][1] < 39.0, "{c:?}");
+        // The mesh matches the corners: row 0 is the northern edge.
+        assert!(g.lat[0] > g.lat[(ny - 1) * nx] && g.lon[0] < g.lon[nx - 1]);
+        assert!(res.ground_source.is_none(), "no ground is rendered");
+    }
+
+    #[test]
+    fn cloud_layer_cloudy_scene_delivers_cloud_and_shadow() {
+        // The cold-top source (a thick high ice cloud over the whole domain) through
+        // Product::CloudLayer under a 45-deg sun: the delivered cloud image has real
+        // alpha + lit color over the domain, and the shadow layer darkens the ground.
+        let src = cold_top_source(24, 24, 24, 3000.0);
+        let p = synthetic_params(ViewMode::TopDownMap);
+        let res = render_cloud_layer_scene(&src, &p).unwrap();
+        let (nx, ny) = (res.nx, res.ny);
+        match &res.data {
+            FrameData::CloudLayer {
+                rgba_premul,
+                shadow,
+            } => {
+                let o = ((ny / 2) * nx + nx / 2) * 4;
+                assert!(
+                    rgba_premul[o + 3] > 200,
+                    "thick cloud centre alpha {} not near-opaque",
+                    rgba_premul[o + 3]
+                );
+                assert!(
+                    rgba_premul[o] > 0 && rgba_premul[o + 1] > 0 && rgba_premul[o + 2] > 0,
+                    "sun-lit cloud should have positive color: {:?}",
+                    &rgba_premul[o..o + 4]
+                );
+                assert!(
+                    shadow[(ny / 2) * nx + nx / 2] < 0.95,
+                    "a whole-domain thick cloud must shadow the ground: {}",
+                    shadow[(ny / 2) * nx + nx / 2]
+                );
+                // The straight-alpha delivery conversion keeps alpha and stays in range.
+                let straight = crate::web_layer::unpremultiply_rgba(rgba_premul);
+                assert_eq!(straight.len(), rgba_premul.len());
+                assert_eq!(straight[o + 3], rgba_premul[o + 3]);
+            }
+            other => panic!("expected CloudLayer, got {other:?}"),
+        }
+        assert!(
+            res.sun_elev_deg > 40.0,
+            "the 45-deg override drives the sun"
+        );
+    }
+
+    // ── free-perspective frame (Product::Perspective) ──────────────────────────
+
+    /// A low-oblique camera south of the synthetic domain centre (39 N, -97.5 E),
+    /// looking at it from 150 km altitude. ODD dims so the middle pixel is exactly
+    /// the optical axis (the centre-mesh-hits-the-look-point assertion; even dims
+    /// put the centre pixel half a pixel off axis ~1.6 km on the ground).
+    fn oblique_camera() -> PerspectiveCamera {
+        PerspectiveCamera {
+            eye_lat_deg: 37.8,
+            eye_lon_deg: -97.5,
+            eye_alt_m: 150_000.0,
+            look_lat_deg: 39.0,
+            look_lon_deg: -97.5,
+            look_alt_m: 0.0,
+            fov_deg: 45.0,
+            width: 65,
+            height: 49,
+        }
+    }
+
+    #[test]
+    fn perspective_requires_the_camera_params() {
+        let src = synthetic_source(20, 20, 16, 3000.0);
+        let p = synthetic_params(ViewMode::TopDownMap); // no perspective set
+        let err = render_perspective_scene(&src, &p, false).unwrap_err();
+        assert!(
+            err.contains("RenderParams::perspective"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn perspective_full_composite_shape_pose_and_lit_ground() {
+        let src = synthetic_source(24, 24, 24, 3000.0);
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        let cam = oblique_camera();
+        p.perspective = Some(cam);
+        let res = render_perspective_scene(&src, &p, false).unwrap();
+        // The frame is CAMERA-sized (not domain-sized) and carries its pose.
+        assert_eq!((res.nx, res.ny), (cam.width, cam.height));
+        assert_eq!(
+            res.georef.camera_pose,
+            Some(cam),
+            "the pose must ride along"
+        );
+        assert_eq!(res.georef.extent_kind, ExtentKind::LonLatDegrees);
+        assert_eq!(res.georef.lat.len(), cam.width * cam.height);
+        match &res.data {
+            FrameData::Visible { rgb, rgba } => {
+                assert_eq!(rgb.len(), cam.width * cam.height * 3);
+                assert_eq!(rgba.len(), cam.width * cam.height * 4);
+                // The centre pixel looks at the lit domain-centre ground: opaque + lit.
+                let c = ((cam.height / 2) * cam.width + cam.width / 2) * 4;
+                assert_eq!(rgba[c + 3], 255, "centre pixel should be on earth");
+                assert!(
+                    rgba[c] > 0 || rgba[c + 1] > 0 || rgba[c + 2] > 0,
+                    "the 45-deg-sun ground should be lit"
+                );
+            }
+            other => panic!("expected Visible, got {other:?}"),
+        }
+        // The centre pixel's mesh position is the look point (the camera aims there).
+        let idx = (cam.height / 2) * cam.width + cam.width / 2;
+        assert!(
+            (res.georef.lat[idx] - 39.0).abs() < 1e-4 && (res.georef.lon[idx] - -97.5).abs() < 1e-4,
+            "centre mesh ({}, {}) != the look point",
+            res.georef.lat[idx],
+            res.georef.lon[idx]
+        );
+    }
+
+    #[test]
+    fn perspective_cloud_layer_only_is_alpha_true_and_clear_transparent() {
+        // The cold-top source (a thick high cloud over the domain): the layer-only
+        // variant is premultiplied cloud RGBA — real alpha where rays cross the cloud.
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        p.perspective = Some(oblique_camera());
+        let cloudy =
+            render_perspective_scene(&cold_top_source(24, 24, 24, 3000.0), &p, true).unwrap();
+        match &cloudy.data {
+            FrameData::Visible { rgba, .. } => {
+                let max_alpha = rgba.chunks_exact(4).map(|px| px[3]).max().unwrap();
+                assert!(
+                    max_alpha > 200,
+                    "a thick cloud should be near-opaque in the layer: {max_alpha}"
+                );
+            }
+            other => panic!("expected Visible (layer rgba), got {other:?}"),
+        }
+        assert!(
+            cloudy.ground_source.is_none(),
+            "layer-only renders no ground"
+        );
+        assert_eq!(cloudy.georef.camera_pose, Some(oblique_camera()));
+        // A CLEAR scene through the same camera: exactly transparent everywhere.
+        let clear =
+            render_perspective_scene(&synthetic_source(24, 24, 24, 3000.0), &p, true).unwrap();
+        match &clear.data {
+            FrameData::Visible { rgba, .. } => {
+                assert!(
+                    rgba.iter().all(|&v| v == 0),
+                    "a clear layer-only frame must be exactly transparent"
+                );
+            }
+            other => panic!("expected Visible (layer rgba), got {other:?}"),
         }
     }
 }

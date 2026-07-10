@@ -10,7 +10,7 @@ exclude = ["crates/simsat_py"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/simsat"
@@ -76,6 +76,15 @@ rfd = { version = "0.15", default-features = false, features = [
 
 # wrfout reading (WrfFile::read_var streaming) — separate wrf-rust repo.
 wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "f05758d9b8ea0132ea8b9767882396cbc5b2cfac", package = "wrf-core" }
+
+# GRIB2 decode for the HRRR/RRFS operational-model ingest (`simsat::ingest_grib`).
+# The SAME pinned rusty-weather rev as the rw-* crates above (it lives at
+# vendor/grib-core in that monorepo; BowEcho pins it identically for its GRIB1
+# import). default-features = false: the probed operational files use only data
+# templates 5.0/5.2/5.3 (complex packing + spatial differencing) — see
+# notes/grib-probe/probe_{hrrr,rrfs}.log — so the jpeg2000/png codec features
+# (openjp2 / png crates) never need to build.
+grib-core = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a", default-features = false }
 
 # netcrust depends on `hdf5-reader` by crates.io name; redirect it to the
 # rusty-weather git version (same as BowEcho's workspace patch).

@@ -24,13 +24,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use simsat::atmosphere::OutputTransform;
-use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
+use simsat::camera::{ResolutionMode, SatellitePreset};
 use simsat::clouds::StepQuality;
 use simsat::derived::DerivedField;
 use simsat::ir_enhance::IrEnhancement;
 use simsat::wv::WvBand;
 
-use crate::RenderMode;
+use crate::{RenderMode, StudioView};
 
 /// Maximum entries kept in the recent-files list.
 pub const RECENT_CAP: usize = 8;
@@ -101,6 +101,15 @@ pub struct StudioSettings {
     pub bm_allow_download: bool,
     pub play_fps: f32,
     pub frame_cap: usize,
+    /// Perspective (3-D) orbit camera: azimuth / tilt / range / fov + output dims
+    /// (see `pipeline::OrbitParams`). Persisted so the owner's framing survives a
+    /// restart; sanitized to the UI slider ranges on load.
+    pub orbit_az_deg: f32,
+    pub orbit_tilt_deg: f32,
+    pub orbit_range_km: f32,
+    pub orbit_fov_deg: f32,
+    pub persp_width: u32,
+    pub persp_height: u32,
     pub recent: Vec<RecentEntry>,
 }
 
@@ -111,7 +120,7 @@ impl Default for StudioSettings {
             store_root: None,
             sat: sat_token(SatellitePreset::GoesEast).to_string(),
             resolution: resolution_token(ResolutionMode::Native).to_string(),
-            view: view_token(ViewMode::Geostationary).to_string(),
+            view: view_token(StudioView::Geostationary).to_string(),
             mode: mode_token(RenderMode::Visible).to_string(),
             ir_enhancement: enhancement_token(IrEnhancement::default()).to_string(),
             output_transform: output_transform_token(OutputTransform::AbiReflectance).to_string(),
@@ -127,6 +136,14 @@ impl Default for StudioSettings {
             bm_allow_download: true,
             play_fps: 8.0,
             frame_cap: 120,
+            // Orbit defaults: from the south at a 30-deg oblique, 300 km out, a
+            // 45-deg horizontal FOV, 720p output (the hero-shot framing family).
+            orbit_az_deg: 180.0,
+            orbit_tilt_deg: 30.0,
+            orbit_range_km: 300.0,
+            orbit_fov_deg: 45.0,
+            persp_width: 1280,
+            persp_height: 720,
             recent: Vec::new(),
         }
     }
@@ -152,6 +169,14 @@ impl StudioSettings {
         self.exposure = clamp_finite(self.exposure, 0.25, 4.0, d.exposure);
         self.play_fps = clamp_finite(self.play_fps, 1.0, 30.0, d.play_fps);
         self.frame_cap = self.frame_cap.clamp(8, 480);
+        // Perspective orbit params: the UI slider ranges (the render-time mapping
+        // additionally clamps range to the domain-derived bounds).
+        self.orbit_az_deg = clamp_finite(self.orbit_az_deg, 0.0, 360.0, d.orbit_az_deg);
+        self.orbit_tilt_deg = clamp_finite(self.orbit_tilt_deg, 5.0, 85.0, d.orbit_tilt_deg);
+        self.orbit_range_km = clamp_finite(self.orbit_range_km, 10.0, 5000.0, d.orbit_range_km);
+        self.orbit_fov_deg = clamp_finite(self.orbit_fov_deg, 15.0, 120.0, d.orbit_fov_deg);
+        self.persp_width = self.persp_width.clamp(2, 4096);
+        self.persp_height = self.persp_height.clamp(2, 4096);
         if self.bm_month_override > 12 {
             self.bm_month_override = 0;
         }
@@ -222,15 +247,16 @@ pub fn resolution_from_token(t: &str) -> Option<ResolutionMode> {
         .find(|r| resolution_token(*r) == t)
 }
 
-pub fn view_token(v: ViewMode) -> &'static str {
+pub fn view_token(v: StudioView) -> &'static str {
     match v {
-        ViewMode::Geostationary => "geo",
-        ViewMode::TopDownMap => "topdown",
+        StudioView::Geostationary => "geo",
+        StudioView::TopDownMap => "topdown",
+        StudioView::Perspective => "perspective",
     }
 }
 
-pub fn view_from_token(t: &str) -> Option<ViewMode> {
-    ViewMode::ALL.into_iter().find(|v| view_token(*v) == t)
+pub fn view_from_token(t: &str) -> Option<StudioView> {
+    StudioView::ALL.into_iter().find(|v| view_token(*v) == t)
 }
 
 pub fn mode_token(m: RenderMode) -> &'static str {
@@ -382,7 +408,7 @@ mod tests {
         for r in ResolutionMode::ALL {
             assert_eq!(resolution_from_token(resolution_token(r)), Some(r));
         }
-        for v in ViewMode::ALL {
+        for v in StudioView::ALL {
             assert_eq!(view_from_token(view_token(v)), Some(v));
         }
         for m in RenderMode::ALL {
@@ -441,6 +467,10 @@ mod tests {
             bm_month_override: 13,
             sat: "geostationary-9".to_string(),
             mode: "x-ray".to_string(),
+            orbit_tilt_deg: 90.0,
+            orbit_range_km: f32::NAN,
+            persp_width: 100_000,
+            persp_height: 0,
             ..Default::default()
         };
         s.sanitize();
@@ -452,6 +482,11 @@ mod tests {
         assert_eq!(s.bm_month_override, 0);
         assert_eq!(s.sat, StudioSettings::default().sat);
         assert_eq!(s.mode, StudioSettings::default().mode);
+        // Perspective orbit fields clamp to the slider ranges (NaN -> the default).
+        assert_eq!(s.orbit_tilt_deg, 85.0);
+        assert_eq!(s.orbit_range_km, StudioSettings::default().orbit_range_km);
+        assert_eq!(s.persp_width, 4096);
+        assert_eq!(s.persp_height, 2);
         // Idempotent.
         let once = s.clone();
         s.sanitize();

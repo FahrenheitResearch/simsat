@@ -231,9 +231,10 @@ pub fn edge_feather(fi: f64, fj: f64, nx: usize, ny: usize, band_cells: f64) -> 
 // is a granular carpet of sub-grid elements. GRANULATION represents that unresolved
 // variability by a SUBTRACT-ONLY, deterministic EROSION of the sampled extinction:
 //
-//   sigma' = sigma * m(d, e),  m = remap-style multiplier (Nubis/Decima lineage),
+//   sigma' = sigma * B(m(d, e)),  m = remap-style multiplier (Nubis/Decima lineage),
+//   B      = the BIMODAL carve shape (round 2): gap-or-grain, see GRAN_BIMODAL_*,
 //   d = sigma / (trilinear-corner-neighbourhood max)  — the RELATIVE density,
-//   e = amplitude/GRAN_AMP_CAP * gate * noise         — the erosion threshold,
+//   e = amplitude/GRAN_AMP_CAP * gate * coherence * noise  — the erosion threshold,
 //
 // where `noise` is a 3-octave 2-D WORLEY (cellular) F1 field — cumulus morphology per
 // the Nubis/Decima detail-erosion lineage (Schneider, "The Real-Time Volumetric
@@ -242,11 +243,36 @@ pub fn edge_feather(fi: f64, fj: f64, nx: usize, ny: usize, band_cells: f64) -> 
 // 1996, JAS 53; the 3DCLOUD realism criterion: Szczap et al. 2014, GMD 7), base cell
 // scale a few hundred metres to ~1 km (the dominant element scale of the observed
 // cloud-size distribution, power-law exponent ~1.66: Wood & Field 2011, J. Climate 24).
+// The sample coordinates are DOMAIN-WARPED (round 2) by a low-frequency value noise
+// from the same hash family before the Worley octaves, so cell size/spacing varies
+// smoothly across the scene instead of reading as a mechanical uniform lattice at
+// domain scale (see GRAN_WARP_*).
 // The noise is 2-D (horizontal) so grains are vertically-coherent COLUMNS, the honest
 // morphology of boundary-layer elements, and it is anchored DETERMINISTICALLY in
 // brick/world space (position-hash cells, the hash01_position style): the same run
 // renders the same field every frame (loops do not shimmer) and the geostationary and
 // top-down views agree exactly (both sample by fractional brick coordinates).
+//
+// `coherence` (round 2, the DECK-COHERENCE GATE) is a per-COLUMN 2-D field built once
+// per composite from the volume itself ([`GranCoherence::build`]): granulation is
+// applied only where the local NEIGHBOURHOOD is genuinely BROKEN/partial cloud. A
+// spatially coherent deck — near-total cloud fill AND low resolved column-tau
+// variability over the 15x15-cell DECK-SCALE window (~45 km at 3 km dx; a band
+// sheet is locally filled at 7x7 but never at deck scale) — is a SOLID CORE; the
+// gate closes granulation over every core and (via a distance-tapered dilation)
+// over the deck's MARGINS, so a stratiform sheet stays closed everywhere while
+// broken-cu / confluence-band regions keep full granulation. This is the FSD literature's regime dependence made explicit (Boutle
+// et al. 2014, QJRMS 140: fractional standard deviation of liquid falls toward
+// overcast; Shonk et al. 2010): the represented sub-grid variability is LARGE in
+// broken regimes and SMALL inside solid stratiform — round 1 applied one amplitude
+// everywhere and peppered deck interiors/margins with pinholes (the owner's "cheese
+// grater"), which the interior-protection window alone could not stop because
+// moderate-thickness rings around an optical core legitimately sit at d < 0.75.
+// The same field also carries the OPTICAL-THINNESS standdown (owner round-2
+// addendum): where the neighbourhood-max eligible tau is small (a regionally
+// translucent veil) granulation stands down and the honest transmittance gradient
+// carries the wispy look; erosion earns its keep only on optically substantial,
+// unresolved broken cloud (see GRAN_THIN_TAU_LO/HI).
 //
 // HONESTY CONTRACT (each point is test-pinned):
 //   - SUBTRACT-ONLY: sigma' <= sigma everywhere; sigma = 0 stays 0 — the erosion never
@@ -284,6 +310,11 @@ pub fn edge_feather(fi: f64, fj: f64, nx: usize, ny: usize, band_cells: f64) -> 
 // march ([`MarchConfig::granulation`]) AND the sun-OD map accumulation
 // ([`accumulate_sun_od_granulated`]), so every march of one composite samples the SAME
 // eroded field (clouds, their self-shadows and their ground shadows stay consistent).
+// The DECK-COHERENCE field rides the [`SunOdMap`] (`gran_coherence`): the sun-OD
+// accumulation is the one per-composite call that receives BOTH the volume and the
+// granulation value from every render assembly (api + studio), so it builds the
+// coherence once, applies it to its own accumulation, and carries it to the marches
+// through [`CloudScene::sun_od`] — the assemblies themselves stay untouched.
 // The occupancy mip is built from the UN-ERODED field — erosion only reduces extinction,
 // so the mip stays conservative. `tau_up` (an ingest-time column integral) is NOT eroded
 // (it feeds only the cloud-ambient attenuation; a documented second-order approximation).
@@ -339,9 +370,13 @@ pub const GRAN_HEIGHT_ZERO_M: f64 = 7000.0;
 /// BORDER network (the carved gaps between grains) — the grain/gap bimodality that
 /// makes the erosion granulate instead of uniformly dimming, and what keeps the mean
 /// reduction inside the Cahalan bound (the eroded area fraction is the W-tail).
-pub const GRAN_CARVE_LO: f64 = 0.52;
+/// Round-2 retune 0.52/0.62 -> 0.46/0.58: the bimodal carve restores the broad
+/// partial-erosion halo that round 1's carpet texture leaned on, so the gap NETWORK
+/// itself must be wider for grains to read as separated elements; the Cahalan
+/// mean-tau bound is re-verified by test at this width.
+pub const GRAN_CARVE_LO: f64 = 0.46;
 /// See [`GRAN_CARVE_LO`].
-pub const GRAN_CARVE_HI: f64 = 0.62;
+pub const GRAN_CARVE_HI: f64 = 0.58;
 /// INTERIOR-PROTECTION window on the RELATIVE density `d` (round-1 QA lever): the
 /// erosion threshold is scaled by `1 - smoothstep(GRAN_INTERIOR_LO,
 /// GRAN_INTERIOR_HI, d)`, so a sample at `d >= GRAN_INTERIOR_HI` never erodes and
@@ -354,6 +389,96 @@ pub const GRAN_CARVE_HI: f64 = 0.62;
 pub const GRAN_INTERIOR_LO: f64 = 0.45;
 /// See [`GRAN_INTERIOR_LO`].
 pub const GRAN_INTERIOR_HI: f64 = 0.75;
+
+// ── round-2 tuning: DECK-COHERENCE GATE / BIMODAL CARVE / DOMAIN WARP ─────────
+
+/// The neighbourhood window side (cells) of the OPTICAL-THINNESS measure — the
+/// model's unresolved scale, ~7 dx (Skamarock 2004 effective resolution). Odd;
+/// radius 3.
+pub const GRAN_COHERENCE_WINDOW_CELLS: usize = 7;
+/// The SOLID-CORE window side (cells): a deck must be filled AND uniform over this
+/// much larger scale (~15 dx = 45 km at 3 km) to close granulation. The first
+/// round-2 render used the 7x7 unresolved-scale window here and the core test
+/// fired INSIDE confluence-band sheets (locally filled/uniform 7x7 patches exist
+/// all through a band field), stamping protection squares across the exact region
+/// the owner wants granular — a real stratiform deck distinguishes itself from an
+/// unresolved-cu sheet by coherence over tens of km, not one effective-resolution
+/// cell. Odd; radius 7.
+pub const GRAN_COHERENCE_CORE_WINDOW_CELLS: usize = 15;
+/// A column counts as CLOUD for the neighbourhood fill fraction when its
+/// granulation-eligible (liquid, height-gated) optical depth exceeds this. Low on
+/// purpose: soft deck fringes (tau well below optical thickness) must count as part
+/// of the deck's mass so a margin window reads FULL, not broken.
+pub const GRAN_COHERENCE_TAU_CLOUDY: f64 = 0.25;
+/// SOLID-CORE fill window: a 7x7 neighbourhood is a solid core only when its cloud
+/// fill fraction rises through this band toward total ([`GRAN_COHERENCE_FILL_HI`]).
+pub const GRAN_COHERENCE_FILL_LO: f64 = 0.85;
+/// See [`GRAN_COHERENCE_FILL_LO`].
+pub const GRAN_COHERENCE_FILL_HI: f64 = 0.97;
+/// SOLID-CORE uniformity window on the RESOLVED column-tau fractional standard
+/// deviation (std/mean over the 7x7 window): a filled-but-internally-variable
+/// convective sheet (fsd well above this) is NOT a coherent deck and keeps
+/// granulating; a smooth stratiform deck (fsd below) is. The regime split is the
+/// FSD literature's (Boutle et al. 2014: overcast fsd ~0.2-0.4, broken ~0.7-1+).
+pub const GRAN_COHERENCE_FSD_LO: f64 = 0.40;
+/// See [`GRAN_COHERENCE_FSD_LO`].
+pub const GRAN_COHERENCE_FSD_HI: f64 = 0.75;
+/// OPTICAL-THINNESS standdown (owner round-2 addendum): where the neighbourhood is
+/// optically THIN (7x7-window MAX eligible column tau at/below this), granulation
+/// stands down entirely — a translucent veil already gets its wispy texture from the
+/// honest transmittance gradient of the physics; erosion there reads as dark specks
+/// in grey, never as grains. Granulation earns its keep only on optically
+/// SUBSTANTIAL-but-unresolved broken cloud (window max at/above
+/// [`GRAN_THIN_TAU_HI`], smoothstep between). Keyed on the neighbourhood MAX (not
+/// the point column) so the thin trilinear SKIRT of a thick element still carves —
+/// its neighbourhood is substantial; only regionally-thin veils stand down.
+pub const GRAN_THIN_TAU_LO: f64 = 0.5;
+/// See [`GRAN_THIN_TAU_LO`].
+pub const GRAN_THIN_TAU_HI: f64 = 2.5;
+/// CORE-REGION EROSION radius (cells, Chebyshev min-filter on the solid-core
+/// strength): a core counts only if it is INTERIOR to a coherent core REGION —
+/// with the core window this demands deck coherence over ~(15 + 2x4) = 23 cells
+/// (~70 km at 3 km dx). An isolated deck-scale patch that barely qualifies inside a
+/// broken-cu field is part of the broken REGIME (the first 15x15 retune stamped
+/// protection squares on 45-60 km patches all through the confluence bands; radius
+/// 2 still left the larger ones); a real stratiform deck is coherent over hundreds
+/// of km and survives easily.
+pub const GRAN_CORE_ERODE_CELLS: usize = 4;
+/// Deck-margin protection reach (cells, Chebyshev — the core window's own metric, so
+/// deck corners are covered exactly like edges): a column within this distance of an
+/// ERODED solid-core centre is FULLY closed (the dilation that keeps a coherent
+/// deck's soft margins closed). Eroded cores sit >= core-window-radius (7) + the
+/// erosion (4) + the physical fringe width (~2 cells) inside the cloudy mask, and
+/// the protection must also cover the first CLEAR column past the fringe (the
+/// trilinear tent between the last cloudy column and it carries real extinction and
+/// reads the gate bilinearly) — hence 7 + 4 + 2 + 1 = 14.
+pub const GRAN_PROTECT_FULL_CELLS: f64 = 14.0;
+/// Protection tapers smoothly from full at [`GRAN_PROTECT_FULL_CELLS`] to none here
+/// (no hard granulated/closed seam next to a deck).
+pub const GRAN_PROTECT_ZERO_CELLS: f64 = 19.0;
+/// BIMODAL CARVE (round 2): the remap multiplier `m` is reshaped grain-or-gap by
+/// `smoothstep(GRAN_BIMODAL_GAP, GRAN_BIMODAL_GRAIN, m)` — at/below the GAP point the
+/// sample carves to CLEAR, at/above the GRAIN point it is restored to FULL extinction
+/// (still `<=` the raw sample: subtract-only holds by construction), and the
+/// half-eroded middle band that read as translucent GREY mush is squeezed into a
+/// steep transition. Real high-sun cu fields are high-contrast (white grain / clear
+/// gap), not translucent; round 1's plain remap left most eroded samples mid-band.
+pub const GRAN_BIMODAL_GAP: f64 = 0.25;
+/// See [`GRAN_BIMODAL_GAP`].
+pub const GRAN_BIMODAL_GRAIN: f64 = 0.65;
+/// DOMAIN WARP (round 2): the Worley sample position is displaced by a smooth
+/// low-frequency value noise (same deterministic hash family) with this correlation
+/// scale (m) ...
+pub const GRAN_WARP_SCALE_M: f64 = 4000.0;
+/// ... and this maximum displacement (m, per axis). The warp gradient (~2 x amp /
+/// scale) locally stretches/compresses/shears the cell lattice ~30-60%, so grain
+/// size and spacing vary across the scene — the uniform cell spacing is what read
+/// as mechanical ("cheese grater") at domain scale. Deterministic, view-agnostic.
+pub const GRAN_WARP_AMP_M: f64 = 1300.0;
+/// Hash salts of the warp's two displacement channels (fixed, arbitrary).
+pub const GRAN_WARP_SALT_U: u32 = 0x1B56_C4E9;
+/// See [`GRAN_WARP_SALT_U`].
+pub const GRAN_WARP_SALT_V: u32 = 0x7A99_1E3D;
 
 /// Sub-grid granulation parameters carried by [`MarchConfig::granulation`] and
 /// [`accumulate_sun_od_granulated`]. `None` anywhere = the feature fully off
@@ -444,13 +569,44 @@ fn worley2_f1(qx: f64, qy: f64, salt: u32) -> f64 {
     best.sqrt().clamp(0.0, 1.0)
 }
 
+/// Smooth 2-D VALUE NOISE in `[0, 1)`: the cell-corner hashes of the same
+/// deterministic family, blended with a smoothstep interpolant (C1). Low-frequency
+/// input for the domain warp.
+fn gran_value_noise(qx: f64, qy: f64, salt: u32) -> f64 {
+    let bx = qx.floor();
+    let by = qy.floor();
+    let (ix, iy) = (bx as i64, by as i64);
+    let tx = smooth01(qx - bx);
+    let ty = smooth01(qy - by);
+    let h00 = gran_cell_hash01(ix, iy, salt);
+    let h10 = gran_cell_hash01(ix + 1, iy, salt);
+    let h01 = gran_cell_hash01(ix, iy + 1, salt);
+    let h11 = gran_cell_hash01(ix + 1, iy + 1, salt);
+    (h00 * (1.0 - tx) + h10 * tx) * (1.0 - ty) + (h01 * (1.0 - tx) + h11 * tx) * ty
+}
+
+/// The DOMAIN-WARP displacement (m) of the granulation noise at a brick-plane
+/// position (m): two independent smooth value-noise channels ([`GRAN_WARP_SALT_U`] /
+/// [`GRAN_WARP_SALT_V`]) at correlation scale [`GRAN_WARP_SCALE_M`], each mapped to
+/// `[-GRAN_WARP_AMP_M, GRAN_WARP_AMP_M]`. Deterministic and view-agnostic (a pure
+/// function of the position, like the erosion noise it feeds); its smooth gradient
+/// is what varies the Worley cell size/spacing across the scene.
+pub fn granulation_warp_offset(u_m: f64, v_m: f64) -> (f64, f64) {
+    let qx = u_m / GRAN_WARP_SCALE_M;
+    let qy = v_m / GRAN_WARP_SCALE_M;
+    let du = GRAN_WARP_AMP_M * (2.0 * gran_value_noise(qx, qy, GRAN_WARP_SALT_U) - 1.0);
+    let dv = GRAN_WARP_AMP_M * (2.0 * gran_value_noise(qx, qy, GRAN_WARP_SALT_V) - 1.0);
+    (du, dv)
+}
+
 /// The GRANULATION EROSION FIELD at a horizontal position (m) in the brick plane:
-/// the k^-5/3-weighted 3-octave Worley F1 ([`GRAN_OCTAVE_SCALES_M`] /
-/// [`GRAN_OCTAVE_WEIGHTS`]) tail-shaped through `smoothstep(GRAN_CARVE_LO,
-/// GRAN_CARVE_HI, W)` into `[0, 1]`: 0 over grain interiors (no erosion), 1 on the
-/// carved gap network. Pure and deterministic in the position (memoised per thread
-/// for the exact repeated `(u, v)` a nadir top-down column produces — a bit-exact
-/// cache, never an approximation).
+/// the position is first DOMAIN-WARPED ([`granulation_warp_offset`] — round 2, cell
+/// size/spacing varies across the scene), then the k^-5/3-weighted 3-octave Worley
+/// F1 ([`GRAN_OCTAVE_SCALES_M`] / [`GRAN_OCTAVE_WEIGHTS`]) is tail-shaped through
+/// `smoothstep(GRAN_CARVE_LO, GRAN_CARVE_HI, W)` into `[0, 1]`: 0 over grain
+/// interiors (no erosion), 1 on the carved gap network. Pure and deterministic in
+/// the position (memoised per thread for the exact repeated `(u, v)` a nadir
+/// top-down column produces — a bit-exact cache, never an approximation).
 pub fn granulation_erosion_noise(u_m: f64, v_m: f64) -> f64 {
     thread_local! {
         static MEMO: std::cell::Cell<(u64, u64, f64)> =
@@ -461,10 +617,12 @@ pub fn granulation_erosion_noise(u_m: f64, v_m: f64) -> f64 {
     if hit.2 >= 0.0 && hit.0 == key.0 && hit.1 == key.1 {
         return hit.2;
     }
+    let (du, dv) = granulation_warp_offset(u_m, v_m);
+    let (uw, vw) = (u_m + du, v_m + dv);
     let mut w = 0.0f64;
     for i in 0..GRAN_OCTAVE_SCALES_M.len() {
         let lam = GRAN_OCTAVE_SCALES_M[i];
-        w += GRAN_OCTAVE_WEIGHTS[i] * worley2_f1(u_m / lam, v_m / lam, GRAN_OCTAVE_SALTS[i]);
+        w += GRAN_OCTAVE_WEIGHTS[i] * worley2_f1(uw / lam, vw / lam, GRAN_OCTAVE_SALTS[i]);
     }
     let e = smooth01((w.clamp(0.0, 1.0) - GRAN_CARVE_LO) / (GRAN_CARVE_HI - GRAN_CARVE_LO));
     MEMO.with(|m| m.set((key.0, key.1, e)));
@@ -512,6 +670,322 @@ pub fn granulation_multiplier(rel_density: f64, erosion: f64) -> f64 {
     }
     let e = erosion.min(GRAN_EROSION_MAX);
     (((d - e).max(0.0)) / (d * (1.0 - e))).clamp(0.0, 1.0)
+}
+
+/// The BIMODAL CARVE shape (round 2) applied to the remap multiplier:
+/// `smoothstep(GRAN_BIMODAL_GAP, GRAN_BIMODAL_GRAIN, m)`. Monotone `[0,1] -> [0,1]`
+/// with `B(0) = 0` and `B(1) = 1`; at/below the GAP point the sample carves to CLEAR,
+/// at/above the GRAIN point it is RESTORED to the full raw extinction (`B(m) <= 1`,
+/// so the eroded sample never exceeds the raw one — subtract-only holds), and the
+/// half-eroded middle that rendered as translucent grey mush is squeezed into a steep
+/// transition (grain-or-gap, the high-contrast look of a real high-sun cu field).
+pub fn granulation_bimodal(m: f64) -> f64 {
+    smooth01((m.clamp(0.0, 1.0) - GRAN_BIMODAL_GAP) / (GRAN_BIMODAL_GRAIN - GRAN_BIMODAL_GAP))
+}
+
+/// The per-column DECK-COHERENCE GATE (round 2): `1.0` where the neighbourhood at the
+/// unresolved scale is genuinely broken/partial cloud (granulate freely), `0.0` over
+/// a spatially coherent deck AND its margins (stay closed). Built ONCE per composite
+/// from the volume by [`accumulate_sun_od_granulated`] and carried to the marches on
+/// the [`SunOdMap`] (`gran_coherence`) so every march of the composite reads the same
+/// field. Pure function of the volume: deterministic, identical for the geostationary
+/// and top-down views.
+///
+/// Construction (see the granulation section header for the science):
+/// 1. Per column: the granulation-ELIGIBLE optical depth (liquid extinction through
+///    the height ramp, vertically integrated).
+/// 2. Per column, over the 15x15-cell DECK-SCALE window
+///    ([`GRAN_COHERENCE_CORE_WINDOW_CELLS`]): the cloud FILL fraction (columns above
+///    [`GRAN_COHERENCE_TAU_CLOUDY`]) and the resolved column-tau fractional standard
+///    deviation (std/mean).
+/// 3. SOLID CORE strength = `smoothstep(fill)` x `1 - smoothstep(fsd)` — filled AND
+///    uniform (a stratiform deck) over tens of km, not filled-but-variable or
+///    merely locally-filled (a convective / unresolved-cu sheet) — then ERODED by a
+///    min-filter ([`GRAN_CORE_ERODE_CELLS`]): a core must be interior to a coherent
+///    core REGION, so an isolated deck-scale patch inside a broken field stays part
+///    of the broken regime.
+/// 4. OPTICAL-THINNESS standdown: a smooth ramp of the window MAX eligible tau
+///    ([`GRAN_THIN_TAU_LO`]/[`GRAN_THIN_TAU_HI`]) — regionally-translucent veils
+///    already read wispy through the honest transmittance gradient, so granulation
+///    stands down there (erosion on a veil is dark specks in grey, not grains).
+/// 5. Gate = thinness x (`1 -` the distance-tapered max of core strength within
+///    [`GRAN_PROTECT_ZERO_CELLS`], full protection inside
+///    [`GRAN_PROTECT_FULL_CELLS`]) — the dilation that keeps deck MARGINS closed.
+#[derive(Debug, Clone)]
+pub struct GranCoherence {
+    nx: usize,
+    ny: usize,
+    gate: Vec<f32>,
+}
+
+impl GranCoherence {
+    /// Build the gate field from a decoded volume (see the type docs).
+    pub fn build(vol: &DecodedVolume) -> Self {
+        let (nx, ny, nz) = (vol.nx, vol.ny, vol.nz);
+        let n = nx * ny;
+        if n == 0 {
+            return Self {
+                nx,
+                ny,
+                gate: Vec::new(),
+            };
+        }
+        // 1. Granulation-eligible column optical depth (liquid x height ramp).
+        let mut tau = vec![0.0f64; n];
+        for k in 0..nz {
+            let z = vol.z_min_m + k as f64 * vol.dz_m;
+            if z >= GRAN_HEIGHT_ZERO_M {
+                break; // layers are ascending in z; nothing eligible above
+            }
+            let ramp = 1.0
+                - smooth01((z - GRAN_HEIGHT_FULL_M) / (GRAN_HEIGHT_ZERO_M - GRAN_HEIGHT_FULL_M));
+            let plane = &vol.ext_liquid[k * n..(k + 1) * n];
+            for (t, &e) in tau.iter_mut().zip(plane.iter()) {
+                *t += e as f64 * ramp * vol.dz_m;
+            }
+        }
+        // 2. Window stats via summed-area tables (exact box sums, edge-clamped).
+        let sat = |f: &dyn Fn(usize) -> f64| -> Vec<f64> {
+            let w = nx + 1;
+            let mut s = vec![0.0f64; w * (ny + 1)];
+            for j in 0..ny {
+                let mut row = 0.0f64;
+                for i in 0..nx {
+                    row += f(j * nx + i);
+                    s[(j + 1) * w + (i + 1)] = s[j * w + (i + 1)] + row;
+                }
+            }
+            s
+        };
+        let sat_fill = sat(&|c| {
+            if tau[c] >= GRAN_COHERENCE_TAU_CLOUDY {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        let sat_tau = sat(&|c| tau[c]);
+        let sat_tau2 = sat(&|c| tau[c] * tau[c]);
+        // The SOLID-CORE stats window (15x15, deck scale) and the THINNESS window
+        // (7x7, the unresolved scale) — see the constants for why they differ.
+        let r_core = GRAN_COHERENCE_CORE_WINDOW_CELLS / 2;
+        let r = GRAN_COHERENCE_WINDOW_CELLS / 2;
+        let box_sum = |s: &[f64], i0: usize, i1: usize, j0: usize, j1: usize| -> f64 {
+            let w = nx + 1;
+            s[(j1 + 1) * w + (i1 + 1)] + s[j0 * w + i0]
+                - s[j0 * w + (i1 + 1)]
+                - s[(j1 + 1) * w + i0]
+        };
+        // 3. Solid-core strength per column (rows in parallel, flattened in order).
+        let solid_rows: Vec<Vec<f32>> = (0..ny)
+            .into_par_iter()
+            .map(|j| {
+                let j0 = j.saturating_sub(r_core);
+                let j1 = (j + r_core).min(ny - 1);
+                (0..nx)
+                    .map(|i| {
+                        let i0 = i.saturating_sub(r_core);
+                        let i1 = (i + r_core).min(nx - 1);
+                        let count = ((i1 + 1 - i0) * (j1 + 1 - j0)) as f64;
+                        let fill = box_sum(&sat_fill, i0, i1, j0, j1) / count;
+                        let fill_term = smooth01(
+                            (fill - GRAN_COHERENCE_FILL_LO)
+                                / (GRAN_COHERENCE_FILL_HI - GRAN_COHERENCE_FILL_LO),
+                        );
+                        if fill_term <= 0.0 {
+                            return 0.0f32;
+                        }
+                        let mean = box_sum(&sat_tau, i0, i1, j0, j1) / count;
+                        if mean <= 1.0e-9 {
+                            return 0.0f32;
+                        }
+                        let var =
+                            (box_sum(&sat_tau2, i0, i1, j0, j1) / count - mean * mean).max(0.0);
+                        let fsd = var.sqrt() / mean;
+                        let uniform_term = 1.0
+                            - smooth01(
+                                (fsd - GRAN_COHERENCE_FSD_LO)
+                                    / (GRAN_COHERENCE_FSD_HI - GRAN_COHERENCE_FSD_LO),
+                            );
+                        (fill_term * uniform_term) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut solid_raw = Vec::with_capacity(n);
+        for row in solid_rows {
+            solid_raw.extend(row);
+        }
+        // 3b. CORE-REGION EROSION (min-filter): a core must be INTERIOR to a coherent
+        // core region — isolated deck-scale stamps inside a broken field die here.
+        let re = GRAN_CORE_ERODE_CELLS;
+        let solid: Vec<f32> = {
+            let eroded_rows: Vec<Vec<f32>> = (0..ny)
+                .into_par_iter()
+                .map(|j| {
+                    let j0 = j.saturating_sub(re);
+                    let j1 = (j + re).min(ny - 1);
+                    (0..nx)
+                        .map(|i| {
+                            let i0 = i.saturating_sub(re);
+                            let i1 = (i + re).min(nx - 1);
+                            let mut m = 1.0f32;
+                            for jj in j0..=j1 {
+                                for ii in i0..=i1 {
+                                    let s = solid_raw[jj * nx + ii];
+                                    if s < m {
+                                        m = s;
+                                    }
+                                }
+                            }
+                            m
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut v = Vec::with_capacity(n);
+            for row in eroded_rows {
+                v.extend(row);
+            }
+            v
+        };
+        // 4. OPTICAL-THINNESS standdown (owner round-2 addendum): the 7x7-window MAX
+        // eligible tau through the smooth ramp — regionally-thin translucent veils
+        // stand down (their wispy look is the honest transmittance gradient); the
+        // thin skirt of a SUBSTANTIAL element keeps carving (window max is high).
+        let thin_rows: Vec<Vec<f32>> = (0..ny)
+            .into_par_iter()
+            .map(|j| {
+                let j0 = j.saturating_sub(r);
+                let j1 = (j + r).min(ny - 1);
+                (0..nx)
+                    .map(|i| {
+                        let i0 = i.saturating_sub(r);
+                        let i1 = (i + r).min(nx - 1);
+                        let mut wmax = 0.0f64;
+                        for jj in j0..=j1 {
+                            for ii in i0..=i1 {
+                                let t = tau[jj * nx + ii];
+                                if t > wmax {
+                                    wmax = t;
+                                }
+                            }
+                        }
+                        smooth01((wmax - GRAN_THIN_TAU_LO) / (GRAN_THIN_TAU_HI - GRAN_THIN_TAU_LO))
+                            as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut thin = Vec::with_capacity(n);
+        for row in thin_rows {
+            thin.extend(row);
+        }
+        // 5. Distance-tapered dilation: protection = max of solid x taper(distance);
+        // gate = thinness x (1 - protection).
+        let reach = GRAN_PROTECT_ZERO_CELLS.ceil() as usize;
+        let any_solid = solid.iter().any(|&s| s > 0.0);
+        let gate: Vec<f32> = if !any_solid {
+            thin
+        } else {
+            let gate_rows: Vec<Vec<f32>> = (0..ny)
+                .into_par_iter()
+                .map(|j| {
+                    (0..nx)
+                        .map(|i| {
+                            let thin_here = thin[j * nx + i] as f64;
+                            if thin_here <= 0.0 {
+                                return 0.0f32;
+                            }
+                            let j_lo = j.saturating_sub(reach);
+                            let j_hi = (j + reach).min(ny - 1);
+                            let i_lo = i.saturating_sub(reach);
+                            let i_hi = (i + reach).min(nx - 1);
+                            let mut protection = 0.0f64;
+                            'scan: for jj in j_lo..=j_hi {
+                                for ii in i_lo..=i_hi {
+                                    let s = solid[jj * nx + ii] as f64;
+                                    // s is an upper bound of s * taper: skip fast.
+                                    if s <= protection {
+                                        continue;
+                                    }
+                                    let d = (ii as i64 - i as i64)
+                                        .unsigned_abs()
+                                        .max((jj as i64 - j as i64).unsigned_abs())
+                                        as f64;
+                                    let taper = 1.0
+                                        - smooth01(
+                                            (d - GRAN_PROTECT_FULL_CELLS)
+                                                / (GRAN_PROTECT_ZERO_CELLS
+                                                    - GRAN_PROTECT_FULL_CELLS),
+                                        );
+                                    protection = protection.max(s * taper);
+                                    if protection >= 1.0 {
+                                        break 'scan;
+                                    }
+                                }
+                            }
+                            (thin_here * (1.0 - protection)).clamp(0.0, 1.0) as f32
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut gate = Vec::with_capacity(n);
+            for row in gate_rows {
+                gate.extend(row);
+            }
+            gate
+        };
+        Self { nx, ny, gate }
+    }
+
+    /// Bilinear sample of the gate at fractional column coords (clamp-to-edge;
+    /// out-of-domain / non-finite reads the nearest edge column — such samples are
+    /// CLEAR anyway). `1.0` = granulate freely, `0.0` = closed (coherent deck).
+    #[inline]
+    pub fn gate_at(&self, fi: f64, fj: f64) -> f64 {
+        if self.gate.is_empty() {
+            return 1.0;
+        }
+        let fi = if fi.is_finite() {
+            fi.clamp(0.0, (self.nx - 1) as f64)
+        } else {
+            0.0
+        };
+        let fj = if fj.is_finite() {
+            fj.clamp(0.0, (self.ny - 1) as f64)
+        } else {
+            0.0
+        };
+        let i0 = fi.floor() as usize;
+        let j0 = fj.floor() as usize;
+        let i1 = (i0 + 1).min(self.nx - 1);
+        let j1 = (j0 + 1).min(self.ny - 1);
+        let ti = fi - i0 as f64;
+        let tj = fj - j0 as f64;
+        let g = |i: usize, j: usize| self.gate[j * self.nx + i] as f64;
+        let g0 = g(i0, j0) * (1.0 - ti) + g(i1, j0) * ti;
+        let g1 = g(i0, j1) * (1.0 - ti) + g(i1, j1) * ti;
+        g0 * (1.0 - tj) + g1 * tj
+    }
+
+    /// Summary counts over the gate field `(open >= 0.9, partial, closed <= 0.1)` —
+    /// the render-log / QA diagnostic.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let mut open = 0usize;
+        let mut partial = 0usize;
+        let mut closed = 0usize;
+        for &g in &self.gate {
+            if g >= 0.9 {
+                open += 1;
+            } else if g <= 0.1 {
+                closed += 1;
+            } else {
+                partial += 1;
+            }
+        }
+        (open, partial, closed)
+    }
 }
 
 /// Henyey-Greenstein phase (normalised to integrate to 1 over the sphere).
@@ -839,22 +1313,40 @@ impl DecodedVolume {
         self.sample_granulated(fi, fj, fk, None)
     }
 
-    /// [`Self::sample`] with the optional sub-grid GRANULATION erosion applied (see the
-    /// granulation section at the top of this module). `None` is byte-identical to the
-    /// raw trilinear sample (same operations, same order — the off-flag anchor test pins
-    /// it). With `Some`, the three EXTINCTION channels are scaled by the remap-style
-    /// erosion multiplier ([`granulation_multiplier`]) of the sample's relative density
-    /// `d = total / (max total over its 8 trilinear-support corners)` under the
-    /// deterministic erosion field `e = amplitude/GRAN_AMP_CAP * gate *
-    /// interior_protection(d) * noise`; `tau_up` is never eroded (an ingest-time
-    /// column integral — documented approximation).
-    /// Subtract-only: the eroded sample never exceeds the raw one; zero stays zero.
+    /// [`Self::sample_granulated_gated`] WITHOUT a deck-coherence field (coherence
+    /// `None` = gate 1 everywhere). The shipping marches pass the per-composite
+    /// coherence carried on the [`SunOdMap`]; this wrapper serves the pure
+    /// sampler-level tests and any caller without a composite context.
     pub fn sample_granulated(
         &self,
         fi: f64,
         fj: f64,
         fk: f64,
         granulation: Option<Granulation>,
+    ) -> CloudSample {
+        self.sample_granulated_gated(fi, fj, fk, granulation, None)
+    }
+
+    /// [`Self::sample`] with the optional sub-grid GRANULATION erosion applied (see the
+    /// granulation section at the top of this module). `None` is byte-identical to the
+    /// raw trilinear sample (same operations, same order — the off-flag anchor test pins
+    /// it). With `Some`, the three EXTINCTION channels are scaled by the BIMODAL carve
+    /// ([`granulation_bimodal`]) of the remap-style erosion multiplier
+    /// ([`granulation_multiplier`]) of the sample's relative density
+    /// `d = total / (max total over its 8 trilinear-support corners)` under the
+    /// deterministic erosion field `e = amplitude/GRAN_AMP_CAP * gate *
+    /// interior_protection(d) * coherence * noise`, where `coherence` is the
+    /// per-column DECK-COHERENCE gate ([`GranCoherence`]; `None` = 1 everywhere);
+    /// `tau_up` is never eroded (an ingest-time column integral — documented
+    /// approximation).
+    /// Subtract-only: the eroded sample never exceeds the raw one; zero stays zero.
+    pub fn sample_granulated_gated(
+        &self,
+        fi: f64,
+        fj: f64,
+        fk: f64,
+        granulation: Option<Granulation>,
+        coherence: Option<&GranCoherence>,
     ) -> CloudSample {
         if !(fi.is_finite() && fj.is_finite() && fk.is_finite())
             || fi < 0.0
@@ -920,6 +1412,12 @@ impl DecodedVolume {
         if gate <= 0.0 {
             return s;
         }
+        // DECK-COHERENCE gate (round 2, cheap 2-D bilinear): a coherent deck and its
+        // margins skip the erosion (and the noise cost) entirely.
+        let coh = coherence.map_or(1.0, |c| c.gate_at(fi, fj));
+        if coh <= 0.0 {
+            return s;
+        }
         // Relative density vs the trilinear-support neighbourhood max (convexity of the
         // trilerp guarantees d <= 1; total > 0 guarantees corner_max > 0), and the
         // interior protection — both cheap, both before the noise: a solid-deck
@@ -944,11 +1442,13 @@ impl DecodedVolume {
         // view/ray that sampled it).
         let pitch = self.horiz_pitch_m.max(1.0);
         let noise = granulation_erosion_noise(fi * pitch, fj * pitch);
-        let e = (g.amplitude * GRAN_EROSION_GAIN * gate * protection * noise).min(GRAN_EROSION_MAX);
+        let e = (g.amplitude * GRAN_EROSION_GAIN * gate * protection * coh * noise)
+            .min(GRAN_EROSION_MAX);
         if e <= 0.0 {
             return s;
         }
-        let m = granulation_multiplier(d, e);
+        // The remap multiplier through the BIMODAL carve (round 2): gap-or-grain.
+        let m = granulation_bimodal(granulation_multiplier(d, e));
         if m < 1.0 {
             s.ext_liquid *= m;
             s.ext_ice *= m;
@@ -1171,6 +1671,13 @@ pub struct SunOdMap {
     pub od: Vec<f32>,
     /// Extinction-weighted mean occluder slant distance (m) per texel; 0 where clear.
     pub occ_dist: Vec<f32>,
+    /// The per-composite DECK-COHERENCE gate (round-2 granulation; `Some` iff the map
+    /// was accumulated with granulation on). Carried HERE because the sun-OD
+    /// accumulation is the one per-composite call that receives both the volume and
+    /// the granulation value from every render assembly (api + studio), and every
+    /// march reads this map through [`CloudScene::sun_od`] — so all marches of one
+    /// composite share the SAME coherence field with zero assembly changes.
+    pub gran_coherence: Option<GranCoherence>,
     center: [f64; 3],
     au: [f64; 3],
     av: [f64; 3],
@@ -1263,6 +1770,19 @@ pub fn accumulate_sun_od_granulated(
     granulation: Option<Granulation>,
 ) -> SunOdMap {
     let resolution = resolution.max(1);
+    // The per-composite DECK-COHERENCE gate (round 2): built once from the volume,
+    // applied to THIS accumulation and carried to the marches on the returned map.
+    let gran_coherence = granulation
+        .filter(|g| g.amplitude > 0.0)
+        .map(|_| GranCoherence::build(vol));
+    if let Some(c) = &gran_coherence {
+        let (open, partial, closed) = c.stats();
+        crate::log_line!(
+            "simsat clouds: granulation deck-coherence gate: {open} open / {partial} partial / \
+             {closed} closed of {} columns",
+            open + partial + closed
+        );
+    }
     let sun = norm3(sun_ecef);
     let (au, av) = perp_basis(sun);
     let ci = (vol.nx - 1) as f64 / 2.0;
@@ -1298,6 +1818,7 @@ pub fn accumulate_sun_od_granulated(
             height: resolution,
             od: vec![0.0; resolution * resolution],
             occ_dist: vec![0.0; resolution * resolution],
+            gran_coherence,
             center,
             au,
             av,
@@ -1343,7 +1864,9 @@ pub fn accumulate_sun_od_granulated(
                     let t = (step as f64 + 0.5) * ds;
                     let p = madd3(start, sun, -t);
                     let (fi, fj, fk, r) = ecef_to_brick(p, georef, vol.z_min_m, vol.dz_m);
-                    let ext = vol.sample_granulated(fi, fj, fk, granulation).total_ext();
+                    let ext = vol
+                        .sample_granulated_gated(fi, fj, fk, granulation, gran_coherence.as_ref())
+                        .total_ext();
                     if ext > 0.0 {
                         acc += ext * ds;
                         // Slant distance from this occluder sample down to the ground
@@ -1389,6 +1912,7 @@ pub fn accumulate_sun_od_granulated(
         height: resolution,
         od,
         occ_dist,
+        gran_coherence,
         center,
         au,
         av,
@@ -1612,9 +2136,11 @@ pub struct MarchConfig {
     /// at the top of this module). `None` (the [`MarchConfig::new`] default) = off,
     /// byte-identical to the pre-granulation march. When `Some`, BOTH the primary view
     /// march and the secondary sun march sample the eroded field
-    /// ([`DecodedVolume::sample_granulated`]); the render assembly must pass the SAME
-    /// value to [`accumulate_sun_od_granulated`] so the ground shadows agree — every
-    /// march of one composite samples the SAME eroded field.
+    /// ([`DecodedVolume::sample_granulated_gated`]) under the DECK-COHERENCE gate
+    /// carried on [`CloudScene::sun_od`]; the render assembly must pass the SAME
+    /// value to [`accumulate_sun_od_granulated`] so the ground shadows (and the
+    /// coherence field it builds) agree — every march of one composite samples the
+    /// SAME eroded field.
     pub granulation: Option<Granulation>,
 }
 
@@ -1741,15 +2267,17 @@ fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
     let mut tau = 0.0f64;
     let mut dist = 0.0f64;
     let mut ds = base;
+    let coherence = scene.sun_od.gran_coherence.as_ref();
     for _ in 0..n {
         // Sample within the segment (dist .. dist+ds) at the stratified offset,
-        // toward the sun. Samples the SAME (optionally granulated) field as the
-        // primary view march, so cloud self-shadowing matches the eroded cloud.
+        // toward the sun. Samples the SAME (optionally granulated, coherence-gated)
+        // field as the primary view march, so cloud self-shadowing matches the
+        // eroded cloud.
         let pp = madd3(p, scene.sun_ecef, dist + offset * ds);
         let (fi, fj, fk, _) = ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
         tau += scene
             .vol
-            .sample_granulated(fi, fj, fk, cfg.granulation)
+            .sample_granulated_gated(fi, fj, fk, cfg.granulation, coherence)
             .total_ext()
             * ds;
         dist += ds;
@@ -1776,7 +2304,7 @@ fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
                 ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
             tau += scene
                 .vol
-                .sample_granulated(fi, fj, fk, cfg.granulation)
+                .sample_granulated_gated(fi, fj, fk, cfg.granulation, coherence)
                 .total_ext()
                 * half;
             dist += half;
@@ -1855,9 +2383,16 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         }
         let pm = madd3(cam, view, t + 0.5 * ds);
         let (mi, mj, mk, rm) = ecef_to_brick(pm, scene.georef, vol.z_min_m, vol.dz_m);
-        // The (optionally granulated) view sample — the same eroded field the sun
-        // march and the sun-OD map read (MarchConfig::granulation).
-        let sample = vol.sample_granulated(mi, mj, mk, scene.cfg.granulation);
+        // The (optionally granulated, coherence-gated) view sample — the same eroded
+        // field the sun march and the sun-OD map read (MarchConfig::granulation +
+        // the coherence carried on the sun-OD map).
+        let sample = vol.sample_granulated_gated(
+            mi,
+            mj,
+            mk,
+            scene.cfg.granulation,
+            scene.sun_od.gran_coherence.as_ref(),
+        );
         let sigma_t = sample.total_ext();
         if sigma_t <= 0.0 {
             t += ds;
@@ -4562,7 +5097,29 @@ mod tests {
                 ..base_cfg
             },
         };
+        // Liveness sweep: a dense ray grid across the blob. (Round 2 note: the
+        // BIMODAL carve restores weakly-eroded samples to exactly 1.0, so only rays
+        // crossing the strong carve network differ — a handful of rays can miss it.)
         let mut any_differ = false;
+        for si in 0..10 {
+            for sj in 0..10 {
+                let gi = 8.0 + si as f64 * 0.6;
+                let gj = 8.0 + sj as f64 * 0.6;
+                let target = brick_to_ecef(&georef, gi, gj, 0.0, 0.0, 250.0).unwrap();
+                let view = norm3([
+                    target[0] - cam.camera[0],
+                    target[1] - cam.camera[1],
+                    target[2] - cam.camera[2],
+                ]);
+                let m_off = march_cloud(&scene_off, cam.camera, view);
+                let m_on = march_cloud(&scene_on, cam.camera, view);
+                if (m_on.transmittance - m_off.transmittance).abs() > 1e-9
+                    || m_on.inscatter != m_off.inscatter
+                {
+                    any_differ = true;
+                }
+            }
+        }
         for &(gi, gj) in &[(9.0f64, 9.0f64), (10.5, 11.5), (11.0, 9.5), (12.5, 12.0)] {
             let target = brick_to_ecef(&georef, gi, gj, 0.0, 0.0, 250.0).unwrap();
             let view = norm3([
@@ -4603,5 +5160,420 @@ mod tests {
             }
         }
         assert!(any_differ, "granulation should be live through the march");
+    }
+
+    #[test]
+    fn granulation_coherence_gate_closes_a_solid_deck_and_its_margins() {
+        // ROUND-2 headline regression (the owner's "cheese grater"): a spatially
+        // COHERENT deck — including its soft MARGINS — must gain ZERO carved holes
+        // under the deck-coherence gate. The in-test round-1 contrast (the same
+        // sampler WITHOUT the coherence field) proves the margins DID erode before,
+        // i.e. this test fails against the round-1 code by construction.
+        let (nx, ny, nz) = (64usize, 64usize, 10usize);
+        // A wide deck (i, j in 8..56) with +/-10% cell-to-cell variability and a SOFT
+        // MARGIN: extinction tapers 0.6 / 0.3 over the two cells outside the rect.
+        let deck = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if !(2..6).contains(&k) {
+                return (0.0, 0.0, 0.0);
+            }
+            let di = if i < 8 { 8 - i } else { i.saturating_sub(55) };
+            let dj = if j < 8 { 8 - j } else { j.saturating_sub(55) };
+            let dist = di.max(dj);
+            let factor = match dist {
+                0 => 1.0,
+                1 => 0.6,
+                2 => 0.3,
+                _ => return (0.0, 0.0, 0.0),
+            };
+            let var = 1.0 + 0.1 * (((i * 5 + j * 11 + k) % 7) as f64 / 3.0 - 1.0);
+            (2.0e-2 * factor * var, 0.0, 0.0)
+        });
+        let coh = GranCoherence::build(&deck);
+        let (open, partial, closed) = coh.stats();
+        println!("GRAN coherence deck: open={open} partial={partial} closed={closed}");
+        assert!(
+            coh.gate_at(32.0, 32.0) <= 1.0e-6,
+            "deck interior gate must be closed: {}",
+            coh.gate_at(32.0, 32.0)
+        );
+        let gran = Some(Granulation::for_grid(3000.0));
+        let mut probes = 0usize;
+        let mut round1_eroded = 0usize;
+        for pi in 0..120 {
+            for pj in 0..120 {
+                let fi = 5.05 + pi as f64 * 0.45;
+                let fj = 5.05 + pj as f64 * 0.45;
+                if fi > 58.95 || fj > 58.95 {
+                    continue;
+                }
+                for &fk in &[2.5f64, 3.5, 4.6, 5.4] {
+                    let raw = deck.sample(fi, fj, fk);
+                    if raw.total_ext() <= 0.0 {
+                        continue;
+                    }
+                    // ROUND 2: the coherence-gated sampler is byte-identical across
+                    // the WHOLE deck, margins included.
+                    let gated = deck.sample_granulated_gated(fi, fj, fk, gran, Some(&coh));
+                    assert_eq!(
+                        gated.total_ext().to_bits(),
+                        raw.total_ext().to_bits(),
+                        "coherent deck carved at ({fi},{fj},{fk})"
+                    );
+                    // ROUND-1 contrast: without the coherence field the margins erode
+                    // (counted below; the pepper this round exists to kill).
+                    let ungated = deck.sample_granulated(fi, fj, fk, gran);
+                    if ungated.total_ext() < raw.total_ext() {
+                        round1_eroded += 1;
+                    }
+                    probes += 1;
+                }
+            }
+        }
+        assert!(probes > 5_000, "sweep too sparse: {probes}");
+        assert!(
+            round1_eroded > 100,
+            "the round-1 (un-gated) path should erode the deck margins — the defect \
+             this gate exists to fix: {round1_eroded} eroded of {probes}"
+        );
+    }
+
+    #[test]
+    fn granulation_coherence_gate_keeps_a_broken_field_granulating() {
+        // The regime separation in ONE volume: a solid uniform deck on the left
+        // (wide enough that its ERODED core region is non-empty — a real deck), a
+        // broken popcorn field on the right. The gate must stay CLOSED over the deck
+        // (and its edge) and fully OPEN over the popcorn, and the gated sampler must
+        // still erode the popcorn (the feature survives the gate).
+        let (nx, ny, nz) = (48usize, 40usize, 10usize);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            let deck = (2..26).contains(&i) && (2..38).contains(&j) && (2..6).contains(&k);
+            let popcorn = i >= 34 && (i % 5 == 2) && (j % 4 == 1) && (2..7).contains(&k);
+            if deck || popcorn {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let coh = GranCoherence::build(&vol);
+        // Deck interior + edge closed; popcorn columns fully open.
+        assert!(
+            coh.gate_at(12.0, 20.0) <= 1.0e-6,
+            "deck interior must close"
+        );
+        assert!(coh.gate_at(25.9, 20.0) <= 1.0e-6, "deck edge must close");
+        for &(fi, fj) in &[(37.0f64, 9.0f64), (42.0, 21.0), (47.0, 33.0)] {
+            assert!(
+                coh.gate_at(fi, fj) >= 0.9,
+                "broken-field gate must stay open at ({fi},{fj}): {}",
+                coh.gate_at(fi, fj)
+            );
+        }
+        // The gated sampler still granulates the popcorn.
+        let gran = Some(Granulation::for_grid(3000.0));
+        let mut eroded = 0usize;
+        let mut carved_clear = 0usize;
+        for pi in 0..80 {
+            for pj in 0..80 {
+                let fi = 36.05 + pi as f64 * 0.14;
+                let fj = 5.05 + pj as f64 * 0.42;
+                let raw = vol.sample(fi, fj, 3.0);
+                if raw.total_ext() <= 0.0 {
+                    continue;
+                }
+                let gated = vol.sample_granulated_gated(fi, fj, 3.0, gran, Some(&coh));
+                if gated.total_ext() < raw.total_ext() {
+                    eroded += 1;
+                }
+                if gated.total_ext() <= 1.0e-9 {
+                    carved_clear += 1;
+                }
+            }
+        }
+        println!("GRAN coherence popcorn: eroded={eroded} carved_clear={carved_clear}");
+        assert!(
+            eroded > 100,
+            "the broken field must still granulate under the gate: {eroded}"
+        );
+        assert!(
+            carved_clear > 20,
+            "the bimodal carve should open real clear gaps: {carved_clear}"
+        );
+        // And the deck half of the SAME volume is byte-untouched through the same
+        // gated sampler (margins included).
+        for pi in 0..90 {
+            for pj in 0..60 {
+                let fi = 1.05 + pi as f64 * 0.3;
+                let fj = 1.05 + pj as f64 * 0.62;
+                let raw = vol.sample(fi, fj, 3.0);
+                if raw.total_ext() <= 0.0 {
+                    continue;
+                }
+                let gated = vol.sample_granulated_gated(fi, fj, 3.0, gran, Some(&coh));
+                assert_eq!(
+                    gated.total_ext().to_bits(),
+                    raw.total_ext().to_bits(),
+                    "deck half carved at ({fi},{fj})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn granulation_bimodal_carve_narrows_the_half_eroded_middle() {
+        // Anchors of the bimodal shape itself.
+        assert_eq!(granulation_bimodal(0.0), 0.0);
+        assert_eq!(granulation_bimodal(1.0), 1.0);
+        assert_eq!(granulation_bimodal(GRAN_BIMODAL_GAP), 0.0);
+        assert_eq!(granulation_bimodal(GRAN_BIMODAL_GRAIN), 1.0);
+        assert_eq!(
+            granulation_bimodal(0.1),
+            0.0,
+            "below the gap point carves clear"
+        );
+        assert_eq!(
+            granulation_bimodal(0.9),
+            1.0,
+            "above the grain point restores full"
+        );
+        let mut prev = 0.0f64;
+        for i in 0..=40 {
+            let m = i as f64 / 40.0;
+            let b = granulation_bimodal(m);
+            assert!((0.0..=1.0).contains(&b));
+            assert!(b >= prev - 1e-12, "bimodal shape must be monotone");
+            prev = b;
+        }
+        // The DISTRIBUTION metric on the popcorn tent (the granulation target case):
+        // among ENGAGED samples (a live erosion threshold, below the neighbourhood
+        // max) the round-1 multiplier m1 leaves a broad half-eroded middle band that
+        // rendered as grey mush; the bimodal carve m2 = B(m1) must (a) squeeze that
+        // middle to less than half of round 1's and (b) place the bulk of eroded
+        // samples at grain-or-gap. The identity shape gives mid2 == mid1, so (a)
+        // FAILS against the round-1 code by construction.
+        let (nx, ny, nz) = (16usize, 16usize, 8usize);
+        let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if i == 8 && j == 8 && k == 3 {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let amp = granulation_amplitude(3000.0);
+        let gran = Some(Granulation { amplitude: amp });
+        let peak = vol.sample(8.0, 8.0, 3.0).total_ext();
+        let (mut engaged, mut mid1, mut mid2, mut bulk2) = (0usize, 0usize, 0usize, 0usize);
+        for pi in 0..99 {
+            for pj in 0..99 {
+                let fi = 7.02 + pi as f64 * 0.02;
+                let fj = 7.02 + pj as f64 * 0.02;
+                let raw = vol.sample(fi, fj, 3.0);
+                let total = raw.total_ext();
+                if total <= 0.0 {
+                    continue;
+                }
+                // Replicate the sampler's erosion pipeline through the PUBLIC pure
+                // functions (corner max == peak for this single-cell tent).
+                let d = total / peak;
+                let gate = granulation_gate(raw.ext_liquid, raw.ext_ice, raw.ext_precip, 750.0);
+                let prot = granulation_interior_protection(d);
+                let noise = granulation_erosion_noise(fi * 3000.0, fj * 3000.0);
+                let e = (amp * GRAN_EROSION_GAIN * gate * prot * noise).min(GRAN_EROSION_MAX);
+                if e <= 0.05 || d >= 0.999 {
+                    continue;
+                }
+                let m1 = granulation_multiplier(d, e);
+                let m2 = granulation_bimodal(m1);
+                engaged += 1;
+                if m1 > 0.2 && m1 < 0.8 {
+                    mid1 += 1;
+                }
+                if m2 > 0.2 && m2 < 0.8 {
+                    mid2 += 1;
+                }
+                if !(0.2..=0.8).contains(&m2) {
+                    bulk2 += 1;
+                }
+                // Integration lock: the sampler applies exactly B(m1).
+                let expected = if m2 < 1.0 { total * m2 } else { total };
+                let ero = vol.sample_granulated(fi, fj, 3.0, gran).total_ext();
+                assert_eq!(
+                    ero.to_bits(),
+                    expected.to_bits(),
+                    "sampler multiplier drifted from B(remap) at ({fi},{fj})"
+                );
+            }
+        }
+        let f_mid1 = mid1 as f64 / engaged as f64;
+        let f_mid2 = mid2 as f64 / engaged as f64;
+        let f_bulk2 = bulk2 as f64 / engaged as f64;
+        println!(
+            "GRAN bimodal: engaged={engaged} mid1={f_mid1:.4} mid2={f_mid2:.4} bulk2={f_bulk2:.4}"
+        );
+        assert!(engaged > 500, "engaged set too small: {engaged}");
+        assert!(
+            f_mid2 < 0.5 * f_mid1,
+            "the bimodal carve must narrow the grey middle band to under half of \
+             round 1's: mid2 {f_mid2:.4} vs mid1 {f_mid1:.4}"
+        );
+        assert!(
+            f_bulk2 > 0.8,
+            "the bulk of eroded samples must sit at grain-or-gap: {f_bulk2:.4}"
+        );
+    }
+
+    #[test]
+    fn granulation_thinness_gate_stands_down_on_translucent_veils() {
+        // Owner round-2 addendum: a regionally-THIN broken veil (window-max eligible
+        // tau below GRAN_THIN_TAU_LO) already reads wispy through the honest
+        // transmittance gradient — granulation must stand down there (erosion on a
+        // veil is dark specks in grey, never grains). The SAME broken pattern at
+        // substantial optical depth keeps granulating: thinness, not pattern, is
+        // the discriminator. The un-gated sampler erodes the veil (the round-1
+        // behavior this ramp removes), so the standdown fails against round-1 code.
+        let (nx, ny, nz) = (24usize, 24usize, 10usize);
+        let pattern =
+            |i: usize, j: usize, k: usize| (i % 5 == 2) && (j % 4 == 1) && (2..6).contains(&k);
+        // Thin veil: column tau = 4 layers x 250 m x 4e-4 = 0.4 < GRAN_THIN_TAU_LO.
+        let veil = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if pattern(i, j, k) {
+                (4.0e-4, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        // Substantial: column tau = 20 >> GRAN_THIN_TAU_HI, same pattern.
+        let thick = build_volume(nx, ny, nz, 250.0, 3000.0, |i, j, k| {
+            if pattern(i, j, k) {
+                (2.0e-2, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let coh_veil = GranCoherence::build(&veil);
+        let coh_thick = GranCoherence::build(&thick);
+        assert!(
+            coh_veil.gate_at(7.0, 5.0) <= 1.0e-6,
+            "thin-veil gate must stand down: {}",
+            coh_veil.gate_at(7.0, 5.0)
+        );
+        assert!(
+            coh_thick.gate_at(7.0, 5.0) >= 0.9,
+            "substantial broken cloud must keep granulating: {}",
+            coh_thick.gate_at(7.0, 5.0)
+        );
+        let gran = Some(Granulation::for_grid(3000.0));
+        let (mut veil_ungated_eroded, mut thick_gated_eroded) = (0usize, 0usize);
+        for pi in 0..70 {
+            for pj in 0..70 {
+                let fi = 1.05 + pi as f64 * 0.31;
+                let fj = 1.05 + pj as f64 * 0.31;
+                let raw_v = veil.sample(fi, fj, 3.0);
+                if raw_v.total_ext() > 0.0 {
+                    // Gated: byte-identical (the standdown).
+                    let g = veil.sample_granulated_gated(fi, fj, 3.0, gran, Some(&coh_veil));
+                    assert_eq!(
+                        g.total_ext().to_bits(),
+                        raw_v.total_ext().to_bits(),
+                        "thin veil eroded at ({fi},{fj})"
+                    );
+                    // Un-gated (round 1): erodes.
+                    let u = veil.sample_granulated(fi, fj, 3.0, gran);
+                    if u.total_ext() < raw_v.total_ext() {
+                        veil_ungated_eroded += 1;
+                    }
+                }
+                let raw_t = thick.sample(fi, fj, 3.0);
+                if raw_t.total_ext() > 0.0 {
+                    let g = thick.sample_granulated_gated(fi, fj, 3.0, gran, Some(&coh_thick));
+                    if g.total_ext() < raw_t.total_ext() {
+                        thick_gated_eroded += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "GRAN thinness: veil_ungated_eroded={veil_ungated_eroded} \
+             thick_gated_eroded={thick_gated_eroded}"
+        );
+        assert!(
+            veil_ungated_eroded > 50,
+            "the un-gated path should erode the veil (the round-1 defect): \
+             {veil_ungated_eroded}"
+        );
+        assert!(
+            thick_gated_eroded > 100,
+            "substantial broken cloud must still granulate: {thick_gated_eroded}"
+        );
+    }
+
+    #[test]
+    fn granulation_domain_warp_is_deterministic_bounded_smooth_and_wired() {
+        // Determinism.
+        let (a0, a1) = granulation_warp_offset(12_345.0, -6_789.0);
+        let (b0, b1) = granulation_warp_offset(12_345.0, -6_789.0);
+        assert_eq!(a0.to_bits(), b0.to_bits());
+        assert_eq!(a1.to_bits(), b1.to_bits());
+        // Bounded by the amplitude; spatially VARYING (the whole point: cell
+        // size/spacing changes across the scene); smooth (no popping between
+        // adjacent samples — Lipschitz bound of the smoothstep value noise).
+        let mut du_min = f64::INFINITY;
+        let mut du_max = f64::NEG_INFINITY;
+        for s in 0..200 {
+            let u = s as f64 * 137.0;
+            let v = s as f64 * 89.0 - 7_000.0;
+            let (du, dv) = granulation_warp_offset(u, v);
+            assert!(du.abs() <= GRAN_WARP_AMP_M && dv.abs() <= GRAN_WARP_AMP_M);
+            du_min = du_min.min(du);
+            du_max = du_max.max(du);
+        }
+        assert!(
+            du_max - du_min > 500.0,
+            "the warp must vary across the scene: range {}",
+            du_max - du_min
+        );
+        for s in 0..300 {
+            let u = 500.0 + s as f64 * 50.0;
+            let (d0, _) = granulation_warp_offset(u, 4_321.0);
+            let (d1, _) = granulation_warp_offset(u + 50.0, 4_321.0);
+            assert!(
+                (d1 - d0).abs() < 60.0,
+                "warp not smooth: step {} at u={u}",
+                (d1 - d0).abs()
+            );
+        }
+        // WIRED: the erosion noise consumes exactly this warp (bit-exact
+        // reconstruction through the same private octave stack), and the warp
+        // actually displaces the field somewhere.
+        let mut differs = false;
+        for &(u, v) in &[
+            (1_234.0f64, 5_678.0f64),
+            (20_000.0, 3_000.0),
+            (7_500.0, 44_000.0),
+            (61_000.0, 12_500.0),
+        ] {
+            let (du, dv) = granulation_warp_offset(u, v);
+            let (uw, vw) = (u + du, v + dv);
+            let mut w = 0.0f64;
+            let mut w0 = 0.0f64;
+            for i in 0..GRAN_OCTAVE_SCALES_M.len() {
+                let lam = GRAN_OCTAVE_SCALES_M[i];
+                w += GRAN_OCTAVE_WEIGHTS[i] * worley2_f1(uw / lam, vw / lam, GRAN_OCTAVE_SALTS[i]);
+                w0 += GRAN_OCTAVE_WEIGHTS[i] * worley2_f1(u / lam, v / lam, GRAN_OCTAVE_SALTS[i]);
+            }
+            let e_manual =
+                smooth01((w.clamp(0.0, 1.0) - GRAN_CARVE_LO) / (GRAN_CARVE_HI - GRAN_CARVE_LO));
+            assert_eq!(
+                granulation_erosion_noise(u, v).to_bits(),
+                e_manual.to_bits(),
+                "the erosion noise must consume the domain warp"
+            );
+            if (w - w0).abs() > 1e-6 {
+                differs = true;
+            }
+        }
+        assert!(
+            differs,
+            "the warp should displace the octave field somewhere"
+        );
     }
 }

@@ -97,6 +97,15 @@
 //!   ([`derived::resample_field`]) via the raster's fractional WRF indices. The RAW `f32`
 //!   field is the primary deliverable; [`derived::colorize`] is a basic studio colormap.
 //!
+//! Operational-model ingest (HRRR/RRFS GRIB2) parallels the wrfout path:
+//!
+//! - [`ingest_grib`] — streaming NOAA HRRR / RRFS native-level GRIB2 -> the SAME
+//!   `.ssb` brick + `run.json` (an operational brick is indistinguishable from a
+//!   WRF brick downstream). Seek-indexed one-message-at-a-time decode via the
+//!   pinned `grib-core`, per-species extinction through the same [`optics`]
+//!   constants, the same integral-conserving vertical resample, valid time from
+//!   the GRIB headers.
+//!
 //! The high-level render API (the reusable assembly behind the examples + the Python
 //! binding) sits on top of all of the above:
 //!
@@ -124,6 +133,7 @@ pub mod geocolor;
 pub mod gpu;
 pub mod horizon;
 pub mod ingest;
+pub mod ingest_grib;
 pub mod ir;
 pub mod ir_enhance;
 pub mod log;
@@ -134,6 +144,7 @@ pub mod sandwich;
 pub mod solar;
 pub mod store_out;
 pub mod topdown;
+pub mod web_layer;
 pub mod wv;
 
 /// On-disk format version for `.ssb` volume bricks + the `run.json` manifest

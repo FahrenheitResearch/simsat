@@ -22,6 +22,16 @@
 // cloud shadow is PENUMBRAL (blur radius = occluder distance x tan 0.533 deg); the sky
 // ambient is the SH-2 directional projection (bindings 14/15). surface.wgsl (the active
 // clouds-OFF pass) still carries the M2 scalar ambient — a documented CPU/GPU divergence.
+//
+// ACTIVE as of the gpu-clouds pass (feat/gpu-clouds): this pass is dispatched by
+// `gpu::CloudPassResources` behind the studio's "GPU clouds (experimental)" toggle —
+// the INTERACTIVE-schedule live preview. The CPU composite remains the shipping
+// default, the stored-frame path, and the parity ground truth. Reconciled to the
+// current CPU behavior in that pass: EXPOSURE (u.m1.x), multi-scatter OCTAVES
+// (u.m1.y), GROUND_DAY_LIFT (u.frx2.z), the WS2 CLOUD_SHADOW_FLOOR effective shadow,
+// and the zoom-out-margin EDGE FEATHER (u.frx2.y). The remaining divergences are
+// enumerated in notes/gpu-clouds-notes.md (granulation off, M3 per-texel uploads
+// deferred, interactive sun schedule, trilinear-on-codes sampling, f32 ALU).
 
 const PI: f32 = 3.14159265358979;
 const DEG2RAD: f32 = 0.017453292519943295;
@@ -63,11 +73,16 @@ const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
 const GLINT_STRENGTH: f32 = 3.5;
 const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller, brighter glint streak (round 3: 0.6->0.4)
-// WS2 bright-cloud tonemap (twins of render.rs). This inactive GPU twin runs at an
-// implicit exposure of 1.0, so the exposure-aware shoulder bound is RHO_HIGHLIGHT_MAX
-// itself (the CPU paths derive x_max = exposure * RHO_HIGHLIGHT_MAX at their seam).
+// WS2 bright-cloud tonemap (twins of render.rs). EXPOSURE is wired as u.m1.x
+// (gpu-clouds activation): rho = exposure * pi * L / E_sun, and the shoulder bound is
+// x_max = exposure * RHO_HIGHLIGHT_MAX — the exact seam of the CPU
+// render::radiance_to_rgba_softclip. A non-positive uniform falls back to 1.0.
 const CLOUD_SOFTCLIP_KNEE: f32 = 0.75;   // identity below; bounded Mobius shoulder above
 const RHO_HIGHLIGHT_MAX: f32 = 1.05;     // physical reflectance ceiling -> display 1.0
+// WS2 diffuse cloud-shadow floor (twin of render::CLOUD_SHADOW_FLOOR /
+// effective_cloud_shadow): day-gated on the shared 20->30 deg ramp; the specular
+// glint keeps the RAW shadow. Was deliberately CPU-only until this activation.
+const CLOUD_SHADOW_FLOOR: f32 = 0.25;
 // Low-sun visible pass (twins of render.rs; see surface.wgsl for the full notes):
 // the SUNRISE veil ramp + the LUT-derived low-sun ILLUMINANT correction.
 const VEIL_TERMINATOR_ELEV: f32 = 2.0;   // full physical veil at/below (dusk band byte-identical)
@@ -106,7 +121,7 @@ const AMBIENT_W_BELOW: f32 = 0.3;
 // Wrenninge/Oz multi-scatter octaves (M5) — MUST match clouds.rs. octave 0 == fix2
 // single scatter; deeper octaves scale sun-Beer extinction a^k, phase eccentricity b^k,
 // brightness weight c^k. See clouds.rs octave-constants block for the physics/citation.
-const OCTAVES: i32 = 6;               // DEFAULT_OCTAVES
+const OCTAVES: i32 = 6;               // DEFAULT_OCTAVES (the max + fallback; live count = u.m1.y)
 const OCTAVE_EXTINCTION_SCALE: f32 = 0.5;
 const OCTAVE_PHASE_SCALE: f32 = 0.5;
 const OCTAVE_BRIGHTNESS_SCALE: f32 = 0.85;
@@ -127,8 +142,8 @@ const GRAN_AMP_CAP: f32 = 0.6;        // Cahalan-bound amplitude cap (clouds.rs 
 const GRAN_EROSION_MAX: f32 = 0.98;
 const GRAN_HEIGHT_FULL_M: f32 = 4000.0;
 const GRAN_HEIGHT_ZERO_M: f32 = 7000.0;
-const GRAN_CARVE_LO: f32 = 0.52;
-const GRAN_CARVE_HI: f32 = 0.62;
+const GRAN_CARVE_LO: f32 = 0.46;  // round-2 retune (clouds.rs: wider gap network)
+const GRAN_CARVE_HI: f32 = 0.58;
 const GRAN_INTERIOR_LO: f32 = 0.45; // interior protection window on the relative density
 const GRAN_INTERIOR_HI: f32 = 0.75; // (solid-deck variability never erodes; clouds.rs twin)
 const GRAN_SCALE0_M: f32 = 1000.0;    // Worley octave cell scales (k^-5/3 envelope)
@@ -140,6 +155,15 @@ const GRAN_W2: f32 = 0.2599213;
 const GRAN_SALT0: u32 = 0x51A7C0DEu;
 const GRAN_SALT1: u32 = 0x9BD2A0E5u;
 const GRAN_SALT2: u32 = 0x2F63D19Bu;
+// Round-2 tuning (clouds.rs twins): the BIMODAL carve shape (gap-or-grain remap
+// reshaping) and the DOMAIN WARP (low-frequency value-noise displacement of the
+// Worley sample position — cell size/spacing varies across the scene).
+const GRAN_BIMODAL_GAP: f32 = 0.25;
+const GRAN_BIMODAL_GRAIN: f32 = 0.65;
+const GRAN_WARP_SCALE_M: f32 = 4000.0;
+const GRAN_WARP_AMP_M: f32 = 1300.0;
+const GRAN_WARP_SALT_U: u32 = 0x1B56C4E9u;
+const GRAN_WARP_SALT_V: u32 = 0x7A991E3Du;
 
 struct Uniforms {
     // --- surface (M2, layout verbatim from surface.wgsl) ---
@@ -162,13 +186,13 @@ struct Uniforms {
     ql: vec4<f32>,     // ext_liquid vmin,vmax ; ext_ice vmin,vmax
     qp: vec4<f32>,     // ext_precip vmin,vmax ; tau_up vmin,vmax
     m0: vec4<f32>,     // coarse_step_m, fine_step_m, max_steps, unused (was detail_taps)
-    m1: vec4<f32>,     // unused, unused, beer_powder, ground_albedo (sun march uses u.dims.w)
+    m1: vec4<f32>,     // exposure, octaves, beer_powder, ground_albedo (sun march uses u.dims.w)
     sod_c: vec4<f32>,  // sun_od center xyz, transmittance_floor
     sod_u: vec4<f32>,  // au xyz, u_min
     sod_v: vec4<f32>,  // av xyz, u_max
     sod_e: vec4<f32>,  // v_min, v_max, sunod_dim, clouds_enabled
     frx: vec4<f32>,    // scan x_min, x_max, y_min, y_max
-    frx2: vec4<f32>,   // froxel_dim, unused, unused, unused
+    frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -396,6 +420,49 @@ fn land_day_gain(sun_elev: f32) -> f32 {
     return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
+// GROUND LIFT daytime gain on the WHOLE surface radiance — land AND water (twin of
+// render::ground_day_lift; the top-down/basemap appearance pass). The lift value is
+// u.frx2.z (the CPU MarchConfig::ground_day_lift, default render::GROUND_DAY_LIFT);
+// 1.0 at/below the twilight gate so the locked twilight band is unchanged.
+fn ground_day_lift_gain(sun_elev: f32) -> f32 {
+    let lift = max(u.frx2.z, 0.0);
+    if (lift <= 0.0) {
+        return 1.0;
+    }
+    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (lift - 1.0);
+}
+
+// The EFFECTIVE cloud shadow the DIFFUSE direct-sun terms see (twin of
+// render::effective_cloud_shadow, WS2): f + (1-f)*shadow with
+// f = CLOUD_SHADOW_FLOOR * smoothstep(LO, HI, sun_elev). The specular glint keeps the
+// RAW shadow (an occluded solar disk has no mirror image; the floor is diffuse fill).
+fn effective_cloud_shadow_gpu(shadow: f32, sun_elev: f32) -> f32 {
+    let s = clamp(shadow, 0.0, 1.0);
+    let f = CLOUD_SHADOW_FLOOR * smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev);
+    return f + (1.0 - f) * s;
+}
+
+// Zoom-out-margin EDGE FEATHER (twin of clouds::edge_feather): the cloud contribution
+// ramps to zero over the outer u.frx2.y cells of the domain so clouds melt into a
+// margin instead of a hard cutoff. band <= 0 -> 1.0 everywhere (the no-op at margin 0).
+fn edge_feather(fi: f32, fj: f32) -> f32 {
+    let band = u.frx2.y;
+    if (band <= 0.0) {
+        return 1.0;
+    }
+    let hi_i = u.dims.x - 1.0;
+    let hi_j = u.dims.y - 1.0;
+    let d = min(min(fi, hi_i - fi), min(fj, hi_j - fj));
+    if (d <= 0.0) {
+        return 0.0;
+    }
+    if (d >= band) {
+        return 1.0;
+    }
+    let t = d / band;
+    return t * t * (3.0 - 2.0 * t);
+}
+
 // SUNRISE veil ramp (twin of render::aerial_veil_scale / surface.wgsl).
 fn aerial_veil_scale(sun_elev: f32) -> f32 {
     return 1.0 - smoothstep(VEIL_TERMINATOR_ELEV, VEIL_SUNRISE_ELEV_HI, sun_elev) * (1.0 - AERIAL_VEIL_DAY_SCALE);
@@ -548,23 +615,35 @@ fn synthesize_abi_green(rho: vec3<f32>) -> vec3<f32> {
     );
 }
 
+// The display EXPOSURE gain (u.m1.x; the owner-approved display control, default 1.6
+// in the studio). Twin of render::radiance_to_rgba_softclip's gain guard: a
+// non-finite/non-positive uniform falls back to 1.0 (never darkens to nothing).
+fn exposure_gain() -> f32 {
+    if (u.m1.x > 0.0) {
+        return u.m1.x;
+    }
+    return 1.0;
+}
+
 fn output_transform(rho: vec3<f32>) -> vec3<f32> {
     if (u.p1.w < 0.5) {
         // ABI-like reflectance factor: OPTIONAL synthesized green (prototype, module
         // const off by default — twin of the CPU process-global), then desaturate
         // highlights, then the bounded highlight soft-clip (WS2 — the desaturate-then-
-        // shoulder ORDER matches the CPU path), then the toe-lifted sqrt. This pass
-        // runs at implicit exposure 1.0 -> the shoulder bound is RHO_HIGHLIGHT_MAX
-        // (the CPU seam derives exposure * RHO_HIGHLIGHT_MAX).
+        // shoulder ORDER matches the CPU path), then the toe-lifted sqrt. The caller
+        // has ALREADY applied the exposure gain to rho, so the exposure-aware shoulder
+        // bound is exposure * RHO_HIGHLIGHT_MAX — the exact CPU seam
+        // (render::radiance_to_rgba_softclip).
+        let x_max = exposure_gain() * RHO_HIGHLIGHT_MAX;
         var rr = rho;
         if (SYNTHETIC_GREEN_MODE > 0.5) {
             rr = synthesize_abi_green(rho);
         }
         let ds = desaturate_highlights(rr);
         let sc = vec3<f32>(
-            soft_clip_highlight(ds.x, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
-            soft_clip_highlight(ds.y, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
-            soft_clip_highlight(ds.z, CLOUD_SOFTCLIP_KNEE, RHO_HIGHLIGHT_MAX),
+            soft_clip_highlight(ds.x, CLOUD_SOFTCLIP_KNEE, x_max),
+            soft_clip_highlight(ds.y, CLOUD_SOFTCLIP_KNEE, x_max),
+            soft_clip_highlight(ds.z, CLOUD_SOFTCLIP_KNEE, x_max),
         );
         return vec3<f32>(abi_stretch_ch(sc.x), abi_stretch_ch(sc.y), abi_stretch_ch(sc.z));
     }
@@ -657,12 +736,34 @@ fn gran_worley_f1(qx: f32, qy: f32, salt: u32) -> f32 {
     return clamp(sqrt(best), 0.0, 1.0);
 }
 
+// Smooth 2-D value noise in [0, 1) (twin of clouds.rs gran_value_noise): cell-corner
+// hashes blended with the smoothstep interpolant — the domain-warp input.
+fn gran_value_noise(qx: f32, qy: f32, salt: u32) -> f32 {
+    let bx = floor(qx);
+    let by = floor(qy);
+    let ix = i32(bx);
+    let iy = i32(by);
+    let tx = smoothstep(0.0, 1.0, qx - bx);
+    let ty = smoothstep(0.0, 1.0, qy - by);
+    let h00 = gran_cell_hash01(ix, iy, salt);
+    let h10 = gran_cell_hash01(ix + 1, iy, salt);
+    let h01 = gran_cell_hash01(ix, iy + 1, salt);
+    let h11 = gran_cell_hash01(ix + 1, iy + 1, salt);
+    return (h00 * (1.0 - tx) + h10 * tx) * (1.0 - ty) + (h01 * (1.0 - tx) + h11 * tx) * ty;
+}
+
 // The tail-shaped erosion field at a brick-plane position (m) — twin of
-// clouds.rs granulation_erosion_noise (k^-5/3-weighted octaves + smoothstep tail).
+// clouds.rs granulation_erosion_noise: the position is DOMAIN-WARPED (round 2, twin
+// of granulation_warp_offset — cell size/spacing varies across the scene), then the
+// k^-5/3-weighted octaves are tail-shaped by the carve smoothstep.
 fn gran_erosion_noise(u_m: f32, v_m: f32) -> f32 {
-    var w = GRAN_W0 * gran_worley_f1(u_m / GRAN_SCALE0_M, v_m / GRAN_SCALE0_M, GRAN_SALT0);
-    w = w + GRAN_W1 * gran_worley_f1(u_m / GRAN_SCALE1_M, v_m / GRAN_SCALE1_M, GRAN_SALT1);
-    w = w + GRAN_W2 * gran_worley_f1(u_m / GRAN_SCALE2_M, v_m / GRAN_SCALE2_M, GRAN_SALT2);
+    let qx = u_m / GRAN_WARP_SCALE_M;
+    let qy = v_m / GRAN_WARP_SCALE_M;
+    let uw = u_m + GRAN_WARP_AMP_M * (2.0 * gran_value_noise(qx, qy, GRAN_WARP_SALT_U) - 1.0);
+    let vw = v_m + GRAN_WARP_AMP_M * (2.0 * gran_value_noise(qx, qy, GRAN_WARP_SALT_V) - 1.0);
+    var w = GRAN_W0 * gran_worley_f1(uw / GRAN_SCALE0_M, vw / GRAN_SCALE0_M, GRAN_SALT0);
+    w = w + GRAN_W1 * gran_worley_f1(uw / GRAN_SCALE1_M, vw / GRAN_SCALE1_M, GRAN_SALT1);
+    w = w + GRAN_W2 * gran_worley_f1(uw / GRAN_SCALE2_M, vw / GRAN_SCALE2_M, GRAN_SALT2);
     return smoothstep(GRAN_CARVE_LO, GRAN_CARVE_HI, clamp(w, 0.0, 1.0));
 }
 
@@ -698,6 +799,24 @@ fn gran_multiplier(rel_density: f32, erosion: f32) -> f32 {
     return clamp(max(d - e, 0.0) / (d * (1.0 - e)), 0.0, 1.0);
 }
 
+// BIMODAL carve shape (round 2, twin of clouds.rs granulation_bimodal): gap-or-grain
+// — at/below GAP the sample carves clear, at/above GRAIN it restores to full raw
+// extinction (still subtract-only vs the raw sample), squeezing the grey middle.
+fn gran_bimodal(m: f32) -> f32 {
+    return smoothstep(GRAN_BIMODAL_GAP, GRAN_BIMODAL_GRAIN, clamp(m, 0.0, 1.0));
+}
+
+// DECK-COHERENCE gate (round 2, twin of clouds.rs GranCoherence::gate_at).
+// ACTIVATION NOTE: the CPU builds this per-composite 2-D per-column field
+// (GranCoherence::build — fill fraction + column-tau fsd over the ~7 dx window,
+// distance-tapered dilation) and the GPU activation must upload it as an R8/R32
+// texture sampled bilinearly at the column coords `b.xy`; until then this stub
+// returns 1.0 (open) and the whole granulate() path is inert anyway behind
+// GRAN_AMPLITUDE = 0.0.
+fn gran_coherence_gate(bx: f32, by: f32) -> f32 {
+    return 1.0;
+}
+
 // Apply the granulation erosion to a decoded volume sample at brick coords `b`
 // (twin of clouds.rs DecodedVolume::sample_granulated). The CPU's relative-density
 // neighbourhood is the 8 trilinear-support corners; here they are 8 unfiltered
@@ -716,6 +835,11 @@ fn granulate(s: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
     let z_msl = u.vert.x + b.z * u.vert.y;
     let gate = gran_gate(s.x, s.y, s.z, z_msl);
     if (gate <= 0.0) {
+        return s;
+    }
+    // Deck-coherence gate (round 2; stub 1.0 until the activation uploads the field).
+    let coh = gran_coherence_gate(b.x, b.y);
+    if (coh <= 0.0) {
         return s;
     }
     let hi = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
@@ -748,11 +872,12 @@ fn granulate(s: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
     }
     let pitch = max(min(u.geo0.w, u.geo1.z), 1.0);
     let noise = gran_erosion_noise(b.x * pitch, b.y * pitch);
-    let e = min(GRAN_AMPLITUDE / GRAN_AMP_CAP * gate * protection * noise, GRAN_EROSION_MAX);
+    let e = min(GRAN_AMPLITUDE / GRAN_AMP_CAP * gate * protection * coh * noise, GRAN_EROSION_MAX);
     if (e <= 0.0) {
         return s;
     }
-    let m = gran_multiplier(d, e);
+    // The remap multiplier through the bimodal carve (round 2): gap-or-grain.
+    let m = gran_bimodal(gran_multiplier(d, e));
     return vec4<f32>(s.x * m, s.y * m, s.z * m, s.w);
 }
 
@@ -829,12 +954,18 @@ fn aggregate_phase_scaled(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, g_sc
 
 // Wrenninge/Oz multi-scatter octave SUN SOURCE (M5): sum_k weight_k * phase(g*b^k) *
 // vis(tau_sun*a^k). octaves=1 == the fix2 single scatter. Twin of clouds.rs::octave_sun_source.
+// The octave count comes from u.m1.y (the studio Multi-scatter A/B: DEFAULT_OCTAVES vs 1),
+// clamped to [1, OCTAVES]; a zero/garbage uniform falls back to the full OCTAVES.
 fn octave_sun_source(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, tau_sun: f32, powder: bool) -> f32 {
+    var octaves = i32(u.m1.y + 0.5);
+    if (octaves < 1 || octaves > OCTAVES) {
+        octaves = OCTAVES;
+    }
     var acc = 0.0;
     var ext_scale = 1.0;
     var g_scale = 1.0;
     var weight = 1.0;
-    for (var k: i32 = 0; k < OCTAVES; k = k + 1) {
+    for (var k: i32 = 0; k < octaves; k = k + 1) {
         let tau_k = tau_sun * ext_scale;
         var vis_k = exp(-tau_k);
         if (powder) {
@@ -1152,6 +1283,14 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
             t = t + ds;
             continue;
         }
+        // Zoom-out-margin EDGE FEATHER (twin of the CPU march): scales BOTH the
+        // in-scatter source and the step opacity, so a faded sample scatters less
+        // AND grows more transparent. sigma_eff == sigma_t at band 0 (no margin).
+        let sigma_eff = sigma_t * edge_feather(bm.x, bm.y);
+        if (sigma_eff <= 0.0) {
+            t = t + ds;
+            continue;
+        }
         // Sun source: Wrenninge multi-scatter octaves (M5) over the single depth-
         // resolved cloud sun optical depth (octaves=1 == fix2 single scatter).
         let tau_cloud_sun = cloud_sun_optical_depth(pm, sun);
@@ -1178,11 +1317,13 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         let col_total = sample_volume(vec3<f32>(bm.x, bm.y, 0.0)).w;
         let tau_down = max(col_total - s.w, 0.0);
         let amb_factor = AMBIENT_W_ABOVE * exp(-s.w) + AMBIENT_W_BELOW * u.m1.w * exp(-tau_down);
-        let step_t = exp(-sigma_t * ds);
-        let s_sun = e_sun * (sigma_t * sun_src) * t_atmo;
-        let s_amb = e_sky * (sigma_t * amb_factor / PI);
+        // The FEATHERED extinction drives the step opacity + the local in-scatter
+        // source (the sun/ambient inputs above use the TRUE field — CPU twin).
+        let step_t = exp(-sigma_eff * ds);
+        let s_sun = e_sun * (sigma_eff * sun_src) * t_atmo;
+        let s_amb = e_sky * (sigma_eff * amb_factor / PI);
         let src = s_sun + s_amb;
-        l = l + trans * (src - src * step_t) / sigma_t;
+        l = l + trans * (src - src * step_t) / sigma_eff;
         let contribution = trans * (1.0 - step_t);
         w_accum = w_accum + contribution * (t + 0.5 * ds - t_enter) / seg;
         w_weight = w_weight + contribution;
@@ -1247,7 +1388,10 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
     let disk = terrain_shadow_fraction(sun_elev * DEG2RAD, 0.0);
     let mu_sun = sin(max(sun_elev, 0.0) * DEG2RAD);
     let t_sun = sample_transmittance(R_GROUND + 1.0, mu_sun);
-    let shadow = clamp(cloud_shadow, 0.0, 1.0);
+    // Raw sun-OD cloud shadow (the specular glint consumer) and the WS2 FLOORED
+    // effective shadow the diffuse direct terms see (twin of render.rs).
+    let shadow_raw = clamp(cloud_shadow, 0.0, 1.0);
+    let shadow = effective_cloud_shadow_gpu(shadow_raw, sun_elev);
     // SH-2 directional terrain ambient (M5): sky irradiance at the terrain normal in the
     // sun-relative frame (full upper hemisphere; the M3 aperture openness/bent-normal
     // upload is deferred with this GPU cloud pass — twin of render.rs surface_toa).
@@ -1263,7 +1407,9 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
         let glint = cox_munk_glint(sun_ecef, to_cam, up_e, cox_munk_mss(0.0) * GLINT_MSS_SCALE) * GLINT_STRENGTH;
         let cos_view = max(dot(to_cam, up_e), 0.0);
         let f_sky = fresnel_unpolarized(cos_view, WATER_N);
-        let l_glint = e_sun * (glint / PI) * t_sun * (disk * LIMB_DISK_AVG * shadow);
+        // The specular glint sees the RAW shadow (twin of render.rs — the WS2 floor
+        // models diffuse cloud-scattered fill, which has no specular component).
+        let l_glint = e_sun * (glint / PI) * t_sun * (disk * LIMB_DISK_AVG * shadow_raw);
         // WS2 water direct sun (twin of render.rs): the water BODY sees the same
         // disk-gated, cloud-shadow-weighted direct term as land, DAY-GATED so twilight
         // is byte-unchanged, with the water albedo simultaneously retuned toward
@@ -1282,6 +1428,10 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
         // sun-gated so twilight is byte-unchanged. Applied before the aerial veil below.
         l_surf = l_surf * land_day_gain(sun_elev);
     }
+    // GROUND LIFT (twin of render::surface_toa_radiance): the sun-gated daytime
+    // brightness lift on the WHOLE surface radiance (land AND water), applied AFTER
+    // the land gain and BEFORE the aerial veil — exactly the CPU order.
+    l_surf = l_surf * ground_day_lift_gain(sun_elev);
 
     let top = ray_sphere(cam, view, R_TOP);
     let gnd = ray_sphere(cam, view, R_GROUND);
@@ -1317,7 +1467,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
         let l_limb = surface_radiance(coord, view, 1.0);
-        let rho = PI * l_limb / max(e_sun, vec3<f32>(1e-6));
+        let rho = exposure_gain() * PI * l_limb / max(e_sun, vec3<f32>(1e-6));
         return vec4<f32>(output_transform(rho), 1.0);
     }
 
@@ -1335,7 +1485,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     if (u.sod_e.w < 0.5) {
         // Clouds disabled: the M2 surface unchanged.
-        let rho = illum * PI * l_toa / max(e_sun, vec3<f32>(1e-6));
+        let rho = exposure_gain() * illum * PI * l_toa / max(e_sun, vec3<f32>(1e-6));
         return vec4<f32>(output_transform(rho), 1.0);
     }
 
@@ -1348,6 +1498,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Front airlight weighted by (1 - T_cloud) to avoid double-counting the front
     // segment already inside l_toa's full-column airlight (FINDING 4).
     let l_final = l_toa * m.transmittance + ap.a * m.inscatter + ap.rgb * (1.0 - m.transmittance);
-    let rho = illum * PI * l_final / max(e_sun, vec3<f32>(1e-6));
+    // Display seam (twin of shade_cloud_pixel -> radiance_to_rgba_softclip): the
+    // low-sun illuminant gains, then rho = EXPOSURE * pi * L / E_sun into the
+    // exposure-aware output transform.
+    let rho = exposure_gain() * illum * PI * l_final / max(e_sun, vec3<f32>(1e-6));
     return vec4<f32>(output_transform(rho), 1.0);
 }

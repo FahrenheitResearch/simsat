@@ -1,12 +1,18 @@
 // SimSat sun optical-depth compute pass (design doc section 6, M4). GPU twin of the
 // CPU reference `clouds::accumulate_sun_od`. Accumulates, per texel of a sun-aligned
 // orthographic map, the TOTAL optical depth of the brick column along the sun ray
-// (Texture A = the log-quantized extinction volume). Consumers: cloud shadows on the
-// ground (T = e^-od) and the raymarch long-range sun transmittance.
+// (Texture A = the log-quantized extinction volume) AND the extinction-weighted mean
+// occluder slant distance (the M5 penumbra channel — `clouds.wgsl` binding 15).
+// Consumers: cloud shadows on the ground (T = e^-od, penumbra-widened by the
+// distance channel) and the raymarch long-range sun transmittance.
 //
-// M4 ships the CPU accumulation (`clouds::accumulate_sun_od`) for tested correctness
-// on the headless nodes; this compute shader is the naga-validated GPU-acceleration
-// path activated in M5. One invocation per texel; no atomics, no shared memory.
+// ACTIVE as of the gpu-clouds pass (feat/gpu-clouds): dispatched by
+// `gpu::CloudPassResources` in ROW BANDS (`vert.w` = the band's row offset) so one
+// submit never exceeds the TDR budget. The CPU accumulation
+// (`clouds::accumulate_sun_od`) remains the shipping/stored-frame path and the
+// tested reference. One invocation per texel; no atomics, no shared memory.
+// Named divergence from the CPU reference: NEAREST-voxel extinction taps (the CPU
+// trilerps) — the map is a coarse shadow field; documented at `total_ext`.
 
 const R_GROUND: f32 = 6370000.0;
 
@@ -18,7 +24,7 @@ struct SunOdUniforms {
     sun: vec4<f32>,      // xyz unit sun dir, w v_min
     extent: vec4<f32>,   // v_max, s_start, s_len, n_steps
     dims: vec4<f32>,     // nx, ny, nz, map_dim
-    vert: vec4<f32>,     // z_min, dz, ds, unused
+    vert: vec4<f32>,     // z_min, dz, ds, ty_offset (row-band offset, TDR chunking)
     // WRF projection forward (lat/lon -> i,j): see frame.rs::MapProjection.
     geo0: vec4<f32>,     // proj_kind, ref_i, ref_j, dx
     geo1: vec4<f32>,     // ref_u, ref_v, dy, central_meridian_deg
@@ -32,6 +38,10 @@ struct SunOdUniforms {
 @group(0) @binding(0) var<uniform> u: SunOdUniforms;
 @group(0) @binding(1) var volume: texture_3d<f32>;
 @group(0) @binding(2) var out_od: texture_storage_2d<r32float, write>;
+// The M5 occluder-distance channel (extinction-weighted mean slant distance, m) —
+// twin of the CPU `SunOdMap::occ_dist`; `clouds.wgsl` binding 15 samples it for the
+// penumbral ground shadow.
+@group(0) @binding(3) var out_dist: texture_storage_2d<r32float, write>;
 
 const PI: f32 = 3.14159265358979;
 const DEG2RAD: f32 = 0.017453292519943295;
@@ -122,7 +132,9 @@ fn total_ext(b: vec3<f32>) -> f32 {
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dim = i32(u.dims.w);
     let tx = i32(gid.x);
-    let ty = i32(gid.y);
+    // Row-band offset (TDR chunking): the dispatcher submits the map in horizontal
+    // bands, each with its own `vert.w` row offset, so one submit stays bounded.
+    let ty = i32(gid.y) + i32(u.vert.w);
     if (tx >= dim || ty >= dim) {
         return;
     }
@@ -138,14 +150,32 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_steps = i32(u.extent.w);
     let ds = u.vert.z;
     var acc = 0.0;
+    var dist_weighted = 0.0;
     for (var s: i32 = 0; s < n_steps; s = s + 1) {
         let t = (f32(s) + 0.5) * ds;
         let p = start - sun * t;
-        acc = acc + total_ext(ecef_to_brick(p)) * ds;
+        let ext = total_ext(ecef_to_brick(p));
+        if (ext > 0.0) {
+            acc = acc + ext * ds;
+            // Occluder slant distance down to the ground along the sun ray
+            // ~= height above ground / sin(local sun elevation), sine clamped so a
+            // near-horizon sun stays bounded (twin of the CPU accumulation).
+            let r = length(p);
+            let h = max(r - R_GROUND, 0.0);
+            let mu = max(dot(p / r, sun), 0.05);
+            dist_weighted = dist_weighted + ext * ds * (h / mu);
+        }
+    }
+    var dist = 0.0;
+    if (acc > 0.0) {
+        dist = dist_weighted / acc;
     }
     // WS1 edge feather: smoothstep of the texel's distance to the nearest map edge.
+    // Feathers ONLY the od channel (an additive column quantity); the occluder
+    // distance is a mean and stays meaningful unscaled (twin of the CPU feather).
     let dedge = f32(min(min(tx, dim - 1 - tx), min(ty, dim - 1 - ty)));
     let tf = clamp(dedge / EDGE_FEATHER_TEXELS, 0.0, 1.0);
     let w = tf * tf * (3.0 - 2.0 * tf);
     textureStore(out_od, vec2<i32>(tx, ty), vec4<f32>(acc * w, 0.0, 0.0, 1.0));
+    textureStore(out_dist, vec2<i32>(tx, ty), vec4<f32>(dist, 0.0, 0.0, 1.0));
 }

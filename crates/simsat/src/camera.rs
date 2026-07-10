@@ -962,6 +962,287 @@ impl MapRaster {
     }
 }
 
+// ── free PERSPECTIVE camera (tier 2: prerendered angled flyovers) ──────────────
+
+/// Geodetic `(lat, lon)` (deg) + altitude above the sphere (m) -> ECEF metres on the
+/// WRF sphere (`R = 6.37e6`, owner decision 5). The geodetic up on a sphere is the
+/// radial direction, so this is exact (no ellipsoid normal).
+pub fn geodetic_to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> [f64; 3] {
+    let (la, lo) = (lat_deg.to_radians(), lon_deg.to_radians());
+    let (sla, cla) = la.sin_cos();
+    let (slo, clo) = lo.sin_cos();
+    let r = R_EARTH + alt_m;
+    [r * cla * clo, r * cla * slo, r * sla]
+}
+
+/// A FREE PERSPECTIVE camera (the broadcast-visuals "angled 3D scene" product): an eye
+/// at `(lat, lon, alt)` looking at a target `(lat, lon, alt)` with a HORIZONTAL field
+/// of view `fov_deg` across a `width x height` image. Produces per-pixel ECEF rays
+/// ([`PerspectiveBasis::pixel_ray`]) that feed the SAME ray-agnostic marches the
+/// geostationary and top-down products use (`render::surface_toa_radiance`,
+/// `clouds::march_cloud`) — the [`topdown_nadir_ray`] pattern generalized from one
+/// fixed nadir ray per pixel to a pinhole ray fan from one eye.
+///
+/// CONVENTIONS: `fov_deg` is the HORIZONTAL FOV (the vertical follows from the aspect,
+/// `tan(v/2) = tan(h/2) * height/width`); the image up is the LOCAL VERTICAL at the eye
+/// projected perpendicular to the view (a horizon-level camera keeps the horizon
+/// level); when the view is within ~0.8 deg of straight up/down the up-hint degenerates
+/// and LOCAL NORTH is used instead (a nadir shot comes out north-up, matching the
+/// top-down map). A yaw/pitch parameterization is deliberately NOT built this wave —
+/// a flyover path is naturally scripted as eye/look pairs (see the binding README);
+/// deriving one from yaw/pitch is a trivial caller-side conversion.
+///
+/// HONESTY: perspective renders carry the camera on the render result
+/// (`api::Georef::camera_pose`) and in the render log — the what-if labeling
+/// discipline. Parallax displacement of high cloud against the ground is PHYSICAL and
+/// intended (the rays are true 3-D lines through the volume; that is the 3D look).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerspectiveCamera {
+    pub eye_lat_deg: f64,
+    pub eye_lon_deg: f64,
+    /// Eye altitude above the sphere (m); must be > 0 (the eye is airborne/space).
+    pub eye_alt_m: f64,
+    pub look_lat_deg: f64,
+    pub look_lon_deg: f64,
+    /// Look-target altitude above the sphere (m); >= 0 (a ground point or a level).
+    pub look_alt_m: f64,
+    /// HORIZONTAL field of view (deg), across the image width. `1..=160`.
+    pub fov_deg: f64,
+    /// Output image dims (px); each `2..=`[`MAX_AXIS`].
+    pub width: usize,
+    pub height: usize,
+}
+
+impl PerspectiveCamera {
+    /// Validate the camera parameters (finite coordinates, an airborne eye, a sane
+    /// FOV, in-cap dims, and a non-degenerate eye->look direction).
+    pub fn validate(&self) -> Result<(), String> {
+        let vals = [
+            self.eye_lat_deg,
+            self.eye_lon_deg,
+            self.eye_alt_m,
+            self.look_lat_deg,
+            self.look_lon_deg,
+            self.look_alt_m,
+            self.fov_deg,
+        ];
+        if vals.iter().any(|v| !v.is_finite()) {
+            return Err("perspective camera has a non-finite parameter".to_string());
+        }
+        if self.eye_lat_deg.abs() > 90.0 || self.look_lat_deg.abs() > 90.0 {
+            return Err("perspective camera latitude out of [-90, 90]".to_string());
+        }
+        if self.eye_alt_m <= 0.0 {
+            return Err(format!(
+                "perspective eye altitude must be > 0 m (got {})",
+                self.eye_alt_m
+            ));
+        }
+        if self.look_alt_m < 0.0 {
+            return Err(format!(
+                "perspective look altitude must be >= 0 m (got {})",
+                self.look_alt_m
+            ));
+        }
+        if !(1.0..=160.0).contains(&self.fov_deg) {
+            return Err(format!(
+                "perspective fov must be 1..=160 deg (got {})",
+                self.fov_deg
+            ));
+        }
+        if !(2..=MAX_AXIS).contains(&self.width) || !(2..=MAX_AXIS).contains(&self.height) {
+            return Err(format!(
+                "perspective dims must be 2..={MAX_AXIS} px per axis (got {}x{})",
+                self.width, self.height
+            ));
+        }
+        let eye = geodetic_to_ecef(self.eye_lat_deg, self.eye_lon_deg, self.eye_alt_m);
+        let look = geodetic_to_ecef(self.look_lat_deg, self.look_lon_deg, self.look_alt_m);
+        let d = sub3(look, eye);
+        if len3(d) < 1.0 {
+            return Err("perspective eye and look-at coincide".to_string());
+        }
+        Ok(())
+    }
+
+    /// Build the ECEF pinhole basis (validating first). See the type docs for the
+    /// up-vector and FOV conventions.
+    pub fn basis(&self) -> Result<PerspectiveBasis, String> {
+        self.validate()?;
+        let eye = geodetic_to_ecef(self.eye_lat_deg, self.eye_lon_deg, self.eye_alt_m);
+        let look = geodetic_to_ecef(self.look_lat_deg, self.look_lon_deg, self.look_alt_m);
+        let forward = norm3(sub3(look, eye));
+        // Up hint: the local vertical at the eye (radial); local north when the view is
+        // near-vertical (the nadir/zenith degeneracy — a nadir shot renders north-up).
+        let up_world = norm3(eye);
+        let up_hint = if dot3(forward, up_world).abs() > 0.9999 {
+            let (sla, cla) = self.eye_lat_deg.to_radians().sin_cos();
+            let (slo, clo) = self.eye_lon_deg.to_radians().sin_cos();
+            [-sla * clo, -sla * slo, cla] // local north (ENU north in ECEF)
+        } else {
+            up_world
+        };
+        let right = norm3(cross3(forward, up_hint));
+        let up = cross3(right, forward); // unit by construction (right ⊥ forward)
+        let tan_half_h = (self.fov_deg.to_radians() * 0.5).tan();
+        let tan_half_v = tan_half_h * self.height as f64 / self.width as f64;
+        Ok(PerspectiveBasis {
+            eye,
+            forward,
+            right,
+            up,
+            tan_half_h,
+            tan_half_v,
+            width: self.width,
+            height: self.height,
+        })
+    }
+
+    /// A short human-readable pose label for logs / frame provenance.
+    pub fn label(&self) -> String {
+        format!(
+            "eye=({:.4},{:.4},{:.0} m) look=({:.4},{:.4},{:.0} m) fov={:.1} deg {}x{}",
+            self.eye_lat_deg,
+            self.eye_lon_deg,
+            self.eye_alt_m,
+            self.look_lat_deg,
+            self.look_lon_deg,
+            self.look_alt_m,
+            self.fov_deg,
+            self.width,
+            self.height
+        )
+    }
+}
+
+/// The resolved ECEF pinhole basis of a [`PerspectiveCamera`]: the eye position and
+/// the orthonormal `(forward, right, up)` frame plus the half-FOV tangents.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerspectiveBasis {
+    pub eye: [f64; 3],
+    pub forward: [f64; 3],
+    pub right: [f64; 3],
+    pub up: [f64; 3],
+    pub tan_half_h: f64,
+    pub tan_half_v: f64,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl PerspectiveBasis {
+    /// The unit ECEF view ray through the CENTRE of pixel `(px, py)` (row 0 = image
+    /// top). NDC runs over pixel centres, so for odd dims the middle pixel's ray is
+    /// exactly `forward`.
+    pub fn pixel_ray(&self, px: usize, py: usize) -> [f64; 3] {
+        let ndc_x = ((px as f64 + 0.5) / self.width as f64) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((py as f64 + 0.5) / self.height as f64) * 2.0;
+        let mut v = self.forward;
+        v = madd3(v, self.right, ndc_x * self.tan_half_h);
+        v = madd3(v, self.up, ndc_y * self.tan_half_v);
+        norm3(v)
+    }
+}
+
+/// Build the per-pixel SURFACE raster for a perspective camera: for every pixel,
+/// intersect its ray with the ground sphere (`R_EARTH`); a hit yields the geodetic
+/// lat/lon (+ the fractional WRF `(i, j)` when inside the domain), a miss stays `NaN`
+/// (sky/space — the render composites the existing limb/space handling there, and the
+/// cloud march still runs, since near-horizon rays can cross the cloud shell without
+/// touching the ground). The returned [`SurfaceRaster`]'s `ScanGrid` is the same
+/// benign placeholder [`MapRaster::as_surface_raster`] uses — the perspective render
+/// path derives its rays from the basis, never from scan angles — so the shared LUT
+/// builder (`gpu::build_luts`) and assemble machinery work unchanged.
+pub fn build_perspective_raster(
+    basis: &PerspectiveBasis,
+    georef: &GridGeoref,
+    domain_nx: usize,
+    domain_ny: usize,
+) -> SurfaceRaster {
+    let scan = ScanGrid {
+        nx: basis.width,
+        ny: basis.height,
+        x_min: 0.0,
+        y_max: 0.0,
+        pitch_x: VISIBLE_PITCH_RAD,
+        pitch_y: VISIBLE_PITCH_RAD,
+    };
+    let mut raster = SurfaceRaster::empty(scan);
+    let (di, dj) = ((domain_nx.max(1) - 1) as f64, (domain_ny.max(1) - 1) as f64);
+    for py in 0..basis.height {
+        for px in 0..basis.width {
+            let view = basis.pixel_ray(px, py);
+            let Some(t) = ray_sphere_first_hit(basis.eye, view, R_EARTH) else {
+                continue; // sky/space: stays NaN
+            };
+            let p = madd3(basis.eye, view, t);
+            let r = len3(p);
+            let lat = (p[2] / r).clamp(-1.0, 1.0).asin().to_degrees();
+            let lon = p[1].atan2(p[0]).to_degrees();
+            let idx = py * basis.width + px;
+            raster.lat[idx] = lat as f32;
+            raster.lon[idx] = lon as f32;
+            let (fi, fj) = georef.forward(lat, lon);
+            if (0.0..=di).contains(&fi) && (0.0..=dj).contains(&fj) {
+                raster.grid_i[idx] = fi as f32;
+                raster.grid_j[idx] = fj as f32;
+            }
+        }
+    }
+    raster
+}
+
+/// The nearest POSITIVE ray/sphere intersection distance, or `None` (miss, or the
+/// sphere is entirely behind the origin). `dir` unit; origin outside the sphere for
+/// the validated camera (eye altitude > 0).
+fn ray_sphere_first_hit(origin: [f64; 3], dir: [f64; 3], radius: f64) -> Option<f64> {
+    let b = dot3(origin, dir);
+    let c = dot3(origin, origin) - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let t0 = -b - s;
+    let t1 = -b + s;
+    if t0 > 0.0 {
+        Some(t0)
+    } else if t1 > 0.0 {
+        Some(t1)
+    } else {
+        None
+    }
+}
+
+// Small ECEF vector helpers for the perspective section (camera.rs had no vector
+// math before; kept private and minimal).
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn madd3(a: [f64; 3], b: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s]
+}
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn len3(a: [f64; 3]) -> f64 {
+    dot3(a, a).sqrt()
+}
+fn norm3(a: [f64; 3]) -> [f64; 3] {
+    let l = len3(a);
+    if l > 0.0 {
+        [a[0] / l, a[1] / l, a[2] / l]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,5 +1936,219 @@ mod tests {
             m0 < -0.5 && m1 > 119.5 && m2 < -0.5 && m3 > 89.5,
             "bounds not extended"
         );
+    }
+
+    // ── free perspective camera (tier 2) ───────────────────────────────────────
+
+    /// An eye directly above a look point (a pure nadir shot). Odd dims so the
+    /// middle pixel's ray is exactly the optical axis.
+    fn nadir_camera(lat: f64, lon: f64, alt_m: f64) -> PerspectiveCamera {
+        PerspectiveCamera {
+            eye_lat_deg: lat,
+            eye_lon_deg: lon,
+            eye_alt_m: alt_m,
+            look_lat_deg: lat,
+            look_lon_deg: lon,
+            look_alt_m: 0.0,
+            fov_deg: 40.0,
+            width: 641,
+            height: 481,
+        }
+    }
+
+    #[test]
+    fn perspective_nadir_centre_ray_matches_the_topdown_nadir_ray() {
+        // The nadir-degenerate perspective camera must reproduce the top-down ray at
+        // the same point: the middle pixel's ray equals `topdown_nadir_ray`'s view
+        // (straight down the local vertical), and the basis is orthonormal despite
+        // the up-hint degeneracy (local north takes over).
+        let cam = nadir_camera(46.9, -97.6, 150_000.0);
+        let basis = cam.basis().expect("valid camera");
+        let centre = basis.pixel_ray(cam.width / 2, cam.height / 2);
+        let (_, nadir_view) = topdown_nadir_ray(46.9, -97.6);
+        let dot = centre[0] * nadir_view[0] + centre[1] * nadir_view[1] + centre[2] * nadir_view[2];
+        assert!(dot > 1.0 - 1e-12, "centre ray != nadir view (dot {dot})");
+        // Orthonormal basis.
+        assert!((len3(basis.forward) - 1.0).abs() < 1e-12);
+        assert!((len3(basis.right) - 1.0).abs() < 1e-12);
+        assert!((len3(basis.up) - 1.0).abs() < 1e-12);
+        assert!(dot3(basis.forward, basis.right).abs() < 1e-12);
+        assert!(dot3(basis.forward, basis.up).abs() < 1e-12);
+        assert!(dot3(basis.right, basis.up).abs() < 1e-12);
+        // North-up nadir image: image up projects onto local north (positive z-ish
+        // component toward the pole at this northern latitude).
+        let north = {
+            let (sla, cla) = 46.9f64.to_radians().sin_cos();
+            let (slo, clo) = (-97.6f64).to_radians().sin_cos();
+            [-sla * clo, -sla * slo, cla]
+        };
+        assert!(
+            dot3(basis.up, north) > 0.999,
+            "nadir image should be north-up: {}",
+            dot3(basis.up, north)
+        );
+    }
+
+    #[test]
+    fn perspective_rays_are_unit_and_span_the_horizontal_fov() {
+        // An oblique camera: every pixel ray is unit length, and the angle between
+        // the row-centre edge pixels' rays matches the pixel-centre FOV
+        // (2 * atan(tan(fov/2) * (1 - 1/width))) — the pure-geometry FOV invariant.
+        let cam = PerspectiveCamera {
+            eye_lat_deg: 45.5,
+            eye_lon_deg: -99.0,
+            eye_alt_m: 150_000.0,
+            look_lat_deg: 46.9,
+            look_lon_deg: -97.6,
+            look_alt_m: 0.0,
+            fov_deg: 50.0,
+            width: 640,
+            height: 360,
+        };
+        let basis = cam.basis().expect("valid camera");
+        for &(px, py) in &[
+            (0usize, 0usize),
+            (639, 0),
+            (0, 359),
+            (639, 359),
+            (320, 180),
+            (17, 251),
+        ] {
+            let v = basis.pixel_ray(px, py);
+            assert!((len3(v) - 1.0).abs() < 1e-12, "ray ({px},{py}) not unit");
+        }
+        let mid_row = cam.height / 2;
+        let left = basis.pixel_ray(0, mid_row);
+        let right = basis.pixel_ray(cam.width - 1, mid_row);
+        let angle = dot3(left, right).clamp(-1.0, 1.0).acos().to_degrees();
+        let tan_half = (cam.fov_deg.to_radians() * 0.5).tan();
+        let edge = tan_half * (1.0 - 1.0 / cam.width as f64);
+        let expected = 2.0 * edge.atan().to_degrees();
+        // The mid row sits half a pixel off the optical axis (even height), so the
+        // edge-to-edge angle is a hair under the in-plane value; a loose 0.1-deg
+        // tolerance covers it while still pinning the FOV scale.
+        assert!(
+            (angle - expected).abs() < 0.1,
+            "edge-to-edge angle {angle} != expected {expected}"
+        );
+        // Left/right symmetry about the forward axis.
+        assert!(
+            (dot3(left, basis.forward) - dot3(right, basis.forward)).abs() < 1e-9,
+            "rays not symmetric about forward"
+        );
+    }
+
+    #[test]
+    fn perspective_centre_pixel_hits_the_look_point() {
+        // The camera looks AT a ground point: the middle pixel's ground intersection
+        // must be that point (the ray passes through it and it is the first sphere
+        // hit for a below-horizon target). Pure geometry via the raster builder.
+        let proj = MapProjection::lambert(30.0, 60.0, -97.5);
+        let (nx, ny) = (120usize, 90usize);
+        let georef = GridGeoref::new(
+            proj,
+            (nx - 1) as f64 / 2.0,
+            (ny - 1) as f64 / 2.0,
+            39.0,
+            -97.5,
+            3000.0,
+            3000.0,
+        );
+        let cam = PerspectiveCamera {
+            eye_lat_deg: 37.8,
+            eye_lon_deg: -99.1,
+            eye_alt_m: 150_000.0,
+            look_lat_deg: 39.0,
+            look_lon_deg: -97.5,
+            look_alt_m: 0.0,
+            fov_deg: 45.0,
+            width: 321,
+            height: 241,
+        };
+        let basis = cam.basis().unwrap();
+        let raster = build_perspective_raster(&basis, &georef, nx, ny);
+        let idx = (cam.height / 2) * cam.width + cam.width / 2;
+        let (la, lo) = (raster.lat[idx] as f64, raster.lon[idx] as f64);
+        assert!(
+            (la - 39.0).abs() < 1e-6 && (lo - -97.5).abs() < 1e-6,
+            "centre pixel hit ({la}, {lo}) != the look point (39, -97.5)"
+        );
+        // And that point is the domain centre -> the fractional grid index is the
+        // centre cell.
+        let (fi, fj) = (raster.grid_i[idx] as f64, raster.grid_j[idx] as f64);
+        assert!(
+            (fi - (nx - 1) as f64 / 2.0).abs() < 1e-3 && (fj - (ny - 1) as f64 / 2.0).abs() < 1e-3,
+            "centre grid index ({fi}, {fj})"
+        );
+    }
+
+    #[test]
+    fn perspective_raster_marks_sky_above_the_horizon() {
+        // A LOW-oblique camera aimed at the horizon: the top image rows are SKY
+        // (NaN — no ground intersection), the bottom rows are ground, and the sky
+        // fraction is substantial. This is the raster contract the render relies on
+        // (sky pixels composite the limb/space path; ground pixels the surface).
+        let proj = MapProjection::lambert(30.0, 60.0, -97.5);
+        let georef = GridGeoref::new(proj, 59.5, 44.5, 39.0, -97.5, 3000.0, 3000.0);
+        let cam = PerspectiveCamera {
+            eye_lat_deg: 38.0,
+            eye_lon_deg: -99.0,
+            eye_alt_m: 20_000.0,
+            // Look far past the horizon at altitude: the upper half is sky.
+            look_lat_deg: 43.0,
+            look_lon_deg: -92.0,
+            look_alt_m: 150_000.0,
+            fov_deg: 60.0,
+            width: 160,
+            height: 120,
+        };
+        let basis = cam.basis().unwrap();
+        let raster = build_perspective_raster(&basis, &georef, 120, 90);
+        let row_finite = |py: usize| {
+            (0..raster.nx)
+                .filter(|px| raster.lat[py * raster.nx + px].is_finite())
+                .count()
+        };
+        assert_eq!(row_finite(0), 0, "the top row must be sky (no ground hit)");
+        assert_eq!(
+            row_finite(raster.ny - 1),
+            raster.nx,
+            "the bottom row must be ground"
+        );
+        let sky = raster.lat.iter().filter(|v| !v.is_finite()).count();
+        let frac = sky as f64 / (raster.nx * raster.ny) as f64;
+        assert!(
+            (0.2..=0.95).contains(&frac),
+            "sky fraction {frac} implausible for a horizon shot"
+        );
+    }
+
+    #[test]
+    fn perspective_camera_validation_rejects_bad_input() {
+        let good = nadir_camera(46.9, -97.6, 150_000.0);
+        assert!(good.validate().is_ok());
+        let mut c = good;
+        c.eye_alt_m = 0.0;
+        assert!(c.validate().is_err(), "grounded eye must be rejected");
+        c = good;
+        c.fov_deg = 0.5;
+        assert!(c.validate().is_err(), "sub-degree fov must be rejected");
+        c = good;
+        c.fov_deg = 179.0;
+        assert!(c.validate().is_err(), "near-180 fov must be rejected");
+        c = good;
+        c.width = 1;
+        assert!(c.validate().is_err(), "degenerate width must be rejected");
+        c = good;
+        c.eye_lon_deg = f64::NAN;
+        assert!(c.validate().is_err(), "NaN must be rejected");
+        c = good;
+        c.look_lat_deg = c.eye_lat_deg;
+        c.look_lon_deg = c.eye_lon_deg;
+        c.look_alt_m = c.eye_alt_m;
+        assert!(c.validate().is_err(), "eye == look must be rejected");
+        c = good;
+        c.eye_lat_deg = 91.0;
+        assert!(c.validate().is_err(), "latitude out of range");
     }
 }

@@ -18,6 +18,9 @@ eframe = { workspace = true }
 # wrfout reading (WrfFile::read_var streaming) + NetCDF/HDF5 metadata fallback.
 wrf-core = { workspace = true }
 netcrust = { workspace = true }
+# GRIB2 decode (HRRR/RRFS operational ingest, `ingest_grib.rs`). Pinned rev +
+# default-features = false rationale in the root manifest.
+grib-core = { workspace = true }
 # Output contract (sat-store) + geostationary camera math + grid geometry types.
 rw-store = { workspace = true }
 rw-sat = { workspace = true }

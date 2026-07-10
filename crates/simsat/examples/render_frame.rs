@@ -40,6 +40,24 @@
 //!                      colored band-13 IR night) instead of plain visible  (default off).
 //!   sandwich=<b>       on | off  — render the Sandwich composite (true-color visible base +
 //!                      color-enhanced band-13 IR overlaid on the cold cloud tops)  (default off).
+//!   product=<p>        visible | geocolor | sandwich | cloud-layer. `cloud-layer` renders the
+//!                      WEB-MAP CLOUD LAYER pair (the Mapbox-class compositing product): `out`
+//!                      becomes the cloud RGBA PNG (straight alpha), plus `<stem>_shadow.png`
+//!                      (grayscale multiply layer, 255 = no shadow) and `<stem>.json` (the
+//!                      Mapbox ImageSource corner lon/lats + EPSG:3857 extent). Top-down by
+//!                      definition (view= is ignored for it).
+//!   composite-out=<p>  With product=cloud-layer: ALSO write the in-process synthetic composite
+//!                      proof (shadow multiply + cloud over a checkerboard basemap) to this PNG.
+//!   eye=lat,lon,alt    FREE-PERSPECTIVE camera eye (deg, deg, metres above the sphere).
+//!   look=lat,lon,alt   The perspective look-at target. eye= + look= together switch the
+//!                      render to Product::Perspective (the angled-3D full composite over
+//!                      our Blue Marble ground; sky rays composite the limb/space).
+//!   fov=<deg>          Perspective HORIZONTAL field of view (default 40).
+//!   camsize=<WxH>      Perspective image dims (default 1280x720).
+//!   perspective-layer=<b>  on | off (default off): render the CLOUD FIELD ONLY through the
+//!                      perspective camera; `out` becomes a straight-alpha RGBA PNG (for
+//!                      compositing over a host 3-D map with a matching camera).
+//!                      A FLYOVER is N invocations along your own eye/look path.
 //!   ground-gain=<f>    OVERRIDE the baked GROUND LIFT (render::GROUND_DAY_LIFT); 1.0 = neutral.
 //!   cloud-softclip=<f> OVERRIDE the baked highlight soft-clip knee (render::CLOUD_SOFTCLIP_KNEE);
 //!                      1.0 = disable the shoulder (hard clamp).
@@ -75,15 +93,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use image::RgbImage;
+use image::{GrayImage, RgbImage, RgbaImage};
 use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams, SunOverride};
-use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
+use simsat::camera::{PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMode};
 use simsat::clouds::StepQuality;
 use simsat::gpu::RenderedFrame;
 use simsat::ingest;
 use simsat::render::DEFAULT_EXPOSURE;
 use simsat::store_out::{self, VisibleFrame};
 use simsat::topdown;
+use simsat::web_layer;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -125,6 +144,26 @@ struct Opts {
     /// overlaid on the cold cloud tops) instead of the plain visible frame. Takes precedence
     /// over `geocolor`. The output is still a baked RGB composite.
     sandwich: bool,
+    /// Render the WEB-MAP CLOUD LAYER pair (`product=cloud-layer`): the cloud-only RGBA
+    /// (straight alpha in the PNG) + the ground cloud-shadow multiply PNG + a JSON
+    /// sidecar with the Mapbox ImageSource corner lon/lats, on a Web-Mercator grid.
+    /// Takes precedence over `sandwich`/`geocolor`.
+    cloud_layer: bool,
+    /// With `product=cloud-layer`: ALSO write the in-process SYNTHETIC COMPOSITE PROOF
+    /// (shadow-multiply then cloud-over on a checkerboard basemap) to this PNG — the
+    /// no-Mapbox registration/appearance check.
+    composite_out: Option<PathBuf>,
+    /// FREE-PERSPECTIVE camera (tier 2): `eye=lat,lon,alt_m` + `look=lat,lon,alt_m`
+    /// trigger the perspective product (both required together).
+    eye: Option<(f64, f64, f64)>,
+    look: Option<(f64, f64, f64)>,
+    /// Horizontal field of view (deg) for the perspective camera (default 40).
+    fov: f64,
+    /// Perspective image dims `camsize=WxH` (default 1280x720).
+    camsize: (usize, usize),
+    /// Perspective CLOUD-LAYER-ONLY mode: `out` becomes a straight-alpha RGBA PNG of
+    /// the cloud field alone (for compositing over a host 3-D map).
+    perspective_layer: bool,
     /// Appearance-pass tuning overrides (None = the baked engine defaults). Future tuning
     /// knobs; the shipped look already comes from the baked constants.
     ground_gain: Option<f64>,
@@ -186,10 +225,18 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // ── the one shared render assembly ──
     let params = render_params(&opts);
-    // Sandwich = the visible base + cold-top IR overlay; GeoColor = the day/night blend; else
-    // the plain refined true-color visible frame. All three are baked RGB composites
-    // (FrameData::Visible). Sandwich takes precedence over GeoColor if both are set.
-    let product = if opts.sandwich {
+    // The web-map cloud layer is a different delivery (RGBA + shadow + sidecar, not one
+    // RGB PNG) — its own output path.
+    if opts.cloud_layer {
+        return run_cloud_layer(&opts, &params);
+    }
+    // Perspective (eye= + look=) wins; then Sandwich > GeoColor > plain visible. All are
+    // baked RGB(A) composites (FrameData::Visible).
+    let product = if params.perspective.is_some() {
+        Product::Perspective {
+            cloud_layer_only: opts.perspective_layer,
+        }
+    } else if opts.sandwich {
         Product::Sandwich
     } else if opts.geocolor {
         Product::GeoColor
@@ -218,18 +265,39 @@ fn run(args: &[String]) -> Result<(), String> {
         },
         wall.as_secs_f64(),
     );
+    // The what-if labeling discipline: a perspective frame always states its camera.
+    if let Some(cam) = &result.georef.camera_pose {
+        println!(
+            "PERSPECTIVE {} layer_only={} ground_frac={:.3}",
+            cam.label(),
+            opts.perspective_layer,
+            result.georef.lat.iter().filter(|v| v.is_finite()).count() as f64
+                / (rnx * rny).max(1) as f64,
+        );
+    }
 
-    // ── optional canvas letterbox to a fixed figure size (black pad) ──
-    let (final_nx, final_ny, final_rgb) = match opts.canvas {
-        Some((cw, ch)) => (cw, ch, topdown::letterbox_rgb(rgb, rnx, rny, cw, ch)),
-        None => (rnx, rny, rgb.clone()),
+    // ── output: RGBA (perspective cloud layer) or RGB (+ optional canvas letterbox) ──
+    let (final_nx, final_ny) = if opts.perspective_layer {
+        // The cloud-layer-only perspective frame delivers STRAIGHT-alpha RGBA (the
+        // canvas letterbox is RGB-only and skipped for it).
+        if opts.canvas.is_some() {
+            eprintln!("render_frame: canvas= skipped for the RGBA perspective layer.");
+        }
+        write_rgba8_png(&opts.out, rnx, rny, &web_layer::unpremultiply_rgba(rgba))?;
+        (rnx, rny)
+    } else {
+        let (fnx, fny, final_rgb) = match opts.canvas {
+            Some((cw, ch)) => (cw, ch, topdown::letterbox_rgb(rgb, rnx, rny, cw, ch)),
+            None => (rnx, rny, rgb.clone()),
+        };
+        write_rgb8_png(&opts.out, fnx, fny, &final_rgb)?;
+        (fnx, fny)
     };
-    write_rgb8_png(&opts.out, final_nx, final_ny, &final_rgb)?;
 
     // ── optional sat-store write (geostationary only — the store carries the scan mesh) ──
     if opts.store.is_some() {
-        if opts.view == ViewMode::TopDownMap {
-            eprintln!("render_frame: store write skipped (store= is geostationary only).");
+        if opts.view == ViewMode::TopDownMap || params.perspective.is_some() {
+            eprintln!("render_frame: store write skipped (store= is for the geostationary view).");
         } else {
             write_store(&opts, &result, rgba)?;
         }
@@ -306,6 +374,156 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Render + deliver the WEB-MAP CLOUD LAYER pair (`product=cloud-layer`): the cloud
+/// RGBA PNG (STRAIGHT alpha — the PNG/browser/Mapbox convention; the engine computes
+/// premultiplied, see `web_layer`), the grayscale shadow multiply PNG
+/// (`<out stem>_shadow.png`, 255 = no shadow), the JSON sidecar (`<out stem>.json`,
+/// Mapbox ImageSource corners + EPSG:3857 extent), and optionally the in-process
+/// synthetic composite proof (`composite-out=`): shadow-multiply then cloud-over on a
+/// checkerboard basemap — the registration check that needs no Mapbox.
+fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
+    let t0 = Instant::now();
+    let result = api::render(params, Product::CloudLayer)?;
+    let wall = t0.elapsed();
+    let (rgba_premul, shadow) = match &result.data {
+        FrameData::CloudLayer {
+            rgba_premul,
+            shadow,
+        } => (rgba_premul, shadow),
+        _ => return Err("expected a cloud-layer frame".to_string()),
+    };
+    let (nx, ny) = (result.nx, result.ny);
+
+    // 1. The cloud RGBA PNG (straight alpha for PNG delivery).
+    let straight = web_layer::unpremultiply_rgba(rgba_premul);
+    write_rgba8_png(&opts.out, nx, ny, &straight)?;
+
+    // 2. The shadow multiply PNG (grayscale; 255 = no shadow).
+    let shadow_path = sibling_path(&opts.out, "_shadow.png");
+    write_gray8_png(&shadow_path, nx, ny, &web_layer::shadow_to_gray(shadow))?;
+
+    // 3. The JSON sidecar (Mapbox ImageSource corners + extent + semantics).
+    let corners = result
+        .georef
+        .mercator_corners_lonlat
+        .ok_or("cloud layer missing mercator corners")?;
+    let extent = result.georef.extent;
+    let grid = web_layer::MercatorGrid {
+        nx,
+        ny,
+        x_min: extent[0],
+        x_max: extent[1],
+        y_min: extent[2],
+        y_max: extent[3],
+    };
+    let t = result.time;
+    let mut hh = t.ut as u32;
+    let mut mm = ((t.ut - hh as f64) * 60.0).round() as u32;
+    if mm >= 60 {
+        hh += 1;
+        mm -= 60;
+    }
+    let time_iso = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:00Z",
+        t.year, t.month, t.day, hh, mm
+    );
+    let sidecar = web_layer::cloud_layer_sidecar_json(
+        &grid,
+        opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+        shadow_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?"),
+        &time_iso,
+        result.sun_elev_deg,
+        result.granulation,
+    );
+    let sidecar_path = sibling_path(&opts.out, ".json");
+    std::fs::write(&sidecar_path, &sidecar)
+        .map_err(|e| format!("write sidecar {}: {e}", sidecar_path.display()))?;
+
+    // 4. Optional synthetic composite proof over a checkerboard basemap.
+    if let Some(comp_path) = &opts.composite_out {
+        let base = web_layer::checker_basemap(nx, ny, 32);
+        let composed = web_layer::composite_over_basemap(&base, &straight, shadow, nx * ny);
+        write_rgb8_png(comp_path, nx, ny, &composed)?;
+        eprintln!(
+            "render_frame: wrote composite proof {}",
+            comp_path.display()
+        );
+    }
+
+    // 5. Layer stats: coverage (alpha > 0), mean alpha, shadow floor.
+    let covered = straight.chunks_exact(4).filter(|p| p[3] > 0).count();
+    let mean_alpha = straight
+        .chunks_exact(4)
+        .map(|p| p[3] as f64 / 255.0)
+        .sum::<f64>()
+        / (nx * ny).max(1) as f64;
+    let shadow_min = shadow.iter().cloned().fold(1.0f32, f32::min);
+    let shadow_mean = shadow.iter().map(|&s| s as f64).sum::<f64>() / shadow.len().max(1) as f64;
+    let nw = corners[0];
+    let se = corners[2];
+    eprintln!(
+        "render_frame: wrote {} + {} + {}",
+        opts.out.display(),
+        shadow_path.display(),
+        sidecar_path.display()
+    );
+    println!(
+        "LAYERSUMMARY file={} dims={}x{} crs=EPSG:3857 corner_nw={:.4},{:.4} \
+         corner_se={:.4},{:.4} sun_elev={:.1} cover_frac={:.3} mean_alpha={:.3} \
+         shadow_min={:.3} shadow_mean={:.3} granulation={} wall_s={:.3}",
+        opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+        nx,
+        ny,
+        nw[0],
+        nw[1],
+        se[0],
+        se[1],
+        result.sun_elev_deg,
+        covered as f64 / (nx * ny).max(1) as f64,
+        mean_alpha,
+        shadow_min,
+        shadow_mean,
+        result.granulation,
+        wall.as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// `path` with `suffix` appended to its file STEM (`clouds.png` + `_shadow.png` ->
+/// `clouds_shadow.png`; `clouds.png` + `.json` -> `clouds.json`).
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+    path.with_file_name(format!("{stem}{suffix}"))
+}
+
+/// Write RGBA8 bytes (row 0 = north, straight alpha) to a PNG.
+fn write_rgba8_png(path: &Path, nx: usize, ny: usize, rgba: &[u8]) -> Result<(), String> {
+    if rgba.len() != nx * ny * 4 {
+        return Err(format!("rgba byte count {} != {}x{}x4", rgba.len(), nx, ny));
+    }
+    let img = RgbaImage::from_fn(nx as u32, ny as u32, |x, y| {
+        let o = (y as usize * nx + x as usize) * 4;
+        image::Rgba([rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]])
+    });
+    img.save(path)
+        .map_err(|e| format!("write PNG {}: {e}", path.display()))
+}
+
+/// Write 8-bit grayscale bytes (row 0 = north) to a PNG.
+fn write_gray8_png(path: &Path, nx: usize, ny: usize, gray: &[u8]) -> Result<(), String> {
+    if gray.len() != nx * ny {
+        return Err(format!("gray byte count {} != {}x{}", gray.len(), nx, ny));
+    }
+    let img = GrayImage::from_fn(nx as u32, ny as u32, |x, y| {
+        image::Luma([gray[y as usize * nx + x as usize]])
+    });
+    img.save(path)
+        .map_err(|e| format!("write PNG {}: {e}", path.display()))
+}
+
 /// Display luminance threshold above which an output pixel is counted as
 /// STRONGLY CLOUDY for the [`cloud_contrast_stat`] metric. `0.70` display sits at
 /// `rho' ~ 0.49` (just under the soft-clip knee at exposure 1.6), so the population is
@@ -340,9 +558,18 @@ fn cloud_contrast_stat(rgba: &[u8]) -> (f64, f64) {
     (q(0.90) - q(0.10), frac)
 }
 
-/// A short product label for the log line (sandwich > geocolor > visible).
+/// A short product label for the log line
+/// (perspective > cloud-layer > sandwich > geocolor > visible).
 fn product_label(opts: &Opts) -> &'static str {
-    if opts.sandwich {
+    if opts.eye.is_some() {
+        if opts.perspective_layer {
+            "perspective-cloud-layer"
+        } else {
+            "perspective"
+        }
+    } else if opts.cloud_layer {
+        "cloud-layer"
+    } else if opts.sandwich {
         "sandwich"
     } else if opts.geocolor {
         "geocolor"
@@ -389,6 +616,26 @@ fn render_params(opts: &Opts) -> RenderParams {
         ground_gain: opts.ground_gain,
         cloud_softclip: opts.cloud_softclip,
         topdown_cloud_norm: opts.topdown_cloud_norm,
+        perspective: perspective_camera_of(opts),
+    }
+}
+
+/// The free-perspective camera from the CLI options (both `eye=` and `look=` present —
+/// parse_opts guarantees they come in pairs), or `None` (no perspective requested).
+fn perspective_camera_of(opts: &Opts) -> Option<PerspectiveCamera> {
+    match (opts.eye, opts.look) {
+        (Some(eye), Some(look)) => Some(PerspectiveCamera {
+            eye_lat_deg: eye.0,
+            eye_lon_deg: eye.1,
+            eye_alt_m: eye.2,
+            look_lat_deg: look.0,
+            look_lon_deg: look.1,
+            look_alt_m: look.2,
+            fov_deg: opts.fov,
+            width: opts.camsize.0,
+            height: opts.camsize.1,
+        }),
+        _ => None,
     }
 }
 
@@ -499,6 +746,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut sector: Option<String> = None;
     let mut geocolor = false;
     let mut sandwich = false;
+    let mut cloud_layer = false;
+    let mut composite_out: Option<PathBuf> = None;
+    let mut eye: Option<(f64, f64, f64)> = None;
+    let mut look: Option<(f64, f64, f64)> = None;
+    let mut fov = 40.0f64;
+    let mut camsize = (1280usize, 720usize);
+    let mut perspective_layer = false;
+    let mut product_perspective = false;
     let mut ground_gain: Option<f64> = None;
     let mut cloud_softclip: Option<f64> = None;
     let mut topdown_cloud_norm: Option<f64> = None;
@@ -552,6 +807,29 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "sector" | "run-token" => sector = Some(v.to_string()),
             "geocolor" | "gc" => geocolor = parse_bool(v)?,
             "sandwich" | "sw" => sandwich = parse_bool(v)?,
+            "product" => match v.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+                "visible" | "vis" => {}
+                "geocolor" => geocolor = true,
+                "sandwich" => sandwich = true,
+                "cloudlayer" | "layer" => cloud_layer = true,
+                "perspective" | "persp" => product_perspective = true,
+                other => {
+                    return Err(format!(
+                        "unknown product '{other}' \
+                         (visible|geocolor|sandwich|cloud-layer|perspective)"
+                    ));
+                }
+            },
+            "composite-out" | "composite_out" | "compositeout" => {
+                composite_out = Some(PathBuf::from(v))
+            }
+            "eye" => eye = Some(parse_triple(v)?),
+            "look" | "lookat" | "look-at" => look = Some(parse_triple(v)?),
+            "fov" => fov = v.parse().map_err(|_| format!("bad fov '{v}'"))?,
+            "camsize" | "cam-size" | "cam_size" => camsize = parse_canvas(v)?,
+            "perspective-layer" | "perspective_layer" | "persplayer" => {
+                perspective_layer = parse_bool(v)?
+            }
             "ground-gain" | "ground_gain" | "groundgain" => {
                 ground_gain = Some(v.parse().map_err(|_| format!("bad ground-gain '{v}'"))?)
             }
@@ -568,6 +846,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "synthetic-green" | "synthetic_green" | "syngreen" => synthetic_green = parse_bool(v)?,
             other => return Err(format!("unknown key '{other}'")),
         }
+    }
+    // The perspective camera is all-or-nothing: eye + look come as a pair, and the
+    // perspective-only flags demand them.
+    if eye.is_some() != look.is_some() {
+        return Err("perspective needs BOTH eye=lat,lon,alt_m AND look=lat,lon,alt_m".to_string());
+    }
+    if (product_perspective || perspective_layer) && eye.is_none() {
+        return Err("product=perspective / perspective-layer= require eye= and look=".to_string());
     }
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
@@ -593,12 +879,32 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         sector,
         geocolor,
         sandwich,
+        cloud_layer,
+        composite_out,
+        eye,
+        look,
+        fov,
+        camsize,
+        perspective_layer,
         ground_gain,
         cloud_softclip,
         topdown_cloud_norm,
         bands_out,
         synthetic_green,
     })
+}
+
+/// Parse a `lat,lon,alt_m` triple (e.g. `eye=46.2,-98.9,150000`).
+fn parse_triple(v: &str) -> Result<(f64, f64, f64), String> {
+    let parts: Vec<&str> = v.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return Err(format!("expected lat,lon,alt_m, got '{v}'"));
+    }
+    let f = |s: &str| {
+        s.parse::<f64>()
+            .map_err(|_| format!("bad number '{s}' in '{v}'"))
+    };
+    Ok((f(parts[0])?, f(parts[1])?, f(parts[2])?))
 }
 
 fn parse_view(v: &str) -> Result<ViewMode, String> {
@@ -692,6 +998,13 @@ fn print_usage() {
          \x20 sector=<token>     store run sector token (default: the input's run id)\n\
          \x20 geocolor=<b>       on|off  GeoColor day/night blend (true-color day + IR night)\n\
          \x20 sandwich=<b>       on|off  Sandwich (true-color base + color IR on cold tops)\n\
+         \x20 product=<p>        visible|geocolor|sandwich|cloud-layer|perspective\n\
+         \x20 composite-out=<p>  cloud-layer only: synthetic composite proof PNG\n\
+         \x20 eye=lat,lon,alt    perspective camera eye (with look= switches to perspective)\n\
+         \x20 look=lat,lon,alt   perspective look-at target\n\
+         \x20 fov=<deg>          perspective horizontal FOV (default 40)\n\
+         \x20 camsize=<WxH>      perspective image dims (default 1280x720)\n\
+         \x20 perspective-layer=<b>  on|off cloud-field-only RGBA through the camera\n\
          \x20 ground-gain=<f>    override the baked GROUND LIFT (1.0 = neutral)\n\
          \x20 cloud-softclip=<f> override the highlight soft-clip knee (1.0 = disable)\n\
          \x20 topdown-cloudnorm=<f>  override the top-down cloud normalization (1.0 = none)\n\

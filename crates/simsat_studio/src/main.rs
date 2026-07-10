@@ -43,16 +43,21 @@ use simsat::atmosphere::{
 use simsat::bluemarble;
 use simsat::bricks::{self, RunManifest};
 use simsat::camera::{
-    GeoCamera, MAX_AXIS, ResolutionMode, SatellitePreset, SurfaceRaster, ViewMode,
-    build_map_raster, build_surface_raster_mode, extended_native_counts,
+    GeoCamera, MAX_AXIS, PerspectiveBasis, PerspectiveCamera, ResolutionMode, SatellitePreset,
+    SurfaceRaster, build_map_raster, build_perspective_raster, build_surface_raster_mode,
+    extended_native_counts,
 };
 use simsat::clouds::{self, MarchConfig, StepQuality};
 use simsat::derived::{self, DerivedField};
 use simsat::frame::{GridGeoref, WrfProjectionParams};
 use simsat::geocolor;
-use simsat::gpu::{self, RenderedFrame, SurfaceFrameInputs, SurfaceResources, SurfaceUniforms};
+use simsat::gpu::{
+    self, CloudFrameInputs, CloudMarchParams, CloudPassResources, RenderedFrame,
+    SurfaceFrameInputs, SurfaceResources, SurfaceUniforms,
+};
 use simsat::horizon::HorizonMap;
 use simsat::ingest::{self, IngestConfig};
+use simsat::ingest_grib;
 use simsat::ir::{self, IrConfig, IrScene, IrVolume};
 use simsat::ir_enhance::{IrEnhancement, render_ir_rgba};
 use simsat::render::{
@@ -196,6 +201,35 @@ impl RenderMode {
     }
 }
 
+/// The STUDIO view picker: the engine's two `camera::ViewMode` products
+/// (geostationary from-space, top-down map) plus the studio-only Perspective (3-D)
+/// orbit view over the engine's free `PerspectiveCamera` (the map-layers tier-2
+/// engine work, 9fd0d5e). Perspective renders on the CPU (like top-down), is
+/// VISIBLE-mode only in v1 (no perspective IR march), and has no sat-store
+/// contract (a picture, not a map — Save PNG is the export).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StudioView {
+    Geostationary,
+    TopDownMap,
+    Perspective,
+}
+
+impl StudioView {
+    const ALL: [StudioView; 3] = [
+        StudioView::Geostationary,
+        StudioView::TopDownMap,
+        StudioView::Perspective,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            StudioView::Geostationary => "Geostationary (from space)",
+            StudioView::TopDownMap => "Top-down map",
+            StudioView::Perspective => "Perspective (3-D)",
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // GLOBAL rayon pool, installed FIRST THING (machine-stability discipline, the
     // hard-rule-4 spirit): all cores MINUS ONE spare so the UI/desktop always has a
@@ -238,6 +272,10 @@ struct GpuCtx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     resources: SurfaceResources,
+    /// The ACTIVATED GPU cloud pass (sun-OD compute + clouds.wgsl march) behind the
+    /// experimental "GPU clouds" toggle. Pipelines are created once here; the CPU
+    /// composite remains the shipping default and the stored-frame path.
+    cloud_resources: CloudPassResources,
 }
 
 /// A selectable timestep (a wrfout time index, a cached brick hhmm, or one entry of
@@ -392,7 +430,7 @@ struct PreparedRender {
     sector: String,
     satellite: SatellitePreset,
     /// View mode this frame was rendered in (for the header label).
-    view_mode: ViewMode,
+    view_mode: StudioView,
     year: i32,
     month: u32,
     day: u32,
@@ -431,6 +469,172 @@ struct PreparedRender {
     derived: Option<(DerivedField, Vec<f32>)>,
     /// The product mode this frame was rendered in (for the PNG-export file name).
     render_mode: RenderMode,
+    /// The EXPERIMENTAL GPU cloud-pass inputs: `Some` when this frame is to be
+    /// rendered by the GPU cloud pass on the UI thread (`cloud_rgba` is then `None`).
+    /// Carries an optional CPU reference frame for the parity instrument.
+    gpu_cloud: Option<Box<GpuCloudPrep>>,
+}
+
+/// Worker-prepared inputs of one GPU cloud render (the owned twin of
+/// `gpu::CloudFrameInputs`' cloud half; the surface half comes from the existing
+/// `PreparedRender` fields). Built in `prepare_render`, consumed on the UI thread.
+struct GpuCloudPrep {
+    texture_a: Vec<u8>,
+    occupancy: Vec<u8>,
+    vol_nx: u32,
+    vol_ny: u32,
+    vol_nz: u32,
+    occ_dims: (u32, u32, u32),
+    ql: [f32; 4],
+    qp: [f32; 4],
+    z_min_m: f32,
+    dz_m: f32,
+    r_top_m: f32,
+    r_bottom_m: f32,
+    voxel_pitch_m: f32,
+    geo: gpu::GeoQuads,
+    march: CloudMarchParams,
+    sun_od: gpu::SunOdPlan,
+    froxel_dim: u32,
+    froxel_data: Vec<f32>,
+    sh_rows: u32,
+    sh_data: Vec<f32>,
+    scan_rect: [f32; 4],
+    /// The CPU reference frame for the parity instrument (`Some` on a parity render):
+    /// the SAME scene through the CPU composite at GPU-COMPARABLE settings
+    /// (Interactive schedule, granulation off, flat/open M3 surface fields, no snow
+    /// blend — the documented GPU surface model), so the delta isolates the GPU march.
+    cpu_reference: Option<Vec<u8>>,
+}
+
+/// The last GPU parity report: the logged summary + the delta heatmap texture.
+struct ParityReport {
+    summary: String,
+    texture: egui::TextureHandle,
+}
+
+/// Info about a frame rendered through the GPU cloud pass (for the status line +
+/// the parity report hand-off from `render_prepared` to `finish_prepared`).
+struct GpuRenderInfo {
+    gpu_ms: u64,
+    parity: Option<ParityReport>,
+}
+
+/// Per-channel |delta| statistics between two same-size RGBA frames, in 8-bit counts,
+/// over pixels that are ON-EARTH in either frame (alpha > 0 — space is excluded, a
+/// masked-vs-masked disagreement still counts). Pure math, node-tested.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParityStats {
+    mean: [f64; 3],
+    p95: [u8; 3],
+    max: [u8; 3],
+    compared: usize,
+}
+
+impl ParityStats {
+    fn summary(&self) -> String {
+        format!(
+            "mean |d| R {:.2} G {:.2} B {:.2} / p95 {} {} {} / max {} {} {} (8-bit units, \
+             {} px)",
+            self.mean[0],
+            self.mean[1],
+            self.mean[2],
+            self.p95[0],
+            self.p95[1],
+            self.p95[2],
+            self.max[0],
+            self.max[1],
+            self.max[2],
+            self.compared
+        )
+    }
+}
+
+/// Compute [`ParityStats`] between the CPU reference and the GPU frame (both
+/// row-major RGBA8 of the same dimensions).
+fn parity_stats(cpu: &[u8], gpu: &[u8]) -> ParityStats {
+    let n = (cpu.len() / 4).min(gpu.len() / 4);
+    let mut deltas: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut sums = [0u64; 3];
+    let mut compared = 0usize;
+    for i in 0..n {
+        let c = &cpu[i * 4..i * 4 + 4];
+        let g = &gpu[i * 4..i * 4 + 4];
+        if c[3] == 0 && g[3] == 0 {
+            continue; // space in both
+        }
+        compared += 1;
+        for ch in 0..3 {
+            let d = c[ch].abs_diff(g[ch]);
+            sums[ch] += d as u64;
+            deltas[ch].push(d);
+        }
+    }
+    let mut mean = [0.0f64; 3];
+    let mut p95 = [0u8; 3];
+    let mut max = [0u8; 3];
+    for ch in 0..3 {
+        if compared > 0 {
+            mean[ch] = sums[ch] as f64 / compared as f64;
+            deltas[ch].sort_unstable();
+            // Nearest-rank p95: 95% of compared pixels have |delta| <= this value.
+            let idx = ((compared as f64 * 0.95).ceil() as usize).clamp(1, compared) - 1;
+            p95[ch] = deltas[ch][idx];
+            max[ch] = *deltas[ch].last().unwrap_or(&0);
+        }
+    }
+    ParityStats {
+        mean,
+        p95,
+        max,
+        compared,
+    }
+}
+
+/// A delta HEATMAP between the CPU reference and the GPU frame: per pixel the
+/// max-channel |delta| through a gain ramp (black = identical, orange -> white =
+/// growing delta; gain 4x so a 64-count delta saturates). Space-in-both stays black.
+fn parity_heatmap_rgba(cpu: &[u8], gpu: &[u8]) -> Vec<u8> {
+    let n = (cpu.len() / 4).min(gpu.len() / 4);
+    let mut out = vec![0u8; n * 4];
+    for i in 0..n {
+        let c = &cpu[i * 4..i * 4 + 4];
+        let g = &gpu[i * 4..i * 4 + 4];
+        let px = &mut out[i * 4..i * 4 + 4];
+        px[3] = 255;
+        if c[3] == 0 && g[3] == 0 {
+            continue;
+        }
+        let d = c[0]
+            .abs_diff(g[0])
+            .max(c[1].abs_diff(g[1]))
+            .max(c[2].abs_diff(g[2])) as u32;
+        px[0] = (d * 4).min(255) as u8;
+        px[1] = (d * 2).min(255) as u8;
+        px[2] = d.min(255) as u8;
+    }
+    out
+}
+
+/// The `SurfaceFrameInputs` view of a prepared frame — shared by the clouds-off GPU
+/// surface pass and the surface half of the GPU cloud pass.
+fn surface_inputs(prep: &PreparedRender) -> SurfaceFrameInputs<'_> {
+    SurfaceFrameInputs {
+        width: prep.width,
+        height: prep.height,
+        lut_geo: prep.lut_geo.as_slice(),
+        lut_light: &prep.lut_light,
+        nx: prep.nx,
+        ny: prep.ny,
+        normals_rgba: &prep.normals_rgba,
+        landmask_r8: &prep.landmask_r8,
+        bluemarble: prep.bluemarble.as_ref().map(|a| &a.0),
+        transmittance_lut: &prep.transmittance_lut,
+        multiscatter_lut: &prep.multiscatter_lut,
+        ambient_lut: &prep.ambient_lut,
+        ambient_n: prep.ambient_n,
+        uniforms: prep.uniforms,
+    }
 }
 
 enum WorkerMsg {
@@ -469,8 +673,8 @@ struct RenderedState {
     lon: Vec<f32>,
     sector: String,
     satellite: SatellitePreset,
-    /// View mode this frame was rendered in (Geostationary or Top-down map).
-    view_mode: ViewMode,
+    /// View mode this frame was rendered in (Geostationary, Top-down, Perspective).
+    view_mode: StudioView,
     year: i32,
     month: u32,
     day: u32,
@@ -494,6 +698,10 @@ struct RenderedState {
     derived: Option<(DerivedField, derived::FieldStats)>,
     /// The product mode this frame was rendered in (for the PNG-export file name).
     render_mode: RenderMode,
+    /// `Some(wall ms)` when this frame was rendered by the EXPERIMENTAL GPU cloud
+    /// pass — such a frame is a preview and is never written to the store (the
+    /// stored-frame path stays CPU for quality/provenance).
+    gpu_ms: Option<u64>,
 }
 
 /// One rendered frame retained in memory for instant loop playback (the
@@ -569,10 +777,22 @@ struct SimSatStudioApp {
     preset: SatellitePreset,
     /// Output-raster resolution mode (default Native — one pixel per WRF cell).
     resolution: ResolutionMode,
-    /// View mode: the from-space geostationary product (default) or the top-down
-    /// map-registered product (the WRF-Runner integration view). Top-down always
-    /// renders on the CPU (like the shipped clouds/IR path).
-    view: ViewMode,
+    /// View mode: the from-space geostationary product (default), the top-down
+    /// map-registered product (the WRF-Runner integration view), or the
+    /// Perspective (3-D) orbit view. Top-down and Perspective always render on
+    /// the CPU (like the shipped clouds/IR path).
+    view: StudioView,
+    /// Perspective orbit-camera params (see `pipeline::OrbitParams`): compass
+    /// azimuth the camera sits FROM the domain centre, tilt above the horizontal,
+    /// slant range (km, clamped at render to the domain-derived bounds), and the
+    /// horizontal FOV. Persisted.
+    orbit_az_deg: f32,
+    orbit_tilt_deg: f32,
+    orbit_range_km: f32,
+    orbit_fov_deg: f32,
+    /// Perspective output size (px per axis, 2..=4096; default 1280x720).
+    persp_width: u32,
+    persp_height: u32,
     /// Zoom-out / domain MARGIN as a PERCENTAGE (0-100%) of the domain size added on each
     /// side (the "Zoom out / margin" slider). 0 = the domain edge-to-edge (default). The
     /// margin frames the domain with the real surrounding earth (Blue Marble ground + clear
@@ -637,6 +857,19 @@ struct SimSatStudioApp {
     /// coarse (2-3 km) run granulates strongly. Session-scoped (not persisted).
     granulation: bool,
     step_quality: StepQuality,
+    /// EXPERIMENTAL "GPU clouds" toggle (the M5-GPU cloud-pass activation): when on,
+    /// the DISPLAYED geostationary Visible clouds-on frame renders through the
+    /// `clouds.wgsl` GPU pass at the Interactive schedule instead of the CPU
+    /// composite. The CPU path remains the shipping default and ground truth:
+    /// Write-store and sequence batch renders ALWAYS use the CPU path regardless.
+    /// Session-scoped (deliberately not persisted while experimental). Default OFF.
+    gpu_clouds: bool,
+    /// One-shot "GPU parity check" request: the next render marches BOTH paths
+    /// (GPU pass + a CPU reference at GPU-comparable settings), logs the per-channel
+    /// mean/p95/max |delta| and keeps a delta heatmap for review.
+    parity_pending: bool,
+    /// The last parity report (summary + heatmap texture), shown in the drawer.
+    parity: Option<ParityReport>,
     /// Display-side exposure gain applied before the ABI stretch (see
     /// `render::radiance_to_rgba`). Affects the clouds-on CPU composite (surface +
     /// cloud together); the clouds-off GPU surface pass keeps the implicit 1.0 (a
@@ -686,6 +919,7 @@ impl SimSatStudioApp {
                     device: rs.device.clone(),
                     queue: rs.queue.clone(),
                     resources: SurfaceResources::init(&rs.device),
+                    cloud_resources: CloudPassResources::init(&rs.device),
                 }),
                 None,
             ),
@@ -711,8 +945,14 @@ impl SimSatStudioApp {
             // coarse fixed ABI pitch that undersampled and pixelated fine domains.
             resolution: ResolutionMode::Native,
             // Geostationary from-space is the default view; Top-down map is the
-            // integration product.
-            view: ViewMode::Geostationary,
+            // integration product; Perspective (3-D) is the orbit flyover view.
+            view: StudioView::Geostationary,
+            orbit_az_deg: 180.0,
+            orbit_tilt_deg: 30.0,
+            orbit_range_km: 300.0,
+            orbit_fov_deg: 45.0,
+            persp_width: 1280,
+            persp_height: 720,
             // Zoom-out / margin OFF by default: the domain renders edge-to-edge (the
             // pre-margin behavior). The owner drags it up to frame the domain with earth.
             margin_pct: 0.0,
@@ -756,6 +996,10 @@ impl SimSatStudioApp {
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.
             step_quality: StepQuality::Offline,
+            // GPU clouds OFF by default (experimental preview; CPU stays shipping).
+            gpu_clouds: false,
+            parity_pending: false,
+            parity: None,
             // A moderate display brightening over the pre-exposure 1.0 (the owner
             // reported "too dark no matter the time"); tuned from real frames.
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
@@ -812,7 +1056,13 @@ impl SimSatStudioApp {
         self.preset = settings::sat_from_token(&s.sat).unwrap_or(SatellitePreset::GoesEast);
         self.resolution =
             settings::resolution_from_token(&s.resolution).unwrap_or(ResolutionMode::Native);
-        self.view = settings::view_from_token(&s.view).unwrap_or(ViewMode::Geostationary);
+        self.view = settings::view_from_token(&s.view).unwrap_or(StudioView::Geostationary);
+        self.orbit_az_deg = s.orbit_az_deg;
+        self.orbit_tilt_deg = s.orbit_tilt_deg;
+        self.orbit_range_km = s.orbit_range_km;
+        self.orbit_fov_deg = s.orbit_fov_deg;
+        self.persp_width = s.persp_width;
+        self.persp_height = s.persp_height;
         self.render_mode = settings::mode_from_token(&s.mode).unwrap_or(RenderMode::Visible);
         self.ir_enhancement =
             settings::enhancement_from_token(&s.ir_enhancement).unwrap_or_default();
@@ -856,6 +1106,12 @@ impl SimSatStudioApp {
             bm_allow_download: self.bm_allow_download,
             play_fps: self.play_fps,
             frame_cap: self.frame_cap,
+            orbit_az_deg: self.orbit_az_deg,
+            orbit_tilt_deg: self.orbit_tilt_deg,
+            orbit_range_km: self.orbit_range_km,
+            orbit_fov_deg: self.orbit_fov_deg,
+            persp_width: self.persp_width,
+            persp_height: self.persp_height,
             recent: self.recent.clone(),
         }
     }
@@ -918,8 +1174,14 @@ impl SimSatStudioApp {
     // ── open dialogs (shared by the Open menu and the first-run CTA) ─────────
 
     fn dialog_open_wrfout(&mut self) {
+        // wrfout files are frequently EXTENSION-LESS, so "All files" must be the
+        // FIRST (default) filter — a model-output extension filter as the default
+        // hid every wrfout in the picker (owner-reported in the v0.1.2 preview).
+        // The GRIB2 filter stays as an optional narrowing in the type dropdown.
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open a wrfout file")
+            .add_filter("All files (wrfout / GRIB2)", &["*"])
+            .add_filter("GRIB2", &["grib2", "grb2", "grib", "grb"])
+            .set_title("Open a wrfout or GRIB2 file")
             .pick_file()
         {
             self.open_wrfout(path);
@@ -1036,6 +1298,12 @@ impl SimSatStudioApp {
     }
 
     fn open_wrfout(&mut self, path: PathBuf) {
+        // A GRIB2 file (HRRR wrfnat / RRFS natlev) routes to its own open path;
+        // everything downstream (Source::Wrfout, the prepare worker) is shared.
+        if ingest_grib::is_grib_input(&path) {
+            self.open_grib(path);
+            return;
+        }
         // Cheap probe: dims only (no field decode) + file size, for the size gate.
         let file = match ingest::probe_wrf(&path) {
             Ok(f) => f,
@@ -1101,6 +1369,61 @@ impl SimSatStudioApp {
             ));
         } else {
             self.logline("wrfout opened. Pick a satellite + timestep, then Render.");
+        }
+    }
+
+    /// GRIB2 sibling of `open_wrfout` (HRRR wrfnat / RRFS natlev): one probe pass
+    /// gives dims + the single valid time + the cycle-keyed run id, then the shared
+    /// `Source::Wrfout` flow (size gate, prepare worker) carries it — the worker
+    /// branches to `ingest_grib_timestep` by extension. A GRIB file is ONE forecast
+    /// hour, so it opens with exactly one timestep. NOTE: a full-NA RRFS file will
+    /// refuse at ingest with the crop remedy message in the log/error banner (no
+    /// crop UI yet — the recorded open decision).
+    fn open_grib(&mut self, path: PathBuf) {
+        let probe = match ingest_grib::probe_grib(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.logerr(format!("Failed to open GRIB2 file: {e}"));
+                return;
+            }
+        };
+        self.remember_recent("wrfout", vec![path.display().to_string()]);
+        let file_bytes = probe.file_bytes;
+        let cells_3d = probe.nx.saturating_mul(probe.ny).saturating_mul(probe.nz);
+        let needs_confirm =
+            cells_3d >= LARGE_WRF_WARN_CELLS_3D || file_bytes >= LARGE_WRF_WARN_BYTES;
+        self.timesteps = vec![Timestep {
+            label: probe.time_iso.clone(),
+            hhmm: probe.hhmm,
+            ts_index: Some(0),
+            file: bricks::brick_file_name_for(Some(&probe.time_iso), probe.hhmm),
+            time_iso: Some(probe.time_iso.clone()),
+            seq_index: None,
+        }];
+        self.selected_ts = 0;
+        self.rendered = None;
+        self.loop_state = None;
+        let cache_dir = ingest::default_cache_dir();
+        let (nx, ny, nz) = (probe.nx, probe.ny, probe.nz);
+        self.source = Some(Source::Wrfout {
+            path,
+            cache_dir,
+            run_id: probe.default_run_id,
+            nx,
+            ny,
+            nz,
+            file_bytes,
+            needs_confirm,
+            confirmed: false,
+        });
+        if needs_confirm {
+            self.logline(format!(
+                "Large GRIB2 file: {nx}x{ny}x{nz} (~{:.1}M cells), {:.2} GB. Confirm to ingest.",
+                cells_3d as f64 / 1.0e6,
+                file_bytes as f64 / (1u64 << 30) as f64
+            ));
+        } else {
+            self.logline("GRIB2 opened (one valid time). Pick a satellite, then Render.");
         }
     }
 
@@ -1270,6 +1593,12 @@ impl SimSatStudioApp {
         if self.busy || self.gpu.is_none() || self.timesteps.is_empty() {
             return false;
         }
+        // Perspective (3-D) is VISIBLE-mode only in v1 (the engine has no
+        // perspective IR march); the Render button carries the "(needs Mode:
+        // Visible)" hint.
+        if self.view == StudioView::Perspective && self.render_mode != RenderMode::Visible {
+            return false;
+        }
         match &self.source {
             Some(Source::Wrfout {
                 needs_confirm,
@@ -1287,9 +1616,10 @@ impl SimSatStudioApp {
     }
 
     /// Whether a batch (loop) render can start: rendering is possible and there is more
-    /// than one timestep to sweep (a single frame is just Render).
+    /// than one timestep to sweep (a single frame is just Render). Perspective view is
+    /// excluded in v1 (a fixed-camera perspective loop is the queued follow-up).
     fn can_render_sequence(&self) -> bool {
-        self.can_render() && self.timesteps.len() >= 2
+        self.can_render() && self.timesteps.len() >= 2 && self.view != StudioView::Perspective
     }
 
     /// Build the render job for one timestep of the current source (single Render or one
@@ -1357,6 +1687,18 @@ impl SimSatStudioApp {
         let preset = self.preset;
         let resolution = self.resolution;
         let atmo = self.capture_atmo();
+        // The parity request is one-shot: consumed by this render.
+        self.parity_pending = false;
+        if atmo.parity {
+            self.parity = None;
+            self.logline("GPU parity check: rendering BOTH paths (CPU reference + GPU pass)...");
+        }
+        if (atmo.gpu_clouds || atmo.parity) && atmo.granulation {
+            self.logline(
+                "Note: granulation is CPU-only; the GPU cloud pass renders without it \
+                 (parity compares granulation-off).",
+            );
+        }
         let Some(job) = self.job_for_timestep(&ts) else {
             return;
         };
@@ -1391,43 +1733,84 @@ impl SimSatStudioApp {
         });
     }
 
-    /// Turn a prepared frame into a displayable `(RenderedFrame, TextureHandle)`: the
-    /// clouds-ON / IR / top-down CPU RGBA is used directly; the clouds-OFF geostationary
-    /// path runs the M2 GPU surface pass here on the UI thread. Shared by the single
-    /// render (`finish_prepared`) and the batch loop (`accept_batch_frame`). Takes
-    /// `prep.cloud_rgba` out; leaves `prep.ir_bt` for the caller.
+    /// Turn a prepared frame into a displayable `(RenderedFrame, TextureHandle)` plus
+    /// GPU-cloud info when that path rendered it: the clouds-ON / IR / top-down CPU
+    /// RGBA is used directly; a `gpu_cloud` prep runs the EXPERIMENTAL GPU cloud pass;
+    /// the clouds-OFF geostationary path runs the M2 GPU surface pass — all on the UI
+    /// thread. Shared by the single render (`finish_prepared`) and the batch loop
+    /// (`accept_batch_frame`; batches never carry `gpu_cloud`). Takes
+    /// `prep.cloud_rgba`/`prep.gpu_cloud` out; leaves `prep.ir_bt` for the caller.
     fn render_prepared(
         &self,
         ctx: &egui::Context,
         prep: &mut PreparedRender,
-    ) -> Result<(RenderedFrame, egui::TextureHandle), String> {
+    ) -> Result<(RenderedFrame, egui::TextureHandle, Option<GpuRenderInfo>), String> {
+        let mut gpu_info = None;
         let rendered = if let Some(rgba) = prep.cloud_rgba.take() {
             RenderedFrame {
                 width: prep.width,
                 height: prep.height,
                 rgba,
             }
+        } else if let Some(gc) = prep.gpu_cloud.take() {
+            // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): sun-OD compute +
+            // the clouds.wgsl march, offscreen + readback, on the UI thread (the M1
+            // NOTE-5 pattern the surface pass already uses).
+            let gpu = self
+                .gpu
+                .as_ref()
+                .ok_or_else(|| "GPU unavailable; cannot render.".to_string())?;
+            let inputs = CloudFrameInputs {
+                surface: surface_inputs(prep),
+                vol_nx: gc.vol_nx,
+                vol_ny: gc.vol_ny,
+                vol_nz: gc.vol_nz,
+                texture_a: &gc.texture_a,
+                occ_dims: gc.occ_dims,
+                occupancy: &gc.occupancy,
+                ql: gc.ql,
+                qp: gc.qp,
+                z_min_m: gc.z_min_m,
+                dz_m: gc.dz_m,
+                r_top_m: gc.r_top_m,
+                r_bottom_m: gc.r_bottom_m,
+                voxel_pitch_m: gc.voxel_pitch_m,
+                geo: gc.geo,
+                march: gc.march,
+                sun_od: gc.sun_od,
+                froxel_dim: gc.froxel_dim,
+                froxel_data: &gc.froxel_data,
+                sh_rows: gc.sh_rows,
+                sh_data: &gc.sh_data,
+                scan_rect: gc.scan_rect,
+            };
+            let t0 = Instant::now();
+            let frame = gpu.cloud_resources.render(&gpu.device, &gpu.queue, &inputs);
+            let gpu_ms = t0.elapsed().as_millis() as u64;
+            // Parity instrument: diff the GPU frame against the CPU reference (mean/
+            // p95/max |delta| per channel + a heatmap texture the owner can view).
+            let parity = gc.cpu_reference.as_ref().map(|cpu| {
+                let stats = parity_stats(cpu, &frame.rgba);
+                let heat = parity_heatmap_rgba(cpu, &frame.rgba);
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &heat,
+                );
+                let texture =
+                    ctx.load_texture("simsat-parity-heatmap", color, egui::TextureOptions::LINEAR);
+                ParityReport {
+                    summary: stats.summary(),
+                    texture,
+                }
+            });
+            gpu_info = Some(GpuRenderInfo { gpu_ms, parity });
+            frame
         } else {
             let gpu = self
                 .gpu
                 .as_ref()
                 .ok_or_else(|| "GPU unavailable; cannot render.".to_string())?;
-            let inputs = SurfaceFrameInputs {
-                width: prep.width,
-                height: prep.height,
-                lut_geo: prep.lut_geo.as_slice(),
-                lut_light: &prep.lut_light,
-                nx: prep.nx,
-                ny: prep.ny,
-                normals_rgba: &prep.normals_rgba,
-                landmask_r8: &prep.landmask_r8,
-                bluemarble: prep.bluemarble.as_ref().map(|a| &a.0),
-                transmittance_lut: &prep.transmittance_lut,
-                multiscatter_lut: &prep.multiscatter_lut,
-                ambient_lut: &prep.ambient_lut,
-                ambient_n: prep.ambient_n,
-                uniforms: prep.uniforms,
-            };
+            let inputs = surface_inputs(prep);
             gpu.resources.render(&gpu.device, &gpu.queue, &inputs)
         };
 
@@ -1443,7 +1826,7 @@ impl SimSatStudioApp {
         // LINEAR (not NEAREST): the frame renders at the WRF native resolution, so any
         // residual window magnification is smooth instead of hard blocky pixels.
         let texture = ctx.load_texture("simsat-frame", color, egui::TextureOptions::LINEAR);
-        Ok((rendered, texture))
+        Ok((rendered, texture, gpu_info))
     }
 
     /// Snapshot the M2/M4/M5/M6 render controls into the worker-side `AtmoSettings`
@@ -1452,6 +1835,14 @@ impl SimSatStudioApp {
     fn capture_atmo(&self) -> AtmoSettings {
         AtmoSettings {
             view_mode: self.view,
+            orbit: pipeline::OrbitParams {
+                az_deg: self.orbit_az_deg as f64,
+                tilt_deg: self.orbit_tilt_deg as f64,
+                range_km: self.orbit_range_km as f64,
+                fov_deg: self.orbit_fov_deg as f64,
+                width: self.persp_width as usize,
+                height: self.persp_height as usize,
+            },
             // Zoom-out / margin: the UI slider is a PERCENTAGE (0-100%); the internal render
             // param is a fraction (a future km-based UI is then a trivial swap).
             margin_frac: self.margin_pct as f64 / 100.0,
@@ -1465,6 +1856,8 @@ impl SimSatStudioApp {
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             step_quality: self.step_quality,
+            gpu_clouds: self.gpu_clouds,
+            parity: self.parity_pending,
             exposure: self.exposure as f64,
             // Fake-sun what-if override: Some((elev_deg, az_deg)) when on, else the file's
             // real solar geometry. Uniform sun direction across the frame (sun at infinity).
@@ -1490,8 +1883,9 @@ impl SimSatStudioApp {
         let is_ir = ir_bt.is_some();
         let ir_enhancement = prep.ir_enhancement;
         let ir_band = prep.ir_band;
-        let clouds_on = prep.cloud_rgba.is_some() && !is_ir && derived.is_none();
-        let (rendered, texture) = match self.render_prepared(ctx, &mut prep) {
+        let has_cloud_frame = prep.cloud_rgba.is_some() || prep.gpu_cloud.is_some();
+        let clouds_on = has_cloud_frame && !is_ir && derived.is_none();
+        let (rendered, texture, gpu_info) = match self.render_prepared(ctx, &mut prep) {
             Ok(v) => v,
             Err(e) => {
                 self.logerr(e);
@@ -1500,6 +1894,15 @@ impl SimSatStudioApp {
                 return;
             }
         };
+        // GPU-cloud preview bookkeeping: frame time for the status line, and the
+        // parity report (numbers logged + heatmap kept for the drawer).
+        let gpu_ms = gpu_info.as_ref().map(|i| i.gpu_ms);
+        if let Some(info) = gpu_info
+            && let Some(report) = info.parity
+        {
+            self.logline(format!("GPU parity: {}", report.summary));
+            self.parity = Some(report);
+        }
 
         // IR BT stats for the status line (coldest cloud-top vs warmest ground).
         let ir_stats = ir_bt.as_ref().map(|bt| ir::ir_frame_stats(bt));
@@ -1531,6 +1934,7 @@ impl SimSatStudioApp {
             ir_band,
             derived: derived_summary,
             render_mode: prep.render_mode,
+            gpu_ms,
         });
         // A new render resets the display viewport to fit-to-window (no leftover zoom/pan).
         self.view_zoom = 1.0;
@@ -1579,8 +1983,14 @@ impl SimSatStudioApp {
                 stats.median_bt,
             ));
         } else {
+            let gpu_note = match gpu_ms {
+                Some(ms) => {
+                    format!(" [GPU clouds {ms} ms — experimental preview; store stays CPU]")
+                }
+                None => String::new(),
+            };
             self.logline(format!(
-                "Rendered {}x{} {}{} ({:.0}% on-earth, sun {:.1} deg{}, PW x{:.2}, clouds {}, {}).",
+                "Rendered {}x{} {}{} ({:.0}% on-earth, sun {:.1} deg{}, PW x{:.2}, clouds {}, {}){}.",
                 prep.width,
                 prep.height,
                 prep.resolution.label(),
@@ -1598,7 +2008,8 @@ impl SimSatStudioApp {
                     bm_status.chip_label()
                 } else {
                     prep.season_line.clone()
-                }
+                },
+                gpu_note
             ));
         }
     }
@@ -1651,6 +2062,25 @@ impl SimSatStudioApp {
         let Some(state) = &self.rendered else {
             return;
         };
+        if state.gpu_ms.is_some() {
+            // Stored-frame quality/provenance stays CPU (the tested shipping path);
+            // the GPU frame is an experimental preview. The button is also disabled,
+            // this is defense in depth.
+            self.logerr(
+                "GPU-clouds preview frames are not written to the store (the stored \
+                 path stays CPU). Turn off GPU clouds and Render again to write.",
+            );
+            return;
+        }
+        if state.view_mode == StudioView::Perspective {
+            // No sat-store contract for a perspective frame (a picture, not a
+            // georegistered map). The button is also disabled; defense in depth.
+            self.logerr(
+                "Perspective (3-D) frames are not written to the sat store (no store \
+                 contract for a free-camera picture). Use Save PNG..., or switch View.",
+            );
+            return;
+        }
         // IR mode writes the true-Kelvin BT plane as a SINGLE-BAND band-13 frame
         // (BowEcho re-enhances it live); visible mode writes the three baked rgb planes.
         let written = store_write_frame(
@@ -1695,7 +2125,7 @@ impl SimSatStudioApp {
     /// it as a `LoopFrame` for instant playback (up to `frame_cap`). Reuses the exact
     /// single-frame `prepare_render` per timestep — no re-implemented render path.
     fn start_batch_render(&mut self, ctx: &egui::Context) {
-        if !self.can_render_sequence() {
+        if !self.can_render_sequence() || self.view == StudioView::Perspective {
             return;
         }
         let jobs = self.build_all_jobs();
@@ -1705,7 +2135,17 @@ impl SimSatStudioApp {
         let total = jobs.len();
         let preset = self.preset;
         let resolution = self.resolution;
-        let atmo = self.capture_atmo();
+        let mut atmo = self.capture_atmo();
+        // Sequence/batch renders ALWAYS take the CPU path (stored-frame quality and
+        // provenance stay CPU); the experimental GPU toggle applies only to the
+        // single displayed frame.
+        if atmo.gpu_clouds {
+            self.logline(
+                "Sequence renders always use the CPU path; GPU clouds ignored for the batch.",
+            );
+        }
+        atmo.gpu_clouds = false;
+        atmo.parity = false;
         let cancel = Arc::new(AtomicBool::new(false));
         self.batch = Some(BatchState {
             total,
@@ -1798,7 +2238,9 @@ impl SimSatStudioApp {
         let started = Instant::now();
         let ir_bt = prep.ir_bt.take();
         let ir_band = prep.ir_band;
-        let (rendered, texture) = match self.render_prepared(ctx, &mut prep) {
+        // Batch frames never carry a GPU-cloud prep (start_batch_render forces the
+        // CPU path), so the GPU info leg is always None here.
+        let (rendered, texture, _gpu_info) = match self.render_prepared(ctx, &mut prep) {
             Ok(v) => v,
             Err(e) => {
                 self.logerr(format!("Frame {}/{} render failed: {e}", index + 1, total));
@@ -1989,7 +2431,20 @@ impl SimSatStudioApp {
     fn top_strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let can_render = self.can_render();
         let can_seq = self.can_render_sequence();
-        let can_write = self.rendered.is_some() && !self.busy;
+        // A GPU-clouds preview frame is never written to the store (the stored path
+        // stays CPU for quality/provenance) — the button disables with a tooltip.
+        // A Perspective frame has NO store contract (a picture, not a map) — same
+        // disabled-with-hint pattern.
+        let gpu_preview = self.rendered.as_ref().is_some_and(|s| s.gpu_ms.is_some());
+        let persp_frame = self
+            .rendered
+            .as_ref()
+            .is_some_and(|s| s.view_mode == StudioView::Perspective);
+        let persp_view = self.view == StudioView::Perspective;
+        // Perspective is Visible-mode only in v1: the Render button greys with the
+        // "(needs Mode: Visible)" hint (the GPU-cluster discoverability pattern).
+        let persp_needs_visible = persp_view && self.render_mode != RenderMode::Visible;
+        let can_write = self.rendered.is_some() && !self.busy && !gpu_preview && !persp_frame;
         let batch_active = self.batch.is_some();
         let busy = self.busy;
 
@@ -2004,18 +2459,35 @@ impl SimSatStudioApp {
                 }
                 if ui
                     .add_enabled(can_write, egui::Button::new("Write store"))
-                    .on_hover_text(
-                        "Write the current frame into the sat store so BowEcho can play it.",
-                    )
+                    .on_hover_text(if gpu_preview {
+                        "The displayed frame is a GPU-clouds preview (experimental); \
+                         stored frames always come from the CPU path. Turn off GPU \
+                         clouds and Render again to write."
+                    } else if persp_frame {
+                        "Perspective (3-D) frames have no sat-store contract (a \
+                         free-camera picture, not a georegistered map). Use Save \
+                         PNG..., or switch View to Geostationary / Top-down."
+                    } else {
+                        "Write the current frame into the sat store so BowEcho can play it."
+                    })
                     .clicked()
                 {
                     self.write_to_store();
                 }
                 if ui
                     .add_enabled(can_render, egui::Button::new("Render"))
+                    .on_disabled_hover_text(if persp_needs_visible {
+                        "Perspective (3-D) renders the Visible product only in v1 \
+                         (the engine has no perspective IR march). Set Mode: Visible."
+                    } else {
+                        "Open a source (and confirm a large import) to render."
+                    })
                     .clicked()
                 {
                     self.start_render(ctx);
+                }
+                if persp_needs_visible {
+                    ui.label(egui::RichText::new("(needs Mode: Visible)").weak());
                 }
                 if batch_active {
                     if ui
@@ -2032,6 +2504,14 @@ impl SimSatStudioApp {
                          each frame renders on the below-normal worker, is written to the store, \
                          and is retained for instant scrub/play. Progressive + cancelable.",
                     )
+                    .on_disabled_hover_text(if persp_view {
+                        "Sequence rendering is not available in Perspective (3-D) view \
+                         in v1 (a fixed-camera perspective loop is a queued follow-up). \
+                         Switch View to Geostationary or Top-down."
+                    } else {
+                        "Open a multi-timestep source (sequence / multi-time wrfout) to \
+                         batch-render a loop."
+                    })
                     .clicked()
                 {
                     self.start_batch_render(ctx);
@@ -2073,7 +2553,7 @@ impl SimSatStudioApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.menu_button("Open", |ui| {
-                        if ui.button("Open wrfout...").clicked() {
+                        if ui.button("Open wrfout / GRIB2...").clicked() {
                             ui.close();
                             self.dialog_open_wrfout();
                         }
@@ -2142,21 +2622,30 @@ impl SimSatStudioApp {
                         );
                     ui.separator();
                     ui.label("Sat:");
-                    egui::ComboBox::from_id_salt("sat")
-                        .selected_text(self.preset.label())
-                        .show_ui(ui, |ui| {
-                            for p in SatellitePreset::ALL {
-                                ui.selectable_value(&mut self.preset, p, p.label());
-                            }
-                        });
+                    // The satellite preset drives the geostationary scan camera; in
+                    // Perspective view the orbit camera IS the view, so grey it out.
+                    ui.add_enabled_ui(self.view != StudioView::Perspective, |ui| {
+                        egui::ComboBox::from_id_salt("sat")
+                            .selected_text(self.preset.label())
+                            .show_ui(ui, |ui| {
+                                for p in SatellitePreset::ALL {
+                                    ui.selectable_value(&mut self.preset, p, p.label());
+                                }
+                            })
+                            .response
+                            .on_disabled_hover_text(
+                                "Not used in Perspective (3-D) view — the orbit camera \
+                                 (Camera group) defines the view.",
+                            );
+                    });
                     ui.separator();
                     // View toggle: from-space geostationary <-> the top-down map-registered
-                    // product (the WRF-Runner integration view; always CPU-rendered).
+                    // product <-> the Perspective (3-D) orbit view (CPU-rendered like top-down).
                     ui.label("View:");
                     egui::ComboBox::from_id_salt("view")
                         .selected_text(self.view.label())
                         .show_ui(ui, |ui| {
-                            for v in ViewMode::ALL {
+                            for v in StudioView::ALL {
                                 ui.selectable_value(&mut self.view, v, v.label());
                             }
                         })
@@ -2166,7 +2655,10 @@ impl SimSatStudioApp {
                              (curved earth, limb, space). Top-down map = a synthetic north-up \
                              near-nadir map over the WRF domain's own Lambert extent, which \
                              registers with top-down field plots (the WRF-Runner integration \
-                             product). Top-down renders on the CPU.",
+                             product). Perspective (3-D) = a free camera orbiting the domain \
+                             centre (azimuth / tilt / range / FOV in the Camera group) — angled \
+                             3-D storm shots with true parallax; Visible mode only in v1. \
+                             Top-down and Perspective render on the CPU.",
                         );
                     ui.separator();
                     ui.label("Timestep:");
@@ -2236,6 +2728,20 @@ impl SimSatStudioApp {
                     } else {
                         unit
                     },
+                ),
+            );
+        }
+        // GPU-clouds preview marker: the displayed frame came from the experimental
+        // GPU pass — say so (with the frame time) and that the store stays CPU.
+        if let Some(state) = &self.rendered
+            && let Some(ms) = state.gpu_ms
+        {
+            ui.add_space(2.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 185, 120),
+                format!(
+                    "GPU clouds (experimental preview): frame rendered on the GPU in {ms} ms. \
+                     Stored frames always come from the CPU path."
                 ),
             );
         }
@@ -2309,10 +2815,61 @@ impl SimSatStudioApp {
     fn advanced_drawer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mode = self.render_mode;
 
-        // Camera — all modes.
+        // Camera — all modes. In Perspective (3-D) view the group shows the orbit
+        // controls instead (Resolution / margin do not apply — the camera frames
+        // the scene; the march still samples the full-resolution data).
         egui::CollapsingHeader::new("Camera")
             .default_open(true)
             .show(ui, |ui| {
+                if self.view == StudioView::Perspective {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.orbit_az_deg, 0.0..=360.0)
+                                .text("Azimuth deg"),
+                        )
+                        .on_hover_text(
+                            "Compass direction the camera sits FROM the domain centre \
+                             (0 = north of it looking south, 180 = south of it looking \
+                             north).",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.orbit_tilt_deg, 5.0..=85.0)
+                                .text("Tilt deg"),
+                        )
+                        .on_hover_text(
+                            "Camera elevation above the horizontal, seen from the domain \
+                             centre: 85 = nearly overhead, low values = a low oblique \
+                             flyover angle.",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.orbit_range_km, 10.0..=5000.0)
+                                .logarithmic(true)
+                                .text("Range km"),
+                        )
+                        .on_hover_text(
+                            "Slant distance from the domain centre to the camera. Clamped \
+                             at render time to 0.3x-5x the domain diagonal (logged when \
+                             clamped).",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.orbit_fov_deg, 15.0..=120.0)
+                                .text("FOV deg"),
+                        )
+                        .on_hover_text("Horizontal field of view of the output image.");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Output size:");
+                        ui.add(egui::Slider::new(&mut self.persp_width, 2..=4096).text("W px"));
+                        ui.add(egui::Slider::new(&mut self.persp_height, 2..=4096).text("H px"));
+                        ui.label(
+                            egui::RichText::new(
+                                "(Resolution / zoom-out margin do not apply in this view)",
+                            )
+                            .weak(),
+                        );
+                    });
+                    return;
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Resolution:");
                     egui::ComboBox::from_id_salt("res")
@@ -2472,6 +3029,92 @@ impl SimSatStudioApp {
                                 });
                         });
                     });
+                    // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): geostationary
+                    // Visible clouds-on only; the CPU composite stays the shipping default
+                    // and the ONLY stored-frame path.
+                    let gpu_applicable = self.gpu.is_some()
+                        && matches!(self.render_mode, RenderMode::Visible)
+                        && self.view == StudioView::Geostationary
+                        && self.clouds_enabled;
+                    // egui shows NO hover text on disabled widgets, so a greyed GPU
+                    // cluster was unexplained (owner-reported) — name the unmet
+                    // conditions inline and on the disabled-hover instead.
+                    let gpu_hint = if self.gpu.is_none() {
+                        "(no GPU device)".to_string()
+                    } else {
+                        let mut unmet: Vec<&str> = Vec::new();
+                        if !matches!(self.render_mode, RenderMode::Visible) {
+                            unmet.push("Mode: Visible");
+                        }
+                        if self.view != StudioView::Geostationary {
+                            unmet.push("View: Geostationary");
+                        }
+                        if !self.clouds_enabled {
+                            unmet.push("Clouds on");
+                        }
+                        if unmet.is_empty() {
+                            String::new()
+                        } else {
+                            format!("(needs {})", unmet.join(" + "))
+                        }
+                    };
+                    const GPU_DISABLED_HINT: &str =
+                        "Enabled in Visible mode + Geostationary view with Clouds on \
+                         (needs a GPU device, a loaded run, and no render in progress).";
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_enabled_ui(gpu_applicable, |ui| {
+                            ui.checkbox(&mut self.gpu_clouds, "GPU clouds (experimental)")
+                                .on_hover_text(
+                                    "Render the DISPLAYED frame through the GPU cloud pass \
+                                     (clouds.wgsl, Interactive sun schedule) instead of the CPU \
+                                     composite — the fast live preview. Stored frames and \
+                                     sequence renders ALWAYS use the CPU path. Known preview \
+                                     divergences: no granulation on GPU; terrain shadows / \
+                                     ambient aperture / per-pixel wind / snow use flat-open \
+                                     defaults; hardware-trilinear volume sampling; f32 math. \
+                                     Geostationary Visible mode only.",
+                                )
+                                .on_disabled_hover_text(GPU_DISABLED_HINT);
+                            if ui
+                                .add_enabled(
+                                    !self.busy && self.can_render(),
+                                    egui::Button::new("GPU parity check"),
+                                )
+                                .on_hover_text(
+                                    "Render the current scene BOTH ways (CPU reference at \
+                                     GPU-comparable settings + the GPU pass), log the \
+                                     per-channel mean/p95/max |delta| and show a delta \
+                                     heatmap. The GPU frame is displayed; nothing is stored.",
+                                )
+                                .on_disabled_hover_text(GPU_DISABLED_HINT)
+                                .clicked()
+                            {
+                                self.parity_pending = true;
+                                self.start_render(ctx);
+                            }
+                        });
+                        if !gpu_hint.is_empty() {
+                            ui.label(egui::RichText::new(gpu_hint).weak());
+                        }
+                    });
+                    // The last parity report: numbers + the delta heatmap (black =
+                    // identical; brighter = larger delta, gain 4x).
+                    let mut dismiss_parity = false;
+                    if let Some(report) = &self.parity {
+                        ui.separator();
+                        ui.label(format!("GPU parity: {}", report.summary));
+                        let size = report.texture.size_vec2();
+                        let scale = (360.0 / size.x.max(1.0)).min(1.0);
+                        ui.add(egui::Image::new(&report.texture).fit_to_exact_size(size * scale))
+                            .on_hover_text(
+                                "Delta heatmap: black = identical, brighter/warmer = larger \
+                                 CPU-vs-GPU delta (gain 4x — a 64-count delta saturates).",
+                            );
+                        dismiss_parity = ui.button("Dismiss parity report").clicked();
+                    }
+                    if dismiss_parity {
+                        self.parity = None;
+                    }
                 });
 
             // Ground / Blue Marble.
@@ -3045,11 +3688,13 @@ impl eframe::App for SimSatStudioApp {
                 });
             let frame_info = loop_info.or_else(|| {
                 self.rendered.as_ref().map(|state| {
-                    // View label: the satellite name for the from-space product, or
-                    // "Top-down map" for the map-registered product (honest header).
+                    // View label: the satellite name for the from-space product,
+                    // "Top-down map" for the map-registered product, or
+                    // "Perspective (3-D)" for the orbit view (honest header).
                     let view_label = match state.view_mode {
-                        ViewMode::TopDownMap => "Top-down map".to_string(),
-                        ViewMode::Geostationary => state.satellite.label().to_string(),
+                        StudioView::TopDownMap => "Top-down map".to_string(),
+                        StudioView::Perspective => "Perspective (3-D)".to_string(),
+                        StudioView::Geostationary => state.satellite.label().to_string(),
                     };
                     let dims = format!(
                         "{}  {}x{} {}{}",
@@ -3297,9 +3942,13 @@ impl eframe::App for SimSatStudioApp {
 /// The M2 atmosphere + M4 cloud + M6 IR controls captured from the UI for one render.
 #[derive(Debug, Clone, Copy)]
 struct AtmoSettings {
-    /// View mode (Geostationary from-space or the top-down map-registered product). The
-    /// top-down view renders on the CPU (nadir rays into the shared shading kernels).
-    view_mode: ViewMode,
+    /// View mode (Geostationary from-space, the top-down map-registered product, or the
+    /// Perspective (3-D) orbit view). Top-down and Perspective render on the CPU.
+    view_mode: StudioView,
+    /// The Perspective orbit-camera params (always captured; read only when
+    /// `view_mode == StudioView::Perspective`). Mapped to the engine's
+    /// `PerspectiveCamera` by the pure `pipeline::orbit_to_camera`.
+    orbit: pipeline::OrbitParams,
     /// Zoom-out / domain MARGIN as a FRACTION of the domain size added on each side (0.0 =
     /// the domain edge-to-edge; e.g. 0.30 = +30% of the domain span on every side). The
     /// margin renders the real earth around the domain (Blue Marble ground + clear sky, no
@@ -3322,6 +3971,13 @@ struct AtmoSettings {
     /// field (clouds.rs granulation section). Thermal modes never granulate.
     granulation: bool,
     step_quality: StepQuality,
+    /// EXPERIMENTAL: render the geostationary Visible clouds-on frame through the
+    /// GPU cloud pass (Interactive schedule) instead of the CPU composite. Only the
+    /// DISPLAYED single-frame render honors it; batch/sequence renders force it off.
+    gpu_clouds: bool,
+    /// One-shot GPU parity check: march BOTH paths and return the CPU reference so
+    /// the UI can diff them (works whether or not `gpu_clouds` is on).
+    parity: bool,
     /// Display-side exposure gain (before the ABI stretch) for the CPU composite.
     exposure: f64,
     /// "Fake sun" what-if OVERRIDE: `Some((elev_deg, az_deg))` places a single uniform
@@ -3407,8 +4063,15 @@ fn prepare_render(
             run_id,
             ts_index,
         } => {
-            let geom = ingest::read_grid_geometry(&path, ts_index)
-                .map_err(|e| format!("read geometry: {e}"))?;
+            // A GRIB2 source shares this whole arm; only the geometry read and the
+            // ingest call differ (a GRIB file carries a single valid time).
+            let is_grib = ingest_grib::is_grib_input(&path);
+            let geom = if is_grib {
+                ingest_grib::read_grib_geometry(&path).map_err(|e| format!("read geometry: {e}"))?
+            } else {
+                ingest::read_grid_geometry(&path, ts_index)
+                    .map_err(|e| format!("read geometry: {e}"))?
+            };
             let georef = geom.georef().map_err(|e| format!("georef: {e}"))?;
             let brick_path = bricks::run_dir(&cache_dir, &run_id).join(
                 bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm),
@@ -3434,7 +4097,12 @@ fn prepare_render(
                 let mut config = IngestConfig::new(cache_dir.clone());
                 config.run_id = Some(run_id.clone());
                 config.timestep = ts_index;
-                ingest::ingest_timestep(&path, &config).map_err(|e| format!("ingest: {e}"))?;
+                if is_grib {
+                    ingest_grib::ingest_grib_timestep(&path, &config)
+                        .map_err(|e| format!("grib ingest: {e}"))?;
+                } else {
+                    ingest::ingest_timestep(&path, &config).map_err(|e| format!("ingest: {e}"))?;
+                }
                 status("Ingest complete.");
             }
             (
@@ -3502,12 +4170,53 @@ fn prepare_render(
     // Blue Marble + assemble machinery below is IDENTICAL — only the per-pixel ray at
     // render time diverges (nadir vs scan). `build_surface_raster_mode` logs to stderr if
     // a huge domain forces the MAX_AXIS clamp.
-    let is_topdown = atmo.view_mode == ViewMode::TopDownMap;
+    let is_topdown = atmo.view_mode == StudioView::TopDownMap;
+    let is_persp = atmo.view_mode == StudioView::Perspective;
     let camera = GeoCamera::new(preset);
     // Zoom-out / domain-margin: 0.0 = the domain edge-to-edge; > 0 grows the extent by that
     // fraction of the domain span on each side (real Blue Marble ground + clear sky around
-    // the domain — no WRF weather outside it).
+    // the domain — no WRF weather outside it). Ignored in Perspective view (the camera
+    // frames the scene; no margin extent and no edge feather — the api pattern).
     let margin = atmo.margin_frac;
+
+    // PERSPECTIVE (3-D) view: map the orbit (azimuth/tilt/range/fov around the domain
+    // centre) to the engine's free PerspectiveCamera via the pure, node-tested
+    // `pipeline::orbit_to_camera` (range clamped to 0.3x-5x the domain diagonal).
+    // Visible-mode only in v1 (UI-gated; guarded here as defense in depth).
+    if is_persp && atmo.render_mode != RenderMode::Visible {
+        return Err("Perspective (3-D) view renders the Visible product only in v1.".to_string());
+    }
+    let persp: Option<(PerspectiveCamera, PerspectiveBasis)> = if is_persp {
+        // Domain diagonal in metres (MAP_PROJ 6 stores dx/dy in degrees).
+        let (ddx, ddy) = if params.map_proj == 6 {
+            (params.dx_m * 111_195.0, params.dy_m * 111_195.0)
+        } else {
+            (params.dx_m, params.dy_m)
+        };
+        let diag_m = (((nx.max(2) - 1) as f64 * ddx).powi(2)
+            + ((ny.max(2) - 1) as f64 * ddy).powi(2))
+        .sqrt();
+        let (lo_m, hi_m) = pipeline::orbit_range_bounds_m(diag_m);
+        let req_m = atmo.orbit.range_km * 1000.0;
+        if !(lo_m..=hi_m).contains(&req_m) {
+            status(&format!(
+                "Orbit range clamped to {:.0}-{:.0} km for this domain.",
+                lo_m / 1000.0,
+                hi_m / 1000.0
+            ));
+        }
+        let cam =
+            pipeline::orbit_to_camera(&atmo.orbit, params.cen_lat_deg, params.cen_lon_deg, diag_m);
+        let basis = cam
+            .basis()
+            .map_err(|e| format!("perspective camera: {e}"))?;
+        // Provenance discipline: the camera pose goes into the render log (the api's
+        // PERSPECTIVE log-line pattern).
+        status(&format!("PERSPECTIVE camera {}", cam.label()));
+        Some((cam, basis))
+    } else {
+        None
+    };
     // The scene cache (WS4 item 1): single-slot, exact-key-equality caches for the
     // timestep-independent resources. The one in-flight worker is the only lock
     // holder (renders are serialized by the busy flag); a poisoned lock from an
@@ -3524,33 +4233,53 @@ fn prepare_render(
         view: view_ordinal(atmo.view_mode),
         sat: sat_ordinal(preset),
     };
-    let (raster_arc, raster_hit) = scache.raster.get_or_try_insert_with(
-        raster_key.clone(),
-        || -> Result<SurfaceRaster, String> {
-            if is_topdown {
-                status("Building top-down map raster...");
-                build_map_raster(&georef, nx, ny, nx, ny, margin)
-                    .map(|m| m.as_surface_raster())
-                    .ok_or_else(|| "The domain is too small to build a top-down map.".to_string())
-            } else {
-                status("Building geostationary raster...");
-                build_surface_raster_mode(&camera, &georef, nx, ny, resolution, margin, MAX_AXIS)
+    let (raster_arc, raster_hit) = if let Some((cam, basis)) = &persp {
+        // Perspective rasters BYPASS the scene cache: the cache key does not carry
+        // the orbit, and the per-pixel ray/sphere raster is cheap to rebuild (the
+        // owner is expected to drag the orbit between renders anyway).
+        status(&format!(
+            "Building perspective raster ({}x{})...",
+            cam.width, cam.height
+        ));
+        (
+            Arc::new(build_perspective_raster(basis, &georef, nx, ny)),
+            false,
+        )
+    } else {
+        scache.raster.get_or_try_insert_with(
+            raster_key.clone(),
+            || -> Result<SurfaceRaster, String> {
+                if is_topdown {
+                    status("Building top-down map raster...");
+                    build_map_raster(&georef, nx, ny, nx, ny, margin)
+                        .map(|m| m.as_surface_raster())
+                        .ok_or_else(|| {
+                            "The domain is too small to build a top-down map.".to_string()
+                        })
+                } else {
+                    status("Building geostationary raster...");
+                    build_surface_raster_mode(
+                        &camera, &georef, nx, ny, resolution, margin, MAX_AXIS,
+                    )
                     .ok_or_else(|| {
                         format!(
                             "The domain is not fully visible from {}. Try a different satellite.",
                             preset.label()
                         )
                     })
-            }
-        },
-    )?;
+                }
+            },
+        )?
+    };
     hits.raster = Some(raster_hit);
     let raster: &SurfaceRaster = &raster_arc;
     // Native clamped against the per-axis cap (the margin-extended target exceeds MAX_AXIS)?
     // Then the raster is coarser than native — the honest exception, surfaced in the UI.
-    // (Top-down is always native one-pixel-per-cell, capped separately in build_map_raster.)
+    // (Top-down is always native one-pixel-per-cell, capped separately in build_map_raster;
+    // perspective dims are explicit, never clamped here.)
     let (target_nx, target_ny) = extended_native_counts(nx, ny, margin);
     let res_clamped = !is_topdown
+        && !is_persp
         && resolution == ResolutionMode::Native
         && (raster.nx < target_nx || raster.ny < target_ny);
 
@@ -3570,6 +4299,20 @@ fn prepare_render(
     let is_sandwich = atmo.render_mode.is_sandwich();
     let is_visible_ir_composite = atmo.render_mode.is_visible_ir_composite();
     let ir_band = atmo.render_mode.ir_band();
+    // EXPERIMENTAL GPU cloud path: geostationary Visible clouds-on only. A parity
+    // render takes it too (both paths run) even when the live toggle is off. A
+    // projection the WGSL forward does not implement (rotated lat-lon = GRIB RRFS)
+    // falls back to the CPU composite with a log line.
+    let gpu_projection_ok = gpu::projection_supported(&georef);
+    let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
+        && atmo.clouds_enabled
+        && !is_topdown
+        && !is_persp
+        && matches!(atmo.render_mode, RenderMode::Visible)
+        && gpu_projection_ok;
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
+        status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
+    }
     let bm_cache_dir = ingest::default_cache_dir();
     let (bluemarble, bm_status, season_line): (Option<BmGround>, BmStatus, String) = match raster
         .lat_lon_bbox()
@@ -3685,7 +4428,13 @@ fn prepare_render(
             ]
         }),
     };
-    let (lut_geo, mut lut_light) = if let Some(g) = scache.geo_lut.get(&geo_key) {
+    let (lut_geo, mut lut_light) = if is_persp {
+        // Perspective bypasses the geo-LUT cache too (its raster is uncached and the
+        // key would not carry the orbit).
+        hits.geo_lut = Some(false);
+        let (g, l) = gpu::build_luts(raster, bm_crop, nx, ny, &solar);
+        (Arc::new(g), l)
+    } else if let Some(g) = scache.geo_lut.get(&geo_key) {
         hits.geo_lut = Some(true);
         let light = build_light_lut(raster, &solar);
         (g, light)
@@ -3749,7 +4498,13 @@ fn prepare_render(
     let luts = &atmo_arc.0;
     let sky_sh = &atmo_arc.1;
 
-    let cam_geo = CameraGeometry::from_sub_lon(preset.sub_lon_deg());
+    let mut cam_geo = CameraGeometry::from_sub_lon(preset.sub_lon_deg());
+    if let Some((_, basis)) = &persp {
+        // ONE camera per frame — the perspective EYE (the engine's perspective
+        // contract: FrameContext.cam.camera is the ray origin for the surface and
+        // cloud marches; the api's render_perspective_scene does exactly this).
+        cam_geo.camera = basis.eye;
+    }
     // One ECEF sun vector for the frame (sun at infinity), from the domain centre. With
     // the fake-sun override, place it at the requested elevation/azimuth over the centre
     // (a uniform overridden sun direction, exactly like render_frame's sun-elev override);
@@ -3819,6 +4574,7 @@ fn prepare_render(
     // path and ignores the sun/atmosphere/cloud state above (thermal — no sun input).
     // Both produce the one CPU-rendered RGBA frame `finish_prepared` displays/stores.
     let mut derived_out: Option<(DerivedField, Vec<f32>)> = None;
+    let mut gpu_cloud_out: Option<Box<GpuCloudPrep>> = None;
     let (cloud_rgba, ir_bt) = if let Some(field) = derived_mode {
         // A DERIVED scalar-field map: a per-column brick integral (precipitable water /
         // cloud-top temperature / cloud optical depth), resampled onto the output raster and
@@ -3880,14 +4636,202 @@ fn prepare_render(
         let rgba = render_ir_rgba(&bt, ir_band, atmo.ir_enhancement);
         status("Thermal march complete.");
         (Some(rgba), Some(bt))
-    } else if atmo.clouds_enabled || is_topdown || is_visible_ir_composite {
+    } else if use_gpu_clouds {
+        // ── EXPERIMENTAL GPU cloud path (the M5-GPU activation). The worker packs
+        // the volume + plans + upload payloads; the UI thread runs the sun-OD
+        // compute and the clouds.wgsl march (gpu::CloudPassResources::render). The
+        // CPU composite remains the shipping default and the ONLY stored path; a
+        // parity render ALSO marches the CPU reference here for the diff.
+        status("Preparing GPU cloud volume...");
+        let vol = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
+        let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+        let scan_rect = clouds::scan_rect_of(&raster.scan);
+        let froxel = atmosphere::build_aerial_froxel(
+            luts,
+            &params,
+            &cam_geo,
+            sun_ecef,
+            scan_rect,
+            atmosphere::AERIAL_FROXEL_DIM,
+        );
+        let pitch = vol.voxel_pitch_m();
+        // The GPU pass always renders the INTERACTIVE schedule — the wgsl's
+        // documented sun-march constants are the Interactive (6, 2.0) pair. NOTE:
+        // granulation is NOT wired on the GPU (GRAN_AMPLITUDE = 0.0 in the shader);
+        // the studio toggle is ignored by this preview (logged at Render).
+        let icfg = MarchConfig {
+            beer_powder: atmo.beer_powder,
+            octaves: if atmo.multiscatter {
+                clouds::DEFAULT_OCTAVES
+            } else {
+                1
+            },
+            edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, nx, ny),
+            ..MarchConfig::new(StepQuality::Interactive, pitch)
+        };
+        let march = CloudMarchParams {
+            coarse_step_m: (icfg.coarse_mult * pitch) as f32,
+            fine_step_m: (icfg.fine_mult * pitch) as f32,
+            max_steps: icfg.max_steps as f32,
+            exposure: atmo.exposure as f32,
+            octaves: icfg.octaves as f32,
+            beer_powder: icfg.beer_powder,
+            ground_albedo: icfg.ground_albedo as f32,
+            transmittance_floor: icfg.transmittance_floor as f32,
+            edge_feather_cells: icfg.edge_feather_cells as f32,
+            ground_day_lift: icfg.ground_day_lift as f32,
+        };
+        let sun_od_plan = gpu::plan_sun_od(
+            &georef,
+            nx,
+            ny,
+            brick.nz,
+            vol.z_min_m,
+            vol.dz_m,
+            pitch,
+            sun_ecef,
+            SUN_OD_RESOLUTION,
+        );
+        let lq = brick.quant.get("ext_liquid");
+        let iq = brick.quant.get("ext_ice");
+        let pq = brick.quant.get("ext_precip");
+        let tq = brick.quant.get("tau_up");
+        // Parity: the CPU reference at GPU-COMPARABLE settings — Interactive
+        // schedule, granulation OFF, FLAT/OPEN M3 surface fields, no snow blend (the
+        // documented GPU surface model) — so the numbers isolate the march itself.
+        // The LIVE CPU path additionally carries per-pixel terrain shadows /
+        // aperture / wind / snow (an expected real difference, see the notes).
+        let cpu_reference = if atmo.parity {
+            status("Parity: marching the CPU reference (Interactive schedule)...");
+            let sun_od = clouds::accumulate_sun_od_granulated(
+                &vol,
+                &georef,
+                sun_ecef,
+                SUN_OD_RESOLUTION,
+                clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+                None,
+            );
+            let scene = clouds::CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od: &sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef,
+                cfg: icfg,
+            };
+            let surf = FrameContext {
+                luts,
+                params: &params,
+                sky_sh,
+                cam: cam_geo,
+                sun_ecef,
+                output_transform: atmo.output_transform,
+                bm_present: bluemarble.is_some(),
+                water_scale: WATER_ALBEDO_SCALE as f64,
+                flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
+                raymarch_steps: 16,
+                exposure: atmo.exposure,
+            };
+            let bm_ref = bluemarble.as_ref().map(|a| &a.0);
+            let rnx = raster.nx;
+            let assemble = |px: usize, py: usize| -> SurfacePixel {
+                let idx = py * rnx + px;
+                let g = &lut_geo[idx * 4..idx * 4 + 4];
+                if g[0] < 0.0 {
+                    return SurfacePixel {
+                        on_earth: false,
+                        ..Default::default()
+                    };
+                }
+                let l = &lut_light[idx * 4..idx * 4 + 4];
+                let base = match bm_ref {
+                    Some(bm) if bm.width > 0 && bm.height > 0 => bm.sample_bilinear(g[0], g[1]),
+                    _ => [FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB],
+                };
+                let (normal_enu, is_water) = if g[2] >= 0.0 {
+                    let fi_f = (g[2] as f64 * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
+                    let fj_f = (g[3] as f64 * ny as f64 - 0.5).clamp(0.0, (ny - 1) as f64);
+                    let cell = fj_f.round() as usize * nx + fi_f.round() as usize;
+                    (normals[cell], brick.landmask[cell] < 0.5)
+                } else {
+                    ([0.0, 0.0, 1.0], false)
+                };
+                SurfacePixel {
+                    on_earth: true,
+                    base_srgb: base,
+                    normal_enu,
+                    sun_enu: [l[0], l[1], l[2]],
+                    sun_elev_deg: l[3],
+                    is_water,
+                    view_dir: [0.0, 0.0, 1.0],
+                    // Flat/open M3 defaults (the GPU surface model).
+                    ..Default::default()
+                }
+            };
+            Some(clouds::render_cloud_frame_rgba(
+                &scene,
+                &surf,
+                &froxel,
+                &raster.scan,
+                assemble,
+            ))
+        } else {
+            None
+        };
+        status("Packing the GPU volume upload...");
+        gpu_cloud_out = Some(Box::new(GpuCloudPrep {
+            texture_a: clouds::pack_texture_a(&brick),
+            occupancy: mip.to_r8_occupancy(),
+            vol_nx: brick.nx as u32,
+            vol_ny: brick.ny as u32,
+            vol_nz: brick.nz as u32,
+            occ_dims: (mip.mx as u32, mip.my as u32, mip.mz as u32),
+            ql: [
+                lq.vmin as f32,
+                lq.vmax as f32,
+                iq.vmin as f32,
+                iq.vmax as f32,
+            ],
+            qp: [
+                pq.vmin as f32,
+                pq.vmax as f32,
+                tq.vmin as f32,
+                tq.vmax as f32,
+            ],
+            z_min_m: vol.z_min_m as f32,
+            dz_m: vol.dz_m as f32,
+            r_top_m: vol.r_top() as f32,
+            r_bottom_m: vol.r_bottom() as f32,
+            voxel_pitch_m: pitch as f32,
+            geo: gpu::geo_quads(&georef),
+            march,
+            sun_od: sun_od_plan,
+            froxel_dim: froxel.dim as u32,
+            froxel_data: froxel.data.clone(),
+            sh_rows: sky_sh.entries.len() as u32,
+            sh_data: sky_sh.to_rgba_f32(),
+            scan_rect: [
+                scan_rect.0 as f32,
+                scan_rect.1 as f32,
+                scan_rect.2 as f32,
+                scan_rect.3 as f32,
+            ],
+            cpu_reference,
+        }));
+        status("GPU cloud inputs ready.");
+        (None, None)
+    } else if atmo.clouds_enabled || is_topdown || is_persp || is_visible_ir_composite {
         // ── CPU VISIBLE composite. Geostationary clouds-ON composites the M4/M5 cloud
         // march over the M2/M3 surface radiance (the tested CPU render path; the GPU
-        // cloud pass is the deferred M5 activation). The TOP-DOWN map ALWAYS renders here
-        // (no GPU top-down pass): per-pixel nadir rays into the SAME shading kernels
-        // (`topdown::render_topdown_frame_rgba`). Both run on the below-normal worker with
-        // rayon row-parallelism — the UI never blocks. The scene resources below are built
-        // regardless (cheap) and the render call selects the ray path + clouds on/off.
+        // cloud pass is the deferred M5 activation). The TOP-DOWN map and the
+        // PERSPECTIVE (3-D) view ALWAYS render here (no GPU pass for either):
+        // per-pixel nadir rays / pinhole eye rays into the SAME shading kernels
+        // (`topdown::render_topdown_frame_rgba` / `render_perspective_frame_rgba`).
+        // All run on the below-normal worker with rayon row-parallelism — the UI never
+        // blocks. The scene resources below are built regardless (cheap) and the render
+        // call selects the ray path + clouds on/off.
         status("Building horizon map...");
         // M3 horizon map (penumbral terrain shadows + the ambient aperture that
         // completes M5's SH-2 sky ambient; design section 6). Built here (clouds-on CPU
@@ -3934,15 +4878,6 @@ fn prepare_render(
             clouds::SUN_OD_EDGE_FEATHER_TEXELS,
             granulation,
         );
-        let scan_rect = clouds::scan_rect_of(&raster.scan);
-        let froxel = atmosphere::build_aerial_froxel(
-            luts,
-            &params,
-            &cam_geo,
-            sun_ecef,
-            scan_rect,
-            atmosphere::AERIAL_FROXEL_DIM,
-        );
         let cfg = MarchConfig {
             beer_powder: atmo.beer_powder,
             // Multi-scatter A/B (M5): DEFAULT_OCTAVES = the bright multiple-scatter look,
@@ -3956,8 +4891,13 @@ fn prepare_render(
             // byte-identical no-op at margin 0) — the cloud contribution ramps to
             // zero over the outer band of the domain so clouds melt into the margin
             // instead of the hard glassy domain-edge cut seen in the QA frames.
-            // Mirrors api.rs's wiring of the same engine function.
-            edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, nx, ny),
+            // Mirrors api.rs's wiring of the same engine function. Perspective
+            // ignores the margin, so no feather there (the api perspective pattern).
+            edge_feather_cells: if is_persp {
+                0.0
+            } else {
+                clouds::edge_feather_cells_for_margin(margin, nx, ny)
+            },
             // Sub-grid granulation: the SAME value the sun-OD map above was
             // accumulated with (one eroded field per composite).
             granulation,
@@ -4058,8 +4998,18 @@ fn prepare_render(
         };
         // Geostationary: scan-angle rays + the aerial-perspective froxel. Top-down map:
         // per-pixel nadir rays into the same shading (no froxel — the near-nadir front
-        // airlight is negligible; see `topdown`); clouds toggled off -> surface only.
-        let rgba = if is_topdown {
+        // airlight is negligible; see `topdown`). Perspective (3-D): the pinhole eye-ray
+        // fan into the same shading (no froxel either — the topdown precedent the engine
+        // documents; the surface keeps its full per-ray aerial perspective). Clouds
+        // toggled off -> surface only in all three.
+        let rgba = if let Some((_, basis)) = &persp {
+            let scene_opt = if atmo.clouds_enabled {
+                Some(&scene)
+            } else {
+                None
+            };
+            topdown::render_perspective_frame_rgba(&surf, scene_opt, basis, assemble)
+        } else if is_topdown {
             let scene_opt = if atmo.clouds_enabled {
                 Some(&scene)
             } else {
@@ -4075,6 +5025,15 @@ fn prepare_render(
                 assemble,
             )
         } else {
+            let scan_rect = clouds::scan_rect_of(&raster.scan);
+            let froxel = atmosphere::build_aerial_froxel(
+                luts,
+                &params,
+                &cam_geo,
+                sun_ecef,
+                scan_rect,
+                atmosphere::AERIAL_FROXEL_DIM,
+            );
             clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
         };
         status("Render complete.");
@@ -4180,6 +5139,7 @@ fn prepare_render(
         ir_band,
         derived: derived_out,
         render_mode: atmo.render_mode,
+        gpu_cloud: gpu_cloud_out,
     };
     Ok(Box::new(prep))
 }
@@ -4218,10 +5178,13 @@ fn resolution_ordinal(r: ResolutionMode) -> u8 {
     }
 }
 
-fn view_ordinal(v: ViewMode) -> u8 {
+fn view_ordinal(v: StudioView) -> u8 {
     match v {
-        ViewMode::Geostationary => 0,
-        ViewMode::TopDownMap => 1,
+        StudioView::Geostationary => 0,
+        StudioView::TopDownMap => 1,
+        // Perspective rasters bypass the scene cache (keyed by the orbit, which is
+        // not part of the key) — the ordinal exists only for key completeness.
+        StudioView::Perspective => 2,
     }
 }
 
@@ -4512,6 +5475,65 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parity_stats_identical_frames_are_zero() {
+        // Two identical 3-px frames (one space pixel): zero deltas, space excluded.
+        let frame = vec![
+            10, 20, 30, 255, // on-earth
+            0, 0, 0, 0, // space (alpha 0)
+            200, 150, 100, 255, // on-earth
+        ];
+        let s = parity_stats(&frame, &frame);
+        assert_eq!(s.compared, 2);
+        assert_eq!(s.mean, [0.0, 0.0, 0.0]);
+        assert_eq!(s.p95, [0, 0, 0]);
+        assert_eq!(s.max, [0, 0, 0]);
+        // The heatmap of identical frames is black everywhere (alpha opaque).
+        let heat = parity_heatmap_rgba(&frame, &frame);
+        assert_eq!(heat.len(), frame.len());
+        for px in heat.chunks_exact(4) {
+            assert_eq!(px, [0, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn parity_stats_report_known_deltas() {
+        // Two on-earth pixels with known per-channel deltas + one space pixel.
+        let cpu = vec![
+            100, 100, 100, 255, //
+            0, 0, 0, 0, // space in both: excluded
+            200, 50, 10, 255,
+        ];
+        let gpu = vec![
+            110, 100, 96, 255, // deltas 10, 0, 4
+            0, 0, 0, 0, //
+            180, 50, 10, 255, // deltas 20, 0, 0
+        ];
+        let s = parity_stats(&cpu, &gpu);
+        assert_eq!(s.compared, 2);
+        assert_eq!(s.mean, [15.0, 0.0, 2.0]);
+        assert_eq!(s.max, [20, 0, 4]);
+        // Nearest-rank p95 of two samples: ceil(2 * 0.95) = rank 2 = the larger.
+        assert_eq!(s.p95, [20, 0, 4]);
+        // Heatmap: pixel 0 max-channel delta 10 -> (40, 20, 10); space stays black.
+        let heat = parity_heatmap_rgba(&cpu, &gpu);
+        assert_eq!(&heat[0..4], &[40, 20, 10, 255]);
+        assert_eq!(&heat[4..8], &[0, 0, 0, 255]);
+        // Pixel 2 max delta 20 -> (80, 40, 20).
+        assert_eq!(&heat[8..12], &[80, 40, 20, 255]);
+    }
+
+    #[test]
+    fn parity_stats_count_space_disagreement() {
+        // A pixel that is space on one side but rendered on the other must count
+        // (a masked-vs-rendered disagreement is a real parity break).
+        let cpu = vec![0, 0, 0, 0];
+        let gpu = vec![60, 0, 0, 255];
+        let s = parity_stats(&cpu, &gpu);
+        assert_eq!(s.compared, 1);
+        assert_eq!(s.max, [60, 0, 0]);
+    }
 
     /// Cursor-centred zoom must keep the image point under the cursor FIXED on screen.
     #[test]
