@@ -1,0 +1,15 @@
+# Rust build output
+/target
+**/target
+
+# SimSat brick cache files (design doc section 2)
+*.ssb
+
+# QA render iteration artifacts (feat/render-harness-exposure — not committed)
+notes/qa-frames/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*~

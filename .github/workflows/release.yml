@@ -1,0 +1,82 @@
+# SimSat release-artifact builds — MANUAL DISPATCH ONLY, NO PUBLISHING.
+#
+# This workflow BUILDS the distributable artifacts and uploads them as WORKFLOW
+# ARTIFACTS. It NEVER creates a GitHub release, tag, or any public object —
+# publishing is the owner's held button (see RELEASING.md, which is the go-live
+# checklist that dispatches this).
+#
+# STATUS NOTE: reviewed but never dispatched during release prep (the Windows
+# and maturin legs are expensive on private-repo minutes). ci.yml — the cheap
+# ubuntu fmt/clippy/test gate — WAS dispatched and proven. Budget one iteration
+# for first-run issues here (see RELEASING.md step 2).
+name: Release artifacts (manual, no publish)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-exe:
+    name: SimSat Studio (Windows x86_64, static CRT)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The committed .cargo/config.toml already carries
+      # `-C target-feature=+crt-static` for x86_64-pc-windows-msvc, so this exe
+      # is a single self-contained binary (no VC++ redistributable needed).
+      - name: cargo build --release -p simsat_studio
+        run: cargo build --release -p simsat_studio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simsat-studio-windows-x86_64
+          path: target/release/simsat_studio.exe
+          if-no-files-found: error
+
+  linux-cli:
+    name: Named CLI binaries (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system deps (winit/wayland/xkb build headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # simsat-render-frame + simsat-render-ir: the [[bin]] targets pointing at
+      # the identically-bodied example files (crates/simsat/Cargo.toml).
+      - name: cargo build --release -p simsat --bins
+        run: cargo build --release -p simsat --bins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simsat-cli-linux-x86_64
+          path: |
+            target/release/simsat-render-frame
+            target/release/simsat-render-ir
+          if-no-files-found: error
+
+  python-wheel:
+    name: Python wheel (abi3-py38, manylinux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # crates/simsat_py is its own standalone cargo workspace (excluded from the
+      # repo root) with its own [patch.crates-io]; maturin-action builds it in a
+      # manylinux container. abi3 -> one wheel for CPython >= 3.8.
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/simsat_py
+          command: build
+          args: --release
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simsat-python-wheel
+          path: crates/simsat_py/target/wheels/*.whl
+          if-no-files-found: error

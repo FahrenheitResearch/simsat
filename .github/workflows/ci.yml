@@ -1,0 +1,50 @@
+# SimSat CI — MANUAL DISPATCH ONLY.
+#
+# No push/PR triggers on purpose: this repo's real gate is the node verify trio
+# (see CLAUDE.md "Node procedure"), and while the repo is private, Actions
+# minutes are limited. This workflow exists so a public release has a
+# world-visible CI story; consider adding a pull_request trigger after the repo
+# goes public (see RELEASING.md).
+#
+# Job scope: the full repo-root workspace (crates/simsat + crates/simsat_studio).
+# The studio's Linux build needs a handful of desktop dev headers for
+# winit/wayland/xkb (rfd uses the xdg-portal backend, so no GTK is required);
+# they are cheap to install, so the workspace is gated whole rather than scoping
+# to -p simsat. crates/simsat_py is a standalone workspace (excluded from the
+# root workspace) and is NOT built here — its wheel is release.yml's job.
+name: CI
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt + clippy + test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps (winit/wayland/xkb build headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace

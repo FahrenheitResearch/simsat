@@ -1,0 +1,33 @@
+[package]
+name = "simsat_studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SimSat Studio: standalone desktop app for rendering simulated satellite imagery from WRF."
+
+[[bin]]
+name = "simsat_studio"
+path = "src/main.rs"
+
+[dependencies]
+# The engine crate (camera, ingest, gpu surface pass, store writer).
+simsat = { path = "../simsat" }
+# The app window (wgpu renderer). Design doc section 9: SimSat Studio is its own
+# eframe/wgpu desktop app. `eframe::egui_wgpu::wgpu` is the single workspace wgpu.
+eframe = { workspace = true }
+# Native file dialogs (open wrfout / run.json / choose store root). Same pin +
+# features as BowEcho's workspace.
+rfd = { workspace = true }
+# Sat player panel for loop playback (declared now so the pin is gate-proven;
+# the loop/player UI is wired in at milestone M7, not M1).
+rw-ui = { workspace = true }
+# Global thread pool configured at below-normal priority with a spare core in
+# `main()` (machine-stability discipline; see platform::lower_worker_thread_priority).
+rayon = { workspace = true }
+# Settings persistence (%LOCALAPPDATA%/SimSatStudio/settings.json): serde derive on
+# the settings struct + serde_json for the atomic temp+rename save. Workspace pins.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# "Save PNG..." export of the rendered frame (RGBA -> RGB8 PNG on a spawned thread).
+image = { workspace = true }

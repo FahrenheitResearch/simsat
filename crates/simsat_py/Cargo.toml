@@ -1,0 +1,54 @@
+# SimSat Python binding (the `import simsat` module) — a THIN PyO3 + numpy wrapper over
+# the pure-Rust `simsat::api` render layer. All render logic + tests live in the `simsat`
+# crate (a normal workspace member, gated normally on the build nodes); this crate is only
+# argument parsing + numpy marshalling, built into a wheel by maturin.
+#
+# STANDALONE WORKSPACE: this crate has its own `[workspace]` table (empty) and is EXCLUDED
+# from the repo's root workspace, so `cargo fmt/clippy/test --workspace` on the node never
+# needs a Python interpreter (PyO3 links libpython at test/link time). It path-depends on
+# `../simsat`, which is still a member of the ROOT workspace, so simsat's `{ workspace =
+# true }` dependency inheritances resolve against the root's `[workspace.dependencies]`.
+# The `[patch.crates-io]` below is a copy of the root's (patches only apply from the
+# workspace root that initiates the build — here that is this crate, not the repo root).
+
+[package]
+name = "simsat_py"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FahrenheitResearch/simsat"
+description = "Python binding (import simsat) for the SimSat physically-based simulated satellite renderer."
+
+[lib]
+# The Python import name is `simsat` (so `import simsat`), independent of the crate name.
+name = "simsat"
+# cdylib -> the Python extension module (the wheel); rlib so `cargo test`/`clippy` on this
+# crate can also build a normal lib if ever run directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Aliased to `simsat_engine` because the PyO3 module function is itself named `simsat`
+# (the `#[pymodule] fn simsat` -> PyInit_simsat), which would otherwise be ambiguous with
+# an extern crate also named `simsat`.
+simsat_engine = { package = "simsat", path = "../simsat" }
+# abi3-py38 -> a SINGLE wheel that works on CPython >= 3.8 (the stable ABI). extension-module
+# -> do not link libpython (symbols resolve at import time), so the wheel is portable and
+# builds without a python-dev lib present. pyo3 0.23 <-> numpy 0.23 (matched pair).
+pyo3 = { version = "0.23", features = ["abi3-py38", "extension-module"] }
+numpy = "0.23"
+
+# See the header note: patches apply from the initiating workspace root, which is THIS
+# crate (its own `[workspace]` below), so the netcrust hdf5-reader redirect must be repeated
+# here exactly as in the repo-root Cargo.toml.
+[patch.crates-io]
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+
+# An empty `[workspace]` table makes this crate its OWN workspace root (standalone), so it
+# is not pulled into the repo-root virtual workspace and the node trio stays Python-free.
+[workspace]
+
+# Match the repo-root shipping profile so the wheel is a small, fast release build.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

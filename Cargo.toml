@@ -1,0 +1,101 @@
+[workspace]
+members = ["crates/simsat", "crates/simsat_studio"]
+# `crates/simsat_py` (the PyO3 Python binding) is DELIBERATELY excluded from this
+# workspace so the node gate `cargo fmt/clippy/test --workspace` needs NO Python
+# interpreter (PyO3 links libpython at test time). It is its own standalone workspace
+# (see crates/simsat_py/Cargo.toml, which has its own empty `[workspace]` table and its
+# own `[patch.crates-io]`). The tested render correctness lives in `simsat::api` (a
+# normal workspace member); simsat_py is thin numpy marshalling built via maturin.
+exclude = ["crates/simsat_py"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FahrenheitResearch/simsat"
+
+# Shared dependency pins. Registry versions and git revs mirror BowEcho's
+# workspace so the shared machinery resolves to the exact same objects. The ONE intentional divergence: eframe
+# uses the "wgpu" renderer feature here (BowEcho uses "glow"), because SimSat's
+# renderer is built on eframe::egui_wgpu::wgpu (29.0.3) per the design doc.
+[workspace.dependencies]
+# eframe with the wgpu backend -> pulls egui-wgpu / wgpu 29.0.3 / naga 29.0.3.
+eframe = { version = "0.34.3", features = ["wgpu"] }
+# Shader validation (dev-dependency); version matches the wgpu it validates for.
+naga = "29.0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# `gif` (pure-Rust gif + color_quant underneath) powers the animation loop export
+# (`simsat::animation`). NOTE: gif/color_quant/weezl were ALREADY resolved entries in
+# Cargo.lock (image locks its optional deps), so this feature changes the COMPILED
+# closure only — regenerate THIRD-PARTY-NOTICES.txt before release (see RELEASING.md).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "tiff",
+    "gif",
+] }
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+# float_roundtrip makes the JSON parser reproduce f64 bit-exactly, so the .ssb
+# header's per-volume quantization scales survive a write/read round trip exactly
+# (the default parser can be 1 ULP off). The serializer (ryu) is already exact.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+# Streaming HTTP download of the seasonal Blue Marble monthly assets (M7). Same pin
+# + features as BowEcho's workspace (blocking + rustls-tls, no system OpenSSL) so it
+# builds on the headless Linux nodes exactly as bowecho does. sha2 is the SHA-256 gate
+# that verifies each downloaded month against the pinned manifest (ported alongside the
+# self_update.rs streaming-download pattern).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
+
+# Shared machinery from the rusty-weather monorepo (all one rev). These are the
+# output contract (rw-store), geostationary math (rw-sat), the sat player panel
+# (rw-ui), and the NetCDF/HDF5 metadata fallback reader (netcrust).
+rw-store = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+rw-sat = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+rw-ui = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+# Grid geometry types (GridShape/LatLonGrid) the store writer builds meshes with.
+rustwx-core = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+
+# rfd native file dialogs. Same pin as BowEcho; features add `xdg-portal` +
+# `async-std` on top of BowEcho's `common-controls-v6`. Rationale: rfd's build.rs
+# PANICS on Linux unless a backend (`gtk3` or `xdg-portal`) is chosen, and
+# `xdg-portal` in turn requires `tokio`/`async-std` — so `common-controls-v6`
+# alone fails to build on the headless Linux nodes (BowEcho's Windows/macOS-only
+# app never exercised the Linux leg). These extra deps (ashpd/async-std/pollster)
+# are all Linux-target-gated, so the Windows build (owner's box) is unaffected and
+# still uses the native common-controls-v6 dialog.
+rfd = { version = "0.15", default-features = false, features = [
+    "common-controls-v6",
+    "xdg-portal",
+    "async-std",
+] }
+
+# wrfout reading (WrfFile::read_var streaming) — separate wrf-rust repo.
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "f05758d9b8ea0132ea8b9767882396cbc5b2cfac", package = "wrf-core" }
+
+# netcrust depends on `hdf5-reader` by crates.io name; redirect it to the
+# rusty-weather git version (same as BowEcho's workspace patch).
+[patch.crates-io]
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+
+# Shipping profile mirrors BowEcho: fat LTO + one codegen unit for the smallest,
+# fastest binary. panic = "abort" is intentionally NOT set: workers isolate
+# panics via catch_unwind / thread joins, and abort would turn a contained
+# worker failure into a full app crash.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Local iteration profile (never ships): thin LTO + incremental for fast
+# release-exe rebuilds during the sanctioned local smoke build.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+strip = false

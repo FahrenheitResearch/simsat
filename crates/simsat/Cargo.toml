@@ -1,0 +1,56 @@
+[package]
+name = "simsat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SimSat engine: physically-based simulated visible/IR satellite from WRF output."
+
+# NOTE (M0 scaffold): the dependencies below are declared so the gate actually
+# fetches and compiles the pinned graph, proving the pins resolve/build together.
+# lib.rs does not use them yet — ingest/bricks/rendering are later milestones
+# (design doc section 10, M0+). Unused declared deps do not trip clippy's
+# `-D warnings` (`unused_crate_dependencies` is allow-by-default).
+[dependencies]
+# eframe pulled with the wgpu feature so `eframe::egui_wgpu::wgpu` is the single
+# workspace wgpu the renderer will build on (design doc section 9).
+eframe = { workspace = true }
+# wrfout reading (WrfFile::read_var streaming) + NetCDF/HDF5 metadata fallback.
+wrf-core = { workspace = true }
+netcrust = { workspace = true }
+# Output contract (sat-store) + geostationary camera math + grid geometry types.
+rw-store = { workspace = true }
+rw-sat = { workspace = true }
+rustwx-core = { workspace = true }
+# Ingest/brick/optics utilities the engine will use.
+rayon = { workspace = true }
+flate2 = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# Seasonal Blue Marble asset pack (M7): streaming per-month download + SHA-256 gate.
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# WGSL shader parse+validate in unit tests (design doc section 9, test strategy 3).
+naga = { workspace = true }
+
+# NAMED CLI binaries (the WRF-Runner integration ships these on Linux; design-doc
+# top-down addendum "remaining integration step"). Each [[bin]] points DIRECTLY at
+# the identically-bodied example file — the same source file is the root of two
+# targets, so there is ONE source of truth and zero divergence risk. This was the
+# only reuse mechanism that works without editing the example files: an include!
+# shim fails E0753 (the examples open with `//!` inner doc comments, illegal at an
+# include! expansion site) and a `#[path]` module mount cannot call the example's
+# private `fn main` (E0603). Cargo prints a cosmetic "file found to be present in
+# multiple build targets" warning for these two files; it is a cargo notice, not a
+# rustc/clippy lint, and cannot trip the `-D warnings` gate.
+[[bin]]
+name = "simsat-render-frame"
+path = "examples/render_frame.rs"
+
+[[bin]]
+name = "simsat-render-ir"
+path = "examples/render_ir.rs"

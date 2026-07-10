@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "simsat"
+version = "0.1.0"
+description = "Physically-based simulated visible/IR satellite imagery from WRF output — numpy-returning Python binding."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["satellite", "wrf", "meteorology", "goes", "abi", "cartopy", "numpy"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+# numpy is required at runtime (the render functions return numpy arrays).
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Repository = "https://github.com/FahrenheitResearch/simsat"
+
+[tool.maturin]
+# The compiled module is `simsat` (matches crate `[lib] name`). abi3 -> ONE wheel for
+# CPython >= 3.8; no per-version rebuild.
+module-name = "simsat"
+# Build the release profile (the small, fast wheel).
+profile = "release"

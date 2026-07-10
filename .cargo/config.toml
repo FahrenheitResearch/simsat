@@ -1,0 +1,7 @@
+# Windows release builds statically link the MSVC C runtime so the shipped
+# simsat_studio.exe is a single self-contained binary that launches on a clean
+# Windows 10/11 machine with no Visual C++ Redistributable installed (removes the
+# VCRUNTIME140.dll dependency). Target-scoped: has NO effect on the Linux node
+# build/test target (x86_64-unknown-linux-gnu), so the gate trio is unchanged.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
