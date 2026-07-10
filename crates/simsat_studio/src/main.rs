@@ -629,10 +629,12 @@ struct SimSatStudioApp {
     multiscatter: bool,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the clouds.rs
-    /// granulation section). ON by default — the studio renders the DISPLAY product,
-    /// matching the api's product scoping (raw-Kelvin thermal modes never granulate
-    /// regardless). The amplitude is dx-derived, so a fine (250 m) run is near-neutral
-    /// and a coarse (2-3 km) run granulates strongly. Session-scoped (not persisted).
+    /// granulation section). OFF by default as of v0.1.1 — the round-1 default look
+    /// was owner-rejected on coarse-grid decks ("cheese grater"); OPT-IN via the
+    /// Clouds-group toggle until the tune-2 rework re-earns the default (matches the
+    /// api's opt-in scoping; raw-Kelvin thermal modes never granulate regardless).
+    /// The amplitude is dx-derived, so a fine (250 m) run is near-neutral and a
+    /// coarse (2-3 km) run granulates strongly. Session-scoped (not persisted).
     granulation: bool,
     step_quality: StepQuality,
     /// Display-side exposure gain applied before the ABI stretch (see
@@ -748,8 +750,8 @@ impl SimSatStudioApp {
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
             // scatter buildup, so powder-on would double-darken (design M5 decision).
             beer_powder: false,
-            // Sub-grid granulation ON by default (the display-product scoping).
-            granulation: true,
+            // Sub-grid granulation OPT-IN (off) as of v0.1.1 — see the field doc.
+            granulation: false,
             // Offline (384 steps, full quality) is the default so the displayed AND
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.

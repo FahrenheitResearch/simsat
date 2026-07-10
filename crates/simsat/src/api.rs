@@ -544,14 +544,17 @@ fn render_visible_scene(
     // M4/M5 cloud volume + scene.
     let vol = DecodedVolume::from_brick(brick, horiz_pitch_m);
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
-    // Sub-grid cloud GRANULATION (edge-erosion detail noise): default ON for the
-    // DISPLAY product (VisibleRgb — and through it the GeoColor day half / Sandwich
-    // visible base), OFF for the quantitative raw-reflectance bands. The SAME Option
-    // feeds the sun-OD accumulation AND rides MarchConfig into the view + sun marches,
-    // so every march of this composite samples ONE eroded field.
-    let gran_on = params
-        .granulation
-        .unwrap_or(matches!(product, Product::VisibleRgb));
+    // Sub-grid cloud GRANULATION (edge-erosion detail noise): OPT-IN (default OFF)
+    // as of v0.1.1 — the round-1 default-ON look was owner-rejected on coarse-grid
+    // decks ("cheese grater": uniform pinhole pepper on deck margins + grey
+    // half-thinned transitions); the tune-2 rework (deck-coherence gate, bimodal
+    // carve, domain-warped cells) re-earns the default in a later release. Only
+    // meaningful for the DISPLAY product (VisibleRgb — and through it the GeoColor
+    // day half / Sandwich visible base); the quantitative raw-reflectance bands and
+    // thermal products never granulate regardless. The SAME Option feeds the sun-OD
+    // accumulation AND rides MarchConfig into the view + sun marches, so every march
+    // of this composite samples ONE eroded field.
+    let gran_on = params.granulation.unwrap_or(false) && matches!(product, Product::VisibleRgb);
     let granulation = if gran_on {
         Some(clouds::Granulation::for_grid(horiz_pitch_m))
     } else {
@@ -2529,20 +2532,28 @@ mod tests {
 
     #[test]
     fn granulation_scopes_by_product_and_is_live_in_the_display_rgb() {
-        // Default product scoping: the DISPLAY VisibleRgb granulates (flag recorded on
-        // the result) and the pixels actually change vs a forced-off render; the
-        // quantitative bands / thermal / derived products default OFF.
+        // v0.1.1 OPT-IN scoping: granulation is OFF unless explicitly requested
+        // (owner-rejected round-1 default look; tune-2 re-earns the default later),
+        // and even when requested it is live ONLY for the display VisibleRgb —
+        // quantitative bands / thermal / derived products never granulate.
         let src = low_liquid_source(24, 24, 16, 3000.0);
-        let p = synthetic_params(ViewMode::TopDownMap); // daylight, granulation None
+        let p_default = synthetic_params(ViewMode::TopDownMap); // granulation None
+        let default_off = render_visible_scene(&src, &p_default, Product::VisibleRgb).unwrap();
+        assert!(
+            !default_off.granulation,
+            "VisibleRgb must NOT granulate by default (opt-in as of v0.1.1)"
+        );
+        let mut p = p_default.clone();
+        p.granulation = Some(true);
         let on = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
         assert!(
             on.granulation,
-            "VisibleRgb must granulate by default (display product)"
+            "an explicit opt-in must granulate the display product"
         );
-        let mut p_off = p.clone();
+        let mut p_off = p_default.clone();
         p_off.granulation = Some(false);
         let off = render_visible_scene(&src, &p_off, Product::VisibleRgb).unwrap();
-        assert!(!off.granulation, "the explicit override must win");
+        assert!(!off.granulation, "the explicit off must win");
         let (rgb_on, rgb_off) = match (&on.data, &off.data) {
             (FrameData::Visible { rgb: a, .. }, FrameData::Visible { rgb: b, .. }) => (a, b),
             other => panic!("expected Visible frames, got {other:?}"),
@@ -2555,7 +2566,7 @@ mod tests {
         let bands = render_visible_scene(&src, &p, Product::VisibleBands).unwrap();
         assert!(
             !bands.granulation,
-            "the quantitative raw-reflectance bands must default OFF"
+            "the quantitative raw-reflectance bands must stay OFF even when requested"
         );
         let ir = render_ir_scene(&src, &p, IrConfig::band13()).unwrap();
         assert!(!ir.granulation, "raw-Kelvin IR never granulates");
