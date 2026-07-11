@@ -1,0 +1,55 @@
+{
+  "checks": {
+    "delta_conservative_monotonicity": {
+      "group_count": 20,
+      "worst_successive_toa_reflectance_change": 0.0
+    },
+    "delta_energy_conservation": {
+      "max_abs_energy_sum_error": 1.1102230246251565e-16,
+      "minimum_atmosphere_absorptance": -3.268912918130695e-14,
+      "row_count": 6240
+    },
+    "exact_common_mapping": {
+      "common_cuda_worst_successive_brf_change": 0.03934519919172315,
+      "exact_case_count": 4,
+      "nonzero_case_count": 3
+    },
+    "legacy_thin_higher_order": {
+      "log_log_slope": 2.000022501352098,
+      "tau_pair": [
+        0.0001,
+        0.0002
+      ]
+    },
+    "legacy_weight_sum": {
+      "formula_error": 0.0,
+      "value": 4.1523365624999995
+    },
+    "phase_normalization": {
+      "max_abs_error": 1.1215472994763331e-12,
+      "per_g_abs_error": {
+        "-0.1": 1.0103029524088925e-14,
+        "-0.15": 2.1094237467877974e-15,
+        "0.75": 1.176836406102666e-14,
+        "0.85": 1.1215472994763331e-12
+      }
+    },
+    "request_grid": {
+      "all_have_exact_delta_flux_row": true,
+      "row_count": 603,
+      "unique_row_count": 603
+    },
+    "single_scatter_analytic_agreement": {
+      "case_count": 12,
+      "max_abs_brf_error": 6.75631425806067e-14
+    },
+    "tau_zero": {
+      "case_count": 3,
+      "max_abs_brf": 0.0
+    }
+  },
+  "schema": "simsat.cloud-closure-fit.self-checks.v1",
+  "schema_version": 1,
+  "script_sha256": "a7b1e11a27c3a96459013d59f23cf7f38581fc5439d567e46ca0d384cfe0eb35",
+  "status": "pass"
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "simsat.cuda-cloud-oracle.self-test.v1",
+  "device": "NVIDIA GeForce RTX 5090 (sm_120)",
+  "all_passed": true,
+  "elapsed_ms": 874.59270000000004,
+  "tests": [
+    {"name": "philox4x32_10_known_vector", "passed": true, "detail": "6627e8d5 e169c58d bc57ac4c 9b00dbd8"},
+    {"name": "tau_zero_cpu_gpu", "passed": true, "detail": "cpu_brf=0, gpu_brf=0"},
+    {"name": "ssa_zero_cpu_gpu", "passed": true, "detail": "cpu_brf=0, gpu_brf=0"},
+    {"name": "optically_thin_single_scatter_analytic", "passed": true, "detail": "cpu=0.00079564714116027869, gpu=0.00079564714116028064, analytic=0.00079119681751343778, cpu_abs_delta=4.450323646840908e-06, gpu_abs_delta=4.4503236468428596e-06, cpu_six_sigma=1.9885785586533573e-05, gpu_six_sigma=1.988578558653359e-05"},
+    {"name": "cpu_gpu_statistical_agreement", "passed": true, "detail": "cpu=0.13679821528663011, gpu=0.13679821528663264, abs_delta=2.5257573810222311e-15, six_combined_sigma=0.011084337897920973"},
+    {"name": "gpu_exact_repeatability", "passed": true, "detail": "brf_a=0.13679821528663264, brf_b=0.13679821528663264, truncated=0"},
+    {"name": "finite_nonnegative_pathwise_bound", "passed": true, "detail": "brf=0.4680243021813818, pathwise_bound=46384.004623091496, truncated_fraction=0.037204742431640625, max_batch_ms=3.7709760665893555"},
+    {"name": "forward_analog_energy_closure", "passed": true, "detail": "R=0.3794403076171875, T=0.4323883056640625, A=0.18817138671875, truncated=0, closure=1"},
+    {"name": "stage2_single_hg_black_boundary_exact_identity", "passed": true, "detail": "legacy_cpu=0.13679821528663011, stage2_cpu=0.13679821528663011, legacy_gpu=0.13679821528663264, stage2_gpu=0.13679821528663264"},
+    {"name": "stage2_lambertian_tau_zero_analytic", "passed": true, "detail": "expected=0.59999999999999998, cpu=0.60000000000087828, gpu=0.5999999999999982"},
+    {"name": "stage2_dual_hg_matched_moment_single_scatter_analytic", "passed": true, "detail": "first_moment=0.75, cpu=0.0026964662658263742, gpu=0.0026964662658263841, analytic=0.0026813840177230168"},
+    {"name": "stage2_matched_forward_rta_depth_bin_energy", "passed": true, "detail": "cpu_RTA=0.54666900634765625/0.22100067138671875/0.232330322265625, gpu_RTA=0.54666900634765625/0.22100067138671875/0.232330322265625, max_delta=0, cpu_collisions=1012883, gpu_collisions=1012883"},
+    {"name": "stage2_forward_flux_depth_source_exact_repeatability", "passed": true, "detail": "R/T/A/truncated=71653/28967/30452/0"}
+  ]
+}

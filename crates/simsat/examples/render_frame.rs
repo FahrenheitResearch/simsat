@@ -35,11 +35,21 @@
 //!                              (default on; falls back safely when the field is absent).
 //!   cloud-optical-depth-scale=<f>  cloud OD calibration, 0.0..=4.0 (shipped default 0.15;
 //!                      1.0 = unscaled model extinction).
+//!   feather-exposed-domain-edges=<b> on | off — fade finished clouds at camera-exposed
+//!                      finite WRF boundaries (owner-selected v0.1.5 default on).
 //!   granulation=<b>    on | off  — sub-grid cloud edge erosion (default off).
 //!   steps=<quality>    offline | interactive              (default offline).
 //!   sun-elev=<deg>     OPTIONAL sun-elevation override (else true solar geometry).
 //!   sun-az=<deg>       OPTIONAL sun-azimuth override (deg from north).
 //!   exposure=<f>       Display gain before the ABI stretch (default DEFAULT_EXPOSURE).
+//!   land-sza-normalization=<b> on | off - bounded land-only solar-zenith display
+//!                              normalization (owner-selected default on).
+//!   land-sza-max-gain=<f>      upper bound for that normalization (default 1.6).
+//!   land-dark-toe=<b>          on | off - bounded dark-land reflectance lift
+//!                              (owner-selected default on).
+//!   land-dark-toe-knee=<f>     linear-reflectance identity knee (default 0.08).
+//!   land-dark-toe-gamma=<f>    toe exponent, 0.05..=1 (default 0.65; 1 = identity).
+//!   land-dark-toe-max-gain=<f> upper bound for the toe lift (default 1.5).
 //!   cache=<dir>        Brick cache root + seasonal Blue Marble cache.
 //!   bluemarble=<path>  OPTIONAL single-file Blue Marble override (default seasonal pack).
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
@@ -116,7 +126,10 @@ use simsat::camera::{PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMod
 use simsat::clouds::{CloudFrameStats, DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality};
 use simsat::gpu::RenderedFrame;
 use simsat::ingest;
-use simsat::render::DEFAULT_EXPOSURE;
+use simsat::render::{
+    DEFAULT_EXPOSURE, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
+    LAND_SZA_MAX_GAIN, LandAppearanceConfig,
+};
 use simsat::store_out::{self, VisibleFrame};
 use simsat::topdown;
 use simsat::web_layer;
@@ -143,6 +156,12 @@ struct Opts {
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     multiscatter: bool,
     beer_powder: bool,
     steps: StepQuality,
@@ -151,6 +170,7 @@ struct Opts {
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     exposure: f64,
     cache: PathBuf,
@@ -210,8 +230,9 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!(
         "render_frame: input={} product={} view={} sat={} ts={} res={} margin={:.2} \
          aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
+         land-sza={}({:.2}) land-dark-toe={}({:.3}/{:.2}/{:.2}) \
          multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
-         cloud-od-scale={:.3} granulation={} \
+         cloud-od-scale={:.3} feather-exposed-edges={} granulation={} \
          steps={} sun-elev={} \
          exposure={:.3} canvas={} threads={}",
         opts.input.display(),
@@ -225,11 +246,18 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.rh_aerosol_swelling,
         opts.atmosphere_correction,
         opts.terrain_atmosphere,
+        opts.land_sza_normalization,
+        opts.land_sza_max_gain,
+        opts.land_dark_toe,
+        opts.land_dark_toe_knee,
+        opts.land_dark_toe_gamma,
+        opts.land_dark_toe_max_gain,
         opts.multiscatter,
         opts.beer_powder,
         opts.clouds,
         opts.fractional_clouds,
         opts.cloud_optical_depth_scale,
+        opts.feather_exposed_domain_edges,
         opts.granulation,
         if opts.steps == StepQuality::Offline {
             "offline"
@@ -374,7 +402,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "SUMMARY file={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
          sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
          atmosphere_correction={} terrain_atmosphere={} multiscatter={} beer_powder={} \
-         clouds={} fractional_clouds_requested={} cloud_optical_depth_scale={:.3} granulation={} \
+         clouds={} fractional_clouds_requested={} cloud_optical_depth_scale={:.3} \
+         feather_exposed_domain_edges={} granulation={} \
          steps={} synthetic_green={} \
          on_earth_frac={:.3} \
          peak_lum={:.3} median_lum={:.3} cloud_frac={} peak_reflectance={} \
@@ -402,6 +431,7 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.clouds,
         opts.fractional_clouds,
         opts.cloud_optical_depth_scale,
+        opts.feather_exposed_domain_edges,
         opts.granulation,
         if opts.steps == StepQuality::Offline {
             "offline"
@@ -522,7 +552,7 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
         "LAYERSUMMARY file={} dims={}x{} crs=EPSG:3857 corner_nw={:.4},{:.4} \
          corner_se={:.4},{:.4} sun_elev={:.1} cover_frac={:.3} mean_alpha={:.3} \
          shadow_min={:.3} shadow_mean={:.3} beer_powder={} fractional_clouds_requested={} \
-         granulation={} wall_s={:.3}",
+         feather_exposed_domain_edges={} granulation={} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         nx,
         ny,
@@ -537,6 +567,7 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
         shadow_mean,
         opts.beer_powder,
         opts.fractional_clouds,
+        opts.feather_exposed_domain_edges,
         result.granulation,
         wall.as_secs_f64(),
     );
@@ -672,6 +703,14 @@ fn render_params(opts: &Opts) -> RenderParams {
         rh_aerosol_swelling: opts.rh_aerosol_swelling,
         atmosphere_correction: opts.atmosphere_correction,
         terrain_atmosphere: opts.terrain_atmosphere,
+        land_appearance: LandAppearanceConfig {
+            sza_normalization: opts.land_sza_normalization,
+            sza_max_gain: opts.land_sza_max_gain,
+            dark_toe: opts.land_dark_toe,
+            dark_toe_knee: opts.land_dark_toe_knee,
+            dark_toe_gamma: opts.land_dark_toe_gamma,
+            dark_toe_max_gain: opts.land_dark_toe_max_gain,
+        },
         exposure: opts.exposure,
         multiscatter: opts.multiscatter,
         beer_powder: opts.beer_powder,
@@ -679,6 +718,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         clouds: opts.clouds,
         fractional_clouds: opts.fractional_clouds,
         cloud_optical_depth_scale: opts.cloud_optical_depth_scale,
+        feather_exposed_domain_edges: opts.feather_exposed_domain_edges,
         granulation: Some(opts.granulation),
         sun_override,
         cache: opts.cache.clone(),
@@ -807,11 +847,19 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut rh_aerosol_swelling = false;
     let mut atmosphere_correction = true;
     let mut terrain_atmosphere = true;
+    let land_defaults = LandAppearanceConfig::default();
+    let mut land_sza_normalization = land_defaults.sza_normalization;
+    let mut land_sza_max_gain = LAND_SZA_MAX_GAIN;
+    let mut land_dark_toe = land_defaults.dark_toe;
+    let mut land_dark_toe_knee = LAND_DARK_TOE_KNEE;
+    let mut land_dark_toe_gamma = LAND_DARK_TOE_GAMMA;
+    let mut land_dark_toe_max_gain = LAND_DARK_TOE_MAX_GAIN;
     let mut multiscatter = true;
     let mut beer_powder = false;
     let mut clouds = true;
     let mut fractional_clouds = true;
     let mut cloud_optical_depth_scale = DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
+    let mut feather_exposed_domain_edges = true;
     let mut granulation = false;
     let mut steps = StepQuality::Offline;
     let mut sun_elev_override: Option<f64> = None;
@@ -881,6 +929,58 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "terrain-atmosphere" | "terrain_atmosphere" | "terrain-atmo" => {
                 terrain_atmosphere = parse_bool(v)?
             }
+            "land-sza-normalization" | "land_sza_normalization" | "land-sza" => {
+                land_sza_normalization = parse_bool(v)?
+            }
+            "land-sza-max-gain" | "land_sza_max_gain" => {
+                land_sza_max_gain = v
+                    .parse()
+                    .map_err(|_| format!("bad land-sza-max-gain '{v}'"))?;
+                if !land_sza_max_gain.is_finite() || !(1.0..=4.0).contains(&land_sza_max_gain) {
+                    return Err(format!(
+                        "land-sza-max-gain must be finite and in 1.0..=4.0, got \
+                         {land_sza_max_gain}"
+                    ));
+                }
+            }
+            "land-dark-toe" | "land_dark_toe" | "dark-land-toe" => land_dark_toe = parse_bool(v)?,
+            "land-dark-toe-knee" | "land_dark_toe_knee" => {
+                land_dark_toe_knee = v
+                    .parse()
+                    .map_err(|_| format!("bad land-dark-toe-knee '{v}'"))?;
+                if !land_dark_toe_knee.is_finite() || !(1.0e-6..=1.0).contains(&land_dark_toe_knee)
+                {
+                    return Err(format!(
+                        "land-dark-toe-knee must be finite and in 1e-6..=1.0, got \
+                         {land_dark_toe_knee}"
+                    ));
+                }
+            }
+            "land-dark-toe-gamma" | "land_dark_toe_gamma" => {
+                land_dark_toe_gamma = v
+                    .parse()
+                    .map_err(|_| format!("bad land-dark-toe-gamma '{v}'"))?;
+                if !land_dark_toe_gamma.is_finite() || !(0.05..=1.0).contains(&land_dark_toe_gamma)
+                {
+                    return Err(format!(
+                        "land-dark-toe-gamma must be finite and in 0.05..=1.0, got \
+                         {land_dark_toe_gamma}"
+                    ));
+                }
+            }
+            "land-dark-toe-max-gain" | "land_dark_toe_max_gain" => {
+                land_dark_toe_max_gain = v
+                    .parse()
+                    .map_err(|_| format!("bad land-dark-toe-max-gain '{v}'"))?;
+                if !land_dark_toe_max_gain.is_finite()
+                    || !(1.0..=4.0).contains(&land_dark_toe_max_gain)
+                {
+                    return Err(format!(
+                        "land-dark-toe-max-gain must be finite and in 1.0..=4.0, got \
+                         {land_dark_toe_max_gain}"
+                    ));
+                }
+            }
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
             "beer-powder" | "beer_powder" | "beerpowder" => beer_powder = parse_bool(v)?,
             "clouds" => clouds = parse_bool(v)?,
@@ -899,6 +999,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                          {cloud_optical_depth_scale}"
                     ));
                 }
+            }
+            "feather-exposed-domain-edges" | "feather_exposed_domain_edges" => {
+                feather_exposed_domain_edges = parse_bool(v)?
             }
             "granulation" | "granulate" | "cloud-granulation" => granulation = parse_bool(v)?,
             "steps" | "quality" => steps = parse_steps(v)?,
@@ -995,6 +1098,12 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
         multiscatter,
         beer_powder,
         steps,
@@ -1003,6 +1112,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         clouds,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         granulation,
         exposure,
         cache,
@@ -1123,11 +1233,18 @@ fn print_usage() {
          \x20 rh-aerosol-swelling=<b>    on|off 1.5x aerosol swelling (default off)\n\
          \x20 atmosphere-correction=<b>  on|off daytime aerial-veil correction (default on)\n\
          \x20 terrain-atmosphere=<b>     on|off terrain-height columns (default on)\n\
+         \x20 land-sza-normalization=<b> on|off bounded land SZA normalization (default on)\n\
+         \x20 land-sza-max-gain=<f>      SZA normalization bound (default {LAND_SZA_MAX_GAIN})\n\
+         \x20 land-dark-toe=<b>          on|off bounded dark-land toe (default on)\n\
+         \x20 land-dark-toe-knee=<f>     toe identity knee (default {LAND_DARK_TOE_KNEE})\n\
+         \x20 land-dark-toe-gamma=<f>    toe exponent (default {LAND_DARK_TOE_GAMMA})\n\
+         \x20 land-dark-toe-max-gain=<f> toe gain bound (default {LAND_DARK_TOE_MAX_GAIN})\n\
          \x20 multiscatter=<b>   on | off  (M5 octaves)             (default on)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
          \x20 fractional-clouds=<b> on | off use model cloud fraction (default on; off = legacy)\n\
          \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default {DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE}; 1.0 = unscaled)\n\
+         \x20 feather-exposed-domain-edges=<b> on|off fade finished clouds at visible WRF boundaries (default on)\n\
          \x20 granulation=<b>    on | off  sub-grid cloud detail    (default off)\n\
          \x20 steps=<quality>    offline | interactive              (default offline)\n\
          \x20 sun-elev=<deg>     OPTIONAL sun elevation override (else true solar)\n\
@@ -1178,10 +1295,17 @@ mod tests {
         assert!(!opts.beer_powder);
         assert!(!opts.granulation);
         assert!(opts.fractional_clouds);
+        assert!(opts.feather_exposed_domain_edges);
         assert_eq!(
             opts.cloud_optical_depth_scale,
             DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
+        assert!(opts.land_sza_normalization);
+        assert_eq!(opts.land_sza_max_gain, LAND_SZA_MAX_GAIN);
+        assert!(opts.land_dark_toe);
+        assert_eq!(opts.land_dark_toe_knee, LAND_DARK_TOE_KNEE);
+        assert_eq!(opts.land_dark_toe_gamma, LAND_DARK_TOE_GAMMA);
+        assert_eq!(opts.land_dark_toe_max_gain, LAND_DARK_TOE_MAX_GAIN);
         assert!(opts.ground_gain.is_none());
         assert!(opts.cloud_softclip.is_none());
         assert!(opts.cloud_highlight_max.is_none());
@@ -1189,25 +1313,34 @@ mod tests {
         assert!(!params.beer_powder);
         assert_eq!(params.granulation, Some(false));
         assert!(params.fractional_clouds);
+        assert!(params.feather_exposed_domain_edges);
         assert_eq!(
             params.cloud_optical_depth_scale,
             DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
+        assert_eq!(params.land_appearance, LandAppearanceConfig::shipped());
         assert!(params.ground_gain.is_none());
         assert!(params.cloud_softclip.is_none());
         assert!(params.cloud_highlight_max.is_none());
     }
 
     #[test]
-    fn cloud_controls_parse_and_reach_render_params() {
-        let opts = opts_with(&["beer-powder=on", "granulation=yes", "fractional-clouds=off"]);
+    fn cloud_controls_parse_and_explicit_edge_off_reach_render_params() {
+        let opts = opts_with(&[
+            "beer-powder=on",
+            "granulation=yes",
+            "fractional-clouds=off",
+            "feather-exposed-domain-edges=off",
+        ]);
         assert!(opts.beer_powder);
         assert!(opts.granulation);
         assert!(!opts.fractional_clouds);
+        assert!(!opts.feather_exposed_domain_edges);
         let params = render_params(&opts);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
         assert!(!params.fractional_clouds);
+        assert!(!params.feather_exposed_domain_edges);
     }
 
     #[test]
@@ -1216,15 +1349,66 @@ mod tests {
             "ground-gain=1.6",
             "cloud-softclip=0.65",
             "cloud-highlight-max=1.25",
+            "land-sza-normalization=on",
+            "land-sza-max-gain=1.7",
+            "land-dark-toe=yes",
+            "land-dark-toe-knee=0.07",
+            "land-dark-toe-gamma=0.6",
+            "land-dark-toe-max-gain=1.4",
         ]);
         assert_eq!(opts.ground_gain, Some(1.6));
         assert_eq!(opts.cloud_softclip, Some(0.65));
         assert_eq!(opts.cloud_highlight_max, Some(1.25));
+        assert!(opts.land_sza_normalization);
+        assert_eq!(opts.land_sza_max_gain, 1.7);
+        assert!(opts.land_dark_toe);
+        assert_eq!(opts.land_dark_toe_knee, 0.07);
+        assert_eq!(opts.land_dark_toe_gamma, 0.6);
+        assert_eq!(opts.land_dark_toe_max_gain, 1.4);
 
         let params = render_params(&opts);
         assert_eq!(params.ground_gain, Some(1.6));
         assert_eq!(params.cloud_softclip, Some(0.65));
         assert_eq!(params.cloud_highlight_max, Some(1.25));
+        assert_eq!(
+            params.land_appearance,
+            LandAppearanceConfig {
+                sza_normalization: true,
+                sza_max_gain: 1.7,
+                dark_toe: true,
+                dark_toe_knee: 0.07,
+                dark_toe_gamma: 0.6,
+                dark_toe_max_gain: 1.4,
+            }
+        );
+    }
+
+    #[test]
+    fn land_controls_can_explicitly_select_legacy_identity() {
+        let opts = opts_with(&["land-sza-normalization=off", "land-dark-toe=off"]);
+        assert!(!opts.land_sza_normalization);
+        assert!(!opts.land_dark_toe);
+        assert_eq!(
+            render_params(&opts).land_appearance,
+            LandAppearanceConfig::identity()
+        );
+    }
+
+    #[test]
+    fn invalid_land_appearance_values_are_rejected() {
+        for arg in [
+            "land-sza-max-gain=0.9",
+            "land-dark-toe-knee=0",
+            "land-dark-toe-gamma=1.1",
+            "land-dark-toe-max-gain=nan",
+        ] {
+            let args = vec![
+                "input=input".to_string(),
+                "out=out.png".to_string(),
+                arg.to_string(),
+            ];
+            assert!(parse_opts(&args).is_err(), "must reject {arg}");
+        }
     }
 
     #[test]

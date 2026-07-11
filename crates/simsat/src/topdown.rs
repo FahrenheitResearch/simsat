@@ -96,6 +96,7 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         cloud_highlight_max: base.cloud_highlight_max,
         atmosphere_correction: base.atmosphere_correction,
         terrain_atmosphere: base.terrain_atmosphere,
+        land_appearance: base.land_appearance,
     }
 }
 
@@ -797,6 +798,7 @@ mod tests {
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_appearance: crate::render::LandAppearanceConfig::identity(),
         }
     }
 

@@ -1,0 +1,393 @@
+{
+  "decision": {
+    "control_is_not_a_target_substitute": true,
+    "download_is_a_separate_explicit_command": true,
+    "exact_target_ready_for_crop": false
+  },
+  "exact_target": {
+    "nominal_date": "2026-07-10",
+    "nominal_tag": "A2026191",
+    "products": {
+      "MCD43A2": {
+        "collection": {
+          "catalog_url": "https://www.earthdata.nasa.gov/data/catalog/lpcloud-mcd43a2-061",
+          "concept_id": "C2343116525-LPCLOUD",
+          "doi": "10.5067/MODIS/MCD43A2.061",
+          "entry_title": "MODIS/Terra+Aqua BRDF/Albedo Quality Daily L3 Global - 500m V061",
+          "provider_id": "LPCLOUD",
+          "revision_date": "2026-01-14T21:33:12.174Z",
+          "revision_id": 47,
+          "short_name": "MCD43A2",
+          "version": "061"
+        },
+        "granule_count": 0,
+        "granules": [],
+        "tiles": []
+      },
+      "MCD43A4": {
+        "collection": {
+          "catalog_url": "https://www.earthdata.nasa.gov/data/catalog/lpcloud-mcd43a4-061",
+          "concept_id": "C2218719731-LPCLOUD",
+          "doi": "10.5067/MODIS/MCD43A4.061",
+          "entry_title": "MODIS/Terra+Aqua BRDF/Albedo Nadir BRDF-Adjusted Ref Daily L3 Global - 500m V061",
+          "provider_id": "LPCLOUD",
+          "revision_date": "2026-04-16T20:53:23.855Z",
+          "revision_id": 53,
+          "short_name": "MCD43A4",
+          "version": "061"
+        },
+        "granule_count": 0,
+        "granules": [],
+        "tiles": []
+      }
+    },
+    "role": "target",
+    "status": "unavailable"
+  },
+  "generator": {
+    "path": "experiments/mcd43-nbar/mcd43_probe.py",
+    "sha256": "057bb9035adb14817d0a19775bdfb55f8539cec42bc0e1070aa79d7abf89a5fb",
+    "version": "1.0"
+  },
+  "latest_at_or_before_target": {
+    "MCD43A2": {
+      "age_days_at_target": 9,
+      "granules": [
+        {
+          "cmr_revision_date": "2026-07-10T04:32:09.805Z",
+          "concept_id": "G4241583215-LPCLOUD",
+          "granule_ur": "MCD43A2.A2026182.h12v04.061.2026191034815",
+          "hdf_checksum": {
+            "algorithm": "MD5",
+            "value": "9c372a042d16d43cd647db7abb4cdc50"
+          },
+          "hdf_name": "MCD43A2.A2026182.h12v04.061.2026191034815.hdf",
+          "hdf_size_bytes": 45910115,
+          "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2026182.h12v04.061.2026191034815/MCD43A2.A2026182.h12v04.061.2026191034815.hdf",
+          "local_version_id": "6.1.34",
+          "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G4241583215-LPCLOUD/1",
+          "nominal_date": "2026-07-01",
+          "nominal_tag": "A2026182",
+          "opendap_url": null,
+          "product": "MCD43A2",
+          "production_datetime": "2026-07-10T03:52:12Z",
+          "production_lag_days_from_nominal": 9,
+          "production_tag": "2026191034815",
+          "revision_id": 1,
+          "s3_url": "s3://lp-prod-protected/MCD43A2.061/MCD43A2.A2026182.h12v04.061.2026191034815/MCD43A2.A2026182.h12v04.061.2026191034815.hdf",
+          "temporal_begin": "2026-07-01T00:00:00.000Z",
+          "temporal_end": "2026-07-08T23:59:59.999Z",
+          "tile": "h12v04"
+        },
+        {
+          "cmr_revision_date": "2026-07-10T03:55:09.493Z",
+          "concept_id": "G4241558609-LPCLOUD",
+          "granule_ur": "MCD43A2.A2026182.h13v04.061.2026191032832",
+          "hdf_checksum": {
+            "algorithm": "MD5",
+            "value": "7ef1dc57b0a79e5e73cc81ed69cc3a23"
+          },
+          "hdf_name": "MCD43A2.A2026182.h13v04.061.2026191032832.hdf",
+          "hdf_size_bytes": 25517914,
+          "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2026182.h13v04.061.2026191032832/MCD43A2.A2026182.h13v04.061.2026191032832.hdf",
+          "local_version_id": "6.1.34",
+          "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G4241558609-LPCLOUD/1",
+          "nominal_date": "2026-07-01",
+          "nominal_tag": "A2026182",
+          "opendap_url": null,
+          "product": "MCD43A2",
+          "production_datetime": "2026-07-10T03:32:48Z",
+          "production_lag_days_from_nominal": 9,
+          "production_tag": "2026191032832",
+          "revision_id": 1,
+          "s3_url": "s3://lp-prod-protected/MCD43A2.061/MCD43A2.A2026182.h13v04.061.2026191032832/MCD43A2.A2026182.h13v04.061.2026191032832.hdf",
+          "temporal_begin": "2026-07-01T00:00:00.000Z",
+          "temporal_end": "2026-07-08T23:59:59.999Z",
+          "tile": "h13v04"
+        }
+      ],
+      "nominal_date": "2026-07-01",
+      "nominal_tag": "A2026182"
+    },
+    "MCD43A4": {
+      "age_days_at_target": 9,
+      "granules": [
+        {
+          "cmr_revision_date": "2026-07-10T04:32:21.412Z",
+          "concept_id": "G4241583286-LPCLOUD",
+          "granule_ur": "MCD43A4.A2026182.h12v04.061.2026191034815",
+          "hdf_checksum": {
+            "algorithm": "MD5",
+            "value": "253db7c6ea84d1635e240a04dfab192d"
+          },
+          "hdf_name": "MCD43A4.A2026182.h12v04.061.2026191034815.hdf",
+          "hdf_size_bytes": 60270763,
+          "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2026182.h12v04.061.2026191034815/MCD43A4.A2026182.h12v04.061.2026191034815.hdf",
+          "local_version_id": "6.1.34",
+          "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G4241583286-LPCLOUD/1",
+          "nominal_date": "2026-07-01",
+          "nominal_tag": "A2026182",
+          "opendap_url": "https://opendap.earthdata.nasa.gov/collections/C2218719731-LPCLOUD/granules/MCD43A4.A2026182.h12v04.061.2026191034815",
+          "product": "MCD43A4",
+          "production_datetime": "2026-07-10T03:52:16Z",
+          "production_lag_days_from_nominal": 9,
+          "production_tag": "2026191034815",
+          "revision_id": 1,
+          "s3_url": "s3://lp-prod-protected/MCD43A4.061/MCD43A4.A2026182.h12v04.061.2026191034815/MCD43A4.A2026182.h12v04.061.2026191034815.hdf",
+          "temporal_begin": "2026-07-01T00:00:00.000Z",
+          "temporal_end": "2026-07-08T23:59:59.999Z",
+          "tile": "h12v04"
+        },
+        {
+          "cmr_revision_date": "2026-07-10T04:08:20.641Z",
+          "concept_id": "G4241566840-LPCLOUD",
+          "granule_ur": "MCD43A4.A2026182.h13v04.061.2026191032832",
+          "hdf_checksum": {
+            "algorithm": "MD5",
+            "value": "c9b50e1b7398ceccf1848f11cbfae17c"
+          },
+          "hdf_name": "MCD43A4.A2026182.h13v04.061.2026191032832.hdf",
+          "hdf_size_bytes": 37364814,
+          "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2026182.h13v04.061.2026191032832/MCD43A4.A2026182.h13v04.061.2026191032832.hdf",
+          "local_version_id": "6.1.34",
+          "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G4241566840-LPCLOUD/1",
+          "nominal_date": "2026-07-01",
+          "nominal_tag": "A2026182",
+          "opendap_url": "https://opendap.earthdata.nasa.gov/collections/C2218719731-LPCLOUD/granules/MCD43A4.A2026182.h13v04.061.2026191032832",
+          "product": "MCD43A4",
+          "production_datetime": "2026-07-10T03:32:51Z",
+          "production_lag_days_from_nominal": 9,
+          "production_tag": "2026191032832",
+          "revision_id": 1,
+          "s3_url": "s3://lp-prod-protected/MCD43A4.061/MCD43A4.A2026182.h13v04.061.2026191032832/MCD43A4.A2026182.h13v04.061.2026191032832.hdf",
+          "temporal_begin": "2026-07-01T00:00:00.000Z",
+          "temporal_end": "2026-07-08T23:59:59.999Z",
+          "tile": "h13v04"
+        }
+      ],
+      "nominal_date": "2026-07-01",
+      "nominal_tag": "A2026182"
+    }
+  },
+  "official_endpoints": {
+    "cmr_collections": "https://cmr.earthdata.nasa.gov/search/collections.umm_json",
+    "cmr_granules": "https://cmr.earthdata.nasa.gov/search/granules.umm_json",
+    "cmr_native_concepts": "https://cmr.earthdata.nasa.gov/search/concepts",
+    "cmr_search_api": "https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html",
+    "earthdata_login": "https://urs.earthdata.nasa.gov/",
+    "lp_daac_cloud_access_examples": "https://git.earthdata.nasa.gov/projects/LPDUR/repos/lpdaac_cloud_data_access/browse"
+  },
+  "official_sources_only": true,
+  "prior_year_control": {
+    "must_not_be_substituted_for_target": true,
+    "nominal_date": "2025-07-10",
+    "nominal_tag": "A2025191",
+    "products": {
+      "MCD43A2": {
+        "collection": {
+          "catalog_url": "https://www.earthdata.nasa.gov/data/catalog/lpcloud-mcd43a2-061",
+          "concept_id": "C2343116525-LPCLOUD",
+          "doi": "10.5067/MODIS/MCD43A2.061",
+          "entry_title": "MODIS/Terra+Aqua BRDF/Albedo Quality Daily L3 Global - 500m V061",
+          "provider_id": "LPCLOUD",
+          "revision_date": "2026-01-14T21:33:12.174Z",
+          "revision_id": 47,
+          "short_name": "MCD43A2",
+          "version": "061"
+        },
+        "granule_count": 2,
+        "granules": [
+          {
+            "cmr_revision_date": "2025-07-25T04:57:18.539Z",
+            "concept_id": "G3622739714-LPCLOUD",
+            "granule_ur": "MCD43A2.A2025191.h12v04.061.2025205233113",
+            "hdf_checksum": {
+              "algorithm": "SHA256",
+              "value": "900eb8dc4755f3574de193dab984f433809607a7fae2d2de5a0cccd62a8f1e91"
+            },
+            "hdf_name": "MCD43A2.A2025191.h12v04.061.2025205233113.hdf",
+            "hdf_size_bytes": 40617793,
+            "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h12v04.061.2025205233113/MCD43A2.A2025191.h12v04.061.2025205233113.hdf",
+            "local_version_id": "6.1.34",
+            "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G3622739714-LPCLOUD/1",
+            "nominal_date": "2025-07-10",
+            "nominal_tag": "A2025191",
+            "opendap_url": null,
+            "product": "MCD43A2",
+            "production_datetime": "2025-07-24T23:36:05Z",
+            "production_lag_days_from_nominal": 14,
+            "production_tag": "2025205233113",
+            "revision_id": 1,
+            "s3_url": "s3://lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h12v04.061.2025205233113/MCD43A2.A2025191.h12v04.061.2025205233113.hdf",
+            "temporal_begin": "2025-07-10T00:00:00.000Z",
+            "temporal_end": "2025-07-17T23:59:59.999Z",
+            "tile": "h12v04",
+            "unauthenticated_access_probe": {
+              "accessible_without_credentials": false,
+              "content_type": "text/html",
+              "error": "HTTP 401: Unauthorized",
+              "final_url_without_query": "https://urs.earthdata.nasa.gov/oauth/authorize",
+              "http_status": 401,
+              "method": "GET",
+              "range": "bytes=0-0",
+              "requested_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h12v04.061.2025205233113/MCD43A2.A2025191.h12v04.061.2025205233113.hdf",
+              "sample_bytes_read": 0
+            }
+          },
+          {
+            "cmr_revision_date": "2025-07-25T05:23:15.961Z",
+            "concept_id": "G3622771106-LPCLOUD",
+            "granule_ur": "MCD43A2.A2025191.h13v04.061.2025205235824",
+            "hdf_checksum": {
+              "algorithm": "SHA256",
+              "value": "e8ab4f574979485ae9d9b6fb3ec0d1013b97e6f319fa280d392b89cb270a6ee5"
+            },
+            "hdf_name": "MCD43A2.A2025191.h13v04.061.2025205235824.hdf",
+            "hdf_size_bytes": 22426767,
+            "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h13v04.061.2025205235824/MCD43A2.A2025191.h13v04.061.2025205235824.hdf",
+            "local_version_id": "6.1.34",
+            "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G3622771106-LPCLOUD/1",
+            "nominal_date": "2025-07-10",
+            "nominal_tag": "A2025191",
+            "opendap_url": null,
+            "product": "MCD43A2",
+            "production_datetime": "2025-07-25T00:01:12Z",
+            "production_lag_days_from_nominal": 15,
+            "production_tag": "2025205235824",
+            "revision_id": 1,
+            "s3_url": "s3://lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h13v04.061.2025205235824/MCD43A2.A2025191.h13v04.061.2025205235824.hdf",
+            "temporal_begin": "2025-07-10T00:00:00.000Z",
+            "temporal_end": "2025-07-17T23:59:59.999Z",
+            "tile": "h13v04",
+            "unauthenticated_access_probe": {
+              "accessible_without_credentials": false,
+              "content_type": "text/html",
+              "error": "HTTP 401: Unauthorized",
+              "final_url_without_query": "https://urs.earthdata.nasa.gov/oauth/authorize",
+              "http_status": 401,
+              "method": "GET",
+              "range": "bytes=0-0",
+              "requested_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A2.061/MCD43A2.A2025191.h13v04.061.2025205235824/MCD43A2.A2025191.h13v04.061.2025205235824.hdf",
+              "sample_bytes_read": 0
+            }
+          }
+        ],
+        "tiles": [
+          "h12v04",
+          "h13v04"
+        ]
+      },
+      "MCD43A4": {
+        "collection": {
+          "catalog_url": "https://www.earthdata.nasa.gov/data/catalog/lpcloud-mcd43a4-061",
+          "concept_id": "C2218719731-LPCLOUD",
+          "doi": "10.5067/MODIS/MCD43A4.061",
+          "entry_title": "MODIS/Terra+Aqua BRDF/Albedo Nadir BRDF-Adjusted Ref Daily L3 Global - 500m V061",
+          "provider_id": "LPCLOUD",
+          "revision_date": "2026-04-16T20:53:23.855Z",
+          "revision_id": 53,
+          "short_name": "MCD43A4",
+          "version": "061"
+        },
+        "granule_count": 2,
+        "granules": [
+          {
+            "cmr_revision_date": "2025-07-25T04:53:27.846Z",
+            "concept_id": "G3622734797-LPCLOUD",
+            "granule_ur": "MCD43A4.A2025191.h12v04.061.2025205233113",
+            "hdf_checksum": {
+              "algorithm": "SHA256",
+              "value": "9b78ce94eae05fccb0776b695cf411c5468496d9fc10e128d47c59a5cf5e0cc1"
+            },
+            "hdf_name": "MCD43A4.A2025191.h12v04.061.2025205233113.hdf",
+            "hdf_size_bytes": 60680586,
+            "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h12v04.061.2025205233113/MCD43A4.A2025191.h12v04.061.2025205233113.hdf",
+            "local_version_id": "6.1.34",
+            "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G3622734797-LPCLOUD/1",
+            "nominal_date": "2025-07-10",
+            "nominal_tag": "A2025191",
+            "opendap_url": "https://opendap.earthdata.nasa.gov/collections/C2218719731-LPCLOUD/granules/MCD43A4.A2025191.h12v04.061.2025205233113",
+            "product": "MCD43A4",
+            "production_datetime": "2025-07-24T23:36:10Z",
+            "production_lag_days_from_nominal": 14,
+            "production_tag": "2025205233113",
+            "revision_id": 1,
+            "s3_url": "s3://lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h12v04.061.2025205233113/MCD43A4.A2025191.h12v04.061.2025205233113.hdf",
+            "temporal_begin": "2025-07-10T00:00:00.000Z",
+            "temporal_end": "2025-07-17T23:59:59.999Z",
+            "tile": "h12v04",
+            "unauthenticated_access_probe": {
+              "accessible_without_credentials": false,
+              "content_type": "text/html",
+              "error": "HTTP 401: Unauthorized",
+              "final_url_without_query": "https://urs.earthdata.nasa.gov/oauth/authorize",
+              "http_status": 401,
+              "method": "GET",
+              "range": "bytes=0-0",
+              "requested_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h12v04.061.2025205233113/MCD43A4.A2025191.h12v04.061.2025205233113.hdf",
+              "sample_bytes_read": 0
+            }
+          },
+          {
+            "cmr_revision_date": "2025-07-25T05:19:29.231Z",
+            "concept_id": "G3622766643-LPCLOUD",
+            "granule_ur": "MCD43A4.A2025191.h13v04.061.2025205235824",
+            "hdf_checksum": {
+              "algorithm": "SHA256",
+              "value": "a8093d6e3dcdf6410c5618a6e1e7f24a0248fe0049ae293b4abfa2515d59bd8f"
+            },
+            "hdf_name": "MCD43A4.A2025191.h13v04.061.2025205235824.hdf",
+            "hdf_size_bytes": 36328315,
+            "https_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h13v04.061.2025205235824/MCD43A4.A2025191.h13v04.061.2025205235824.hdf",
+            "local_version_id": "6.1.34",
+            "native_metadata_url": "https://cmr.earthdata.nasa.gov/search/concepts/G3622766643-LPCLOUD/1",
+            "nominal_date": "2025-07-10",
+            "nominal_tag": "A2025191",
+            "opendap_url": "https://opendap.earthdata.nasa.gov/collections/C2218719731-LPCLOUD/granules/MCD43A4.A2025191.h13v04.061.2025205235824",
+            "product": "MCD43A4",
+            "production_datetime": "2025-07-25T00:01:16Z",
+            "production_lag_days_from_nominal": 15,
+            "production_tag": "2025205235824",
+            "revision_id": 1,
+            "s3_url": "s3://lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h13v04.061.2025205235824/MCD43A4.A2025191.h13v04.061.2025205235824.hdf",
+            "temporal_begin": "2025-07-10T00:00:00.000Z",
+            "temporal_end": "2025-07-17T23:59:59.999Z",
+            "tile": "h13v04",
+            "unauthenticated_access_probe": {
+              "accessible_without_credentials": false,
+              "content_type": "text/html",
+              "error": "HTTP 401: Unauthorized",
+              "final_url_without_query": "https://urs.earthdata.nasa.gov/oauth/authorize",
+              "http_status": 401,
+              "method": "GET",
+              "range": "bytes=0-0",
+              "requested_url": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A4.061/MCD43A4.A2025191.h13v04.061.2025205235824/MCD43A4.A2025191.h13v04.061.2025205235824.hdf",
+              "sample_bytes_read": 0
+            }
+          }
+        ],
+        "tiles": [
+          "h12v04",
+          "h13v04"
+        ]
+      }
+    },
+    "role": "prior_year_same_month_day_control_only",
+    "status": "available"
+  },
+  "queried_at_utc": "2026-07-11T19:41:33Z",
+  "region": {
+    "bbox_wgs84_west_south_east_north": [
+      -71.5,
+      42.5,
+      -65.5,
+      48.0
+    ],
+    "name": "Maine, adjacent Canada, and Gulf of Maine D0 probe",
+    "tile_evidence_from_available_granules": [
+      "h12v04",
+      "h13v04"
+    ]
+  },
+  "schema": "simsat.mcd43-regional-probe.v1"
+}

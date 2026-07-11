@@ -40,9 +40,11 @@ re-written over the same path) and returns `(array(s), georef)`:
 Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default), `margin=0.0`
 (zoom-out fraction added on each side — real surrounding earth, clear sky, frames the
-domain), `cache=<dir>`, `threads=<n>`. The visible-family functions additionally take
-`exposure=1.0`, `multiscatter=True`, `beer_powder=False`, `granulation=False`,
+domain), `cache=<dir>`, `threads=<n>`. Finished/display visible functions and cloud
+layers additionally take `exposure=1.5`; raw visible bands deliberately do not.
+Visible-family functions also take `multiscatter=True`, `beer_powder=False`, `granulation=False`,
 `steps` (`offline`/`interactive`), `clouds=True`, `fractional_clouds=True`,
+`feather_exposed_domain_edges=True`,
 `sun_elev`/`sun_az` (what-if sun override), `bluemarble=<path>` (single-file ground),
 `bluemarble_month`, `bluemarble_download=True`. Thermal functions (`render_ir`,
 `render_water_vapor`) take `enhancement=` (`cimss`/`bd`/`avn`/`funktop`/`rainbow`/`gray`);
@@ -61,18 +63,27 @@ also expose the atmosphere/cloud QA controls directly:
 | `cloud_optical_depth_scale` | `0.15` | owner-selected cross-file visible calibration, applied consistently in view/sun/ambient/shadow paths (`0.0..=4.0`; `1.0` = unscaled model extinction) |
 | `beer_powder` | `False` | optional Schneider shaping of the direct cloud-sun term; does not change transmittance |
 | `granulation` | `False` | display-only sub-grid cloud-edge erosion; quantitative bands/thermal/derived products remain unmodified |
+| `feather_exposed_domain_edges` | `True` | owner-selected v0.1.5 presentation control: when the camera exposes a finite WRF-domain boundary, fade finished visible/cloud-layer clouds over the fixed 4% boundary band; `False` restores the exact prior margin-gated behavior; raw visible bands, thermal, and derived products remain unmodified |
 
 Finished visible display products (`render_visible_rgb`, `render_geocolor`,
-`render_sandwich`, `render_cloud_layer`, and `render_perspective`) also accept these
+`render_sandwich`, and full-composite `render_perspective`) also accept these
 optional display-calibration overrides. Omitting them preserves the shipped engine
 constants; they are intentionally absent from `render_visible_bands` so raw reflectance
-cannot be changed by a tonemap choice.
+cannot be changed by a tonemap choice. The land controls are irrelevant to
+`render_cloud_layer` and `cloud_layer_only=True`, which render no ground.
 
 | keyword | omitted behavior | effect |
 |---|---:|---|
+| `exposure` | shipped `1.5` | whole finished-visible display gain before the ABI stretch (`1.0` is the exact neutral override; intentionally absent from raw visible bands) |
 | `ground_gain` | shipped `1.0` | sun-gated daytime surface-radiance lift (`1.0` is neutral; accepted but irrelevant for ground-free cloud layers) |
 | `cloud_softclip` | shipped `0.65` | highlight shoulder knee (`1.0` disables the shoulder/hard-clamps) |
 | `cloud_highlight_max` | shipped `1.25` | physical reflectance factor mapped to display white; raising it retains structure in brighter cloud tops |
+| `land_sza_normalization` | `True` | owner-selected bounded land-only solar-zenith display correction; exact identity through twilight and at/above a 60-degree sun; set false with `land_dark_toe=False` for the legacy identity |
+| `land_sza_max_gain` | `1.6` | upper bound for the SZA correction (`1.0` is identity) |
+| `land_dark_toe` | `True` | owner-selected bounded lift of dark positive land reflectance; black, bright terrain, ocean, clouds, and twilight remain unchanged; set false with `land_sza_normalization=False` for the legacy identity |
+| `land_dark_toe_knee` | `0.08` | linear-reflectance identity knee for the dark-land toe |
+| `land_dark_toe_gamma` | `0.65` | toe exponent (`1.0` is identity; lower values lift dark land) |
+| `land_dark_toe_max_gain` | `1.5` | upper bound for the dark-land toe (`1.0` is identity) |
 
 `cloud_optical_depth_scale` is a labeled calibration/sensitivity control: the shipped
 `0.15` is an owner-selected visual calibration after broad cross-file review, not a
@@ -80,12 +91,20 @@ claimed physical optimum. It supersedes the earlier tied `0.20`/`0.30` midpoint 
 `1.0` preserves the model-derived extinction unchanged, and
 `0.0` makes its visible optical effects transparent. It does not alter
 `render_cloud_optical_depth`, which intentionally returns the unscaled physical input.
+The two land operators are likewise finished-visible display controls: raw visible
+bands, IR/WV, derived products, cloud-only layers, water/glint, and cloud radiance do
+not consume them. Both remain independently switchable despite being shipped on.
 `fractional_clouds=True` consumes model cloud fraction when the input supplies it
 and safely falls back to full-cell coverage otherwise; set it false for the legacy A/B.
 `clouds=False` remains the explicit feature bypass, while `multiscatter=False`
 disables the higher cloud-scattering octaves without changing cloud transmittance.
 `beer_powder` and `granulation` are explicit opt-in appearance controls and remain off
 unless requested.
+`feather_exposed_domain_edges=True` is the owner-selected v0.1.5 default. With it off,
+positive `margin` retains the pre-v0.1.5 4% edge feather and `margin=0` remains an exact
+identity. With it on,
+the same fixed band also activates when the camera raster exposes a WRF boundary; it is
+available on finished RGB, cloud-layer, and perspective products but never raw bands.
 Layer-only products accept the shared keywords for call-site consistency, but
 `atmosphere_correction` and `terrain_atmosphere` have no surface atmosphere to modify there.
 

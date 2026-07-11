@@ -2,7 +2,7 @@
 //! GRIB edition).
 //!
 //! Set `SIMSAT_GRIB_FIXTURE=<dir>` to a directory holding the staged operational
-//! fixtures (node3 `/home/drew/simsat-fixtures/grib/`); the tests ingest the
+//! fixtures from the private build-node cache; the tests ingest the
 //! HRRR native-level file end to end and the RRFS rotated-grid file through the
 //! crop path (asserting the full-NA and full-CONUS refusals first), assert the
 //! memory/geometry contracts, ratchet the projections against grib-core's own

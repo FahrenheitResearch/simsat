@@ -52,9 +52,9 @@ use crate::ingest_grib;
 use crate::ir::{self, IrConfig, IrScene, IrVolume};
 use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::render::{
-    DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow,
-    normals_from_hgt, reflectance_from_radiance, shade_surface, snow_fraction,
-    surface_toa_radiance,
+    DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig, SurfacePixel,
+    WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt, reflectance_from_radiance, shade_surface,
+    snow_fraction, surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::SolarFrame;
@@ -211,6 +211,11 @@ pub struct RenderParams {
     /// Shorten surface atmosphere columns to the WRF terrain elevation. Disable this to
     /// reproduce the legacy mean-sea-level atmosphere geometry.
     pub terrain_atmosphere: bool,
+    /// Display-only land corrections. Both toggles are enabled in the owner-selected
+    /// v0.1.5 preset; [`LandAppearanceConfig::identity`] is the explicit legacy path.
+    /// Visible RGB-family products consume them while raw visible bands, thermal,
+    /// derived, cloud-layer-only, ocean/glint, and cloud radiance remain unchanged.
+    pub land_appearance: LandAppearanceConfig,
     /// Display exposure gain (visible only). [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
     /// M5 Wrenninge multi-scatter octaves (visible only).
@@ -237,6 +242,13 @@ pub struct RenderParams {
     /// view, secondary-sun, ambient, and ground-shadow optical depths. The quantitative
     /// derived cloud-optical-depth product remains the unscaled physical input.
     pub cloud_optical_depth_scale: f32,
+    /// Display-only presentation experiment: fade visible cloud extinction over the
+    /// existing fixed 4% domain-edge band whenever the camera raster exposes samples
+    /// beyond the finite WRF domain, even with zero zoom-out margin. On is the shipped
+    /// v0.1.5 visible preset; Off is the exact pre-v0.1.5 margin-gated behavior. Finished Visible RGB-family, CloudLayer, and
+    /// Perspective products consume it; raw VisibleBands, thermal, and derived products
+    /// deliberately ignore it.
+    pub feather_exposed_domain_edges: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise — see the granulation
     /// section of [`crate::clouds`]). `None` (the default) and `Some(false)` keep it
     /// OFF; `Some(true)` enables it for DISPLAY products ([`Product::VisibleRgb`], and
@@ -289,9 +301,11 @@ pub struct RenderParams {
 
 impl RenderParams {
     /// Shipped defaults: GOES-East, timestep 0, TOP-DOWN map (the integration default),
-    /// native resolution, neutral ABI display exposure, multi-scatter + offline steps +
-    /// clouds + model cloud fraction on, beer-powder + granulation off, the seasonal Blue
-    /// Marble (download on), no sun override, no IR enhancement, the studio cache dir.
+    /// native resolution, the owner-selected ABI display exposure (with `1.0` retained
+    /// as the exact neutral override), multi-scatter + offline steps + clouds + model
+    /// cloud fraction + both land visibility corrections + exposed-domain edge feathering
+    /// on, beer-powder + granulation off, the seasonal Blue Marble (download on), no sun
+    /// override, no IR enhancement, the studio cache dir.
     pub fn new(input: PathBuf) -> Self {
         Self {
             input,
@@ -304,6 +318,7 @@ impl RenderParams {
             rh_aerosol_swelling: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_appearance: LandAppearanceConfig::default(),
             exposure: DEFAULT_EXPOSURE,
             multiscatter: true,
             beer_powder: false,
@@ -311,6 +326,7 @@ impl RenderParams {
             clouds: true,
             fractional_clouds: true,
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            feather_exposed_domain_edges: true,
             granulation: None,
             sun_override: None,
             cache: ingest::default_cache_dir(),
@@ -520,7 +536,8 @@ pub struct RenderResult {
     pub sun_elev_deg: f64,
     /// Whether a Native-resolution geostationary raster was clamped against the axis cap.
     pub res_clamped: bool,
-    /// Cloud reflectance coverage stats (geostationary visible only; `None` otherwise).
+    /// Cloud reflectance coverage stats (cloud-enabled geostationary visible only;
+    /// `None` for surface-only and every other product/view).
     pub cloud_stats: Option<CloudFrameStats>,
     pub time: FrameTime,
     /// TRUE when the source carried no parseable valid time and [`Self::time`] is the
@@ -659,21 +676,6 @@ fn render_visible_scene(
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
     let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
 
-    // M4/M5 cloud volume + scene.
-    let fractional_requested = params.clouds && params.fractional_clouds;
-    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
-    let mut vol = if fractional_clouds {
-        DecodedVolume::from_brick(brick, horiz_pitch_m)
-    } else {
-        DecodedVolume::from_brick_legacy(brick, horiz_pitch_m)
-    };
-    apply_fractional_clouds_for_visible(
-        &mut vol,
-        fractional_clouds,
-        fractional_requested,
-        "visible",
-    );
-    let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     // Sub-grid cloud GRANULATION (edge-erosion detail noise): OPT-IN (default OFF)
     // as of v0.1.1 — the round-1 default-ON look was owner-rejected on coarse-grid
     // decks ("cheese grater": uniform pinhole pepper on deck margins + grey
@@ -700,23 +702,6 @@ fn render_visible_scene(
             g.amplitude
         );
     }
-    let sun_od = clouds::accumulate_sun_od_granulated(
-        &vol,
-        georef,
-        sun_ecef,
-        SUN_OD_RESOLUTION,
-        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
-        granulation,
-    );
-    let scan_rect = scan_rect_of(&raster.scan);
-    let froxel = atmosphere::build_aerial_froxel(
-        &luts,
-        &atmo_params,
-        &cam_geo,
-        sun_ecef,
-        scan_rect,
-        AERIAL_FROXEL_DIM,
-    );
     let mut cfg = MarchConfig {
         beer_powder: params.beer_powder,
         cloud_optical_depth_scale: params.cloud_optical_depth_scale,
@@ -726,12 +711,19 @@ fn render_visible_scene(
             1
         },
         granulation,
-        ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
+        ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch_m).max(1.0))
     };
-    // Appearance-pass wiring: the EDGE FEATHER activates only under a zoom-out margin
-    // (byte-identical no-op at margin 0); the ground-lift / soft-clip / top-down-cloud-norm
-    // levers keep their baked defaults unless a `render_frame` CLI knob overrides them.
-    cfg.edge_feather_cells = clouds::edge_feather_cells_for_margin(margin, nx, ny);
+    // Appearance-pass wiring: Off preserves the exact pre-v0.1.5 margin-gated edge feather.
+    // The exposed-edge control is finished-display only; raw VisibleBands keep
+    // the existing margin behavior even if the same RenderParams is reused for an RGB A/B.
+    cfg.edge_feather_cells = clouds::edge_feather_cells_for_raster(
+        margin,
+        nx,
+        ny,
+        params.feather_exposed_domain_edges && matches!(product, Product::VisibleRgb),
+        &raster.grid_i,
+        &raster.grid_j,
+    );
     // Display-only appearance overrides are deliberately ignored by VisibleBands.
     // That product remains the stable pre-tonemap diagnostic even when the same
     // RenderParams is reused for an RGB A/B render.
@@ -749,16 +741,6 @@ fn render_visible_scene(
             cfg.topdown_cloud_norm = n;
         }
     }
-    let scene = CloudScene {
-        vol: &vol,
-        mip: &mip,
-        sun_od: &sun_od,
-        georef,
-        luts: &luts,
-        sky_sh: &sky_sh,
-        sun_ecef,
-        cfg,
-    };
     let surf = FrameContext {
         luts: &luts,
         params: &atmo_params,
@@ -776,6 +758,11 @@ fn render_visible_scene(
         cloud_highlight_max: cfg.cloud_highlight_max,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
+        land_appearance: if matches!(product, Product::VisibleRgb) {
+            params.land_appearance
+        } else {
+            LandAppearanceConfig::identity()
+        },
     };
 
     // The per-pixel surface assembler (twin of the studio's `assemble`).
@@ -791,85 +778,143 @@ fn render_visible_scene(
         ny,
     );
 
-    // Render the requested product. RGB uses the shipped display path (byte-identical to
-    // the studio/PNG); Bands uses the pre-tonemap reflectance path. Both views and both
-    // visible products honor the clouds flag (`false` = surface only).
+    // Render the requested product. The cloud-off arm deliberately has no cloud-volume,
+    // occupancy-mip, sun-OD, or aerial-froxel construction: those resources cannot affect
+    // either surface-only output and large operational bricks otherwise paid their full
+    // decode/preparation cost before being discarded.
     let (rnx, rny) = (raster.nx, raster.ny);
-    let data = match product {
-        Product::VisibleRgb => {
-            let rgba = if is_topdown {
-                // Top-down honors the clouds flag (clouds-off = the clean surface basemap):
-                // `None` renders surface-only, matching the geostationary clouds-off path.
-                let topdown_scene = if params.clouds { Some(&scene) } else { None };
-                render_topdown_frame_rgba(
-                    &surf,
-                    topdown_scene,
-                    &raster.lat,
-                    &raster.lon,
-                    rnx,
-                    rny,
-                    assemble,
-                )
-            } else if params.clouds {
-                render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
-            } else {
-                render_geo_surface_rgba(&surf, &raster, assemble)
-            };
-            let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
-            FrameData::Visible { rgb, rgba }
-        }
-        Product::VisibleBands => {
-            let reflectance = if is_topdown {
-                // Top-down honors the clouds flag (clouds-off = surface-only reflectance).
-                let topdown_scene = if params.clouds { Some(&scene) } else { None };
-                render_topdown_frame_reflectance(
-                    &surf,
-                    topdown_scene,
-                    &raster.lat,
-                    &raster.lon,
-                    rnx,
-                    rny,
-                    assemble,
-                )
-            } else if params.clouds {
-                render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster.scan, assemble)
-            } else {
-                render_geo_surface_reflectance(&surf, &raster, assemble)
-            };
-            FrameData::Bands { reflectance }
-        }
-        Product::Ir | Product::WaterVapor { .. } => {
-            unreachable!("thermal products are dispatched to render_ir_scene")
-        }
-        Product::GeoColor | Product::Sandwich => {
-            unreachable!("composite products are assembled by their own scene fn, not here")
-        }
-        Product::Derived { .. } => {
-            unreachable!("derived products are assembled by render_derived_scene")
-        }
-        Product::CloudLayer => {
-            unreachable!("the cloud layer is assembled by render_cloud_layer_scene")
-        }
-        Product::Perspective { .. } => {
-            unreachable!("perspective frames are assembled by render_perspective_scene")
-        }
-    };
-
-    // Cloud reflectance stats (geostationary visible only; strided, cheap).
-    let cloud_stats = if is_topdown {
-        None
-    } else {
-        let stride = (rnx.max(rny) / 128).max(1);
-        Some(clouds::cloud_frame_stats(
-            &scene,
+    let (data, cloud_stats) = if params.clouds {
+        let fractional_requested = params.fractional_clouds;
+        let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+        let mut vol = if fractional_clouds {
+            DecodedVolume::from_brick(brick, horiz_pitch_m)
+        } else {
+            DecodedVolume::from_brick_legacy(brick, horiz_pitch_m)
+        };
+        apply_fractional_clouds_for_visible(
+            &mut vol,
+            fractional_clouds,
+            fractional_requested,
+            "visible",
+        );
+        let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+        let sun_od = clouds::accumulate_sun_od_granulated(
+            &vol,
+            georef,
+            sun_ecef,
+            SUN_OD_RESOLUTION,
+            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            granulation,
+        );
+        let scan_rect = scan_rect_of(&raster.scan);
+        let froxel = atmosphere::build_aerial_froxel(
+            &luts,
+            &atmo_params,
             &cam_geo,
-            &raster.lat,
-            &raster.lon,
-            &raster.grid_i,
-            &raster.scan,
-            stride,
-            0.98,
-        ))
+            sun_ecef,
+            scan_rect,
+            AERIAL_FROXEL_DIM,
+        );
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg,
+        };
+        let data = match product {
+            Product::VisibleRgb => {
+                let rgba = if is_topdown {
+                    render_topdown_frame_rgba(
+                        &surf,
+                        Some(&scene),
+                        &raster.lat,
+                        &raster.lon,
+                        rnx,
+                        rny,
+                        assemble,
+                    )
+                } else {
+                    render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+                };
+                let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
+                FrameData::Visible { rgb, rgba }
+            }
+            Product::VisibleBands => {
+                let reflectance = if is_topdown {
+                    render_topdown_frame_reflectance(
+                        &surf,
+                        Some(&scene),
+                        &raster.lat,
+                        &raster.lon,
+                        rnx,
+                        rny,
+                        assemble,
+                    )
+                } else {
+                    render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster.scan, assemble)
+                };
+                FrameData::Bands { reflectance }
+            }
+            _ => unreachable!("render_visible_scene received a non-visible product"),
+        };
+        let cloud_stats = if is_topdown {
+            None
+        } else {
+            let stride = (rnx.max(rny) / 128).max(1);
+            Some(clouds::cloud_frame_stats(
+                &scene,
+                &cam_geo,
+                &raster.lat,
+                &raster.lon,
+                &raster.grid_i,
+                &raster.scan,
+                stride,
+                0.98,
+            ))
+        };
+        (data, cloud_stats)
+    } else {
+        let data = match product {
+            Product::VisibleRgb => {
+                let rgba = if is_topdown {
+                    render_topdown_frame_rgba(
+                        &surf,
+                        None,
+                        &raster.lat,
+                        &raster.lon,
+                        rnx,
+                        rny,
+                        assemble,
+                    )
+                } else {
+                    render_geo_surface_rgba(&surf, &raster, assemble)
+                };
+                let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
+                FrameData::Visible { rgb, rgba }
+            }
+            Product::VisibleBands => {
+                let reflectance = if is_topdown {
+                    render_topdown_frame_reflectance(
+                        &surf,
+                        None,
+                        &raster.lat,
+                        &raster.lon,
+                        rnx,
+                        rny,
+                        assemble,
+                    )
+                } else {
+                    render_geo_surface_reflectance(&surf, &raster, assemble)
+                };
+                FrameData::Bands { reflectance }
+            }
+            _ => unreachable!("render_visible_scene received a non-visible product"),
+        };
+        (data, None)
     };
 
     let georef_out = build_georef(params.view, proj, georef, &raster, nx, ny, margin);
@@ -930,9 +975,8 @@ fn render_ir_scene(
         && (raster.nx < target_nx || raster.ny < target_ny);
 
     let horiz_pitch_m = horiz_pitch_m(proj);
+    let mip = OccupancyMip::from_quantized_brick(brick, clouds::OCCUPANCY_MIP_FACTOR);
     let vol = IrVolume::from_brick(brick, horiz_pitch_m);
-    let dv = DecodedVolume::from_brick_legacy(brick, horiz_pitch_m);
-    let mip = OccupancyMip::build(&dv, clouds::OCCUPANCY_MIP_FACTOR);
     let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
     let band = cfg.band;
     let scene = IrScene {
@@ -1243,91 +1287,101 @@ fn render_cloud_layer_scene(
     let (time, time_is_fallback) = resolve_frame_time(time_iso.as_deref());
     let solar = SolarFrame::new(time.year, time.month, time.day, time.ut);
     let (sun_ecef, center_sun_elev) = resolve_frame_sun(params, &raster, &solar, proj);
-
-    // M2 atmosphere (sun transmittance + the SH sky ambient the cloud march reads).
-    let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
-    let atmo_params = AtmosphereParams {
-        aod: params.aerosol_optical_depth as f64,
-        pw_ratio,
-        aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
-        ground_albedo: atmosphere::GROUND_ALBEDO,
-    };
-    let luts = AtmosphereLuts::build(&atmo_params);
-    let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
-
-    // M4/M5 cloud volume + scene (granulation scoping: the layer is a DISPLAY product —
-    // the same opt-in rule as VisibleRgb).
     let horiz_pitch = horiz_pitch_m(proj);
-    let fractional_requested = params.clouds && params.fractional_clouds;
-    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
-    let mut vol = if fractional_clouds {
-        DecodedVolume::from_brick(brick, horiz_pitch)
-    } else {
-        DecodedVolume::from_brick_legacy(brick, horiz_pitch)
-    };
-    apply_fractional_clouds_for_visible(
-        &mut vol,
-        fractional_clouds,
-        fractional_requested,
-        "cloud layer",
-    );
-    let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
-    let gran_on = params.clouds && params.granulation.unwrap_or(false);
-    let granulation = if gran_on {
-        Some(clouds::Granulation::for_grid(horiz_pitch))
-    } else {
-        None
-    };
-    if let Some(g) = granulation {
-        crate::log_line!(
-            "simsat api: cloud-layer granulation ON (sub-grid edge erosion; dx \
-             {horiz_pitch:.0} m -> amplitude {:.3})",
-            g.amplitude
-        );
-    }
-    let sun_od = clouds::accumulate_sun_od_granulated(
-        &vol,
-        georef,
-        sun_ecef,
-        SUN_OD_RESOLUTION,
-        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
-        granulation,
-    );
-    let mut cfg = MarchConfig {
-        beer_powder: params.beer_powder,
-        cloud_optical_depth_scale: params.cloud_optical_depth_scale,
-        octaves: if params.multiscatter {
-            clouds::DEFAULT_OCTAVES
-        } else {
-            1
-        },
-        granulation,
-        ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
-    };
-    cfg.edge_feather_cells = clouds::edge_feather_cells_for_margin(margin, nx, ny);
-    if let Some(k) = params.cloud_softclip {
-        cfg.cloud_softclip_knee = k;
-    }
-    if let Some(m) = params.cloud_highlight_max {
-        cfg.cloud_highlight_max = m;
-    }
-    if let Some(n) = params.topdown_cloud_norm {
-        cfg.topdown_cloud_norm = n;
-    }
-    let scene = CloudScene {
-        vol: &vol,
-        mip: &mip,
-        sun_od: &sun_od,
-        georef,
-        luts: &luts,
-        sky_sh: &sky_sh,
-        sun_ecef,
-        cfg,
-    };
 
-    // 1. The native cloud layer + shadow on the Lambert map raster.
-    let native = if params.clouds {
-        crate::topdown::render_cloud_layer_frame(
+    // With clouds disabled the exact native payload is known a priori. Keep every
+    // decoded-volume, occupancy, sun-OD, and cloud-atmosphere allocation inside the
+    // enabled arm so the explicit bypass is also a preparation bypass.
+    let (native, gran_on) = if params.clouds {
+        // M2 atmosphere (sun transmittance + the SH sky ambient the cloud march reads).
+        let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
+        let atmo_params = AtmosphereParams {
+            aod: params.aerosol_optical_depth as f64,
+            pw_ratio,
+            aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
+            ground_albedo: atmosphere::GROUND_ALBEDO,
+        };
+        let luts = AtmosphereLuts::build(&atmo_params);
+        let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
+
+        // M4/M5 cloud volume + scene (granulation scoping: the layer is a DISPLAY product —
+        // the same opt-in rule as VisibleRgb).
+        let fractional_requested = params.fractional_clouds;
+        let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+        let mut vol = if fractional_clouds {
+            DecodedVolume::from_brick(brick, horiz_pitch)
+        } else {
+            DecodedVolume::from_brick_legacy(brick, horiz_pitch)
+        };
+        apply_fractional_clouds_for_visible(
+            &mut vol,
+            fractional_clouds,
+            fractional_requested,
+            "cloud layer",
+        );
+        let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+        let gran_on = params.clouds && params.granulation.unwrap_or(false);
+        let granulation = if gran_on {
+            Some(clouds::Granulation::for_grid(horiz_pitch))
+        } else {
+            None
+        };
+        if let Some(g) = granulation {
+            crate::log_line!(
+                "simsat api: cloud-layer granulation ON (sub-grid edge erosion; dx \
+             {horiz_pitch:.0} m -> amplitude {:.3})",
+                g.amplitude
+            );
+        }
+        let sun_od = clouds::accumulate_sun_od_granulated(
+            &vol,
+            georef,
+            sun_ecef,
+            SUN_OD_RESOLUTION,
+            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            granulation,
+        );
+        let mut cfg = MarchConfig {
+            beer_powder: params.beer_powder,
+            cloud_optical_depth_scale: params.cloud_optical_depth_scale,
+            octaves: if params.multiscatter {
+                clouds::DEFAULT_OCTAVES
+            } else {
+                1
+            },
+            granulation,
+            ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
+        };
+        cfg.edge_feather_cells = clouds::edge_feather_cells_for_raster(
+            margin,
+            nx,
+            ny,
+            params.feather_exposed_domain_edges,
+            &raster.grid_i,
+            &raster.grid_j,
+        );
+        if let Some(k) = params.cloud_softclip {
+            cfg.cloud_softclip_knee = k;
+        }
+        if let Some(m) = params.cloud_highlight_max {
+            cfg.cloud_highlight_max = m;
+        }
+        if let Some(n) = params.topdown_cloud_norm {
+            cfg.topdown_cloud_norm = n;
+        }
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg,
+        };
+
+        // 1. The native cloud layer + shadow on the Lambert map raster.
+        let native = crate::topdown::render_cloud_layer_frame(
             &scene,
             OutputTransform::AbiReflectance,
             params.exposure,
@@ -1335,14 +1389,18 @@ fn render_cloud_layer_scene(
             &raster.lon,
             raster.nx,
             raster.ny,
-        )
+        );
+        (native, gran_on)
     } else {
-        crate::topdown::CloudLayerFrame {
-            nx: raster.nx,
-            ny: raster.ny,
-            rgba_premul: vec![0; raster.nx * raster.ny * 4],
-            shadow: vec![1.0; raster.nx * raster.ny],
-        }
+        (
+            crate::topdown::CloudLayerFrame {
+                nx: raster.nx,
+                ny: raster.ny,
+                rgba_premul: vec![0; raster.nx * raster.ny * 4],
+                shadow: vec![1.0; raster.nx * raster.ny],
+            },
+            false,
+        )
     };
 
     // 2. The Web-Mercator delivery grid over the raster's geodetic bbox, ~native pitch.
@@ -1491,20 +1549,6 @@ fn render_perspective_scene(
     };
     let luts = AtmosphereLuts::build(&atmo_params);
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
-    let fractional_requested = params.clouds && params.fractional_clouds;
-    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
-    let mut vol = if fractional_clouds {
-        DecodedVolume::from_brick(brick, horiz_pitch)
-    } else {
-        DecodedVolume::from_brick_legacy(brick, horiz_pitch)
-    };
-    apply_fractional_clouds_for_visible(
-        &mut vol,
-        fractional_clouds,
-        fractional_requested,
-        "perspective",
-    );
-    let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     // Granulation scoping: a DISPLAY product (the same opt-in rule as VisibleRgb).
     let gran_on = params.clouds && params.granulation.unwrap_or(false);
     let granulation = if gran_on {
@@ -1519,14 +1563,6 @@ fn render_perspective_scene(
             g.amplitude
         );
     }
-    let sun_od = clouds::accumulate_sun_od_granulated(
-        &vol,
-        georef,
-        sun_ecef,
-        SUN_OD_RESOLUTION,
-        clouds::SUN_OD_EDGE_FEATHER_TEXELS,
-        granulation,
-    );
     let mut cfg = MarchConfig {
         beer_powder: params.beer_powder,
         cloud_optical_depth_scale: params.cloud_optical_depth_scale,
@@ -1536,8 +1572,19 @@ fn render_perspective_scene(
             1
         },
         granulation,
-        ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
+        ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch).max(1.0))
     };
+    // Perspective ignores `margin_frac`; its own camera raster states whether sky or
+    // ground beyond the finite WRF domain is exposed. Off remains the exact zero-band
+    // legacy path for both the full composite and layer-only product.
+    cfg.edge_feather_cells = clouds::edge_feather_cells_for_raster(
+        0.0,
+        nx,
+        ny,
+        params.feather_exposed_domain_edges,
+        &raster.grid_i,
+        &raster.grid_j,
+    );
     if let Some(k) = params.cloud_softclip {
         cfg.cloud_softclip_knee = k;
     }
@@ -1547,16 +1594,6 @@ fn render_perspective_scene(
     if let Some(g) = params.ground_gain {
         cfg.ground_day_lift = g;
     }
-    let scene = CloudScene {
-        vol: &vol,
-        mip: &mip,
-        sun_od: &sun_od,
-        georef,
-        luts: &luts,
-        sky_sh: &sky_sh,
-        sun_ecef,
-        cfg,
-    };
     // The frame context: ONE camera — the EYE (the perspective render contract).
     let mut cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
     cam_geo.camera = basis.eye;
@@ -1577,6 +1614,11 @@ fn render_perspective_scene(
         cloud_highlight_max: cfg.cloud_highlight_max,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
+        land_appearance: if cloud_layer_only {
+            LandAppearanceConfig::identity()
+        } else {
+            params.land_appearance
+        },
     };
     let assemble = make_assemble(
         brick,
@@ -1590,18 +1632,53 @@ fn render_perspective_scene(
         ny,
     );
 
-    let rgba = if cloud_layer_only && params.clouds {
-        crate::topdown::render_perspective_cloud_layer(
-            &scene,
-            &basis,
-            OutputTransform::AbiReflectance,
-            params.exposure,
-        )
+    let rgba = if params.clouds {
+        let fractional_requested = params.fractional_clouds;
+        let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+        let mut vol = if fractional_clouds {
+            DecodedVolume::from_brick(brick, horiz_pitch)
+        } else {
+            DecodedVolume::from_brick_legacy(brick, horiz_pitch)
+        };
+        apply_fractional_clouds_for_visible(
+            &mut vol,
+            fractional_clouds,
+            fractional_requested,
+            "perspective",
+        );
+        let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+        let sun_od = clouds::accumulate_sun_od_granulated(
+            &vol,
+            georef,
+            sun_ecef,
+            SUN_OD_RESOLUTION,
+            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            granulation,
+        );
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef,
+            luts: &luts,
+            sky_sh: &sky_sh,
+            sun_ecef,
+            cfg,
+        };
+        if cloud_layer_only {
+            crate::topdown::render_perspective_cloud_layer(
+                &scene,
+                &basis,
+                OutputTransform::AbiReflectance,
+                params.exposure,
+            )
+        } else {
+            crate::topdown::render_perspective_frame_rgba(&surf, Some(&scene), &basis, assemble)
+        }
     } else if cloud_layer_only {
         vec![0; raster.nx * raster.ny * 4]
     } else {
-        let persp_scene = if params.clouds { Some(&scene) } else { None };
-        crate::topdown::render_perspective_frame_rgba(&surf, persp_scene, &basis, assemble)
+        crate::topdown::render_perspective_frame_rgba(&surf, None, &basis, assemble)
     };
     let rgb = rgba_to_rgb_black_space(&rgba, raster.nx, raster.ny);
 
@@ -2310,6 +2387,9 @@ mod tests {
         assert!(!p.rh_aerosol_swelling);
         assert!(p.atmosphere_correction);
         assert!(p.terrain_atmosphere);
+        assert_eq!(p.land_appearance, LandAppearanceConfig::shipped());
+        assert!(p.land_appearance.sza_normalization);
+        assert!(p.land_appearance.dark_toe);
         assert_eq!(
             p.cloud_optical_depth_scale,
             clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
@@ -2318,6 +2398,7 @@ mod tests {
         assert!(!p.beer_powder);
         assert!(p.clouds);
         assert!(p.fractional_clouds);
+        assert!(p.feather_exposed_domain_edges);
         assert!(p.granulation.is_none());
         assert!(p.ground_gain.is_none());
         assert!(p.cloud_softclip.is_none());
@@ -2417,6 +2498,21 @@ mod tests {
         p
     }
 
+    fn without_cloud_render_channels(mut src: SceneSource) -> SceneSource {
+        // Deliberately invalid for every decoded-cloud path: dimensions stay non-zero,
+        // so constructing a DecodedVolume/OccupancyMip/SunOdMap would index or reject
+        // these empty channels. Surface atmosphere still has qvapor, and thermal fields
+        // remain intact; this isolates the visible cloud-preparation dependency.
+        src.brick.ext_liquid.clear();
+        src.brick.ext_ice.clear();
+        src.brick.ext_snow.clear();
+        src.brick.ext_precip.clear();
+        src.brick.tau_up.clear();
+        src.brick.cloud_fraction.clear();
+        src.brick.has_cloud_fraction = false;
+        src
+    }
+
     #[test]
     fn visible_rgb_topdown_shape_and_lit() {
         let src = synthetic_source(24, 24, 24, 3000.0);
@@ -2469,15 +2565,22 @@ mod tests {
     #[test]
     fn visible_bands_ignore_display_only_ground_and_highlight_controls() {
         let src = synthetic_source(16, 16, 16, 3000.0);
-        let baseline_params = synthetic_params(ViewMode::TopDownMap);
+        let mut baseline_params = synthetic_params(ViewMode::TopDownMap);
+        baseline_params.land_appearance = LandAppearanceConfig::identity();
         let baseline = render_visible_scene(&src, &baseline_params, Product::VisibleBands)
             .expect("baseline bands");
 
         let mut adjusted_params = baseline_params;
+        adjusted_params.exposure = 4.0;
         adjusted_params.ground_gain = Some(0.5);
         adjusted_params.cloud_softclip = Some(0.4);
         adjusted_params.cloud_highlight_max = Some(2.0);
         adjusted_params.topdown_cloud_norm = Some(0.5);
+        adjusted_params.land_appearance = LandAppearanceConfig {
+            sza_normalization: true,
+            dark_toe: true,
+            ..LandAppearanceConfig::identity()
+        };
         let adjusted = render_visible_scene(&src, &adjusted_params, Product::VisibleBands)
             .expect("bands with display overrides");
 
@@ -2492,6 +2595,95 @@ mod tests {
             bits(&adjusted),
             "display calibration controls must not mutate raw reflectance bands"
         );
+    }
+
+    #[test]
+    fn clouds_off_skips_all_visible_cloud_preparation_and_preserves_outputs() {
+        let complete = cold_top_source(18, 16, 14, 3000.0);
+        let stripped = without_cloud_render_channels(cold_top_source(18, 16, 14, 3000.0));
+
+        for view in [ViewMode::TopDownMap, ViewMode::Geostationary] {
+            for product in [Product::VisibleRgb, Product::VisibleBands] {
+                let mut params = synthetic_params(view);
+                params.clouds = false;
+                let expected = render_visible_scene(&complete, &params, product).unwrap();
+                let got = render_visible_scene(&stripped, &params, product).unwrap();
+                match (&expected.data, &got.data) {
+                    (
+                        FrameData::Visible {
+                            rgb: expected_rgb,
+                            rgba: expected_rgba,
+                        },
+                        FrameData::Visible { rgb, rgba },
+                    ) => {
+                        assert_eq!(rgb, expected_rgb, "{view:?} RGB");
+                        assert_eq!(rgba, expected_rgba, "{view:?} RGBA");
+                    }
+                    (
+                        FrameData::Bands {
+                            reflectance: expected,
+                        },
+                        FrameData::Bands { reflectance },
+                    ) => {
+                        let expected: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+                        let got: Vec<u32> = reflectance.iter().map(|v| v.to_bits()).collect();
+                        assert_eq!(got, expected, "{view:?} raw visible bands");
+                    }
+                    (expected, got) => panic!("frame-data mismatch: {expected:?} vs {got:?}"),
+                }
+                assert!(
+                    got.cloud_stats.is_none(),
+                    "surface-only frames must not decode clouds just to compute stats"
+                );
+                assert!(!got.granulation);
+            }
+        }
+
+        let mut layer_params = synthetic_params(ViewMode::TopDownMap);
+        layer_params.clouds = false;
+        let expected = render_cloud_layer_scene(&complete, &layer_params).unwrap();
+        let got = render_cloud_layer_scene(&stripped, &layer_params).unwrap();
+        match (&expected.data, &got.data) {
+            (
+                FrameData::CloudLayer {
+                    rgba_premul: expected_rgba,
+                    shadow: expected_shadow,
+                },
+                FrameData::CloudLayer {
+                    rgba_premul,
+                    shadow,
+                },
+            ) => {
+                assert_eq!(rgba_premul, expected_rgba);
+                let expected: Vec<u32> = expected_shadow.iter().map(|v| v.to_bits()).collect();
+                let got: Vec<u32> = shadow.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got, expected);
+            }
+            (expected, got) => panic!("cloud-layer mismatch: {expected:?} vs {got:?}"),
+        }
+
+        let mut perspective_params = synthetic_params(ViewMode::TopDownMap);
+        perspective_params.clouds = false;
+        perspective_params.perspective = Some(oblique_camera());
+        for layer_only in [false, true] {
+            let expected =
+                render_perspective_scene(&complete, &perspective_params, layer_only).unwrap();
+            let got = render_perspective_scene(&stripped, &perspective_params, layer_only).unwrap();
+            match (&expected.data, &got.data) {
+                (
+                    FrameData::Visible {
+                        rgb: expected_rgb,
+                        rgba: expected_rgba,
+                    },
+                    FrameData::Visible { rgb, rgba },
+                ) => {
+                    assert_eq!(rgb, expected_rgb, "perspective layer_only={layer_only}");
+                    assert_eq!(rgba, expected_rgba, "perspective layer_only={layer_only}");
+                }
+                (expected, got) => panic!("perspective mismatch: {expected:?} vs {got:?}"),
+            }
+            assert!(!got.granulation);
+        }
     }
 
     #[test]
@@ -3557,6 +3749,56 @@ mod tests {
     }
 
     // ── web-map cloud layer (Product::CloudLayer) ──────────────────────────────
+
+    #[test]
+    fn exposed_edge_feather_changes_finished_geo_only_and_topdown_stays_identity() {
+        let src = cold_top_source(24, 24, 20, 3000.0);
+        let mut geo_off = synthetic_params(ViewMode::Geostationary);
+        geo_off.steps = StepQuality::Interactive;
+        geo_off.feather_exposed_domain_edges = false;
+        let mut geo_on = geo_off.clone();
+        geo_on.feather_exposed_domain_edges = true;
+
+        let rgb_off = render_visible_scene(&src, &geo_off, Product::VisibleRgb).unwrap();
+        assert!(
+            rgb_off.raster.grid_i.iter().any(|v| !v.is_finite()),
+            "the geo bounding raster must expose pixels beyond the WRF polygon"
+        );
+        let rgb_on = render_visible_scene(&src, &geo_on, Product::VisibleRgb).unwrap();
+        fn visible_rgb(result: &RenderResult) -> &[u8] {
+            match &result.data {
+                FrameData::Visible { rgb, .. } => rgb,
+                other => panic!("expected Visible, got {other:?}"),
+            }
+        }
+        assert_ne!(
+            visible_rgb(&rgb_off),
+            visible_rgb(&rgb_on),
+            "the opt-in must taper a domain-filling cloud at an exposed geo edge"
+        );
+
+        // Raw reflectance is a stable diagnostic contract: it keeps the existing
+        // margin behavior even when the finished-display experiment is requested.
+        let bands_off = render_visible_scene(&src, &geo_off, Product::VisibleBands).unwrap();
+        let bands_on = render_visible_scene(&src, &geo_on, Product::VisibleBands).unwrap();
+        let band_bits = |r: &RenderResult| match &r.data {
+            FrameData::Bands { reflectance } => {
+                reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Bands, got {other:?}"),
+        };
+        assert_eq!(band_bits(&bands_off), band_bits(&bands_on));
+
+        // A margin-zero top-down raster contains no outside-domain camera samples,
+        // so enabling the experiment is an exact identity there.
+        let mut td_off = geo_off;
+        td_off.view = ViewMode::TopDownMap;
+        let mut td_on = td_off.clone();
+        td_on.feather_exposed_domain_edges = true;
+        let td_off = render_visible_scene(&src, &td_off, Product::VisibleRgb).unwrap();
+        let td_on = render_visible_scene(&src, &td_on, Product::VisibleRgb).unwrap();
+        assert_eq!(visible_rgb(&td_off), visible_rgb(&td_on));
+    }
 
     #[test]
     fn cloud_layer_clear_scene_is_transparent_on_a_mercator_grid() {

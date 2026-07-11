@@ -62,6 +62,7 @@ const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
 const AERIAL_VEIL_ELEV_HI: f32 = 30.0; // WS2: 40 -> 30 (full daytime treatment by 30 deg; twin of render.rs)
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
+const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
 const GLINT_STRENGTH: f32 = 3.5;
 const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller, brighter glint streak (round 3: 0.6->0.4)
 // WS2 bright-cloud tonemap + water lighting (twins of render.rs). This pass has an
@@ -102,6 +103,8 @@ struct Uniforms {
     p0: vec4<f32>,    // mie_sca_ground, mie_ext_ground, mie_g, pw_ratio
     p1: vec4<f32>,    // bm_present, water_scale, flat_albedo, output_transform
     p2: vec4<f32>,    // ambient_elev_min, ambient_elev_max, ambient_n, atmosphere_correction
+    land0: vec4<f32>, // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
+    land1: vec4<f32>, // dark_toe_gamma, dark_toe_max_gain, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -333,6 +336,49 @@ fn cox_munk_mss(wind: f32) -> f32 {
 fn land_day_gain(sun_elev: f32) -> f32 {
     return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
+
+// Owner-selected v0.1.5 finished-visible LAND corrections. Exact f32 twin of
+// render::{land_sza_normalization_gain, land_dark_toe_gain, land_appearance_gain}:
+// independently switchable, bounded, scalar/colour-preserving, and exactly neutral
+// through the established twilight band. The caller is the LAND branch only.
+// LAND_APPEARANCE_TWIN_BEGIN
+fn land_sza_normalization_gain_gpu(sun_elev: f32) -> f32 {
+    let max_gain = clamp(u.land0.y, 1.0, 4.0);
+    if (u.land0.x <= 0.5 || max_gain == 1.0 || sun_elev >= LAND_SZA_REFERENCE_ELEV) {
+        return 1.0;
+    }
+    let mu_ref = sin(LAND_SZA_REFERENCE_ELEV * DEG2RAD);
+    let mu_floor = sin(AERIAL_VEIL_ELEV_LO * DEG2RAD);
+    let mu = sin(clamp(sun_elev, 0.0, 90.0) * DEG2RAD);
+    let target_gain = clamp(mu_ref / max(mu, mu_floor), 1.0, max_gain);
+    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (target_gain - 1.0);
+}
+
+fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
+    let knee = clamp(u.land0.w, 1e-6, 1.0);
+    let gamma = clamp(u.land1.x, 0.05, 1.0);
+    let max_gain = clamp(u.land1.y, 1.0, 4.0);
+    if (u.land0.z <= 0.5) {
+        return 1.0;
+    }
+    let y = max(dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
+    if (y <= 0.0 || y >= knee || max_gain == 1.0 || gamma == 1.0) {
+        return 1.0;
+    }
+    let power_target = knee * pow(y / knee, gamma);
+    let w = smoothstep(0.0, knee, y);
+    let target_y = power_target * (1.0 - w) + y * w;
+    let gain = clamp(target_y / y, 1.0, max_gain);
+    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (gain - 1.0);
+}
+
+fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
+    if (u.land0.x <= 0.5 && u.land0.z <= 0.5) {
+        return 1.0;
+    }
+    return land_sza_normalization_gain_gpu(sun_elev) * land_dark_toe_gain_gpu(sun_elev, albedo);
+}
+// LAND_APPEARANCE_TWIN_END
 
 // SUNRISE veil ramp (twin of render::aerial_veil_scale, low-sun visible pass): the full
 // physical veil at/below the terminator gate, smoothly reducing to the daytime de-haze
@@ -616,6 +662,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     } else {
         let e_direct = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG);
         l_surf = albedo / PI * (e_direct + e_ambient);
+        // Finished-visible appearance controls are LAND-only and precede the legacy
+        // land gain/aerial veil, matching render::surface_toa_radiance exactly.
+        l_surf = l_surf * land_appearance_gain_gpu(sun_elev, albedo);
         // LAND daytime brightness lift (round 2): ground-only surface-reflectance gain,
         // sun-gated so twilight is byte-unchanged. Applied before the aerial veil below.
         l_surf = l_surf * land_day_gain(sun_elev);

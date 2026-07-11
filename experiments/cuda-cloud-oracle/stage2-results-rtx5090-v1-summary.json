@@ -1,0 +1,189 @@
+{
+  "all_checks_passed": false,
+  "capabilities": {
+    "depth_binned_collision_source": 1,
+    "lambertian_lower_boundary": 1,
+    "matched_forward_rta": 1,
+    "mixture_hg_sampling": 1
+  },
+  "capability_set": "stage2-reference-v1",
+  "depth_bins_per_case": 32,
+  "device": "NVIDIA GeForce RTX 5090 (sm_120)",
+  "executed_backward_paths": 3690987520,
+  "executed_forward_paths": 3690987520,
+  "max_ci95_halfwidth_brf": 0.002743445250675582,
+  "max_directional_truncated_fraction": 0.027264714241027832,
+  "max_forward_closure_error": 0.0,
+  "max_forward_truncated_fraction": 0.00024318695068359375,
+  "raw_timing_sums_ms": {
+    "directional_kernel": 314131.1481266245,
+    "directional_wall": 318973.7443,
+    "forward_kernel": 159138.60955342278,
+    "forward_wall": 160776.9623
+  },
+  "repeat": {
+    "all_compared_rows_exact": true,
+    "completed_rows": 144,
+    "exact_matches_after_timing_removal": 144,
+    "scope": "partial-grid-independent-rerun"
+  },
+  "request_contract": "simsat.cloud-closure-fit.stage2-request-grid.v1",
+  "requested_paths_per_direction": 3690987520,
+  "result_schema": "simsat.cuda-cloud-oracle.result.v2",
+  "rows": 800,
+  "runner_elapsed_seconds": 0.1710505000082776,
+  "runner_executed_cases": 0,
+  "schema": "simsat.cuda-cloud-oracle.stage2-grid-summary.v1",
+  "schema_version": 1,
+  "sha256": {
+    "canonical_results": "7ba7aee813098ee831378df6f853844d74f790fe8d15baf38744614e729404aa",
+    "grid_runner": "369ef9394dc9e93a0858163b9a91617e23030d4f5d17c77d0dc1bcdb48564b1d",
+    "legacy_baseline": "93b75b263b3cd18df5afc816c1b1c41f5f4fa4fb66e98f09e6f6d28676528723",
+    "oracle_executable": "8c24e1cd08baeaab542d0e2fcfe6c9521fcefec18292a0c6d07822d3db383e34",
+    "oracle_source": "9618c3fe6356dd5facefeed5c1771f2a1aa4fbf1251d02234b9fe0a635b8205c",
+    "request_grid": "2cd8e9630cd45d292067aba63904cb3c2d2fdfd9c81f49c9aa506394f3decfa0",
+    "self_test": "566b64015af339e17f0caa0b091b5251701032d3309fba598783e9e7229b2d68"
+  },
+  "smallest_blocker": "16 of 40 tau=30 pairs exceed the predeclared 2048-order truncated-fraction ceiling of 1e-4; 40/40 satisfy the BRF-delta test",
+  "tau30_order_convergence": {
+    "brf_convergence_failures": 0,
+    "failed": 16,
+    "failures": [
+      {
+        "brf_delta": 0.00013965058780618378,
+        "brf_failed": false,
+        "pair": "tau30-shipping-ice-dual-hg-a0.6-s30-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.002389073371887207,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 9.22075988857296e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-ice-dual-hg-a0.6-s30-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0015087127685546875,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 9.47808608121603e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-ice-dual-hg-a0.6-s65-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.002389073371887207,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 6.291241094880107e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-ice-dual-hg-a0.6-s65-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0015087127685546875,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 5.6541379872099284e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-liquid-dual-hg-a0.6-s30-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0007735490798950195,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 3.9498620914124594e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-liquid-dual-hg-a0.6-s30-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0004981756210327148,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 4.207211870088656e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-liquid-dual-hg-a0.6-s65-v0-r0",
+        "tolerance": 0.0024980192779225454,
+        "truncated_fraction_2048": 0.0007735490798950195,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 2.8616277672366408e-05,
+        "brf_failed": false,
+        "pair": "tau30-shipping-liquid-dual-hg-a0.6-s65-v65-r180",
+        "tolerance": 0.0025397395988510803,
+        "truncated_fraction_2048": 0.0004981756210327148,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 0.00013903451071939354,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p665-a0.6-s30-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.002368927001953125,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 8.93838635419586e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p665-a0.6-s30-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0015140771865844727,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 9.515729791909067e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p665-a0.6-s65-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.002368927001953125,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 6.204472133675143e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p665-a0.6-s65-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0015140771865844727,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 5.759955194362121e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p75-a0.6-s30-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0007832050323486328,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 3.636314915778094e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p75-a0.6-s30-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0004979372024536133,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 4.00098563841933e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p75-a0.6-s65-v0-r0",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0007832050323486328,
+        "truncation_failed": true
+      },
+      {
+        "brf_delta": 2.4447982852615624e-05,
+        "brf_failed": false,
+        "pair": "tau30-single-hg-g0p75-a0.6-s65-v65-r180",
+        "tolerance": 0.002,
+        "truncated_fraction_2048": 0.0004979372024536133,
+        "truncation_failed": true
+      }
+    ],
+    "group_count": 40,
+    "max_2048_truncated_fraction": 0.002389073371887207,
+    "max_brf_delta": 0.00013965058780618378,
+    "passed": 24,
+    "truncation_failures": 16
+  },
+  "total_collision_count": 61464669494,
+  "total_scattering_source_count": 61189530308
+}

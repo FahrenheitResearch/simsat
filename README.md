@@ -61,7 +61,7 @@ by default and has an explicit legacy off switch in Rust, the CLI, Python, and
 Studio. Sources without a complete trusted field retain the conservative
 full-cell fallback.
 
-The v0.1.4 visible preset uses cloud-OD scale `0.15`, neutral exposure/ground lift `1.0`,
+The current visible preset uses cloud-OD scale `0.15`, exposure `1.5`, neutral ground lift `1.0`,
 highlight knee `0.65`, and highlight ceiling `1.25`. The OD value is the owner's
 cross-file visual selection, superseding the earlier tied `0.20`/`0.30` midpoint
 candidate. It is not a claimed physical optimum; every value remains overridable. Raw visible bands, thermal
@@ -103,7 +103,7 @@ Two named binaries render without a GPU or GUI (`cargo build --release --bins`):
 simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
     sat=goes-east view=geo aod=0.05 rh-swelling=off \
     atmosphere-correction=on terrain-atmosphere=on fractional-clouds=on cloud-od-scale=0.15 \
-    multiscatter=on beer-powder=off granulation=off clouds=on
+    multiscatter=on beer-powder=off granulation=off feather-exposed-domain-edges=on clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
     enhancement=rainbow
 ```
@@ -115,16 +115,21 @@ fields (`derived=pw|ctt|cod`). Both take `key=value` arguments (run with
 Visible renders expose the same atmosphere/cloud QA controls as Studio and Python:
 numeric aerosol AOD (`0` disables aerosol), RH swelling, reduced-versus-full
 aerial airlight, terrain-height atmosphere, model fractional clouds, multiscatter,
-beer-powder, granulation, clouds, and a shipped `0.15` cloud optical-depth scale
+beer-powder, granulation, exposed-domain edge feathering, clouds, and a shipped `0.15`
+cloud optical-depth scale
 (`1.0` is unscaled model extinction; `0` disables visible cloud extinction; valid
 range `0.0..=4.0`). The `0.15` default is an owner-selected cross-file visual
 calibration, not a claimed physical optimum. Finished RGB products also expose
 `exposure=`, `ground-gain=`, `cloud-softclip=`, and `cloud-highlight-max=`;
-omitting them keeps the shipped neutral `1.0` exposure/ground gain, `0.65`
+omitting them keeps the shipped `1.5` exposure, neutral `1.0` ground gain, `0.65`
 highlight knee, and `1.25` highlight ceiling.
 `fractional-clouds=off` restores legacy horizontally-full cloudy cells. The scale
 is an explicit sensitivity control and does not alter the raw derived cloud-optical-
-depth product; beer-powder and granulation remain opt-in/off by default.
+depth product; beer-powder and granulation remain opt-in/off by default. Owner-selected
+v0.1.5 edge feathering defaults on. `feather-exposed-domain-edges=on` reuses the fixed 4% cloud-edge
+band when a finished visible or cloud-layer camera raster exposes the WRF boundary;
+with it off, the pre-v0.1.5 positive-margin behavior is unchanged, and raw visible bands,
+IR/WV, and derived products ignore the control.
 
 Animated GIF loops are exported from a completed store run:
 
@@ -150,10 +155,13 @@ rgb, geo = simsat.render_visible_rgb(
     rh_aerosol_swelling=False,
     atmosphere_correction=True,
     terrain_atmosphere=True,
+    land_sza_normalization=True,   # owner-selected v0.1.5 display default
+    land_dark_toe=True,            # independently switchable; both false = legacy identity
     fractional_clouds=True,
     cloud_optical_depth_scale=0.15,
     beer_powder=False,
     granulation=False,
+    feather_exposed_domain_edges=True,  # owner-selected v0.1.5 finite-domain default
 )
 ax.imshow(rgb, extent=geo.extent, origin="upper")
 ```

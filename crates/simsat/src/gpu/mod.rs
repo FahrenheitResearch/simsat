@@ -18,9 +18,13 @@
 use eframe::egui_wgpu::wgpu;
 
 use crate::bluemarble::BlueMarbleCrop;
+use crate::bricks::{LogQuant, VolumeBrick};
 use crate::camera::SurfaceRaster;
 use crate::frame::{GridGeoref, MapProjection};
-use crate::render::FLAT_ALBEDO_SRGB;
+use crate::render::{
+    FLAT_ALBEDO_SRGB, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
+    LAND_SZA_MAX_GAIN, LandAppearanceConfig,
+};
 use crate::solar::SolarFrame;
 
 /// The offscreen render-target format. The shader outputs sRGB-encoded display
@@ -39,6 +43,110 @@ pub struct RenderedFrame {
     pub rgba: Vec<u8>,
 }
 
+/// A conservative quantized occupancy upload for the GPU cloud volume.
+///
+/// `r8` is byte-identical to
+/// `OccupancyMip::build(DecodedVolume::from_brick_legacy(..)).to_r8_occupancy()`:
+/// each source code is decoded through the brick's exact [`LogQuant`], the three
+/// decoded f32 channels are summed with the reference's f64 arithmetic, and a
+/// one-block 26-neighbourhood dilation is applied. Building only this binary field
+/// avoids materializing four full f32 volumes merely to prepare a raw-u8 GPU upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantizedOccupancyUpload {
+    pub dims: (u32, u32, u32),
+    pub r8: Vec<u8>,
+}
+
+/// Build the GPU occupancy mip directly from a brick's quantized extinction codes.
+///
+/// This deliberately reproduces the decoded reference's edge semantics, including
+/// degenerate/non-finite quantizers: a voxel is occupied only when the exact decoded
+/// f32 channel sum is greater than zero. It is therefore safe to use for empty-space
+/// skipping without constructing a [`crate::clouds::DecodedVolume`].
+pub fn quantized_occupancy_upload(brick: &VolumeBrick, factor: usize) -> QuantizedOccupancyUpload {
+    let factor = factor.max(1);
+    let cells = brick
+        .nx
+        .checked_mul(brick.ny)
+        .and_then(|n| n.checked_mul(brick.nz))
+        .expect("cloud-volume dimensions overflow usize");
+    assert_eq!(brick.ext_liquid.len(), cells, "ext_liquid length");
+    assert_eq!(brick.ext_ice.len(), cells, "ext_ice length");
+    assert_eq!(brick.ext_precip.len(), cells, "ext_precip length");
+
+    let decode_lut =
+        |quant: LogQuant| -> [f32; 256] { core::array::from_fn(|code| quant.decode(code as u8)) };
+    let liquid_lut = decode_lut(brick.quant.get("ext_liquid"));
+    let ice_lut = decode_lut(brick.quant.get("ext_ice"));
+    let precip_lut = decode_lut(brick.quant.get("ext_precip"));
+
+    let mx = brick.nx.div_ceil(factor);
+    let my = brick.ny.div_ceil(factor);
+    let mz = brick.nz.div_ceil(factor);
+    let mut raw = vec![0u8; mx * my * mz];
+    for k in 0..brick.nz {
+        let kb = k / factor;
+        for j in 0..brick.ny {
+            let jb = j / factor;
+            let row = (k * brick.ny + j) * brick.nx;
+            for i in 0..brick.nx {
+                let cell = row + i;
+                // Match DecodedVolume::total_ext_cell exactly: each stored decoded
+                // f32 is widened to f64, summed left-to-right, then narrowed to f32
+                // by OccupancyMip::build before its `>` comparison.
+                let ext = (liquid_lut[brick.ext_liquid[cell] as usize] as f64
+                    + ice_lut[brick.ext_ice[cell] as usize] as f64
+                    + precip_lut[brick.ext_precip[cell] as usize] as f64)
+                    as f32;
+                if ext > 0.0 {
+                    raw[(kb * my + jb) * mx + i / factor] = 255;
+                }
+            }
+        }
+    }
+
+    // Twin of OccupancyMip::build's one-block dilation. The upload is binary, so
+    // the reference max over the 26-neighbourhood reduces to an any-occupied test.
+    let mut r8 = vec![0u8; raw.len()];
+    for kb in 0..mz {
+        for jb in 0..my {
+            for ib in 0..mx {
+                'neighbours: for dk in -1i64..=1 {
+                    let nk = kb as i64 + dk;
+                    if nk < 0 || nk as usize >= mz {
+                        continue;
+                    }
+                    for dj in -1i64..=1 {
+                        let nj = jb as i64 + dj;
+                        if nj < 0 || nj as usize >= my {
+                            continue;
+                        }
+                        for di in -1i64..=1 {
+                            let ni = ib as i64 + di;
+                            if ni < 0 || ni as usize >= mx {
+                                continue;
+                            }
+                            if raw[(nk as usize * my + nj as usize) * mx + ni as usize] != 0 {
+                                r8[(kb * my + jb) * mx + ib] = 255;
+                                break 'neighbours;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    QuantizedOccupancyUpload {
+        dims: (
+            u32::try_from(mx).expect("occupancy x dimension exceeds u32"),
+            u32::try_from(my).expect("occupancy y dimension exceeds u32"),
+            u32::try_from(mz).expect("occupancy z dimension exceeds u32"),
+        ),
+        r8,
+    }
+}
+
 /// GPU resources created once (pipeline + layout + sampler). Per-frame textures
 /// and bind groups are built in [`SurfaceResources::render`].
 pub struct SurfaceResources {
@@ -48,7 +156,7 @@ pub struct SurfaceResources {
 }
 
 /// The packed per-frame uniform (design section 3/6, M2). Mirrors the WGSL
-/// `Uniforms` (9 vec4 = 144 bytes). Built on the CPU from the camera geometry,
+/// `Uniforms` (11 vec4 = 176 bytes). Built on the CPU from the camera geometry,
 /// scan grid, sun, atmosphere params, and the output transform.
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceUniforms {
@@ -89,12 +197,53 @@ pub struct SurfaceUniforms {
     /// Product-facing atmosphere correction flag (0 = raw physical airlight, 1 =
     /// corrected true-color veil). Packed in the formerly-unused `p2.w` lane.
     pub atmosphere_correction: f32,
+    /// Finished-visible land appearance controls shared by both visible GPU paths.
+    pub land_appearance: LandAppearanceConfig,
+}
+
+/// Sanitize and pack the two land-appearance quads shared by both visible WGSL paths.
+///
+/// The CPU reference performs the same finite checks and clamps at evaluation time.
+/// Doing them before the f64 -> f32 conversion prevents non-finite shader inputs while
+/// preserving the exact switches and every value representable by Studio's f32 controls.
+pub fn land_appearance_uniform_quads(config: LandAppearanceConfig) -> [[f32; 4]; 2] {
+    // Deliberately exhaustive: adding another CPU land operator must break this GPU
+    // packer at compile time until the shader ABI and eligibility review are updated.
+    let LandAppearanceConfig {
+        sza_normalization,
+        sza_max_gain,
+        dark_toe,
+        dark_toe_knee,
+        dark_toe_gamma,
+        dark_toe_max_gain,
+    } = config;
+    let finite_clamped = |value: f64, fallback: f64, lo: f64, hi: f64| {
+        (if value.is_finite() {
+            value.clamp(lo, hi)
+        } else {
+            fallback
+        }) as f32
+    };
+    let sza_max_gain = finite_clamped(sza_max_gain, LAND_SZA_MAX_GAIN, 1.0, 4.0);
+    let dark_toe_knee = finite_clamped(dark_toe_knee, LAND_DARK_TOE_KNEE, 1.0e-6, 1.0);
+    let dark_toe_gamma = finite_clamped(dark_toe_gamma, LAND_DARK_TOE_GAMMA, 0.05, 1.0);
+    let dark_toe_max_gain = finite_clamped(dark_toe_max_gain, LAND_DARK_TOE_MAX_GAIN, 1.0, 4.0);
+    [
+        [
+            if sza_normalization { 1.0 } else { 0.0 },
+            sza_max_gain,
+            if dark_toe { 1.0 } else { 0.0 },
+            dark_toe_knee,
+        ],
+        [dark_toe_gamma, dark_toe_max_gain, 0.0, 0.0],
+    ]
 }
 
 impl SurfaceUniforms {
-    /// The 9 packed vec4s of the WGSL surface `Uniforms` (also the first 9 vec4s of
-    /// the cloud pass's superset uniform — see [`CloudFrameInputs`]).
-    pub fn to_vec4s(&self) -> [[f32; 4]; 9] {
+    /// The 11 packed vec4s of the WGSL surface `Uniforms`. The first nine retain the
+    /// historical surface/cloud ABI; the two land-control quads are shared explicitly.
+    pub fn to_vec4s(&self) -> [[f32; 4]; 11] {
+        let land = land_appearance_uniform_quads(self.land_appearance);
         [
             [self.cam[0], self.cam[1], self.cam[2], self.r_ground],
             [self.sun[0], self.sun[1], self.sun[2], self.r_top],
@@ -115,14 +264,15 @@ impl SurfaceUniforms {
                 self.ambient_n,
                 self.atmosphere_correction,
             ],
+            land[0],
+            land[1],
         ]
     }
 
-    /// Pack into the 144-byte std140 uniform buffer the WGSL `Uniforms` expects
-    /// (9 vec4, each `xyz` + a `w` scalar).
-    pub fn to_bytes(&self) -> [u8; 144] {
+    /// Pack into the 176-byte uniform buffer the WGSL `Uniforms` expects (11 vec4).
+    pub fn to_bytes(&self) -> [u8; 176] {
         let vec4s = self.to_vec4s();
-        let mut out = [0u8; 144];
+        let mut out = [0u8; 176];
         for (i, v) in vec4s.iter().flatten().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -293,7 +443,7 @@ impl SurfaceResources {
     ) -> RenderedFrame {
         let (w, h) = (inputs.width.max(1), inputs.height.max(1));
 
-        // The 144-byte packed uniform (design section 3/6).
+        // The 176-byte packed uniform (surface physics + land appearance controls).
         let uniform_bytes = inputs.uniforms.to_bytes();
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("simsat-surface-uniforms"),
@@ -1208,10 +1358,10 @@ pub struct CloudFrameInputs<'a> {
     pub scan_rect: [f32; 4],
 }
 
-/// The 25 packed vec4s of the WGSL cloud `Uniforms` (the surface 9 + the cloud 16),
-/// in declaration order. Kept as a pure function so the layout is unit-testable on
-/// the headless nodes.
-pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 25] {
+/// The 27 packed vec4s of the WGSL cloud `Uniforms` (the historical surface 9, the
+/// cloud 16, then the shared land-appearance 2), in declaration order. Kept as a
+/// pure function so the layout is unit-testable on the headless nodes.
+pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 27] {
     let s = inputs.surface.uniforms.to_vec4s();
     let m = &inputs.march;
     let so = &inputs.sun_od;
@@ -1273,6 +1423,10 @@ pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 25] {
             m.ground_day_lift,
             crate::clouds::validated_cloud_optical_depth_scale(m.cloud_optical_depth_scale),
         ],
+        // land0/land1: exact twins of the clear-surface land controls. Appended to
+        // preserve every historical cloud-uniform offset above.
+        s[9],
+        s[10],
     ]
 }
 
@@ -1674,7 +1828,7 @@ impl CloudPassResources {
             "sh-ambient",
         );
 
-        // The 400-byte packed cloud uniform.
+        // The 432-byte packed cloud uniform.
         let quads = cloud_uniform_quads(inputs);
         let uniform_bytes = quads_to_bytes(&quads);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1872,8 +2026,284 @@ impl CloudPassResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use crate::bricks::ChannelQuant;
     use crate::camera::{GeoCamera, SatellitePreset, build_surface_raster};
     use crate::frame::{GridGeoref, MapProjection};
+
+    fn occupancy_test_brick(
+        dims: (usize, usize, usize),
+        ext_liquid: Vec<u8>,
+        ext_ice: Vec<u8>,
+        ext_precip: Vec<u8>,
+        quantizers: (LogQuant, LogQuant, LogQuant),
+    ) -> VolumeBrick {
+        let (nx, ny, nz) = dims;
+        let cells = nx * ny * nz;
+        let plane = nx * ny;
+        assert_eq!(ext_liquid.len(), cells);
+        assert_eq!(ext_ice.len(), cells);
+        assert_eq!(ext_precip.len(), cells);
+        let zero = LogQuant {
+            vmin: 0.0,
+            vmax: 0.0,
+        };
+        let mut quant = BTreeMap::new();
+        quant.insert("ext_liquid".to_string(), quantizers.0);
+        quant.insert("ext_ice".to_string(), quantizers.1);
+        quant.insert("ext_snow".to_string(), zero);
+        quant.insert("ext_precip".to_string(), quantizers.2);
+        quant.insert("tau_up".to_string(), zero);
+        quant.insert("qvapor".to_string(), zero);
+        VolumeBrick {
+            nx,
+            ny,
+            nz,
+            z_min_m: 0.0,
+            dz_m: 250.0,
+            time_iso: None,
+            quant: ChannelQuant(quant),
+            ext_liquid,
+            ext_ice,
+            ext_snow: vec![0; cells],
+            ext_precip,
+            tau_up: vec![0; cells],
+            qvapor: vec![0; cells],
+            cloud_fraction: vec![255; cells],
+            has_cloud_fraction: false,
+            temperature_f16: vec![0; cells],
+            hgt: vec![0.0; plane],
+            landmask: vec![1.0; plane],
+            tsk: vec![300.0; plane],
+            u10: vec![0.0; plane],
+            v10: vec![0.0; plane],
+            snowh: None,
+            ivgtyp: None,
+        }
+    }
+
+    fn decoded_occupancy_reference(brick: &VolumeBrick, factor: usize) -> QuantizedOccupancyUpload {
+        let volume = crate::clouds::DecodedVolume::from_brick_legacy(brick, 1000.0);
+        let mip = crate::clouds::OccupancyMip::build(&volume, factor);
+        QuantizedOccupancyUpload {
+            dims: (mip.mx as u32, mip.my as u32, mip.mz as u32),
+            r8: mip.to_r8_occupancy(),
+        }
+    }
+
+    fn assert_quantized_occupancy_matches(brick: &VolumeBrick, factor: usize, label: &str) {
+        let got = quantized_occupancy_upload(brick, factor);
+        let expected = decoded_occupancy_reference(brick, factor);
+        assert_eq!(got.dims, expected.dims, "{label}: dimensions");
+        assert_eq!(got.r8, expected.r8, "{label}: occupancy bytes");
+    }
+
+    #[test]
+    fn quantized_occupancy_matches_every_code_and_logquant_edge() {
+        let codes: Vec<u8> = (0u16..=255).map(|code| code as u8).collect();
+        let zero_codes = vec![0; codes.len()];
+        let quantizers = [
+            (
+                "normal",
+                LogQuant {
+                    vmin: 1.0e-12,
+                    vmax: 1.0e-1,
+                },
+            ),
+            (
+                "zero",
+                LogQuant {
+                    vmin: 0.0,
+                    vmax: 0.0,
+                },
+            ),
+            (
+                "negative-max",
+                LogQuant {
+                    vmin: -1.0,
+                    vmax: -0.1,
+                },
+            ),
+            (
+                "degenerate-positive",
+                LogQuant {
+                    vmin: 0.25,
+                    vmax: 0.25,
+                },
+            ),
+            (
+                "reversed-positive",
+                LogQuant {
+                    vmin: 1.0,
+                    vmax: 0.25,
+                },
+            ),
+            (
+                "zero-min",
+                LogQuant {
+                    vmin: 0.0,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "negative-min",
+                LogQuant {
+                    vmin: -1.0,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "nan-min",
+                LogQuant {
+                    vmin: f64::NAN,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "nan-max",
+                LogQuant {
+                    vmin: 1.0e-6,
+                    vmax: f64::NAN,
+                },
+            ),
+            (
+                "infinite-max",
+                LogQuant {
+                    vmin: 1.0e-6,
+                    vmax: f64::INFINITY,
+                },
+            ),
+        ];
+        let zero = LogQuant {
+            vmin: 0.0,
+            vmax: 0.0,
+        };
+        for &(quant_label, quant) in &quantizers {
+            for channel in 0..3 {
+                let mut channels = [zero_codes.clone(), zero_codes.clone(), zero_codes.clone()];
+                channels[channel] = codes.clone();
+                let mut scales = [zero; 3];
+                scales[channel] = quant;
+                let brick = occupancy_test_brick(
+                    (16, 16, 1),
+                    channels[0].clone(),
+                    channels[1].clone(),
+                    channels[2].clone(),
+                    (scales[0], scales[1], scales[2]),
+                );
+                for factor in [1, 7, 64] {
+                    assert_quantized_occupancy_matches(
+                        &brick,
+                        factor,
+                        &format!("{quant_label}/channel-{channel}/factor-{factor}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_occupancy_matches_mixed_codes_dilation_and_awkward_dimensions() {
+        let dims = (13usize, 11usize, 5usize);
+        let cells = dims.0 * dims.1 * dims.2;
+        let mut seed = 0x9e37_79b9u32;
+        let mut next_code = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let liquid: Vec<u8> = (0..cells).map(|_| next_code()).collect();
+        let ice: Vec<u8> = (0..cells).map(|_| next_code()).collect();
+        let mut precip: Vec<u8> = (0..cells).map(|_| next_code()).collect();
+        // Explicit isolated corner + interior probes exercise partial edge blocks and
+        // the one-block dilation in addition to the deterministic mixed-code field.
+        precip.fill(0);
+        precip[0] = 1;
+        precip[cells / 2] = 127;
+        precip[cells - 1] = 255;
+        let normal = LogQuant {
+            vmin: 1.0e-10,
+            vmax: 1.0e-2,
+        };
+        let nan_min = LogQuant {
+            vmin: f64::NAN,
+            vmax: 1.0,
+        };
+        let reversed = LogQuant {
+            vmin: 0.5,
+            vmax: 1.0e-4,
+        };
+        for (label, quantizers) in [
+            ("all-normal", (normal, normal, normal)),
+            ("nan-poisons-positive", (normal, nan_min, normal)),
+            ("reversed-mix", (reversed, normal, reversed)),
+        ] {
+            let brick = occupancy_test_brick(
+                dims,
+                liquid.clone(),
+                ice.clone(),
+                precip.clone(),
+                quantizers,
+            );
+            for factor in [0, 1, 2, 3, 8, 32] {
+                assert_quantized_occupancy_matches(
+                    &brick,
+                    factor,
+                    &format!("{label}/factor-{factor}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_occupancy_real_fixture_benchmark() {
+        use sha2::{Digest, Sha256};
+
+        let Ok(path) = std::env::var("SIMSAT_GPU_OCCUPANCY_BENCH_BRICK") else {
+            eprintln!("SIMSAT_GPU_OCCUPANCY_BENCH_BRICK unset; skipping occupancy benchmark");
+            return;
+        };
+        let mode = std::env::var("SIMSAT_GPU_OCCUPANCY_BENCH_MODE")
+            .unwrap_or_else(|_| "compare".to_string());
+        let read_started = std::time::Instant::now();
+        let brick = crate::bricks::read_ssb(std::path::Path::new(&path))
+            .unwrap_or_else(|error| panic!("read benchmark brick {path}: {error}"));
+        let read_wall = read_started.elapsed();
+        let prep_started = std::time::Instant::now();
+        let upload = match mode.as_str() {
+            "raw" => quantized_occupancy_upload(&brick, crate::clouds::OCCUPANCY_MIP_FACTOR),
+            "decoded" => decoded_occupancy_reference(&brick, crate::clouds::OCCUPANCY_MIP_FACTOR),
+            "compare" => {
+                let raw = quantized_occupancy_upload(&brick, crate::clouds::OCCUPANCY_MIP_FACTOR);
+                let decoded =
+                    decoded_occupancy_reference(&brick, crate::clouds::OCCUPANCY_MIP_FACTOR);
+                assert_eq!(raw, decoded, "real-fixture occupancy mismatch");
+                raw
+            }
+            other => panic!("unknown SIMSAT_GPU_OCCUPANCY_BENCH_MODE={other}"),
+        };
+        let prep_wall = prep_started.elapsed();
+        let digest = Sha256::digest(&upload.r8);
+        let hash = format!("{digest:x}");
+        let peak_rss = crate::platform::peak_rss_bytes()
+            .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+        eprintln!(
+            "GPU_OCCUPANCY_BENCH mode={mode} brick_dims={}x{}x{} occ_dims={}x{}x{} \
+             occ_bytes={} sha256={hash} read_wall_s={:.6} prep_wall_s={:.6} \
+             peak_rss_bytes={peak_rss}",
+            brick.nx,
+            brick.ny,
+            brick.nz,
+            upload.dims.0,
+            upload.dims.1,
+            upload.dims.2,
+            upload.r8.len(),
+            read_wall.as_secs_f64(),
+            prep_wall.as_secs_f64(),
+        );
+    }
 
     #[test]
     fn cloud_shaders_validate() {
@@ -2008,6 +2438,7 @@ mod tests {
             ambient_elev_max: 90.0,
             ambient_n: 48.0,
             atmosphere_correction: 1.0,
+            land_appearance: LandAppearanceConfig::identity(),
         }
     }
 
@@ -2090,7 +2521,7 @@ mod tests {
     fn cloud_uniform_quads_pack_the_wgsl_layout() {
         let inputs = test_cloud_inputs(test_surface_uniforms());
         let quads = cloud_uniform_quads(&inputs);
-        assert_eq!(quads.len(), 25);
+        assert_eq!(quads.len(), 27);
         // The first 9 quads are the surface uniforms verbatim.
         assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
         assert_eq!(quads[8], [-20.0, 90.0, 48.0, 1.0]);
@@ -2106,6 +2537,9 @@ mod tests {
         assert_eq!(quads[22], [-40_000.0, 40_000.0, 512.0, 1.0]);
         // frx2: froxel dim, edge feather, ground lift, visible cloud OD scale.
         assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
+        // Appended land controls preserve every historical cloud offset above.
+        assert_eq!(quads[25], [0.0, 1.6, 0.0, 0.08]);
+        assert_eq!(quads[26], [0.65, 1.5, 0.0, 0.0]);
         let mut invalid = test_cloud_inputs(test_surface_uniforms());
         invalid.march.cloud_optical_depth_scale = f32::NAN;
         assert_eq!(
@@ -2114,14 +2548,199 @@ mod tests {
         );
         invalid.march.cloud_optical_depth_scale = 99.0;
         assert_eq!(cloud_uniform_quads(&invalid)[24][3], 4.0);
-        // 25 vec4 = 400 bytes, little-endian f32s in order.
+        // 27 vec4 = 432 bytes, little-endian f32s in order.
         let bytes = quads_to_bytes(&quads);
-        assert_eq!(bytes.len(), 400);
+        assert_eq!(bytes.len(), 432);
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         assert_eq!(
             f32::from_le_bytes(bytes[9 * 16..9 * 16 + 4].try_into().unwrap()),
             80.0
         );
+    }
+
+    fn wgsl_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Executable f32 transcription of the marked WGSL helper. The exhaustive property
+    /// test below anchors both shader copies to the public f64 CPU reference over the
+    /// whole solar-elevation range and representative reflectance/control domains.
+    fn wgsl_land_appearance_gain(
+        config: LandAppearanceConfig,
+        sun_elev: f32,
+        albedo: [f32; 3],
+    ) -> f32 {
+        let land = land_appearance_uniform_quads(config);
+        let (land0, land1) = (land[0], land[1]);
+        if land0[0] <= 0.5 && land0[2] <= 0.5 {
+            return 1.0;
+        }
+
+        let sza = if land0[0] <= 0.5
+            || land0[1] == 1.0
+            || sun_elev >= crate::render::LAND_SZA_REFERENCE_ELEV_DEG as f32
+        {
+            1.0
+        } else {
+            let mu_ref = (crate::render::LAND_SZA_REFERENCE_ELEV_DEG as f32)
+                .to_radians()
+                .sin();
+            let mu_floor = (crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32)
+                .to_radians()
+                .sin();
+            let mu = sun_elev.clamp(0.0, 90.0).to_radians().sin();
+            let target = (mu_ref / mu.max(mu_floor)).clamp(1.0, land0[1]);
+            1.0 + wgsl_smoothstep(
+                crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32,
+                crate::render::AERIAL_VEIL_ELEV_HI_DEG as f32,
+                sun_elev,
+            ) * (target - 1.0)
+        };
+
+        let y = (0.2126 * albedo[0] + 0.7152 * albedo[1] + 0.0722 * albedo[2]).max(0.0);
+        let toe =
+            if land0[2] <= 0.5 || y <= 0.0 || y >= land0[3] || land1[1] == 1.0 || land1[0] == 1.0 {
+                1.0
+            } else {
+                let power_target = land0[3] * (y / land0[3]).powf(land1[0]);
+                let w = wgsl_smoothstep(0.0, land0[3], y);
+                let target = power_target * (1.0 - w) + y * w;
+                let gain = (target / y).clamp(1.0, land1[1]);
+                1.0 + wgsl_smoothstep(
+                    crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32,
+                    crate::render::AERIAL_VEIL_ELEV_HI_DEG as f32,
+                    sun_elev,
+                ) * (gain - 1.0)
+            };
+        sza * toe
+    }
+
+    #[test]
+    fn land_appearance_uniforms_match_cpu_sanitization_and_identity() {
+        let identity = land_appearance_uniform_quads(LandAppearanceConfig::identity());
+        assert_eq!(identity[0], [0.0, 1.6, 0.0, 0.08]);
+        assert_eq!(identity[1], [0.65, 1.5, 0.0, 0.0]);
+        let shipped = land_appearance_uniform_quads(LandAppearanceConfig::default());
+        assert_eq!(shipped[0], [1.0, 1.6, 1.0, 0.08]);
+        assert_eq!(shipped[1], [0.65, 1.5, 0.0, 0.0]);
+
+        let invalid = land_appearance_uniform_quads(LandAppearanceConfig {
+            sza_normalization: true,
+            sza_max_gain: f64::NAN,
+            dark_toe: true,
+            dark_toe_knee: f64::INFINITY,
+            dark_toe_gamma: -9.0,
+            dark_toe_max_gain: 99.0,
+        });
+        assert_eq!(invalid[0], [1.0, 1.6, 1.0, 0.08]);
+        assert_eq!(invalid[1], [0.05, 4.0, 0.0, 0.0]);
+
+        for elev in [-90.0, 0.0, 20.0, 25.0, 30.0, 60.0, 90.0] {
+            assert_eq!(
+                wgsl_land_appearance_gain(
+                    LandAppearanceConfig::identity(),
+                    elev,
+                    [0.01, 0.04, 0.02]
+                )
+                .to_bits(),
+                1.0f32.to_bits(),
+                "both-off must be an exact shader identity at {elev} deg"
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_land_appearance_math_tracks_cpu_reference_over_domain() {
+        let identity = LandAppearanceConfig::identity();
+        let configs = [
+            identity,
+            LandAppearanceConfig::default(),
+            LandAppearanceConfig {
+                sza_normalization: true,
+                ..identity
+            },
+            LandAppearanceConfig {
+                dark_toe: true,
+                ..identity
+            },
+            LandAppearanceConfig {
+                sza_normalization: true,
+                sza_max_gain: 2.35f32 as f64,
+                dark_toe: true,
+                dark_toe_knee: 0.12f32 as f64,
+                dark_toe_gamma: 0.42f32 as f64,
+                dark_toe_max_gain: 2.7f32 as f64,
+            },
+            LandAppearanceConfig {
+                sza_normalization: true,
+                sza_max_gain: f64::NAN,
+                dark_toe: true,
+                dark_toe_knee: f64::INFINITY,
+                dark_toe_gamma: f64::NEG_INFINITY,
+                dark_toe_max_gain: f64::NAN,
+            },
+        ];
+        let albedos = [
+            [0.0, 0.0, 0.0],
+            [1.0e-6, 1.0e-6, 1.0e-6],
+            [0.001, 0.004, 0.002],
+            [0.01, 0.02, 0.04],
+            [0.04, 0.04, 0.04],
+            [0.079, 0.079, 0.079],
+            [0.081, 0.081, 0.081],
+            [0.2, 0.1, 0.05],
+            [1.0, 1.0, 1.0],
+        ];
+        for config in configs {
+            for elev_i in -90..=90 {
+                let elev = elev_i as f32;
+                for albedo in albedos {
+                    let gpu = wgsl_land_appearance_gain(config, elev, albedo);
+                    let cpu = crate::render::land_appearance_gain(
+                        config,
+                        elev as f64,
+                        [albedo[0] as f64, albedo[1] as f64, albedo[2] as f64],
+                    ) as f32;
+                    let delta = (gpu - cpu).abs();
+                    assert!(
+                        delta <= 3.0e-5,
+                        "CPU/WGSL land gain delta {delta} at elev={elev}, albedo={albedo:?}, config={config:?}: gpu={gpu}, cpu={cpu}"
+                    );
+                    if elev <= crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32 {
+                        assert_eq!(gpu.to_bits(), 1.0f32.to_bits(), "twilight identity");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_visible_shaders_share_identical_land_helper_and_land_only_callsite() {
+        fn marked_helper(shader: &str) -> &str {
+            shader
+                .split_once("// LAND_APPEARANCE_TWIN_BEGIN")
+                .and_then(|(_, rest)| rest.split_once("// LAND_APPEARANCE_TWIN_END"))
+                .map(|(helper, _)| helper)
+                .expect("marked land-appearance WGSL helper")
+        }
+        assert_eq!(marked_helper(SURFACE_WGSL), marked_helper(CLOUDS_WGSL));
+        let call = "l_surf = l_surf * land_appearance_gain_gpu(sun_elev, albedo);";
+        for (name, shader) in [("surface", SURFACE_WGSL), ("clouds", CLOUDS_WGSL)] {
+            assert_eq!(
+                shader.matches(call).count(),
+                1,
+                "{name} must apply the gain exactly once in its land surface branch"
+            );
+            let call_at = shader.find(call).unwrap();
+            let water_at = shader[..call_at]
+                .rfind("if (is_water)")
+                .expect("water/land branch before land appearance call");
+            let land_at = shader[water_at..call_at]
+                .rfind("} else {")
+                .expect("land branch before land appearance call");
+            assert!(land_at > 0, "{name}: correction must be inside land branch");
+        }
     }
 
     #[test]
@@ -2359,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_uniforms_pack_144_bytes_in_order() {
+    fn surface_uniforms_pack_176_bytes_in_order() {
         let u = SurfaceUniforms {
             cam: [1.0, 2.0, 3.0],
             r_ground: 6_370_000.0,
@@ -2385,9 +3004,10 @@ mod tests {
             ambient_elev_max: 90.0,
             ambient_n: 48.0,
             atmosphere_correction: 1.0,
+            land_appearance: LandAppearanceConfig::identity(),
         };
         let bytes = u.to_bytes();
-        assert_eq!(bytes.len(), 144);
+        assert_eq!(bytes.len(), 176);
         // Spot-check the layout: cam.x at [0], r_ground at [3*4], ambient_n at [34*4].
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         assert_eq!(
@@ -2400,5 +3020,7 @@ mod tests {
         );
         // Trailing word is the product-facing atmosphere-correction flag.
         assert_eq!(f32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[144..148].try_into().unwrap()), 0.0);
+        assert_eq!(f32::from_le_bytes(bytes[148..152].try_into().unwrap()), 1.6);
     }
 }

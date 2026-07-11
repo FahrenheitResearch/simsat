@@ -72,6 +72,7 @@ const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
 const AERIAL_VEIL_ELEV_HI: f32 = 30.0; // WS2: 40 -> 30 (full daytime treatment by 30 deg; twin of render.rs)
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
+const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
 const GLINT_STRENGTH: f32 = 3.5;
 const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller, brighter glint streak (round 3: 0.6->0.4)
 // WS2 bright-cloud tonemap (twins of render.rs). EXPOSURE is wired as u.m1.x
@@ -194,6 +195,8 @@ struct Uniforms {
     sod_e: vec4<f32>,  // v_min, v_max, sunod_dim, clouds_enabled
     frx: vec4<f32>,    // scan x_min, x_max, y_min, y_max
     frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, visible cloud OD scale
+    land0: vec4<f32>,  // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
+    land1: vec4<f32>,  // dark_toe_gamma, dark_toe_max_gain, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -421,6 +424,49 @@ fn land_day_gain(sun_elev: f32) -> f32 {
     return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
+// Owner-selected v0.1.5 finished-visible LAND corrections. Exact f32 twin of
+// render::{land_sza_normalization_gain, land_dark_toe_gain, land_appearance_gain}.
+// These scale only the surface signal in the LAND branch; cloud source radiance,
+// water/glint, limb/space, raw bands, and thermal/derived paths never consume them.
+// LAND_APPEARANCE_TWIN_BEGIN
+fn land_sza_normalization_gain_gpu(sun_elev: f32) -> f32 {
+    let max_gain = clamp(u.land0.y, 1.0, 4.0);
+    if (u.land0.x <= 0.5 || max_gain == 1.0 || sun_elev >= LAND_SZA_REFERENCE_ELEV) {
+        return 1.0;
+    }
+    let mu_ref = sin(LAND_SZA_REFERENCE_ELEV * DEG2RAD);
+    let mu_floor = sin(AERIAL_VEIL_ELEV_LO * DEG2RAD);
+    let mu = sin(clamp(sun_elev, 0.0, 90.0) * DEG2RAD);
+    let target_gain = clamp(mu_ref / max(mu, mu_floor), 1.0, max_gain);
+    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (target_gain - 1.0);
+}
+
+fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
+    let knee = clamp(u.land0.w, 1e-6, 1.0);
+    let gamma = clamp(u.land1.x, 0.05, 1.0);
+    let max_gain = clamp(u.land1.y, 1.0, 4.0);
+    if (u.land0.z <= 0.5) {
+        return 1.0;
+    }
+    let y = max(dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
+    if (y <= 0.0 || y >= knee || max_gain == 1.0 || gamma == 1.0) {
+        return 1.0;
+    }
+    let power_target = knee * pow(y / knee, gamma);
+    let w = smoothstep(0.0, knee, y);
+    let target_y = power_target * (1.0 - w) + y * w;
+    let gain = clamp(target_y / y, 1.0, max_gain);
+    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (gain - 1.0);
+}
+
+fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
+    if (u.land0.x <= 0.5 && u.land0.z <= 0.5) {
+        return 1.0;
+    }
+    return land_sza_normalization_gain_gpu(sun_elev) * land_dark_toe_gain_gpu(sun_elev, albedo);
+}
+// LAND_APPEARANCE_TWIN_END
+
 // GROUND LIFT daytime gain on the WHOLE surface radiance — land AND water (twin of
 // render::ground_day_lift; the top-down/basemap appearance pass). The lift value is
 // u.frx2.z (the CPU MarchConfig::ground_day_lift, default render::GROUND_DAY_LIFT);
@@ -622,7 +668,7 @@ fn synthesize_abi_green(rho: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// The display EXPOSURE gain (u.m1.x; neutral default 1.0 in the studio). Twin of
+// The display EXPOSURE gain (u.m1.x; Studio default 1.5, exact neutral override 1.0). Twin of
 // render::radiance_to_rgba_softclip's gain guard: a
 // non-finite/non-positive uniform falls back to 1.0 (never darkens to nothing).
 fn exposure_gain() -> f32 {
@@ -1465,6 +1511,9 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
     } else {
         let e_direct = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG * shadow);
         l_surf = albedo / PI * (e_direct + e_ambient);
+        // Finished-visible appearance controls are LAND-only and precede the legacy
+        // land gain/ground lift/aerial veil, matching the CPU composite order.
+        l_surf = l_surf * land_appearance_gain_gpu(sun_elev, albedo);
         // LAND daytime brightness lift (round 2): ground-only surface-reflectance gain,
         // sun-gated so twilight is byte-unchanged. Applied before the aerial veil below.
         l_surf = l_surf * land_day_gain(sun_elev);

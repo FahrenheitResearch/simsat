@@ -156,7 +156,8 @@ impl Georef {
 /// 0.05), `rh_aerosol_swelling` (1.5x when true), `atmosphere_correction`,
 /// `terrain_atmosphere`, `fractional_clouds` (default true), and
 /// `cloud_optical_depth_scale` (0..=4, shipped default 0.15 by owner cross-file visual
-/// calibration; 1.0 is unscaled model extinction). Fractional clouds
+/// calibration; 1.0 is unscaled model extinction), and the default-on
+/// `feather_exposed_domain_edges` finite-domain presentation control. Fractional clouds
 /// use the model cloud
 /// fraction when present; false restores legacy horizontally-full cells. The OD scale is
 /// a visible sensitivity control and does not alter the quantitative
@@ -165,7 +166,12 @@ impl Georef {
 /// `beer_powder` enables the optional direct-sun shaping, and `granulation` enables
 /// display-only sub-grid cloud-edge erosion; both default off. Finished visible display
 /// products also accept `ground_gain`, `cloud_softclip`, and `cloud_highlight_max` as
-/// optional calibration overrides; raw visible bands deliberately do not.
+/// optional calibration overrides. The land-only controls
+/// `land_sza_normalization` / `land_sza_max_gain` and `land_dark_toe` plus its
+/// knee/gamma/max-gain parameters are independently switchable and default on in the
+/// owner-selected v0.1.5 display preset. Passing both booleans false is the exact legacy
+/// identity. Raw
+/// visible bands deliberately expose none of these display-only land controls.
 ///
 /// `threads` (default None = all cores, or RAYON_NUM_THREADS) caps the render worker
 /// threads for THIS PROCESS. The pool is global and built ONCE — the first render call's
@@ -176,10 +182,12 @@ impl Georef {
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
+    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
-    granulation=false,
+    feather_exposed_domain_edges=true, granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -196,6 +204,12 @@ fn render_visible_rgb<'py>(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -206,6 +220,7 @@ fn render_visible_rgb<'py>(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -226,6 +241,12 @@ fn render_visible_rgb<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -236,6 +257,7 @@ fn render_visible_rgb<'py>(
         clouds,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         granulation,
         sun_elev,
         sun_az,
@@ -271,10 +293,12 @@ fn render_visible_rgb<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
+    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
-    granulation=false,
+    feather_exposed_domain_edges=true, granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -291,6 +315,12 @@ fn render_geocolor<'py>(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -301,6 +331,7 @@ fn render_geocolor<'py>(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -321,6 +352,12 @@ fn render_geocolor<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -331,6 +368,7 @@ fn render_geocolor<'py>(
         clouds,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         granulation,
         sun_elev,
         sun_az,
@@ -367,10 +405,12 @@ fn render_geocolor<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
+    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
-    granulation=false,
+    feather_exposed_domain_edges=true, granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -387,6 +427,12 @@ fn render_sandwich<'py>(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -397,6 +443,7 @@ fn render_sandwich<'py>(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -417,6 +464,12 @@ fn render_sandwich<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -427,6 +480,7 @@ fn render_sandwich<'py>(
         clouds,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         granulation,
         sun_elev,
         sun_az,
@@ -504,6 +558,12 @@ fn render_visible_bands<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        false,
+        simsat_engine::render::LAND_SZA_MAX_GAIN,
+        false,
+        simsat_engine::render::LAND_DARK_TOE_KNEE,
+        simsat_engine::render::LAND_DARK_TOE_GAMMA,
+        simsat_engine::render::LAND_DARK_TOE_MAX_GAIN,
         None,
         None,
         None,
@@ -514,6 +574,7 @@ fn render_visible_bands<'py>(
         clouds,
         fractional_clouds,
         cloud_optical_depth_scale,
+        false,
         granulation,
         sun_elev,
         sun_az,
@@ -815,8 +876,9 @@ fn render_cloud_optical_depth<'py>(
 ///
 /// TOP-DOWN by definition (there is no `view=` — the host map is the ground; no Blue
 /// Marble is rendered). The sun / aerosol / exposure / steps / multiscatter /
-/// beer-powder / granulation / fractional-cloud / cloud-optical-depth controls drive the cloud march
-/// exactly like `render_visible_rgb`;
+/// beer-powder / granulation / fractional-cloud / cloud-optical-depth controls and the
+/// default-on `feather_exposed_domain_edges` finite-domain presentation control drive the cloud
+/// march exactly like `render_visible_rgb`;
 /// `clouds=False` returns a transparent cloud image and neutral shadow. Datum note:
 /// lat/lon are on the WRF
 /// sphere fed through standard EPSG:3857 — the usual WRF-on-a-web-map approximation.
@@ -826,8 +888,8 @@ fn render_cloud_optical_depth<'py>(
     rh_aerosol_swelling=false, atmosphere_correction=true, terrain_atmosphere=true,
     exposure=None, ground_gain=None, cloud_softclip=None, cloud_highlight_max=None,
     multiscatter=true, beer_powder=false, steps="offline", clouds=true,
-    fractional_clouds=true, cloud_optical_depth_scale=0.15, granulation=false, sun_elev=None,
-    sun_az=None, cache=None,
+    fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    feather_exposed_domain_edges=true, granulation=false, sun_elev=None, sun_az=None, cache=None,
     premultiplied=false, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -851,6 +913,7 @@ fn render_cloud_layer<'py>(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -870,6 +933,7 @@ fn render_cloud_layer<'py>(
         terrain_atmosphere,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         beer_powder,
         granulation,
     )?;
@@ -943,10 +1007,12 @@ fn render_cloud_layer<'py>(
 #[pyo3(signature = (
     input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
+    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
-    granulation=false,
+    feather_exposed_domain_edges=true, granulation=false,
     cloud_layer_only=false, sun_elev=None, sun_az=None,
     cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -963,6 +1029,12 @@ fn render_perspective<'py>(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -973,6 +1045,7 @@ fn render_perspective<'py>(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     cloud_layer_only: bool,
     sun_elev: Option<f64>,
@@ -993,6 +1066,7 @@ fn render_perspective<'py>(
         terrain_atmosphere,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         beer_powder,
         granulation,
     )?;
@@ -1003,6 +1077,15 @@ fn render_perspective<'py>(
         cloud_softclip,
         cloud_highlight_max,
     );
+    apply_land_appearance_controls(
+        &mut params,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
+    )?;
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
@@ -1163,6 +1246,12 @@ fn build_visible_params(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f64,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f64,
+    land_dark_toe_gamma: f64,
+    land_dark_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -1173,6 +1262,7 @@ fn build_visible_params(
     clouds: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -1195,6 +1285,7 @@ fn build_visible_params(
         terrain_atmosphere,
         fractional_clouds,
         cloud_optical_depth_scale,
+        feather_exposed_domain_edges,
         beer_powder,
         granulation,
     )?;
@@ -1205,6 +1296,15 @@ fn build_visible_params(
         cloud_softclip,
         cloud_highlight_max,
     );
+    apply_land_appearance_controls(
+        &mut params,
+        land_sza_normalization,
+        land_sza_max_gain,
+        land_dark_toe,
+        land_dark_toe_knee,
+        land_dark_toe_gamma,
+        land_dark_toe_max_gain,
+    )?;
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
@@ -1240,6 +1340,7 @@ fn apply_visible_physics_controls(
     terrain_atmosphere: bool,
     fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
     beer_powder: bool,
     granulation: bool,
 ) -> PyResult<()> {
@@ -1261,6 +1362,7 @@ fn apply_visible_physics_controls(
     params.terrain_atmosphere = terrain_atmosphere;
     params.fractional_clouds = fractional_clouds;
     params.cloud_optical_depth_scale = cloud_optical_depth_scale;
+    params.feather_exposed_domain_edges = feather_exposed_domain_edges;
     params.beer_powder = beer_powder;
     params.granulation = Some(granulation);
     Ok(())
@@ -1283,6 +1385,37 @@ fn apply_visible_display_controls(
     params.ground_gain = ground_gain;
     params.cloud_softclip = cloud_softclip;
     params.cloud_highlight_max = cloud_highlight_max;
+}
+
+/// Validate and apply the display-only land controls. The shipped preset enables both;
+/// explicitly disabling both is the exact legacy path. Bounds match the CLI and Studio.
+#[allow(clippy::too_many_arguments)]
+fn apply_land_appearance_controls(
+    params: &mut RenderParams,
+    sza_normalization: bool,
+    sza_max_gain: f64,
+    dark_toe: bool,
+    dark_toe_knee: f64,
+    dark_toe_gamma: f64,
+    dark_toe_max_gain: f64,
+) -> PyResult<()> {
+    let bounded = |name: &str, value: f64, lo: f64, hi: f64| -> PyResult<f64> {
+        if !value.is_finite() || !(lo..=hi).contains(&value) {
+            return Err(value_err(format!(
+                "{name} must be finite and in {lo}..={hi}, got {value}"
+            )));
+        }
+        Ok(value)
+    };
+    params.land_appearance = simsat_engine::render::LandAppearanceConfig {
+        sza_normalization,
+        sza_max_gain: bounded("land_sza_max_gain", sza_max_gain, 1.0, 4.0)?,
+        dark_toe,
+        dark_toe_knee: bounded("land_dark_toe_knee", dark_toe_knee, 1.0e-6, 1.0)?,
+        dark_toe_gamma: bounded("land_dark_toe_gamma", dark_toe_gamma, 0.05, 1.0)?,
+        dark_toe_max_gain: bounded("land_dark_toe_max_gain", dark_toe_max_gain, 1.0, 4.0)?,
+    };
+    Ok(())
 }
 
 /// Build the Python [`Georef`] from a render result: scalars + the projection dict + the
@@ -1538,6 +1671,7 @@ mod tests {
             0.5,
             true,
             true,
+            true,
         )
         .unwrap();
         assert_eq!(params.aerosol_optical_depth, 0.2);
@@ -1546,13 +1680,15 @@ mod tests {
         assert!(!params.terrain_atmosphere);
         assert!(!params.fractional_clouds);
         assert_eq!(params.cloud_optical_depth_scale, 0.5);
+        assert!(params.feather_exposed_domain_edges);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
     }
 
     #[test]
-    fn visible_physics_helper_preserves_engine_defaults() {
+    fn visible_physics_helper_honors_explicit_edge_off() {
         let mut params = RenderParams::new(PathBuf::from("input"));
+        assert!(params.feather_exposed_domain_edges);
         apply_visible_physics_controls(
             &mut params,
             simsat_engine::atmosphere::DEFAULT_AOD as f32,
@@ -1561,6 +1697,7 @@ mod tests {
             true,
             true,
             simsat_engine::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            false,
             false,
             false,
         )
@@ -1577,6 +1714,7 @@ mod tests {
             params.cloud_optical_depth_scale,
             simsat_engine::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
+        assert!(!params.feather_exposed_domain_edges);
         assert!(!params.beer_powder);
         assert_eq!(params.granulation, Some(false));
     }
@@ -1600,6 +1738,49 @@ mod tests {
         assert_eq!(params.ground_gain, Some(1.6));
         assert_eq!(params.cloud_softclip, Some(0.65));
         assert_eq!(params.cloud_highlight_max, Some(1.25));
+    }
+
+    #[test]
+    fn land_appearance_helper_assigns_every_control_and_explicit_identity() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        assert_eq!(
+            params.land_appearance,
+            simsat_engine::render::LandAppearanceConfig::shipped()
+        );
+        apply_land_appearance_controls(&mut params, false, 1.6, false, 0.08, 0.65, 1.5).unwrap();
+        assert_eq!(
+            params.land_appearance,
+            simsat_engine::render::LandAppearanceConfig::identity()
+        );
+        apply_land_appearance_controls(&mut params, true, 1.7, true, 0.07, 0.6, 1.4).unwrap();
+        assert_eq!(
+            params.land_appearance,
+            simsat_engine::render::LandAppearanceConfig {
+                sza_normalization: true,
+                sza_max_gain: 1.7,
+                dark_toe: true,
+                dark_toe_knee: 0.07,
+                dark_toe_gamma: 0.6,
+                dark_toe_max_gain: 1.4,
+            }
+        );
+    }
+
+    #[test]
+    fn land_appearance_helper_rejects_nonfinite_and_out_of_range_values() {
+        let cases = [
+            (0.9, 0.08, 0.65, 1.5),
+            (1.6, 0.0, 0.65, 1.5),
+            (1.6, 0.08, 1.1, 1.5),
+            (1.6, 0.08, 0.65, f64::NAN),
+        ];
+        for (sza, knee, gamma, toe_max) in cases {
+            let mut params = RenderParams::new(PathBuf::from("input"));
+            assert!(
+                apply_land_appearance_controls(&mut params, true, sza, true, knee, gamma, toe_max,)
+                    .is_err()
+            );
+        }
     }
 }
 

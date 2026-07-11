@@ -36,9 +36,14 @@ use crate::{RenderMode, StudioView};
 pub const RECENT_CAP: usize = 8;
 /// Visible-calibration settings epoch. Epoch 1 was the diagnostic v0.1.4 RC
 /// (`cloud_optical_depth_scale = 0.25`, exposure/ground = `1.6`); epoch 2 carries
-/// the owner-selected `0.15` plus the neutral ABI display/ground baseline. Older
-/// settings are preserved and surfaced instead of being silently overwritten.
-pub const VISIBLE_CALIBRATION_EPOCH: u32 = 2;
+/// the owner-selected `0.15` plus the neutral ABI display/ground baseline; epoch 3
+/// keeps OD `0.15` and selects exposure `1.5`; epoch 4 promotes the owner-selected
+/// SZA normalization and dark-land toe; epoch 5 promotes exposed-domain cloud-edge
+/// feathering to the shipped visible preset.
+/// Older settings are preserved and surfaced instead of being silently overwritten.
+pub const VISIBLE_CALIBRATION_EPOCH: u32 = 5;
+const LAND_APPEARANCE_CALIBRATION_EPOCH: u64 = 4;
+const EXPOSED_EDGE_CALIBRATION_EPOCH: u64 = 5;
 
 /// One remembered open action: what kind of open it was + the path(s) involved
 /// (one path for a wrfout / cached run / sequence folder; several for a
@@ -107,6 +112,15 @@ pub struct StudioSettings {
     /// Shorten the atmospheric column to the model terrain elevation. `true` is
     /// the physical default; `false` preserves the sea-level-column QA baseline.
     pub terrain_atmosphere: bool,
+    /// Land-only solar-zenith display normalization (owner-selected default on).
+    pub land_sza_normalization: bool,
+    /// Upper bound for the land solar-zenith normalization.
+    pub land_sza_max_gain: f32,
+    /// Bounded dark-land reflectance toe (owner-selected default on).
+    pub land_dark_toe: bool,
+    pub land_dark_toe_knee: f32,
+    pub land_dark_toe_gamma: f32,
+    pub land_dark_toe_max_gain: f32,
     pub clouds_enabled: bool,
     /// Use model cloud fraction/subcolumns when the brick provides them. `true` is
     /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
@@ -115,6 +129,9 @@ pub struct StudioSettings {
     /// Visible cloud optical-depth calibration. The shipped default is `0.15`;
     /// `1.0` keeps the model-derived physical input unchanged.
     pub cloud_optical_depth_scale: f32,
+    /// Fade finished visible clouds at camera-exposed finite-domain boundaries.
+    /// Default on in v0.1.5; false is the exact pre-feature margin-gated behavior.
+    pub feather_exposed_domain_edges: bool,
     pub beer_powder: bool,
     /// Display-only sub-grid cloud-edge erosion. Explicitly opt-in/off by default.
     pub granulation: bool,
@@ -144,6 +161,7 @@ pub struct StudioSettings {
 impl Default for StudioSettings {
     fn default() -> Self {
         // Mirrors SimSatStudioApp::new's defaults exactly (the honest baseline).
+        let land = simsat::render::LandAppearanceConfig::default();
         Self {
             visible_calibration_epoch: VISIBLE_CALIBRATION_EPOCH,
             store_root: None,
@@ -159,10 +177,17 @@ impl Default for StudioSettings {
             rh_swelling: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_sza_normalization: land.sza_normalization,
+            land_sza_max_gain: land.sza_max_gain as f32,
+            land_dark_toe: land.dark_toe,
+            land_dark_toe_knee: land.dark_toe_knee as f32,
+            land_dark_toe_gamma: land.dark_toe_gamma as f32,
+            land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
             clouds_enabled: true,
             fractional_clouds: true,
             multiscatter: true,
             cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            feather_exposed_domain_edges: true,
             beer_powder: false,
             granulation: false,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
@@ -197,6 +222,36 @@ fn clamp_finite(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
 }
 
 impl StudioSettings {
+    /// Replace only the persisted visible-appearance calibration with the current
+    /// shipped preset. File/view/export/playback/recent settings remain untouched.
+    /// This is the single migration seam used by the Studio's calibration banner.
+    pub(crate) fn apply_shipped_visible_calibration(&mut self) {
+        let d = Self::default();
+        self.visible_calibration_epoch = VISIBLE_CALIBRATION_EPOCH;
+        self.output_transform = d.output_transform;
+        self.aod = d.aod;
+        self.rh_swelling = d.rh_swelling;
+        self.atmosphere_correction = d.atmosphere_correction;
+        self.terrain_atmosphere = d.terrain_atmosphere;
+        self.land_sza_normalization = d.land_sza_normalization;
+        self.land_sza_max_gain = d.land_sza_max_gain;
+        self.land_dark_toe = d.land_dark_toe;
+        self.land_dark_toe_knee = d.land_dark_toe_knee;
+        self.land_dark_toe_gamma = d.land_dark_toe_gamma;
+        self.land_dark_toe_max_gain = d.land_dark_toe_max_gain;
+        self.clouds_enabled = d.clouds_enabled;
+        self.fractional_clouds = d.fractional_clouds;
+        self.multiscatter = d.multiscatter;
+        self.cloud_optical_depth_scale = d.cloud_optical_depth_scale;
+        self.feather_exposed_domain_edges = d.feather_exposed_domain_edges;
+        self.beer_powder = d.beer_powder;
+        self.granulation = d.granulation;
+        self.exposure = d.exposure;
+        self.ground_gain = d.ground_gain;
+        self.cloud_softclip = d.cloud_softclip;
+        self.cloud_highlight_max = d.cloud_highlight_max;
+    }
+
     /// Clamp every numeric field to its UI slider range, reset unknown enum
     /// tokens to their defaults, and dedupe + cap the recent list. Idempotent.
     pub fn sanitize(&mut self) {
@@ -208,6 +263,18 @@ impl StudioSettings {
             .min(VISIBLE_CALIBRATION_EPOCH);
         self.margin_pct = clamp_finite(self.margin_pct, 0.0, 100.0, d.margin_pct);
         self.aod = clamp_finite(self.aod, 0.0, 0.6, d.aod);
+        self.land_sza_max_gain =
+            clamp_finite(self.land_sza_max_gain, 1.0, 4.0, d.land_sza_max_gain);
+        self.land_dark_toe_knee =
+            clamp_finite(self.land_dark_toe_knee, 1.0e-6, 1.0, d.land_dark_toe_knee);
+        self.land_dark_toe_gamma =
+            clamp_finite(self.land_dark_toe_gamma, 0.05, 1.0, d.land_dark_toe_gamma);
+        self.land_dark_toe_max_gain = clamp_finite(
+            self.land_dark_toe_max_gain,
+            1.0,
+            4.0,
+            d.land_dark_toe_max_gain,
+        );
         self.cloud_optical_depth_scale = clamp_finite(
             self.cloud_optical_depth_scale,
             0.0,
@@ -409,7 +476,31 @@ pub fn load(path: &Path) -> StudioSettings {
         .and_then(|text| {
             let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
             let had_calibration_epoch = value.get("visible_calibration_epoch").is_some();
+            let saved_calibration_epoch = value
+                .get("visible_calibration_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let had_land_sza = value.get("land_sza_normalization").is_some();
+            let had_land_toe = value.get("land_dark_toe").is_some();
+            let had_exposed_edge = value.get("feather_exposed_domain_edges").is_some();
             let mut settings = serde_json::from_value::<StudioSettings>(value).ok()?;
+            // Files from before epoch 4 either persisted these switches as off or did
+            // not know about them. Missing legacy fields therefore mean identity, not
+            // the new-install preset; the banner lets the user Apply or Keep explicitly.
+            if saved_calibration_epoch < LAND_APPEARANCE_CALIBRATION_EPOCH {
+                if !had_land_sza {
+                    settings.land_sza_normalization = false;
+                }
+                if !had_land_toe {
+                    settings.land_dark_toe = false;
+                }
+            }
+            // Files from before epoch 5 either explicitly kept this switch off or
+            // did not know about it. A missing legacy field means the exact former
+            // margin-gated behavior; the banner offers Apply (on) versus Keep (off).
+            if saved_calibration_epoch < EXPOSED_EDGE_CALIBRATION_EPOCH && !had_exposed_edge {
+                settings.feather_exposed_domain_edges = false;
+            }
             if !had_calibration_epoch {
                 // Preserve every old user-selected value. Epoch zero merely asks the UI
                 // to offer the new shipped preset or explicitly keep those saved values.
@@ -470,17 +561,102 @@ mod tests {
         assert!(!s.rh_swelling);
         assert!(s.atmosphere_correction);
         assert!(s.terrain_atmosphere);
+        assert!(s.land_sza_normalization);
+        assert_eq!(
+            s.land_sza_max_gain,
+            simsat::render::LAND_SZA_MAX_GAIN as f32
+        );
+        assert!(s.land_dark_toe);
+        assert_eq!(
+            s.land_dark_toe_knee,
+            simsat::render::LAND_DARK_TOE_KNEE as f32
+        );
+        assert_eq!(
+            s.land_dark_toe_gamma,
+            simsat::render::LAND_DARK_TOE_GAMMA as f32
+        );
+        assert_eq!(
+            s.land_dark_toe_max_gain,
+            simsat::render::LAND_DARK_TOE_MAX_GAIN as f32
+        );
         assert_eq!(s.output_transform, "abi-reflectance");
         assert!(s.clouds_enabled);
         assert!(s.multiscatter);
         assert!(!s.beer_powder);
         assert_eq!(s.cloud_optical_depth_scale, 0.15);
-        assert_eq!(s.exposure, 1.0);
+        assert!(s.feather_exposed_domain_edges);
+        assert_eq!(s.exposure, simsat::render::DEFAULT_EXPOSURE as f32);
         assert_eq!(s.ground_gain, 1.0);
         assert_eq!(s.cloud_softclip, 0.65);
         assert_eq!(s.cloud_highlight_max, 1.25);
         assert!(s.fractional_clouds);
         assert!(!s.granulation);
+    }
+
+    #[test]
+    fn shipped_visible_calibration_migration_is_complete_and_scoped() {
+        let recent = vec![RecentEntry {
+            kind: "wrfout".to_string(),
+            paths: vec!["C:/runs/keep-me".to_string()],
+        }];
+        let mut s = StudioSettings {
+            visible_calibration_epoch: 2,
+            sat: "himawari".to_string(),
+            recent: recent.clone(),
+            output_transform: "debug-srgb".to_string(),
+            aod: 0.6,
+            rh_swelling: true,
+            atmosphere_correction: false,
+            terrain_atmosphere: false,
+            land_sza_normalization: false,
+            land_sza_max_gain: 3.0,
+            land_dark_toe: false,
+            land_dark_toe_knee: 0.2,
+            land_dark_toe_gamma: 0.2,
+            land_dark_toe_max_gain: 3.0,
+            clouds_enabled: false,
+            fractional_clouds: false,
+            multiscatter: false,
+            cloud_optical_depth_scale: 2.0,
+            feather_exposed_domain_edges: false,
+            beer_powder: true,
+            granulation: true,
+            exposure: 4.0,
+            ground_gain: 4.0,
+            cloud_softclip: 1.0,
+            cloud_highlight_max: 4.0,
+            ..Default::default()
+        };
+        s.apply_shipped_visible_calibration();
+        let d = StudioSettings::default();
+        assert_eq!(s.visible_calibration_epoch, VISIBLE_CALIBRATION_EPOCH);
+        assert_eq!(s.output_transform, d.output_transform);
+        assert_eq!(s.aod, d.aod);
+        assert_eq!(s.rh_swelling, d.rh_swelling);
+        assert_eq!(s.atmosphere_correction, d.atmosphere_correction);
+        assert_eq!(s.terrain_atmosphere, d.terrain_atmosphere);
+        assert_eq!(s.land_sza_normalization, d.land_sza_normalization);
+        assert_eq!(s.land_sza_max_gain, d.land_sza_max_gain);
+        assert_eq!(s.land_dark_toe, d.land_dark_toe);
+        assert_eq!(s.land_dark_toe_knee, d.land_dark_toe_knee);
+        assert_eq!(s.land_dark_toe_gamma, d.land_dark_toe_gamma);
+        assert_eq!(s.land_dark_toe_max_gain, d.land_dark_toe_max_gain);
+        assert_eq!(s.clouds_enabled, d.clouds_enabled);
+        assert_eq!(s.fractional_clouds, d.fractional_clouds);
+        assert_eq!(s.multiscatter, d.multiscatter);
+        assert_eq!(s.cloud_optical_depth_scale, d.cloud_optical_depth_scale);
+        assert_eq!(
+            s.feather_exposed_domain_edges,
+            d.feather_exposed_domain_edges
+        );
+        assert_eq!(s.beer_powder, d.beer_powder);
+        assert_eq!(s.granulation, d.granulation);
+        assert_eq!(s.exposure, d.exposure);
+        assert_eq!(s.ground_gain, d.ground_gain);
+        assert_eq!(s.cloud_softclip, d.cloud_softclip);
+        assert_eq!(s.cloud_highlight_max, d.cloud_highlight_max);
+        assert_eq!(s.sat, "himawari", "unrelated settings remain intact");
+        assert_eq!(s.recent, recent, "recent files remain intact");
     }
 
     #[test]
@@ -540,14 +716,24 @@ mod tests {
             s.visible_calibration_epoch, 0,
             "pre-epoch files must preserve values and request an explicit migration choice"
         );
-        // Backward compatibility: settings written before these controls existed
-        // receive the new shipped defaults field-by-field via `#[serde(default)]`.
+        // Backward compatibility: settings written before the land controls existed
+        // retain the legacy identity until the user accepts the epoch-4 preset.
         assert!(s.atmosphere_correction);
         assert!(s.terrain_atmosphere);
+        assert!(!s.land_sza_normalization);
+        assert!(!s.land_dark_toe);
+        assert_eq!(
+            s.land_sza_max_gain,
+            StudioSettings::default().land_sza_max_gain
+        );
         assert!(s.fractional_clouds);
         assert_eq!(
             s.cloud_optical_depth_scale,
             DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert!(
+            !s.feather_exposed_domain_edges,
+            "older settings default the new experiment off"
         );
         assert!(!s.beer_powder);
         assert!(!s.granulation);
@@ -603,6 +789,87 @@ mod tests {
         assert_eq!(old_rc.exposure, 1.6);
         assert_eq!(old_rc.ground_gain, 1.6);
         assert!(old_rc.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // The released v0.1.4 epoch is likewise retained verbatim and offered the
+        // v0.1.5 exposure migration rather than being rewritten behind the owner.
+        let v014 = dir.join("v014-calibration.json");
+        std::fs::write(
+            &v014,
+            r#"{
+                "visible_calibration_epoch": 2,
+                "cloud_optical_depth_scale": 0.15,
+                "exposure": 1.0,
+                "ground_gain": 1.0
+            }"#,
+        )
+        .unwrap();
+        let old_v014 = load(&v014);
+        assert_eq!(old_v014.visible_calibration_epoch, 2);
+        assert_eq!(old_v014.cloud_optical_depth_scale, 0.15);
+        assert_eq!(old_v014.exposure, 1.0);
+        assert_eq!(old_v014.ground_gain, 1.0);
+        assert!(old_v014.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // Epoch 3 selected exposure 1.5 while the two land operators were still off.
+        // Preserve that exact saved look and leave the epoch behind 4 so the Studio
+        // offers Apply (both on) versus Keep (both off) instead of silently changing it.
+        let exposure_only_v015 = dir.join("v015-exposure-only-calibration.json");
+        std::fs::write(
+            &exposure_only_v015,
+            r#"{
+                "visible_calibration_epoch": 3,
+                "cloud_optical_depth_scale": 0.15,
+                "exposure": 1.5,
+                "land_sza_normalization": false,
+                "land_dark_toe": false
+            }"#,
+        )
+        .unwrap();
+        let old_v015 = load(&exposure_only_v015);
+        assert_eq!(old_v015.visible_calibration_epoch, 3);
+        assert_eq!(old_v015.exposure, 1.5);
+        assert!(!old_v015.land_sza_normalization);
+        assert!(!old_v015.land_dark_toe);
+        assert!(old_v015.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // Epoch 4 selected both land operators while exposed-domain edge feathering
+        // was still off. Preserve the saved switch verbatim and leave the epoch
+        // behind 5 so Studio offers Apply (edge on) versus Keep (edge off).
+        let land_only_v015 = dir.join("v015-land-only-calibration.json");
+        std::fs::write(
+            &land_only_v015,
+            r#"{
+                "visible_calibration_epoch": 4,
+                "cloud_optical_depth_scale": 0.15,
+                "exposure": 1.5,
+                "land_sza_normalization": true,
+                "land_dark_toe": true,
+                "feather_exposed_domain_edges": false
+            }"#,
+        )
+        .unwrap();
+        let old_land_v015 = load(&land_only_v015);
+        assert_eq!(old_land_v015.visible_calibration_epoch, 4);
+        assert!(old_land_v015.land_sza_normalization);
+        assert!(old_land_v015.land_dark_toe);
+        assert!(!old_land_v015.feather_exposed_domain_edges);
+        assert!(old_land_v015.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // Be conservative with a hand-edited epoch-4 file that omitted the then-new
+        // field: missing still means the former off behavior, never a silent rewrite.
+        let land_only_missing_edge = dir.join("v015-land-only-missing-edge.json");
+        std::fs::write(
+            &land_only_missing_edge,
+            r#"{
+                "visible_calibration_epoch": 4,
+                "land_sza_normalization": true,
+                "land_dark_toe": true
+            }"#,
+        )
+        .unwrap();
+        let old_missing_edge = load(&land_only_missing_edge);
+        assert_eq!(old_missing_edge.visible_calibration_epoch, 4);
+        assert!(!old_missing_edge.feather_exposed_domain_edges);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -611,6 +878,10 @@ mod tests {
         let mut s = StudioSettings {
             margin_pct: 250.0,
             aod: -3.0,
+            land_sza_max_gain: 99.0,
+            land_dark_toe_knee: 0.0,
+            land_dark_toe_gamma: f32::NAN,
+            land_dark_toe_max_gain: -2.0,
             cloud_optical_depth_scale: 99.0,
             fractional_clouds: false,
             exposure: 99.0,
@@ -631,6 +902,13 @@ mod tests {
         s.sanitize();
         assert_eq!(s.margin_pct, 100.0);
         assert_eq!(s.aod, 0.0);
+        assert_eq!(s.land_sza_max_gain, 4.0);
+        assert_eq!(s.land_dark_toe_knee, 1.0e-6);
+        assert_eq!(
+            s.land_dark_toe_gamma,
+            StudioSettings::default().land_dark_toe_gamma
+        );
+        assert_eq!(s.land_dark_toe_max_gain, 1.0);
         assert_eq!(s.cloud_optical_depth_scale, 4.0);
         assert!(
             !s.fractional_clouds,
@@ -725,8 +1003,15 @@ mod tests {
             exposure: 2.5,
             atmosphere_correction: false,
             terrain_atmosphere: false,
+            land_sza_normalization: false,
+            land_sza_max_gain: 1.7,
+            land_dark_toe: false,
+            land_dark_toe_knee: 0.07,
+            land_dark_toe_gamma: 0.6,
+            land_dark_toe_max_gain: 1.4,
             fractional_clouds: false,
             cloud_optical_depth_scale: 0.5,
+            feather_exposed_domain_edges: true,
             beer_powder: true,
             granulation: true,
             ground_gain: 1.6,

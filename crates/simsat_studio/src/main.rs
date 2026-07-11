@@ -61,8 +61,9 @@ use simsat::ingest_grib;
 use simsat::ir::{self, IrConfig, IrScene, IrVolume};
 use simsat::ir_enhance::{IrEnhancement, render_ir_rgba};
 use simsat::render::{
-    CLOUD_SOFTCLIP_KNEE, FLAT_ALBEDO_SRGB, FrameContext, GROUND_DAY_LIFT, RHO_HIGHLIGHT_MAX,
-    SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt, shade_surface, snow_fraction,
+    CLOUD_SOFTCLIP_KNEE, FLAT_ALBEDO_SRGB, FrameContext, GROUND_DAY_LIFT, LandAppearanceConfig,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt,
+    shade_surface, snow_fraction,
 };
 use simsat::sandwich;
 use simsat::solar::{self, SolarFrame};
@@ -853,6 +854,14 @@ struct SimSatStudioApp {
     /// Clip the atmospheric column to each surface pixel's terrain elevation.
     /// On is physical; off reproduces the old full sea-level column for QA.
     terrain_atmosphere: bool,
+    /// Land-only solar-zenith display normalization (owner-selected default on).
+    land_sza_normalization: bool,
+    land_sza_max_gain: f32,
+    /// Bounded dark-reflectance land toe (owner-selected default on).
+    land_dark_toe: bool,
+    land_dark_toe_knee: f32,
+    land_dark_toe_gamma: f32,
+    land_dark_toe_max_gain: f32,
     output_transform: OutputTransform,
     // M4 cloud controls (design section 4) + M5 multi-scatter (section 4/6).
     clouds_enabled: bool,
@@ -863,6 +872,9 @@ struct SimSatStudioApp {
     /// Visible cloud optical-depth calibration. The shipped 0.15 is the owner's
     /// cross-file visual selection; 1.0 uses model extinction without scaling.
     cloud_optical_depth_scale: f32,
+    /// Default-off presentation experiment: taper finished visible clouds where the
+    /// camera exposes the finite WRF domain boundary even without a zoom-out margin.
+    feather_exposed_domain_edges: bool,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the clouds.rs
     /// granulation section). OFF by default as of v0.1.1 — the round-1 default look
@@ -960,6 +972,7 @@ impl SimSatStudioApp {
         // then apply below via `apply_settings` so the mapping lives in one place.
         let settings_path = settings::settings_path();
         let loaded = settings::load(&settings_path);
+        let land_appearance = LandAppearanceConfig::default();
         let mut app = Self {
             gpu,
             gpu_error,
@@ -1009,6 +1022,12 @@ impl SimSatStudioApp {
             rh_swelling: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_sza_normalization: land_appearance.sza_normalization,
+            land_sza_max_gain: land_appearance.sza_max_gain as f32,
+            land_dark_toe: land_appearance.dark_toe,
+            land_dark_toe_knee: land_appearance.dark_toe_knee as f32,
+            land_dark_toe_gamma: land_appearance.dark_toe_gamma as f32,
+            land_dark_toe_max_gain: land_appearance.dark_toe_max_gain as f32,
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: true,
             // Model fractional cloud coverage ON by default; missing fields fall back safely.
@@ -1017,6 +1036,8 @@ impl SimSatStudioApp {
             multiscatter: true,
             // Owner-selected v0.1.4 cross-file visible calibration.
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            // Owner-selected v0.1.5 finite-domain cloud-edge presentation default.
+            feather_exposed_domain_edges: true,
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
             // scatter buildup, so powder-on would double-darken (design M5 decision).
             beer_powder: false,
@@ -1030,8 +1051,8 @@ impl SimSatStudioApp {
             gpu_clouds: false,
             parity_pending: false,
             parity: None,
-            // Neutral reflectance-factor gain before the ABI square-root display
-            // stretch; brighter appearance presets remain explicit controls.
+            // Owner-selected display gain before the ABI square-root stretch;
+            // exposure 1.0 remains the exact neutral override.
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             ground_gain: GROUND_DAY_LIFT as f32,
             cloud_softclip: CLOUD_SOFTCLIP_KNEE as f32,
@@ -1110,10 +1131,17 @@ impl SimSatStudioApp {
         self.rh_swelling = s.rh_swelling;
         self.atmosphere_correction = s.atmosphere_correction;
         self.terrain_atmosphere = s.terrain_atmosphere;
+        self.land_sza_normalization = s.land_sza_normalization;
+        self.land_sza_max_gain = s.land_sza_max_gain;
+        self.land_dark_toe = s.land_dark_toe;
+        self.land_dark_toe_knee = s.land_dark_toe_knee;
+        self.land_dark_toe_gamma = s.land_dark_toe_gamma;
+        self.land_dark_toe_max_gain = s.land_dark_toe_max_gain;
         self.clouds_enabled = s.clouds_enabled;
         self.fractional_clouds = s.fractional_clouds;
         self.multiscatter = s.multiscatter;
         self.cloud_optical_depth_scale = s.cloud_optical_depth_scale;
+        self.feather_exposed_domain_edges = s.feather_exposed_domain_edges;
         self.beer_powder = s.beer_powder;
         self.granulation = s.granulation;
         self.exposure = s.exposure;
@@ -1144,10 +1172,17 @@ impl SimSatStudioApp {
             rh_swelling: self.rh_swelling,
             atmosphere_correction: self.atmosphere_correction,
             terrain_atmosphere: self.terrain_atmosphere,
+            land_sza_normalization: self.land_sza_normalization,
+            land_sza_max_gain: self.land_sza_max_gain,
+            land_dark_toe: self.land_dark_toe,
+            land_dark_toe_knee: self.land_dark_toe_knee,
+            land_dark_toe_gamma: self.land_dark_toe_gamma,
+            land_dark_toe_max_gain: self.land_dark_toe_max_gain,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
             multiscatter: self.multiscatter,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             exposure: self.exposure,
@@ -1916,6 +1951,18 @@ impl SimSatStudioApp {
         Ok((rendered, texture, gpu_info))
     }
 
+    /// Keep the UI, worker capture, and GPU-compatibility gate on one land config.
+    fn land_appearance_config(&self) -> LandAppearanceConfig {
+        LandAppearanceConfig {
+            sza_normalization: self.land_sza_normalization,
+            sza_max_gain: self.land_sza_max_gain as f64,
+            dark_toe: self.land_dark_toe,
+            dark_toe_knee: self.land_dark_toe_knee as f64,
+            dark_toe_gamma: self.land_dark_toe_gamma as f64,
+            dark_toe_max_gain: self.land_dark_toe_max_gain as f64,
+        }
+    }
+
     /// Snapshot the M2/M4/M5/M6 render controls into the worker-side `AtmoSettings`
     /// (shared by the single Render and the batch loop so every frame uses the current
     /// satellite/exposure/view/mode/enhancement settings).
@@ -1939,11 +1986,13 @@ impl SimSatStudioApp {
             rh_swelling: self.rh_swelling,
             atmosphere_correction: self.atmosphere_correction,
             terrain_atmosphere: self.terrain_atmosphere,
+            land_appearance: self.land_appearance_config(),
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
             multiscatter: self.multiscatter,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             step_quality: self.step_quality,
@@ -2783,7 +2832,7 @@ impl SimSatStudioApp {
             });
     }
 
-    /// Non-destructive calibration migration. Settings written before the v0.1.4
+    /// Non-destructive calibration migration. Settings written before the v0.1.5
     /// epoch keep every saved value; this banner makes that fact visible and asks the
     /// user to either apply the new RC preset or deliberately keep their controls.
     fn calibration_epoch_banner(&mut self, ui: &mut egui::Ui) {
@@ -2799,28 +2848,12 @@ impl SimSatStudioApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(245, 210, 120),
-                        "v0.1.4 has a new visible calibration. Your saved controls are still active.",
+                        "v0.1.5 has a new visible calibration. Your saved controls are still active.",
                     );
-                    if ui.button("Use v0.1.4 RC preset").clicked() {
-                        let d = settings::StudioSettings::default();
-                        self.aod = d.aod;
-                        self.rh_swelling = d.rh_swelling;
-                        self.atmosphere_correction = d.atmosphere_correction;
-                        self.terrain_atmosphere = d.terrain_atmosphere;
-                        self.output_transform =
-                            settings::output_transform_from_token(&d.output_transform)
-                                .unwrap_or(OutputTransform::AbiReflectance);
-                        self.clouds_enabled = d.clouds_enabled;
-                        self.fractional_clouds = d.fractional_clouds;
-                        self.multiscatter = d.multiscatter;
-                        self.cloud_optical_depth_scale = d.cloud_optical_depth_scale;
-                        self.beer_powder = d.beer_powder;
-                        self.granulation = d.granulation;
-                        self.exposure = d.exposure;
-                        self.ground_gain = d.ground_gain;
-                        self.cloud_softclip = d.cloud_softclip;
-                        self.cloud_highlight_max = d.cloud_highlight_max;
-                        self.visible_calibration_epoch = settings::VISIBLE_CALIBRATION_EPOCH;
+                    if ui.button("Use v0.1.5 visible preset").clicked() {
+                        let mut migrated = self.settings_snapshot();
+                        migrated.apply_shipped_visible_calibration();
+                        self.apply_settings(&migrated);
                     }
                     if ui.button("Keep my saved controls").clicked() {
                         self.visible_calibration_epoch = settings::VISIBLE_CALIBRATION_EPOCH;
@@ -2828,8 +2861,9 @@ impl SimSatStudioApp {
                 });
                 ui.weak(
                     "Full shipped visible baseline: AOD/atmosphere/output/cloud toggles plus \
-                     OD 0.15 (owner-selected cross-file calibration), exposure 1.00, ground 1.00, \
-                     knee 0.65, ceiling 1.25, fractional clouds on, granulation off.",
+                     OD 0.15, exposure 1.50, SZA normalization + dark-land toe on, exposed-domain \
+                     edge feathering on, ground 1.00, knee 0.65, ceiling 1.25, fractional clouds \
+                     on, granulation off.",
                 );
             });
     }
@@ -3134,6 +3168,64 @@ impl SimSatStudioApp {
                              keeps more structure in bright anvils; this is display-only.",
                         );
                     });
+                    ui.separator();
+                    ui.label("Land visibility calibration (independent controls)");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(
+                            &mut self.land_sza_normalization,
+                            "Land solar-zenith normalization",
+                        )
+                        .on_hover_text(
+                            "Bounded land-only operational-display correction for moderate sun \
+                             angles. It is exactly neutral through twilight and at/above a \
+                             60-degree sun; ocean, cloud radiance, and raw bands are untouched.",
+                        );
+                        ui.add_enabled_ui(self.land_sza_normalization, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.land_sza_max_gain, 1.0..=4.0)
+                                    .text("SZA max gain"),
+                            )
+                            .on_hover_text("Upper bound; 1.0 is an identity correction.");
+                        });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut self.land_dark_toe, "Dark-land reflectance toe")
+                            .on_hover_text(
+                                "Bounded scalar lift below a linear-reflectance knee. It \
+                                 preserves black and land colour ratios; brighter terrain, \
+                                 ocean, cloud radiance, twilight, and raw bands are unchanged.",
+                            );
+                        ui.add_enabled_ui(self.land_dark_toe, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.land_dark_toe_knee, 0.001..=0.25)
+                                    .text("Toe knee"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.land_dark_toe_gamma, 0.05..=1.0)
+                                    .text("Toe gamma"),
+                            )
+                            .on_hover_text("1.0 is identity; lower values lift dark land.");
+                            ui.add(
+                                egui::Slider::new(&mut self.land_dark_toe_max_gain, 1.0..=4.0)
+                                    .text("Toe max gain"),
+                            );
+                        });
+                    });
+                    if self.land_sza_normalization || self.land_dark_toe {
+                        ui.weak(
+                            "Land visibility corrections active for finished visible land only; \
+                             CPU and GPU surface paths use the same bounded formulas.",
+                        );
+                    }
+                    if ui.button("Restore shipped land calibration").clicked() {
+                        let land = LandAppearanceConfig::default();
+                        self.land_sza_normalization = land.sza_normalization;
+                        self.land_sza_max_gain = land.sza_max_gain as f32;
+                        self.land_dark_toe = land.dark_toe;
+                        self.land_dark_toe_knee = land.dark_toe_knee as f32;
+                        self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
+                        self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+                    }
                     let calibrated = display_calibration_is_dirty(
                         self.exposure,
                         self.ground_gain,
@@ -3301,6 +3393,27 @@ impl SimSatStudioApp {
                             {
                                 self.cloud_optical_depth_scale = 1.0;
                             }
+                            if ui
+                                .checkbox(
+                                    &mut self.feather_exposed_domain_edges,
+                                    "Feather exposed domain edges",
+                                )
+                                .on_hover_text(
+                                    "Presentation experiment for finite regional WRF domains: \
+                                     fade finished visible cloud extinction over the existing \
+                                     outer 4% band when the camera reveals ground or sky beyond \
+                                     the model boundary, even at 0% margin. On is the shipped \
+                                     v0.1.5 preset; Off is the exact prior margin-gated behavior. \
+                                     Interior clouds, raw bands, \
+                                     IR/WV, and derived fields are unchanged. CPU-only until the \
+                                     GPU shader has an exact twin.",
+                                )
+                                .changed()
+                                && self.feather_exposed_domain_edges
+                            {
+                                self.gpu_clouds = false;
+                                self.parity_pending = false;
+                            }
                             ui.checkbox(&mut self.beer_powder, "Beer-powder")
                                 .on_hover_text(
                                     "Schneider sugar-powder darkening of the sun term \
@@ -3362,6 +3475,8 @@ impl SimSatStudioApp {
                         <= f32::EPSILON
                         && (self.cloud_highlight_max - RHO_HIGHLIGHT_MAX as f32).abs()
                             <= f32::EPSILON;
+                    let gpu_land_appearance_ok =
+                        gpu_land_appearance_compatible(self.land_appearance_config());
                     let gpu_applicable = self.gpu.is_some()
                         && matches!(self.render_mode, RenderMode::Visible)
                         && self.view == StudioView::Geostationary
@@ -3372,7 +3487,11 @@ impl SimSatStudioApp {
                         && !self.terrain_atmosphere
                         && gpu_fractional_preview_compatible(self.fractional_clouds)
                         && gpu_granulation_preview_compatible(self.granulation)
-                        && gpu_tonemap_ok;
+                        && gpu_exposed_edge_feather_compatible(
+                            self.feather_exposed_domain_edges,
+                        )
+                        && gpu_tonemap_ok
+                        && gpu_land_appearance_ok;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
                     // cluster was unexplained (owner-reported) — name the unmet
                     // conditions inline and on the disabled-hover instead.
@@ -3398,6 +3517,9 @@ impl SimSatStudioApp {
                         if self.granulation {
                             unmet.push("Granulation off");
                         }
+                        if self.feather_exposed_domain_edges {
+                            unmet.push("Feather exposed domain edges off");
+                        }
                         if !gpu_tonemap_ok {
                             unmet.push("shipped highlight calibration");
                         }
@@ -3409,9 +3531,10 @@ impl SimSatStudioApp {
                     };
                     const GPU_DISABLED_HINT: &str =
                         "Enabled in Visible mode + Geostationary view with Clouds on \
-                         terrain-height atmosphere off, Use model cloud fraction off, and \
-                         Granulation off. Fractional subcolumns, granulation, and custom \
-                         highlight calibration are CPU-only. Also needs a GPU device, a loaded \
+                         terrain-height atmosphere off, Use model cloud fraction off, \
+                         Granulation off, and Feather exposed domain edges off. Fractional \
+                         subcolumns, granulation, exposed-edge feathering, and custom highlight \
+                         calibration are CPU-only. Also needs a GPU device, a loaded \
                          run, and no render in progress.";
                     ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(gpu_applicable, |ui| {
@@ -4318,6 +4441,9 @@ struct AtmoSettings {
     atmosphere_correction: bool,
     /// Clip view/sun atmospheric columns to terrain elevation (physical default on).
     terrain_atmosphere: bool,
+    /// Display-only land corrections. The shipped preset enables both bounded
+    /// corrections; the persisted toggles can select the exact legacy identity.
+    land_appearance: LandAppearanceConfig,
     output_transform: OutputTransform,
     clouds_enabled: bool,
     /// Use the source's cloud-fraction/subcolumn closure when available. The CPU
@@ -4327,6 +4453,8 @@ struct AtmoSettings {
     multiscatter: bool,
     /// Visible cloud optical-depth scale. Shipped = 0.15; 1.0 is unscaled.
     cloud_optical_depth_scale: f32,
+    /// Fade finished visible clouds at camera-exposed finite-domain boundaries.
+    feather_exposed_domain_edges: bool,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise): when on, the visible
     /// cloud march + sun march + sun-OD map all sample the SAME dx-amplitude eroded
@@ -4682,6 +4810,11 @@ fn prepare_render(
     // Granulation changes both view extinction and the sunlight OD field. The WGSL
     // preview has neither, so never silently drop this physical control.
     let gpu_granulation_ok = gpu_granulation_preview_compatible(atmo.granulation);
+    // The exposed-domain edge control resolves against the camera raster. The WGSL
+    // preview has only the legacy margin value, so keep the requested presentation exact
+    // by routing it through CPU until the shader receives a reviewed twin.
+    let gpu_exposed_edge_feather_ok =
+        gpu_exposed_edge_feather_compatible(atmo.feather_exposed_domain_edges);
     // The cloud shader consumes exposure and ground lift through `CloudMarchParams`, but
     // its highlight knee/ceiling remain baked. Route custom values through CPU rather
     // than displaying a plausible-looking frame that silently ignored the controls.
@@ -4695,6 +4828,10 @@ fn prepare_render(
         atmo.cloud_softclip,
         atmo.cloud_highlight_max,
     );
+    // Both visible WGSL paths carry exact formula twins and sanitized uniforms for the
+    // land corrections. Keep this predicate at the UI/worker seam so future land
+    // operators cannot silently become GPU-eligible without an explicit review.
+    let gpu_land_appearance_ok = gpu_land_appearance_compatible(atmo.land_appearance);
     let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
         && atmo.clouds_enabled
         && !is_topdown
@@ -4704,7 +4841,9 @@ fn prepare_render(
         && gpu_atmosphere_ok
         && gpu_fractional_clouds_ok
         && gpu_granulation_ok
-        && gpu_cloud_tonemap_ok;
+        && gpu_exposed_edge_feather_ok
+        && gpu_cloud_tonemap_ok
+        && gpu_land_appearance_ok;
     if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
         status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
     }
@@ -4723,12 +4862,18 @@ fn prepare_render(
              sub-grid detail is not ignored.",
         );
     }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_exposed_edge_feather_ok {
+        status(
+            "GPU clouds: exposed-domain edge feathering is CPU-only; using the CPU \
+             composite so the requested boundary presentation is not ignored.",
+        );
+    }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_tonemap_ok {
         status("GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU composite.");
     }
     if !atmo.clouds_enabled
         && matches!(atmo.render_mode, RenderMode::Visible)
-        && !gpu_surface_display_ok
+        && (!gpu_surface_display_ok || !gpu_land_appearance_ok)
     {
         status(
             "Clear-sky display calibration is not representable by the GPU surface pass; \
@@ -4983,6 +5128,7 @@ fn prepare_render(
         ambient_elev_max: sky_sh.elev_max_deg as f32,
         ambient_n: sky_sh.entries.len() as f32,
         atmosphere_correction: if atmo.atmosphere_correction { 1.0 } else { 0.0 },
+        land_appearance: atmo.land_appearance,
     };
     let transmittance_lut = luts.transmittance.data.clone();
     let multiscatter_lut = luts.multiscatter.data.clone();
@@ -5065,9 +5211,12 @@ fn prepare_render(
         // compute and the clouds.wgsl march (gpu::CloudPassResources::render). The
         // CPU composite remains the shipping default and the ONLY stored path; a
         // parity render ALSO marches the CPU reference here for the diff.
-        status("Preparing GPU cloud volume...");
-        let vol = clouds::DecodedVolume::from_brick_legacy(&brick, horiz_pitch_m);
-        let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+        status("Preparing quantized GPU cloud volume...");
+        // The live GPU shader consumes the brick's raw u8 codes. Build its binary
+        // occupancy mip from those same codes too: decoding four full f32 volumes
+        // solely for this conservative skip field used multiple GiB on large HRRR
+        // bricks. The helper is byte-pinned against the decoded reference in gpu tests.
+        let occupancy = gpu::quantized_occupancy_upload(&brick, clouds::OCCUPANCY_MIP_FACTOR);
         let scan_rect = clouds::scan_rect_of(&raster.scan);
         let froxel = atmosphere::build_aerial_froxel(
             luts,
@@ -5077,7 +5226,11 @@ fn prepare_render(
             scan_rect,
             atmosphere::AERIAL_FROXEL_DIM,
         );
-        let pitch = vol.voxel_pitch_m();
+        // Exact twins of DecodedVolume::{voxel_pitch_m,r_bottom,r_top}; no decoded
+        // volume is needed unless the explicit CPU parity render below is requested.
+        let pitch = brick.dz_m.min(horiz_pitch_m).max(1.0);
+        let r_bottom_m = atmosphere::R_GROUND_M + brick.z_min_m;
+        let r_top_m = r_bottom_m + brick.nz as f64 * brick.dz_m;
         // The GPU pass always renders the INTERACTIVE schedule — the wgsl's
         // documented sun-march constants are the Interactive (6, 2.0) pair.
         // Eligibility above guarantees granulation is off; a requested granulated
@@ -5114,8 +5267,8 @@ fn prepare_render(
             nx,
             ny,
             brick.nz,
-            vol.z_min_m,
-            vol.dz_m,
+            brick.z_min_m,
+            brick.dz_m,
             pitch,
             sun_ecef,
             SUN_OD_RESOLUTION,
@@ -5131,6 +5284,8 @@ fn prepare_render(
         // aperture / wind / snow (an expected real difference, see the notes).
         let cpu_reference = if atmo.parity {
             status("Parity: marching the CPU reference (Interactive schedule)...");
+            let vol = clouds::DecodedVolume::from_brick_legacy(&brick, horiz_pitch_m);
+            let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
             let sun_od = clouds::accumulate_sun_od_granulated(
                 &vol,
                 &georef,
@@ -5166,6 +5321,7 @@ fn prepare_render(
                 cloud_highlight_max: atmo.cloud_highlight_max,
                 atmosphere_correction: atmo.atmosphere_correction,
                 terrain_atmosphere: atmo.terrain_atmosphere,
+                land_appearance: atmo.land_appearance,
             };
             let bm_ref = bluemarble.as_ref().map(|a| &a.0);
             let rnx = raster.nx;
@@ -5221,11 +5377,11 @@ fn prepare_render(
         status("Packing the GPU volume upload...");
         gpu_cloud_out = Some(Box::new(GpuCloudPrep {
             texture_a: clouds::pack_texture_a(&brick),
-            occupancy: mip.to_r8_occupancy(),
+            occupancy: occupancy.r8,
             vol_nx: brick.nx as u32,
             vol_ny: brick.ny as u32,
             vol_nz: brick.nz as u32,
-            occ_dims: (mip.mx as u32, mip.my as u32, mip.mz as u32),
+            occ_dims: occupancy.dims,
             ql: [
                 lq.vmin as f32,
                 lq.vmax as f32,
@@ -5238,10 +5394,10 @@ fn prepare_render(
                 tq.vmin as f32,
                 tq.vmax as f32,
             ],
-            z_min_m: vol.z_min_m as f32,
-            dz_m: vol.dz_m as f32,
-            r_top_m: vol.r_top() as f32,
-            r_bottom_m: vol.r_bottom() as f32,
+            z_min_m: brick.z_min_m as f32,
+            dz_m: brick.dz_m as f32,
+            r_top_m: r_top_m as f32,
+            r_bottom_m: r_bottom_m as f32,
             voxel_pitch_m: pitch as f32,
             geo: gpu::geo_quads(&georef),
             march,
@@ -5266,6 +5422,7 @@ fn prepare_render(
         || is_visible_ir_composite
         || !gpu_atmosphere_ok
         || !gpu_surface_display_ok
+        || !gpu_land_appearance_ok
     {
         // ── CPU VISIBLE composite. Geostationary clouds-ON composites the M4/M5 cloud
         // march over the M2/M3 surface radiance (the tested CPU render path; the GPU
@@ -5359,17 +5516,24 @@ fn prepare_render(
             } else {
                 1
             },
+            // The legacy behavior described below remains exact when the new switch is
+            // Off. When On, the shared resolver also activates the same band for an
+            // actually exposed geo/perspective domain boundary at margin zero.
             // EDGE FEATHER (WS4 item 7): active only under a zoom-out margin (a
             // byte-identical no-op at margin 0) — the cloud contribution ramps to
             // zero over the outer band of the domain so clouds melt into the margin
             // instead of the hard glassy domain-edge cut seen in the QA frames.
-            // Mirrors api.rs's wiring of the same engine function. Perspective
-            // ignores the margin, so no feather there (the api perspective pattern).
-            edge_feather_cells: if is_persp {
-                0.0
-            } else {
-                clouds::edge_feather_cells_for_margin(margin, nx, ny)
-            },
+            // Mirrors api.rs's wiring of the same engine function. Perspective ignores
+            // the margin, but the opt-in still resolves from its actual camera raster.
+            edge_feather_cells: studio_edge_feather_cells(
+                is_persp,
+                margin,
+                nx,
+                ny,
+                atmo.feather_exposed_domain_edges,
+                &raster.grid_i,
+                &raster.grid_j,
+            ),
             // Sub-grid granulation: the SAME value the sun-OD map above was
             // accumulated with (one eroded field per composite).
             granulation,
@@ -5403,6 +5567,7 @@ fn prepare_render(
             cloud_highlight_max: atmo.cloud_highlight_max,
             atmosphere_correction: atmo.atmosphere_correction,
             terrain_atmosphere: atmo.terrain_atmosphere,
+            land_appearance: atmo.land_appearance,
         };
         let bm_ref = bluemarble.as_ref().map(|a| &a.0);
         let rnx = raster.nx;
@@ -5902,6 +6067,33 @@ fn gpu_granulation_preview_compatible(granulation: bool) -> bool {
     !granulation
 }
 
+/// The current WGSL preview accepts only the legacy margin-derived feather width;
+/// it cannot inspect camera-raster coverage to activate the exposed-domain experiment.
+fn gpu_exposed_edge_feather_compatible(feather_exposed_domain_edges: bool) -> bool {
+    !feather_exposed_domain_edges
+}
+
+/// Studio-side call seam for the engine-owned camera-coverage resolver. Perspective
+/// ignores the margin slider, while geo/top-down retain the current margin behavior.
+fn studio_edge_feather_cells(
+    is_perspective: bool,
+    margin: f64,
+    nx: usize,
+    ny: usize,
+    feather_exposed_domain_edges: bool,
+    grid_i: &[f32],
+    grid_j: &[f32],
+) -> f64 {
+    clouds::edge_feather_cells_for_raster(
+        if is_perspective { 0.0 } else { margin },
+        nx,
+        ny,
+        feather_exposed_domain_edges,
+        grid_i,
+        grid_j,
+    )
+}
+
 /// The cloud WGSL path has baked highlight shoulder constants. Exposure and ground
 /// lift are uniforms, so only the two baked values constrain GPU preview eligibility.
 fn gpu_cloud_tonemap_compatible(cloud_softclip: f64, cloud_highlight_max: f64) -> bool {
@@ -5922,6 +6114,13 @@ fn gpu_surface_display_compatible(
     (exposure - 1.0).abs() <= EPS
         && (ground_gain - 1.0).abs() <= EPS
         && gpu_cloud_tonemap_compatible(cloud_softclip, cloud_highlight_max)
+}
+
+/// Both visible WGSL paths consume the complete, sanitized land-appearance uniform.
+/// All parameter states are representable: the packer duplicates the CPU bounds and
+/// non-finite fallbacks before f32 upload, and both switches remain independent.
+fn gpu_land_appearance_compatible(_config: LandAppearanceConfig) -> bool {
+    true
 }
 
 /// Default sat-store root under the SimSat Studio data dir (sibling of the brick
@@ -6129,6 +6328,7 @@ mod tests {
             cloud_highlight_max: RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: false,
+            land_appearance: LandAppearanceConfig::identity(),
         }
     }
 
@@ -6211,6 +6411,47 @@ mod tests {
     }
 
     #[test]
+    fn gpu_preview_never_silently_drops_exposed_edge_feathering() {
+        assert!(gpu_exposed_edge_feather_compatible(false));
+        assert!(!gpu_exposed_edge_feather_compatible(true));
+    }
+
+    #[test]
+    fn studio_cpu_edge_feather_seam_uses_camera_coverage_and_ignores_perspective_margin() {
+        let all_i = vec![5.0f32; 8];
+        let all_j = vec![7.0f32; 8];
+        let mut exposed_i = all_i.clone();
+        exposed_i[0] = f32::NAN;
+        let expected = clouds::EDGE_FEATHER_BAND_FRAC * 100.0;
+
+        assert_eq!(
+            studio_edge_feather_cells(false, 0.0, 100, 120, false, &exposed_i, &all_j),
+            0.0,
+            "Off is the exact margin-zero legacy path"
+        );
+        assert_eq!(
+            studio_edge_feather_cells(false, 0.0, 100, 120, true, &exposed_i, &all_j),
+            expected,
+            "geo coverage activates the opt-in"
+        );
+        assert_eq!(
+            studio_edge_feather_cells(false, 0.0, 100, 120, true, &all_i, &all_j),
+            0.0,
+            "all-in-domain top-down coverage stays an identity"
+        );
+        assert_eq!(
+            studio_edge_feather_cells(true, 0.5, 100, 120, false, &exposed_i, &all_j),
+            0.0,
+            "perspective ignores the unrelated margin slider when Off"
+        );
+        assert_eq!(
+            studio_edge_feather_cells(true, 0.5, 100, 120, true, &exposed_i, &all_j),
+            expected,
+            "perspective still resolves actual exposed camera coverage when On"
+        );
+    }
+
+    #[test]
     fn shipped_display_reset_and_dirty_check_include_exposure() {
         let shipped = shipped_display_calibration();
         assert_eq!(shipped.0, simsat::render::DEFAULT_EXPOSURE as f32);
@@ -6242,8 +6483,17 @@ mod tests {
         assert!(!gpu_cloud_tonemap_compatible(0.75, RHO_HIGHLIGHT_MAX));
         assert!(!gpu_cloud_tonemap_compatible(CLOUD_SOFTCLIP_KNEE, 1.05));
 
-        assert!(gpu_surface_display_compatible(
+        // The clear-sky surface shader is still an exposure-1.0 reference. The
+        // owner-selected 1.5 default must therefore route to CPU rather than being
+        // silently previewed at the wrong brightness.
+        assert!(!gpu_surface_display_compatible(
             simsat::render::DEFAULT_EXPOSURE,
+            GROUND_DAY_LIFT,
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX
+        ));
+        assert!(gpu_surface_display_compatible(
+            1.0,
             GROUND_DAY_LIFT,
             CLOUD_SOFTCLIP_KNEE,
             RHO_HIGHLIGHT_MAX
@@ -6260,6 +6510,26 @@ mod tests {
             CLOUD_SOFTCLIP_KNEE,
             RHO_HIGHLIGHT_MAX
         ));
+
+        assert!(gpu_land_appearance_compatible(
+            LandAppearanceConfig::default()
+        ));
+        assert!(gpu_land_appearance_compatible(
+            LandAppearanceConfig::identity()
+        ));
+        assert!(gpu_land_appearance_compatible(LandAppearanceConfig {
+            sza_normalization: true,
+            ..LandAppearanceConfig::identity()
+        }));
+        assert!(gpu_land_appearance_compatible(LandAppearanceConfig {
+            dark_toe: true,
+            ..LandAppearanceConfig::identity()
+        }));
+        assert!(gpu_land_appearance_compatible(LandAppearanceConfig {
+            sza_max_gain: f64::NAN,
+            dark_toe_knee: f64::INFINITY,
+            ..LandAppearanceConfig::default()
+        }));
     }
 
     #[test]

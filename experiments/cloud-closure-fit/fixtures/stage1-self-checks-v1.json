@@ -1,0 +1,43 @@
+{
+  "checks": {
+    "cuda_order_truncation": {
+      "affected_case_count": 93,
+      "maximum_truncated_fraction": 0.007825136184692383
+    },
+    "cuda_precision_target": {
+      "failure_cases": [],
+      "failure_count": 0
+    },
+    "delta_exact_join_energy": {
+      "maximum_abs_energy_sum_error": 1.1102230246251565e-16,
+      "row_count": 603
+    },
+    "exact_request_result_join": {
+      "request_count": 603,
+      "result_count": 603,
+      "unique_case_count": 603
+    },
+    "observable_separation": {
+      "directional_fit_target": "CUDA BRF",
+      "hemispheric_flux_used_in_directional_fit": false
+    },
+    "split_counts": {
+      "absorption-holdout": 36,
+      "angular-holdout": 243,
+      "calibration": 324
+    },
+    "surface_albedo_coverage": {
+      "stability_testable": false,
+      "unique_values": [
+        0.0
+      ]
+    },
+    "tau_zero": {
+      "all_directional_brf_exact_zero": true,
+      "row_count": 63
+    }
+  },
+  "schema": "simsat.cloud-closure-fit.stage1-self-checks.v1",
+  "schema_version": 1,
+  "status": "pass"
+}

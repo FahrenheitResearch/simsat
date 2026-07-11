@@ -357,6 +357,7 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 cloud_highlight_max: simsat::render::RHO_HIGHLIGHT_MAX,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
+                land_appearance: simsat::render::LandAppearanceConfig::identity(),
             };
             let sun_enu = [0.0f32, e.cos() as f32, e.sin() as f32];
             let rnx = native.nx;

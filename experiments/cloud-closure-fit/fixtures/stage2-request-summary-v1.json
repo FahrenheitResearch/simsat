@@ -1,0 +1,94 @@
+{
+  "blocker": "the current oracle has only a black lower boundary, one HG lobe, no matched per-state forward R/T/A, and no depth-binned collision source",
+  "coverage": {
+    "holdout_axis_counts": {
+      "absorption": 180,
+      "albedo": 240,
+      "geometry": 240,
+      "phase_shape": 320
+    },
+    "phase_profiles": {
+      "shipping-ice-dual-hg": 160,
+      "shipping-liquid-dual-hg": 160,
+      "single-hg-g0p665": 160,
+      "single-hg-g0p75": 160,
+      "single-hg-g0p85": 160
+    },
+    "solar_zenith_deg": [
+      30.0,
+      65.0
+    ],
+    "split_counts": {
+      "absorption-holdout": 72,
+      "albedo-extrapolation-holdout": 36,
+      "albedo-extrapolation-holdout+angular-holdout": 18,
+      "albedo-extrapolation-holdout+angular-holdout+phase-shape-holdout": 12,
+      "albedo-extrapolation-holdout+phase-shape-holdout": 24,
+      "albedo-interpolation-holdout": 60,
+      "albedo-interpolation-holdout+angular-holdout": 30,
+      "albedo-interpolation-holdout+angular-holdout+phase-shape-holdout": 20,
+      "albedo-interpolation-holdout+phase-shape-holdout": 40,
+      "angular-holdout": 60,
+      "angular-holdout+absorption-holdout": 36,
+      "angular-holdout+phase-shape-holdout": 40,
+      "angular-holdout+phase-shape-holdout+absorption-holdout": 24,
+      "calibration": 120,
+      "order-convergence-holdout": 48,
+      "phase-shape-holdout": 80,
+      "phase-shape-holdout+absorption-holdout": 48,
+      "phase-shape-holdout+order-convergence-holdout": 32
+    },
+    "ssa": [
+      0.95,
+      0.999
+    ],
+    "surface_albedo": [
+      0.0,
+      0.2,
+      0.6,
+      0.85
+    ],
+    "tau": [
+      0.1,
+      0.3,
+      1.0,
+      3.0,
+      10.0,
+      30.0
+    ]
+  },
+  "effective_radius_policy": "do not use effective radius as a phase surrogate until a wavelength-specific liquid/ice phase table is selected and recorded by immutable hash",
+  "grid_sha256": "2cd8e9630cd45d292067aba63904cb3c2d2fdfd9c81f49c9aa506394f3decfa0",
+  "matched_first_moment_phase_tests": [
+    {
+      "control": "single-hg-g0p75",
+      "holdout": "shipping-liquid-dual-hg",
+      "phase_first_moment": 0.75
+    },
+    {
+      "control": "single-hg-g0p665",
+      "holdout": "shipping-ice-dual-hg",
+      "phase_first_moment": 0.665
+    }
+  ],
+  "row_count": 800,
+  "runnable_with_current_oracle": false,
+  "schema": "simsat.cloud-closure-fit.stage2-request-summary.v1",
+  "schema_version": 1,
+  "script_sha256": "b933410d8a6f8f1da357328c88f8f97277804d9df2e61c6a51beb6c426a58d42",
+  "smallest_next_oracle_capabilities": [
+    "lambertian-lower-boundary",
+    "mixture-hg-sampling",
+    "matched-forward-RTA",
+    "depth-binned-collision-source"
+  ],
+  "tau30_order_convergence": {
+    "acceptance": "absolute BRF difference <= max(0.002, two pooled Monte Carlo standard errors) and truncated fraction <= 1e-4 at 2048",
+    "group_count": 40,
+    "orders": [
+      1024,
+      2048
+    ]
+  },
+  "total_requested_paths": 3690987520
+}

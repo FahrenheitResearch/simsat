@@ -46,12 +46,96 @@ pub const WATER_ALBEDO_DAY_SCALE: f64 = 0.35;
 /// to exactly `1` at every elevation (byte-identical). `0.0` = the old hard floor.
 pub const CLOUD_SHADOW_FLOOR: f64 = 0.25;
 
-/// Default display-side exposure gain (see [`radiance_to_rgba`]). `1.0` keeps the
-/// modeled reflectance factor unchanged before the ABI square-root display stretch,
-/// matching the neutral operational-product transfer. The former `1.6` appearance
-/// preset blew out cloud tops and over-brightened terrain in the v0.1.4 cross-case
-/// review; it remains available as an explicit Studio/CLI/Python override.
-pub const DEFAULT_EXPOSURE: f64 = 1.0;
+/// Default display-side exposure gain (see [`radiance_to_rgba`]). The v0.1.5
+/// cross-case review selected `1.5`: it restores the uniformly dark HRRR 21Z frame,
+/// while the exposure-aware highlight shoulder keeps the 2011 NSSL and Michael
+/// cloud cases below clipping. `1.0` remains the exact neutral/identity override in
+/// Studio, the CLI, Python, and the Rust API.
+pub const DEFAULT_EXPOSURE: f64 = 1.5;
+
+/// Reference solar elevation for the land-only solar-zenith display
+/// normalization. At and above this elevation the correction is exactly neutral.
+pub const LAND_SZA_REFERENCE_ELEV_DEG: f64 = 60.0;
+
+/// Default upper bound for the land-only solar-zenith normalization.
+/// The correction is also gated off through the established twilight band, so this
+/// limit is reached only in moderate daylight.
+pub const LAND_SZA_MAX_GAIN: f64 = 1.6;
+
+/// Linear-reflectance luminance knee for the dark-land toe. Land at or above
+/// this value is unchanged; darker positive reflectances receive a bounded scalar lift.
+pub const LAND_DARK_TOE_KNEE: f64 = 0.08;
+
+/// Power-law exponent for the dark-land toe. Values below one lift the dark
+/// reflectance range while preserving zero and meeting the identity at the knee.
+pub const LAND_DARK_TOE_GAMMA: f64 = 0.65;
+
+/// Default upper bound for the dark-land toe's scalar lift.
+pub const LAND_DARK_TOE_MAX_GAIN: f64 = 1.5;
+
+/// Display-only land appearance controls. The owner-selected v0.1.5 preset enables
+/// both corrections; [`LandAppearanceConfig::identity`] is the explicit legacy/no-op
+/// path. They operate on the land surface signal before aerial perspective and cloud
+/// compositing. Water/glint, clouds, limb/space, thermal products, derived products,
+/// cloud-only layers, and raw visible-band diagnostics do not consume them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LandAppearanceConfig {
+    /// Recover the operational true-colour visibility lost when a Lambertian surface is
+    /// viewed at moderate solar zenith. Exactly neutral through twilight and at/above
+    /// [`LAND_SZA_REFERENCE_ELEV_DEG`].
+    pub sza_normalization: bool,
+    /// Upper bound for [`LandAppearanceConfig::sza_normalization`].
+    pub sza_max_gain: f64,
+    /// Apply a bounded toe to dark positive land reflectances. Zero and reflectances at
+    /// or above [`LandAppearanceConfig::dark_toe_knee`] remain unchanged.
+    pub dark_toe: bool,
+    /// Linear-reflectance luminance knee for the dark-land toe.
+    pub dark_toe_knee: f64,
+    /// Power-law exponent for the dark-land toe.
+    pub dark_toe_gamma: f64,
+    /// Upper bound for the dark-land toe's scalar lift.
+    pub dark_toe_max_gain: f64,
+}
+
+impl Default for LandAppearanceConfig {
+    fn default() -> Self {
+        Self::shipped()
+    }
+}
+
+impl LandAppearanceConfig {
+    /// Owner-selected v0.1.5 finished-visible land calibration.
+    pub const fn shipped() -> Self {
+        Self {
+            sza_normalization: true,
+            sza_max_gain: LAND_SZA_MAX_GAIN,
+            dark_toe: true,
+            dark_toe_knee: LAND_DARK_TOE_KNEE,
+            dark_toe_gamma: LAND_DARK_TOE_GAMMA,
+            dark_toe_max_gain: LAND_DARK_TOE_MAX_GAIN,
+        }
+    }
+
+    /// Exact legacy/no-op configuration. Keep reference physics tests, raw diagnostic
+    /// paths, and reproducibility profiles on this constructor instead of relying on
+    /// [`Default`], whose meaning is the current shipped display preset.
+    pub const fn identity() -> Self {
+        Self {
+            sza_normalization: false,
+            sza_max_gain: LAND_SZA_MAX_GAIN,
+            dark_toe: false,
+            dark_toe_knee: LAND_DARK_TOE_KNEE,
+            dark_toe_gamma: LAND_DARK_TOE_GAMMA,
+            dark_toe_max_gain: LAND_DARK_TOE_MAX_GAIN,
+        }
+    }
+
+    /// Whether the config is the exact legacy/no-op path.
+    #[inline]
+    pub const fn is_identity(self) -> bool {
+        !self.sza_normalization && !self.dark_toe
+    }
+}
 
 /// Neutral flat albedo (sRGB) used when the Blue Marble texture is absent, so the
 /// studio still renders a lit sphere with a clear "texture missing" message.
@@ -148,7 +232,7 @@ pub const LAND_VIBRANCY: f64 = 1.45;
 /// round-1 de-hazed ground read a touch dark/muted vs the bright daylight land of the
 /// GOES true-color references, so the surface signal is lifted toward that brightness.
 /// This is a CALIBRATED TRUE-COLOR DISPLAY GAIN on the ground reflectance, NOT the
-/// global exposure ([`DEFAULT_EXPOSURE`] = 1.0) and NOT an
+/// global exposure ([`DEFAULT_EXPOSURE`] = 1.5) and NOT an
 /// albedo/physics change: it multiplies the assembled surface radiance before the
 /// aerial-perspective veil is added, so only the ground signal brightens (the additive
 /// haze is untouched). WATER is excluded (dark ocean stays dark; the glint has its own
@@ -393,6 +477,8 @@ pub struct FrameContext<'a> {
     /// Shorten the surface sun/view atmosphere columns to each pixel's terrain
     /// elevation. `false` reproduces the legacy mean-sea-level sphere behavior.
     pub terrain_atmosphere: bool,
+    /// Optional display-only land corrections. The default is an exact no-op.
+    pub land_appearance: LandAppearanceConfig,
 }
 
 /// One surface pixel's inputs for [`shade_surface`].
@@ -512,6 +598,100 @@ pub fn land_day_gain(sun_elev_deg: f64) -> f64 {
 #[inline]
 pub fn ground_day_lift(sun_elev_deg: f64, ground_lift: f64) -> f64 {
     day_lerp_ramp(sun_elev_deg, ground_lift)
+}
+
+/// Bounded, land-only solar-zenith display gain. The correction estimates the ratio
+/// between a 60-degree reference illumination and the current horizontal direct-sun
+/// cosine, but it is smoothly gated off through twilight and becomes exactly neutral
+/// again at/above the reference elevation. A disabled correction is never evaluated by
+/// the caller, and `max_gain = 1` is an identity path.
+#[inline]
+pub fn land_sza_normalization_gain(sun_elev_deg: f64, max_gain: f64) -> f64 {
+    let max_gain = if max_gain.is_finite() {
+        max_gain.clamp(1.0, 4.0)
+    } else {
+        LAND_SZA_MAX_GAIN
+    };
+    if max_gain == 1.0 || sun_elev_deg >= LAND_SZA_REFERENCE_ELEV_DEG {
+        return 1.0;
+    }
+    let mu_ref = LAND_SZA_REFERENCE_ELEV_DEG.to_radians().sin();
+    let mu_floor = AERIAL_VEIL_ELEV_LO_DEG.to_radians().sin();
+    let mu = sun_elev_deg.clamp(0.0, 90.0).to_radians().sin();
+    let target = (mu_ref / mu.max(mu_floor)).clamp(1.0, max_gain);
+    day_lerp_ramp(sun_elev_deg, target)
+}
+
+/// Bounded scalar lift for a dark positive land reflectance. `albedo` is the linear
+/// RGB surface reflectance after snow/vibrancy handling. The scalar preserves colour
+/// ratios, zero remains zero, values at/above the knee are exactly unchanged, and the
+/// established daylight ramp keeps twilight byte-identical.
+#[inline]
+pub fn land_dark_toe_gain(
+    albedo: [f64; 3],
+    sun_elev_deg: f64,
+    knee: f64,
+    gamma: f64,
+    max_gain: f64,
+) -> f64 {
+    let knee = if knee.is_finite() {
+        knee.clamp(1.0e-6, 1.0)
+    } else {
+        LAND_DARK_TOE_KNEE
+    };
+    let gamma = if gamma.is_finite() {
+        gamma.clamp(0.05, 1.0)
+    } else {
+        LAND_DARK_TOE_GAMMA
+    };
+    let max_gain = if max_gain.is_finite() {
+        max_gain.clamp(1.0, 4.0)
+    } else {
+        LAND_DARK_TOE_MAX_GAIN
+    };
+    let y = (0.2126 * albedo[0] + 0.7152 * albedo[1] + 0.0722 * albedo[2]).max(0.0);
+    if y <= 0.0 || y >= knee || max_gain == 1.0 || gamma == 1.0 {
+        return 1.0;
+    }
+    let power_target = knee * (y / knee).powf(gamma);
+    // Blend the lifted power toe smoothly back toward the original reflectance across
+    // the whole 0..knee interval. This is the documented Stage-0 candidate: it avoids
+    // an overly broad midtone lift while retaining the bounded very-dark recovery.
+    let w = atmosphere::smoothstep(0.0, knee, y);
+    let target = power_target * (1.0 - w) + y * w;
+    let gain = (target / y).clamp(1.0, max_gain);
+    day_lerp_ramp(sun_elev_deg, gain)
+}
+
+/// Combined land-only display gain. Each correction is independently switchable and
+/// bounded; [`LandAppearanceConfig::identity`] returns exactly `1.0` without touching
+/// the legacy path.
+#[inline]
+pub fn land_appearance_gain(
+    config: LandAppearanceConfig,
+    sun_elev_deg: f64,
+    albedo: [f64; 3],
+) -> f64 {
+    if config.is_identity() {
+        return 1.0;
+    }
+    let sza = if config.sza_normalization {
+        land_sza_normalization_gain(sun_elev_deg, config.sza_max_gain)
+    } else {
+        1.0
+    };
+    let toe = if config.dark_toe {
+        land_dark_toe_gain(
+            albedo,
+            sun_elev_deg,
+            config.dark_toe_knee,
+            config.dark_toe_gamma,
+            config.dark_toe_max_gain,
+        )
+    } else {
+        1.0
+    };
+    sza * toe
 }
 
 /// The EFFECTIVE cloud shadow seen by the DIFFUSE direct-sun terms (land + water body):
@@ -1126,6 +1306,19 @@ pub fn surface_toa_radiance(
                 e_sun[c] * t_sun[c] * disk * ndotl * atmosphere::LIMB_DARKENING_DISK_AVG * shadow;
             l_surf[c] = albedo[c] / pi * (e_direct + e_ambient[c]);
         }
+
+        // Operational-display corrections for LAND only. Both are scalar
+        // gains on the surface signal, so they preserve colour ratios and cannot alter
+        // water/glint or cloud radiance. The explicit identity config takes the exact
+        // legacy path; the daylight gate keeps the established twilight look
+        // byte-identical even in the shipped preset.
+        let appearance_gain =
+            land_appearance_gain(ctx.land_appearance, px.sun_elev_deg as f64, albedo);
+        if appearance_gain != 1.0 {
+            for v in &mut l_surf {
+                *v *= appearance_gain;
+            }
+        }
     }
 
     // LAND daytime brightness lift (refinement pass, round 2): a modest ground-only
@@ -1325,7 +1518,7 @@ mod tests {
 
     #[test]
     fn shipped_visible_display_calibration_is_rc_preset() {
-        assert_eq!(DEFAULT_EXPOSURE, 1.0);
+        assert_eq!(DEFAULT_EXPOSURE, 1.5);
         assert_eq!(GROUND_DAY_LIFT, 1.0);
         assert_eq!(CLOUD_SOFTCLIP_KNEE, 0.65);
         assert_eq!(RHO_HIGHLIGHT_MAX, 1.25);
@@ -1492,6 +1685,7 @@ mod tests {
             cloud_highlight_max: RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_appearance: LandAppearanceConfig::identity(),
         };
         (ctx, sun_enu)
     }
@@ -2474,6 +2668,114 @@ mod tests {
             assert!(g >= prev - 1e-12, "ground lift not monotone at {elev}");
             prev = g;
         }
+    }
+
+    #[test]
+    fn land_appearance_default_is_shipped_and_identity_is_explicit() {
+        let shipped = LandAppearanceConfig::default();
+        assert_eq!(shipped, LandAppearanceConfig::shipped());
+        assert!(shipped.sza_normalization);
+        assert!(shipped.dark_toe);
+        assert!(!shipped.is_identity());
+        assert!(land_appearance_gain(shipped, 33.0, [0.02, 0.04, 0.01]) > 1.0);
+
+        let identity = LandAppearanceConfig::identity();
+        assert!(identity.is_identity());
+        assert!(!identity.sza_normalization);
+        assert!(!identity.dark_toe);
+        assert_eq!(identity.sza_max_gain, LAND_SZA_MAX_GAIN);
+        assert_eq!(identity.dark_toe_knee, LAND_DARK_TOE_KNEE);
+        assert_eq!(identity.dark_toe_gamma, LAND_DARK_TOE_GAMMA);
+        assert_eq!(identity.dark_toe_max_gain, LAND_DARK_TOE_MAX_GAIN);
+        assert_eq!(
+            land_appearance_gain(identity, 33.0, [0.02, 0.04, 0.01]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn land_sza_normalization_is_twilight_safe_reference_neutral_and_bounded() {
+        for &elev in &[-10.0, 0.0, 10.0, AERIAL_VEIL_ELEV_LO_DEG] {
+            assert_eq!(
+                land_sza_normalization_gain(elev, LAND_SZA_MAX_GAIN),
+                1.0,
+                "twilight must be exact identity at {elev}"
+            );
+        }
+        for &elev in &[LAND_SZA_REFERENCE_ELEV_DEG, 75.0, 90.0] {
+            assert_eq!(
+                land_sza_normalization_gain(elev, LAND_SZA_MAX_GAIN),
+                1.0,
+                "reference/high sun must be exact identity at {elev}"
+            );
+        }
+        let moderate = land_sza_normalization_gain(33.0, LAND_SZA_MAX_GAIN);
+        assert!(moderate > 1.0 && moderate <= LAND_SZA_MAX_GAIN);
+        assert_eq!(land_sza_normalization_gain(33.0, 1.0), 1.0);
+        assert!(land_sza_normalization_gain(30.0, 1.2) <= 1.2);
+        assert!(land_sza_normalization_gain(30.0, f64::NAN).is_finite());
+    }
+
+    #[test]
+    fn land_dark_toe_preserves_black_knee_high_values_and_twilight() {
+        let gain = |rgb, elev| {
+            land_dark_toe_gain(
+                rgb,
+                elev,
+                LAND_DARK_TOE_KNEE,
+                LAND_DARK_TOE_GAMMA,
+                LAND_DARK_TOE_MAX_GAIN,
+            )
+        };
+        assert_eq!(gain([0.0; 3], 40.0), 1.0, "black stays black");
+        assert_eq!(
+            gain([LAND_DARK_TOE_KNEE; 3], 40.0),
+            1.0,
+            "the knee is the identity"
+        );
+        assert_eq!(gain([0.4; 3], 40.0), 1.0, "bright land is unchanged");
+        assert_eq!(gain([0.02, 0.04, 0.01], 10.0), 1.0, "twilight is unchanged");
+        let day = gain([0.02, 0.04, 0.01], 40.0);
+        assert!(day > 1.0 && day <= LAND_DARK_TOE_MAX_GAIN);
+        let mid = land_dark_toe_gain([0.04; 3], 40.0, 0.08, 0.65, 4.0);
+        let q = 0.08 * (0.04f64 / 0.08).powf(0.65);
+        let expected = ((q * 0.5 + 0.04 * 0.5) / 0.04).clamp(1.0, 4.0);
+        assert!(
+            (mid - expected).abs() < 1.0e-12,
+            "the toe must use the documented smoothstep-blended target"
+        );
+        assert_eq!(
+            land_dark_toe_gain([0.02; 3], 40.0, 0.08, 1.0, 2.0),
+            1.0,
+            "gamma one is an explicit identity"
+        );
+    }
+
+    #[test]
+    fn shipped_land_appearance_brightens_only_daytime_land() {
+        let (mut ctx, sun) = nadir_surface_pixel(33.0);
+        let pixel = |is_water| SurfacePixel {
+            on_earth: true,
+            base_srgb: [0.19, 0.26, 0.12],
+            normal_enu: [0.0, 0.0, 1.0],
+            sun_enu: [sun[0] as f32, sun[1] as f32, sun[2] as f32],
+            sun_elev_deg: 33.0,
+            is_water,
+            view_dir: nadir_view(),
+            ..Default::default()
+        };
+        let sum = |v: [f64; 3]| v.into_iter().sum::<f64>();
+
+        let land_base = surface_toa_radiance(&ctx, &pixel(false), 1.0, 1.0).unwrap();
+        let water_base = surface_toa_radiance(&ctx, &pixel(true), 1.0, 1.0).unwrap();
+        ctx.land_appearance = LandAppearanceConfig::default();
+        let land_adjusted = surface_toa_radiance(&ctx, &pixel(false), 1.0, 1.0).unwrap();
+        let water_adjusted = surface_toa_radiance(&ctx, &pixel(true), 1.0, 1.0).unwrap();
+        assert!(sum(land_adjusted) > sum(land_base));
+        assert_eq!(
+            water_adjusted, water_base,
+            "land appearance controls must not alter ocean/glint"
+        );
     }
 
     #[test]

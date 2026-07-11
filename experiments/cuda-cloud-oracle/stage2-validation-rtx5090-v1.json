@@ -1,0 +1,64 @@
+{
+  "schema": "simsat.cuda-cloud-oracle.stage2-validation.v1",
+  "schema_version": 1,
+  "device": "NVIDIA GeForce RTX 5090 (sm_120)",
+  "driver_version": "591.86",
+  "cuda_compiler": "CUDA 13.0 V13.0.48",
+  "compute_sanitizer": "2025.3.0.0 build 36260728",
+  "self_test": {
+    "passed": 13,
+    "failed": 0,
+    "stage2_tests": 5,
+    "sha256": "566b64015af339e17f0caa0b091b5251701032d3309fba598783e9e7229b2d68"
+  },
+  "legacy_compatibility": {
+    "reference_commit": "17a9e95fbaca1d06b17741b11126223036432d66",
+    "rows": 13,
+    "physical_or_statistical_field_differences_excluding_timings": 0,
+    "baseline_sha256": "93b75b263b3cd18df5afc816c1b1c41f5f4fa4fb66e98f09e6f6d28676528723"
+  },
+  "compute_sanitizer_checks": {
+    "case": "tau=3, ssa=.97, dual-HG=(.85,-.15,.9), albedo=.6, 32 bins",
+    "samples": 32768,
+    "memcheck_errors": 0,
+    "racecheck_errors": 0,
+    "racecheck_warnings": 0,
+    "initcheck_errors": 0
+  },
+  "stage2_grid": {
+    "rows": 800,
+    "backward_paths": 3690987520,
+    "forward_paths": 3690987520,
+    "per_row_schema_input_energy_and_bin_checks_passed": 800,
+    "forward_max_closure_error": 0.0,
+    "independently_repeated_rows": 144,
+    "independently_repeated_rows_exact_after_timing_removal": 144,
+    "canonical_results_sha256": "7ba7aee813098ee831378df6f853844d74f790fe8d15baf38744614e729404aa",
+    "fully_accepted": false,
+    "tau30_pairs": 40,
+    "tau30_brf_delta_passed": 40,
+    "tau30_full_acceptance_passed": 24,
+    "tau30_truncation_failures": 16,
+    "max_2048_order_truncated_fraction": 0.002389073371887207,
+    "predeclared_2048_order_ceiling": 0.0001
+  },
+  "order_cap_remediation": {
+    "request_schema": "stage2-remediation-request-v1.csv",
+    "rows": 16,
+    "passed": 16,
+    "failed": 0,
+    "only_request_change": "max_scatters 2048 -> 4096 for the 16 failed bright tau30 states",
+    "max_absolute_brf_delta_vs_2048": 7.26460734901124e-8,
+    "max_truncated_fraction_4096": 6.79492950439453e-6,
+    "4096_worst_state_repeat_exact_after_timing_removal": true,
+    "request_sha256": "f76bdf9daadbb04c5938ae5823e91e5e8468a608a431b2701cb38e2f3018616b",
+    "canonical_results_sha256": "c2d9a02a1bced544da33f154e4b995d51079d7dc8b7cce974f07ed7a8330d4da"
+  },
+  "smallest_blocker": "The immutable 800-row Stage-2 request caps bright tau=30 cases at 2048 scattering orders; 16 pairs exceed its predeclared 1e-4 truncation ceiling even though all 40 BRF-delta checks pass. A separate versioned 4096-order remediation passes all 16 without rewriting the failed source grid.",
+  "production_closure_promoted": false,
+  "sha256": {
+    "oracle_source": "9618c3fe6356dd5facefeed5c1771f2a1aa4fbf1251d02234b9fe0a635b8205c",
+    "oracle_executable": "8c24e1cd08baeaab542d0e2fcfe6c9521fcefec18292a0c6d07822d3db383e34",
+    "stage2_grid_runner": "369ef9394dc9e93a0858163b9a91617e23030d4f5d17c77d0dc1bcdb48564b1d"
+  }
+}

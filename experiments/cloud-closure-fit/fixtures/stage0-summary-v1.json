@@ -1,0 +1,170 @@
+{
+  "acceptance_criteria": {
+    "conservation": "For every slab, R+T+A=1 within 1e-4; R,T,A are nonnegative. Conservative black-surface R+T=1 within 1e-4.",
+    "directional_reference": "Reserved CUDA/DISORT cases must meet max(0.005 absolute, 5% relative) BRF error outside reported Monte Carlo uncertainty; no production fit is accepted from the current three-case slice.",
+    "identity": "legacy-v014 CPU output hash remains bit-identical.",
+    "monotonicity": "For fixed conservative black-surface inputs, hemispheric R is nondecreasing with tau. Directional BRF monotonicity is checked only on declared geometry slices, not imposed universally on anisotropic phase functions.",
+    "thin": "higher-order contribution has log-log slope 2 +/- 0.05 as tau -> 0.",
+    "zero": "tau=0 and SSA=0 produce exactly zero cloud BRF/source contribution."
+  },
+  "diagnostic_directional_fit": {
+    "alpha_bounded_inverse_mc_variance": 0.44871652075924484,
+    "alpha_bounded_unweighted": 0.46041897246723895,
+    "case_count": 3,
+    "case_names": [
+      "thin_ice_proxy_tau_0p3",
+      "nssl_like_ice_anvil_probe_tau_1",
+      "ice_anvil_proxy_tau_3"
+    ],
+    "max_abs_residual_brf_unweighted": 0.006319375211351827,
+    "model": "BRF_fit = analytic_single_HG_BRF + alpha * legacy_HG_proxy_higher_BRF",
+    "not_fitted": "delta hemispheric flux; it is a different observable",
+    "per_case_higher_order_scales": [
+      {
+        "case": "thin_ice_proxy_tau_0p3",
+        "cuda_higher_over_legacy_higher": 0.5609113658314587,
+        "tau": 0.3
+      },
+      {
+        "case": "nssl_like_ice_anvil_probe_tau_1",
+        "cuda_higher_over_legacy_higher": 0.3964451800804727,
+        "tau": 1.0
+      },
+      {
+        "case": "ice_anvil_proxy_tau_3",
+        "cuda_higher_over_legacy_higher": 0.46385318056013625,
+        "tau": 3.0
+      }
+    ],
+    "reason": "Only three nonzero exact cases share one HG value, SSA, solar angle, nadir view, relative azimuth, and black surface. The coefficient may describe this slice but cannot identify an angular or phase closure.",
+    "rmse_brf_unweighted": 0.003776155998217173,
+    "status": "diagnostic-only-insufficient-for-production"
+  },
+  "exact_common_mapping": {
+    "case_count": 4,
+    "case_names": [
+      "clear_tau_0",
+      "thin_ice_proxy_tau_0p3",
+      "nssl_like_ice_anvil_probe_tau_1",
+      "ice_anvil_proxy_tau_3"
+    ],
+    "interpolation_performed": false,
+    "nonzero_case_count": 3
+  },
+  "input_sha256": {
+    "experiments/cuda-cloud-oracle/baseline-rtx5090.csv": "d656b20e1968c625801241d847c3de200bf3411455d3f469cac09944867c2df1",
+    "experiments/cuda-cloud-oracle/self-test-rtx5090.json": "3968c41d4a47459b6bf9cd49810723c9e958ac722c786b740208ba18be6ed9a2",
+    "experiments/delta-two-stream/fixtures/stage0-self-checks-v1.json": "37fc7313fbc2b61c6446eb4c5e4cdd65faf15414b5948f03b9d6eea2cf624f61",
+    "experiments/delta-two-stream/fixtures/stage0-slab-flux-v1.csv": "d5d643bfac9c88bb2b082db1ee9d2160ed98485acd149e7cd668014bc871e65b",
+    "experiments/delta-two-stream/fixtures/stage0-slab-flux-v1.json": "40a9b979615ee1a32402a25756849c6c621c3e7c36961b46e2088a4228feab19"
+  },
+  "legacy_source_energy": {
+    "interpretation": "The sphere-integrated local source columns expose unconstrained source amplification. Values above one are not alone an energy violation, because a physical diffuse field can exceed the local direct beam; the defect is that the legacy value is not derived from a conserved diffuse-energy state.",
+    "max_top_source_over_direct_in_cuda_baseline": 4.1523365623827315,
+    "weight_sum_if_all_six_terms_are_unattenuated": 4.1523365624999995
+  },
+  "observable_contract": {
+    "cuda_oracle": "Directional BRF = pi*I/(F0*mu0) for a single-HG black slab.",
+    "delta_two_stream": "TOA and boundary hemispheric flux fractions from a two-stream closure.",
+    "forbidden_inference": "A delta hemispheric reflectance / CUDA directional BRF ratio is not an error metric. No such ratio is generated.",
+    "legacy_dual_hg": "Directional slab BRF analogues using the exact shipping liquid and ice phases.",
+    "legacy_hg_proxy": "Directional slab BRF analogue obtained by integrating the current octave source with a single-HG phase matched to the CUDA input. It isolates octave transport math but is not the shipping dual-HG phase."
+  },
+  "request_grid": {
+    "all_rows_have_exact_delta_flux_join": true,
+    "execution": "run-request-grid.ps1; results are deliberately not fabricated here",
+    "row_count": 603,
+    "split_counts": {
+      "absorption-holdout": 36,
+      "angular-holdout": 243,
+      "calibration": 324
+    }
+  },
+  "schema": "simsat.cloud-closure-fit.summary.v1",
+  "schema_version": 1,
+  "script_sha256": "a7b1e11a27c3a96459013d59f23cf7f38581fc5439d567e46ca0d384cfe0eb35",
+  "self_checks": {
+    "checks": {
+      "delta_conservative_monotonicity": {
+        "group_count": 20,
+        "worst_successive_toa_reflectance_change": 0.0
+      },
+      "delta_energy_conservation": {
+        "max_abs_energy_sum_error": 1.1102230246251565e-16,
+        "minimum_atmosphere_absorptance": -3.268912918130695e-14,
+        "row_count": 6240
+      },
+      "exact_common_mapping": {
+        "common_cuda_worst_successive_brf_change": 0.03934519919172315,
+        "exact_case_count": 4,
+        "nonzero_case_count": 3
+      },
+      "legacy_thin_higher_order": {
+        "log_log_slope": 2.000022501352098,
+        "tau_pair": [
+          0.0001,
+          0.0002
+        ]
+      },
+      "legacy_weight_sum": {
+        "formula_error": 0.0,
+        "value": 4.1523365624999995
+      },
+      "phase_normalization": {
+        "max_abs_error": 1.1215472994763331e-12,
+        "per_g_abs_error": {
+          "-0.1": 1.0103029524088925e-14,
+          "-0.15": 2.1094237467877974e-15,
+          "0.75": 1.176836406102666e-14,
+          "0.85": 1.1215472994763331e-12
+        }
+      },
+      "request_grid": {
+        "all_have_exact_delta_flux_row": true,
+        "row_count": 603,
+        "unique_row_count": 603
+      },
+      "single_scatter_analytic_agreement": {
+        "case_count": 12,
+        "max_abs_brf_error": 6.75631425806067e-14
+      },
+      "tau_zero": {
+        "case_count": 3,
+        "max_abs_brf": 0.0
+      }
+    },
+    "schema": "simsat.cloud-closure-fit.self-checks.v1",
+    "schema_version": 1,
+    "script_sha256": "a7b1e11a27c3a96459013d59f23cf7f38581fc5439d567e46ca0d384cfe0eb35",
+    "status": "pass"
+  },
+  "stage1_recommendation": {
+    "controls": {
+      "cloud_closure_lut_version": "immutable schema/hash recorded in render metadata",
+      "cloud_diffuse_blend": "clamped [0,1], experimental only, default 0",
+      "cloud_multiscatter": [
+        "legacy-octaves",
+        "single-scatter",
+        "delta-flux-v1"
+      ]
+    },
+    "directional_reconstruction": "Keep exact direct single scatter. Initially reconstruct only the higher-order component with a nonnegative hemispherically normalized kernel; never multiply a hemispheric flux by an unconstrained directional gain. A depth-resolved DISORT/Monte-Carlo fixture is required before wiring this into the marcher.",
+    "inputs": [
+      "total vertical tau",
+      "fractional depth",
+      "mu0",
+      "single-scatter albedo",
+      "effective asymmetry",
+      "surface albedo"
+    ],
+    "legacy_identity": "cloud_multiscatter=legacy-octaves must call the unchanged v0.1.4 arithmetic; legacy-v014 remains the preset and default while the experiment is evaluated.",
+    "mode": "delta-flux-v1",
+    "outputs": [
+      "upward diffuse flux",
+      "downward diffuse flux",
+      "absorbed fraction",
+      "validity/bounds flags"
+    ],
+    "status": "experiment-only-default-off"
+  }
+}

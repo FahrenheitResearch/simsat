@@ -229,6 +229,42 @@ pub fn edge_feather_cells_for_margin(margin_frac: f64, nx: usize, ny: usize) -> 
     }
 }
 
+/// Resolve the visible cloud edge-feather band for a rendered camera raster.
+///
+/// With `feather_exposed_domain_edges == false`, this is EXACTLY the pre-v0.1.5
+/// margin-gated behavior from [`edge_feather_cells_for_margin`]. When the shipped
+/// v0.1.5 control is enabled, a raster containing any sample without a finite WRF
+/// `(i, j)` also selects the existing fixed 4% band. That covers geostationary
+/// bounding-box corners and perspective sky/outside-domain rays without fading a
+/// fully in-domain top-down raster at zero margin.
+///
+/// `grid_i` and `grid_j` are expected to be the same camera-raster shape. A shape
+/// mismatch is treated as exposed rather than silently disabling the safety fade.
+#[inline]
+pub fn edge_feather_cells_for_raster(
+    margin_frac: f64,
+    nx: usize,
+    ny: usize,
+    feather_exposed_domain_edges: bool,
+    grid_i: &[f32],
+    grid_j: &[f32],
+) -> f64 {
+    let legacy = edge_feather_cells_for_margin(margin_frac, nx, ny);
+    if !feather_exposed_domain_edges || legacy > 0.0 {
+        return legacy;
+    }
+    let exposes_outside = grid_i.len() != grid_j.len()
+        || grid_i
+            .iter()
+            .zip(grid_j)
+            .any(|(&i, &j)| !(i.is_finite() && j.is_finite()));
+    if exposes_outside {
+        EDGE_FEATHER_BAND_FRAC * (nx.min(ny) as f64)
+    } else {
+        0.0
+    }
+}
+
 /// The EDGE FEATHER weight in `[0, 1]` for a fractional brick sample `(fi, fj)` in a
 /// domain of `nx * ny` cells, with a feather band of `band_cells` cells: `1.0` in the
 /// interior, ramping smoothly to `0.0` at the domain edge over the outer `band_cells`.
@@ -1797,19 +1833,65 @@ pub struct OccupancyMip {
 impl OccupancyMip {
     /// Build a `factor`-downsampled, one-block-DILATED max-extinction mip of `vol`.
     pub fn build(vol: &DecodedVolume, factor: usize) -> Self {
+        Self::build_from_extinction(vol.nx, vol.ny, vol.nz, factor, |i, j, k| {
+            vol.total_ext_cell(i, j, k) as f32
+        })
+    }
+
+    /// Build the same conservative occupancy mip directly from a brick's quantized
+    /// extinction channels, without materializing a [`DecodedVolume`].
+    ///
+    /// The 256-entry decode tables reproduce [`LogQuant::decode`] exactly. Per-voxel
+    /// channel addition follows [`DecodedVolume::total_ext_cell`] (decoded `f32`
+    /// values widened to `f64`, summed left-to-right, then narrowed to `f32`) and the
+    /// shared builder applies the identical block maximum and one-block dilation.
+    /// Consequently every `maxext` value, not only its occupied/empty classification,
+    /// is bit-identical to `OccupancyMip::build(DecodedVolume::from_brick_legacy(..))`.
+    pub fn from_quantized_brick(brick: &VolumeBrick, factor: usize) -> Self {
+        let cells = brick
+            .nx
+            .checked_mul(brick.ny)
+            .and_then(|n| n.checked_mul(brick.nz))
+            .expect("cloud-volume dimensions overflow usize");
+        assert_eq!(brick.ext_liquid.len(), cells, "ext_liquid length");
+        assert_eq!(brick.ext_ice.len(), cells, "ext_ice length");
+        assert_eq!(brick.ext_precip.len(), cells, "ext_precip length");
+
+        let decode_lut = |quant: LogQuant| -> [f32; 256] {
+            core::array::from_fn(|code| quant.decode(code as u8))
+        };
+        let liquid_lut = decode_lut(brick.quant.get("ext_liquid"));
+        let ice_lut = decode_lut(brick.quant.get("ext_ice"));
+        let precip_lut = decode_lut(brick.quant.get("ext_precip"));
+
+        Self::build_from_extinction(brick.nx, brick.ny, brick.nz, factor, |i, j, k| {
+            let cell = (k * brick.ny + j) * brick.nx + i;
+            (liquid_lut[brick.ext_liquid[cell] as usize] as f64
+                + ice_lut[brick.ext_ice[cell] as usize] as f64
+                + precip_lut[brick.ext_precip[cell] as usize] as f64) as f32
+        })
+    }
+
+    fn build_from_extinction(
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        factor: usize,
+        mut extinction: impl FnMut(usize, usize, usize) -> f32,
+    ) -> Self {
         let factor = factor.max(1);
-        let mx = vol.nx.div_ceil(factor);
-        let my = vol.ny.div_ceil(factor);
-        let mz = vol.nz.div_ceil(factor);
+        let mx = nx.div_ceil(factor);
+        let my = ny.div_ceil(factor);
+        let mz = nz.div_ceil(factor);
         // Raw per-block max extinction.
         let mut raw = vec![0.0f32; mx * my * mz];
-        for k in 0..vol.nz {
+        for k in 0..nz {
             let kb = k / factor;
-            for j in 0..vol.ny {
+            for j in 0..ny {
                 let jb = j / factor;
-                for i in 0..vol.nx {
+                for i in 0..nx {
                     let ib = i / factor;
-                    let e = vol.total_ext_cell(i, j, k) as f32;
+                    let e = extinction(i, j, k);
                     let o = (kb * my + jb) * mx + ib;
                     if e > raw[o] {
                         raw[o] = e;
@@ -3252,7 +3334,77 @@ pub fn bilateral_upsample(
 mod tests {
     use super::*;
     use crate::atmosphere::{AtmosphereParams, CameraGeometry};
+    use crate::bricks::ChannelQuant;
     use crate::frame::{GridGeoref, MapProjection};
+    use std::collections::BTreeMap;
+
+    fn occupancy_test_brick(
+        dims: (usize, usize, usize),
+        ext_liquid: Vec<u8>,
+        ext_ice: Vec<u8>,
+        ext_precip: Vec<u8>,
+        quantizers: (LogQuant, LogQuant, LogQuant),
+    ) -> VolumeBrick {
+        let (nx, ny, nz) = dims;
+        let cells = nx * ny * nz;
+        let plane = nx * ny;
+        assert_eq!(ext_liquid.len(), cells);
+        assert_eq!(ext_ice.len(), cells);
+        assert_eq!(ext_precip.len(), cells);
+        let zero = LogQuant {
+            vmin: 0.0,
+            vmax: 0.0,
+        };
+        let mut quant = BTreeMap::new();
+        for (name, value) in [
+            ("ext_liquid", quantizers.0),
+            ("ext_ice", quantizers.1),
+            ("ext_snow", zero),
+            ("ext_precip", quantizers.2),
+            ("tau_up", zero),
+            ("qvapor", zero),
+        ] {
+            quant.insert(name.to_string(), value);
+        }
+        VolumeBrick {
+            nx,
+            ny,
+            nz,
+            z_min_m: 0.0,
+            dz_m: 250.0,
+            time_iso: None,
+            quant: ChannelQuant(quant),
+            ext_liquid,
+            ext_ice,
+            ext_snow: vec![0; cells],
+            ext_precip,
+            tau_up: vec![0; cells],
+            qvapor: vec![0; cells],
+            cloud_fraction: vec![255; cells],
+            has_cloud_fraction: false,
+            temperature_f16: vec![0; cells],
+            hgt: vec![0.0; plane],
+            landmask: vec![1.0; plane],
+            tsk: vec![300.0; plane],
+            u10: vec![0.0; plane],
+            v10: vec![0.0; plane],
+            snowh: None,
+            ivgtyp: None,
+        }
+    }
+
+    fn assert_quantized_mip_matches_decoded(brick: &VolumeBrick, factor: usize, label: &str) {
+        let quantized = OccupancyMip::from_quantized_brick(brick, factor);
+        let decoded = DecodedVolume::from_brick_legacy(brick, 1000.0);
+        let reference = OccupancyMip::build(&decoded, factor);
+        assert_eq!(quantized.mx, reference.mx, "{label}: mx");
+        assert_eq!(quantized.my, reference.my, "{label}: my");
+        assert_eq!(quantized.mz, reference.mz, "{label}: mz");
+        assert_eq!(quantized.factor, reference.factor, "{label}: factor");
+        let got: Vec<u32> = quantized.maxext.iter().map(|v| v.to_bits()).collect();
+        let expected: Vec<u32> = reference.maxext.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got, expected, "{label}: maxext bits");
+    }
 
     /// A tiny analytic volume: `nx*ny*nz` with a caller-filled extinction field.
     fn build_volume(
@@ -3771,6 +3923,214 @@ mod tests {
     }
 
     #[test]
+    fn quantized_occupancy_matches_every_code_and_quantizer_edge_bit_exactly() {
+        let codes: Vec<u8> = (0u16..=255).map(|code| code as u8).collect();
+        let zeros = vec![0; codes.len()];
+        let quantizers = [
+            (
+                "normal",
+                LogQuant {
+                    vmin: 1.0e-12,
+                    vmax: 1.0e-1,
+                },
+            ),
+            (
+                "zero",
+                LogQuant {
+                    vmin: 0.0,
+                    vmax: 0.0,
+                },
+            ),
+            (
+                "negative-max",
+                LogQuant {
+                    vmin: -1.0,
+                    vmax: -0.1,
+                },
+            ),
+            (
+                "degenerate-positive",
+                LogQuant {
+                    vmin: 0.25,
+                    vmax: 0.25,
+                },
+            ),
+            (
+                "reversed-positive",
+                LogQuant {
+                    vmin: 1.0,
+                    vmax: 0.25,
+                },
+            ),
+            (
+                "zero-min",
+                LogQuant {
+                    vmin: 0.0,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "negative-min",
+                LogQuant {
+                    vmin: -1.0,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "nan-min",
+                LogQuant {
+                    vmin: f64::NAN,
+                    vmax: 1.0,
+                },
+            ),
+            (
+                "nan-max",
+                LogQuant {
+                    vmin: 1.0e-6,
+                    vmax: f64::NAN,
+                },
+            ),
+            (
+                "infinite-max",
+                LogQuant {
+                    vmin: 1.0e-6,
+                    vmax: f64::INFINITY,
+                },
+            ),
+        ];
+        let zero = LogQuant {
+            vmin: 0.0,
+            vmax: 0.0,
+        };
+        for &(quant_label, quant) in &quantizers {
+            for channel in 0..3 {
+                let mut channels = [zeros.clone(), zeros.clone(), zeros.clone()];
+                channels[channel] = codes.clone();
+                let mut scales = [zero; 3];
+                scales[channel] = quant;
+                let brick = occupancy_test_brick(
+                    (16, 16, 1),
+                    channels[0].clone(),
+                    channels[1].clone(),
+                    channels[2].clone(),
+                    (scales[0], scales[1], scales[2]),
+                );
+                for factor in [0, 1, 7, 64] {
+                    assert_quantized_mip_matches_decoded(
+                        &brick,
+                        factor,
+                        &format!("{quant_label}/channel-{channel}/factor-{factor}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_occupancy_matches_mixed_odd_volume_and_dilation_bit_exactly() {
+        let dims = (13usize, 11usize, 5usize);
+        let cells = dims.0 * dims.1 * dims.2;
+        let mut seed = 0x9e37_79b9u32;
+        let mut next_code = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let liquid: Vec<u8> = (0..cells).map(|_| next_code()).collect();
+        let ice: Vec<u8> = (0..cells).map(|_| next_code()).collect();
+        let mut precip = vec![0u8; cells];
+        precip[0] = 1;
+        precip[cells / 2] = 127;
+        precip[cells - 1] = 255;
+        let normal = LogQuant {
+            vmin: 1.0e-10,
+            vmax: 1.0e-2,
+        };
+        let nan_min = LogQuant {
+            vmin: f64::NAN,
+            vmax: 1.0,
+        };
+        let reversed = LogQuant {
+            vmin: 0.5,
+            vmax: 1.0e-4,
+        };
+        for (label, quantizers) in [
+            ("all-normal", (normal, normal, normal)),
+            ("nan-poisons-positive", (normal, nan_min, normal)),
+            ("reversed-mix", (reversed, normal, reversed)),
+        ] {
+            let brick = occupancy_test_brick(
+                dims,
+                liquid.clone(),
+                ice.clone(),
+                precip.clone(),
+                quantizers,
+            );
+            for factor in [0, 1, 2, 3, 8, 32] {
+                assert_quantized_mip_matches_decoded(
+                    &brick,
+                    factor,
+                    &format!("{label}/factor-{factor}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_occupancy_real_fixture_benchmark() {
+        use sha2::{Digest, Sha256};
+
+        let Ok(path) = std::env::var("SIMSAT_CPU_OCCUPANCY_BENCH_BRICK") else {
+            eprintln!("SIMSAT_CPU_OCCUPANCY_BENCH_BRICK unset; skipping occupancy benchmark");
+            return;
+        };
+        let mode = std::env::var("SIMSAT_CPU_OCCUPANCY_BENCH_MODE")
+            .unwrap_or_else(|_| "compare".to_string());
+        let read_started = std::time::Instant::now();
+        let brick = crate::bricks::read_ssb(std::path::Path::new(&path))
+            .unwrap_or_else(|error| panic!("read benchmark brick {path}: {error}"));
+        let read_wall = read_started.elapsed();
+        let prep_started = std::time::Instant::now();
+        let mip = match mode.as_str() {
+            "quantized" => OccupancyMip::from_quantized_brick(&brick, OCCUPANCY_MIP_FACTOR),
+            "decoded" => {
+                let decoded = DecodedVolume::from_brick_legacy(&brick, 1000.0);
+                OccupancyMip::build(&decoded, OCCUPANCY_MIP_FACTOR)
+            }
+            "compare" => {
+                let quantized = OccupancyMip::from_quantized_brick(&brick, OCCUPANCY_MIP_FACTOR);
+                let decoded = DecodedVolume::from_brick_legacy(&brick, 1000.0);
+                let reference = OccupancyMip::build(&decoded, OCCUPANCY_MIP_FACTOR);
+                let got: Vec<u32> = quantized.maxext.iter().map(|v| v.to_bits()).collect();
+                let expected: Vec<u32> = reference.maxext.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got, expected, "real-fixture occupancy mismatch");
+                quantized
+            }
+            other => panic!("unknown SIMSAT_CPU_OCCUPANCY_BENCH_MODE={other}"),
+        };
+        let prep_wall = prep_started.elapsed();
+        let digest = Sha256::digest(mip.to_r8_occupancy());
+        let hash = format!("{digest:x}");
+        let peak_rss = crate::platform::peak_rss_bytes()
+            .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+        eprintln!(
+            "CPU_OCCUPANCY_BENCH mode={mode} brick_dims={}x{}x{} occ_dims={}x{}x{} \
+             occ_cells={} sha256={hash} read_wall_s={:.6} prep_wall_s={:.6} \
+             peak_rss_bytes={peak_rss}",
+            brick.nx,
+            brick.ny,
+            brick.nz,
+            mip.mx,
+            mip.my,
+            mip.mz,
+            mip.maxext.len(),
+            read_wall.as_secs_f64(),
+            prep_wall.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn sun_od_map_casts_a_shadow_column_behind_a_box() {
         // A box cloud; a texel whose sun ray passes through the box has od > 0, a
         // texel to the side has od = 0. And the ground point directly "under" the box
@@ -4157,6 +4517,7 @@ mod tests {
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
+            land_appearance: crate::render::LandAppearanceConfig::identity(),
         };
         let rnx = raster.nx;
         let lat = raster.lat.clone();
@@ -4270,6 +4631,7 @@ mod tests {
                 cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
+                land_appearance: crate::render::LandAppearanceConfig::identity(),
             };
             render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, &assemble)
         };
@@ -4806,6 +5168,43 @@ mod tests {
             "band {b}"
         );
         assert!(b > 0.0);
+    }
+
+    #[test]
+    fn exposed_domain_edge_feather_is_opt_in_and_preserves_margin_behavior() {
+        let (nx, ny) = (200usize, 300usize);
+        let all_i = vec![50.0f32; 12];
+        let all_j = vec![75.0f32; 12];
+        let mut exposed_i = all_i.clone();
+        exposed_i[0] = f32::NAN;
+        let band = EDGE_FEATHER_BAND_FRAC * nx.min(ny) as f64;
+
+        // Default/off is the exact current margin-zero identity even if the camera
+        // exposes samples beyond the finite WRF domain.
+        assert_eq!(
+            edge_feather_cells_for_raster(0.0, nx, ny, false, &exposed_i, &all_j),
+            0.0
+        );
+        // On activates only when the actual raster exposes the domain boundary.
+        assert_eq!(
+            edge_feather_cells_for_raster(0.0, nx, ny, true, &exposed_i, &all_j),
+            band
+        );
+        assert_eq!(
+            edge_feather_cells_for_raster(0.0, nx, ny, true, &all_i, &all_j),
+            0.0,
+            "an all-in-domain top-down raster stays unchanged"
+        );
+        // Positive margin already used the same reviewed band and remains identical
+        // with either experiment setting.
+        assert_eq!(
+            edge_feather_cells_for_raster(0.1, nx, ny, false, &all_i, &all_j),
+            band
+        );
+        assert_eq!(
+            edge_feather_cells_for_raster(0.1, nx, ny, true, &all_i, &all_j),
+            band
+        );
     }
 
     #[test]

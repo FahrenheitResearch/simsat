@@ -1,0 +1,18 @@
+schema: simsat.surface-response.stage0
+schema_version: 1
+method_id: bounded-land-sza-and-albedo-toe-v1
+generator_sha256: 388a0869fc248f083132936f151899ad0170b346383590081156fff89c11f7f7
+csv_sha256: 6486d4b4f07a46413eaa88ac70dc81ce334b9e2bdd079b119f8f241fd4e24df4
+result: PASS (11/11)
+
+PASS disabled-exact-identity: 1440/1440 rows exact
+PASS black-exact-identity: 144 black rows tested
+PASS toe-at-or-above-knee-exact-identity: 396 grid rows plus exact knee probe
+PASS twilight-at-or-below-20deg-exact-identity: 480 rows tested
+PASS sza-at-or-above-60deg-exact-identity: 240 rows tested
+PASS finite-unit-bounded-rgb: 21600 channel values; max=0.966215103086
+PASS color-ratio-and-lighting-contrast-preservation: max chromaticity component error=1.110e-16; SZA/toe/combined gain spread across slopes=0.000e+00/0.000e+00/0.000e+00
+PASS finite-bounded-gains: SZA<=1.6, toe<=1.5, combined<=2.4
+PASS operators-never-darken: 1440 rows tested
+PASS grid-exercises-both-operators: SZA active rows=648; toe active rows=576
+PASS byte-repeatable-csv: sha256=6486d4b4f07a46413eaa88ac70dc81ce334b9e2bdd079b119f8f241fd4e24df4

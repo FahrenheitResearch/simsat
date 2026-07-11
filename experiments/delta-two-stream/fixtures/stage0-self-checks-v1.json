@@ -1,0 +1,73 @@
+{
+  "checks": {
+    "conservative_energy": {
+      "cases": 240,
+      "maximum_atmospheric_absorptance_magnitude": 6.195044477408373e-14,
+      "maximum_energy_sum_error": 1.1102230246251565e-16,
+      "maximum_intrinsic_r_plus_t_error": 2.220446049250313e-14,
+      "status": "pass"
+    },
+    "finite_bounded_absorption_grid": {
+      "absorbing_rows_with_positive_atmosphere_absorptance": 4800,
+      "checked_values": 87360,
+      "maximum_bounded_value": 1.121786643216055,
+      "maximum_energy_sum_error": 1.1102230246251565e-16,
+      "minimum_bounded_value": -3.268912918130695e-14,
+      "rows": 6240,
+      "status": "pass"
+    },
+    "layer_partition_invariance": {
+      "cases": 16,
+      "maximum_absolute_error": 3.6637359812630166e-14,
+      "status": "pass"
+    },
+    "pure_absorption_analytic": {
+      "expected_atmosphere_absorptance": 0.9870070628117832,
+      "maximum_absolute_error": 2.710505431213761e-20,
+      "status": "pass"
+    },
+    "repeatability": {
+      "bytes": 9041486,
+      "row_json_sha256": "6dae0158a0f39887ba88ea5877a5c56a07d03965d06db4f79b04f1cd6294e2d0",
+      "status": "pass"
+    },
+    "tau_zero_identity": {
+      "maximum_absolute_error": 0.0,
+      "status": "pass"
+    },
+    "thin_multiple_scatter_order": {
+      "records": [
+        {
+          "g": 0.0,
+          "large": 5.374602178083053e-06,
+          "log_slope": 1.99804563887245,
+          "small": 1.3454719674660127e-06
+        },
+        {
+          "g": 0.665,
+          "large": 1.6743281663553211e-06,
+          "log_slope": 1.9990024366657018,
+          "small": 4.188715736672642e-07
+        },
+        {
+          "g": 0.75,
+          "large": 1.0304129553621345e-06,
+          "log_slope": 1.9992228206008726,
+          "small": 2.577420470150152e-07
+        },
+        {
+          "g": 0.85,
+          "large": 4.147194824709018e-07,
+          "log_slope": 1.9995105944539089,
+          "small": 1.0371504791421241e-07
+        }
+      ],
+      "status": "pass"
+    }
+  },
+  "method": "delta-eddington-s2-gauss-flux-v1",
+  "schema": "simsat.delta-two-stream.stage0",
+  "schema_version": 1,
+  "script_sha256": "c7050c33538bfe7a69df5db1aecabc1d964b81b6ea76ae6510f958d09a82fce3",
+  "status": "pass"
+}

@@ -1,0 +1,149 @@
+{
+  "active_row_counts": {
+    "combined": 792,
+    "dark_toe": 576,
+    "sza": 648
+  },
+  "all_checks_passed": true,
+  "check_report_sha256": "3532e4753778213ecf2338dbbeec96a3e928038abfa5f03ffd707f6bafde4b60",
+  "checks": [
+    {
+      "details": "1440/1440 rows exact",
+      "name": "disabled-exact-identity",
+      "passed": true
+    },
+    {
+      "details": "144 black rows tested",
+      "name": "black-exact-identity",
+      "passed": true
+    },
+    {
+      "details": "396 grid rows plus exact knee probe",
+      "name": "toe-at-or-above-knee-exact-identity",
+      "passed": true
+    },
+    {
+      "details": "480 rows tested",
+      "name": "twilight-at-or-below-20deg-exact-identity",
+      "passed": true
+    },
+    {
+      "details": "240 rows tested",
+      "name": "sza-at-or-above-60deg-exact-identity",
+      "passed": true
+    },
+    {
+      "details": "21600 channel values; max=0.966215103086",
+      "name": "finite-unit-bounded-rgb",
+      "passed": true
+    },
+    {
+      "details": "max chromaticity component error=1.110e-16; SZA/toe/combined gain spread across slopes=0.000e+00/0.000e+00/0.000e+00",
+      "name": "color-ratio-and-lighting-contrast-preservation",
+      "passed": true
+    },
+    {
+      "details": "SZA<=1.6, toe<=1.5, combined<=2.4",
+      "name": "finite-bounded-gains",
+      "passed": true
+    },
+    {
+      "details": "1440 rows tested",
+      "name": "operators-never-darken",
+      "passed": true
+    },
+    {
+      "details": "SZA active rows=648; toe active rows=576",
+      "name": "grid-exercises-both-operators",
+      "passed": true
+    },
+    {
+      "details": "sha256=6486d4b4f07a46413eaa88ac70dc81ce334b9e2bdd079b119f8f241fd4e24df4",
+      "name": "byte-repeatable-csv",
+      "passed": true
+    }
+  ],
+  "configuration": {
+    "base_luminance_grid": [
+      0.0,
+      1e-06,
+      0.001,
+      0.005,
+      0.01,
+      0.02,
+      0.04,
+      0.08,
+      0.15,
+      0.5
+    ],
+    "dark_toe": {
+      "daylight_ramp_end_deg": 30.0,
+      "gamma": 0.65,
+      "knee_luminance": 0.08,
+      "max_gain": 1.5,
+      "twilight_identity_end_deg": 20.0
+    },
+    "diffuse_floor_proxy": 0.18,
+    "gain_application_domain": "illuminated linear surface RGB proxy",
+    "palette_names": [
+      "forest",
+      "neutral",
+      "dry-soil",
+      "cool-rock"
+    ],
+    "slope_toward_sun_grid_deg": [
+      -20.0,
+      0.0,
+      20.0
+    ],
+    "sun_elevation_grid_deg": [
+      -5.0,
+      0.0,
+      10.0,
+      20.0,
+      25.0,
+      30.0,
+      33.0,
+      40.0,
+      50.0,
+      59.999,
+      60.0,
+      75.0
+    ],
+    "sza": {
+      "daylight_ramp_end_deg": 30.0,
+      "elevation_floor_deg": 20.0,
+      "max_gain": 1.6,
+      "reference_elevation_deg": 60.0,
+      "twilight_identity_end_deg": 20.0
+    },
+    "toe_evaluation_domain": "linear surface albedo before terrain/direct/diffuse illumination"
+  },
+  "csv_sha256": "6486d4b4f07a46413eaa88ac70dc81ce334b9e2bdd079b119f8f241fd4e24df4",
+  "generator_sha256": "388a0869fc248f083132936f151899ad0170b346383590081156fff89c11f7f7",
+  "interpretation": "The toe is classified from unilluminated linear surface albedo and applied as a scalar to the illuminated surface signal, preserving terrain-lighting ratios. This fixture selects no production default or radiometric calibration.",
+  "maximums": {
+    "chromaticity_component_error": 1.1102230246251565e-16,
+    "combined_effective_gain": 2.4000000000000004,
+    "output_channel": 0.9662151030857629,
+    "sza_applied_gain": 1.6,
+    "toe_applied_gain": 1.5
+  },
+  "method_id": "bounded-land-sza-and-albedo-toe-v1",
+  "representative_moderate_sun_dark_forest": {
+    "albedo_luminance": 0.039999999999999994,
+    "base_luminance": 0.04,
+    "combined_effective_gain": 1.8083787233979667,
+    "combined_luminance": 0.04532549429404951,
+    "input_luminance": 0.02506416034849289,
+    "slope_toward_sun_deg": 0.0,
+    "sun_elevation_deg": 33.0,
+    "sza_gain": 1.5900905886419694,
+    "sza_luminance": 0.03985428548235176,
+    "toe_gain": 1.1372803136596312,
+    "toe_luminance": 0.028504976142749282
+  },
+  "row_count": 1440,
+  "schema": "simsat.surface-response.stage0",
+  "schema_version": 1
+}
