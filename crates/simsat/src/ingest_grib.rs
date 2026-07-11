@@ -1,8 +1,7 @@
 //! Streaming NOAA HRRR / RRFS GRIB2 -> `.ssb` brick ingest (parallel to [`crate::ingest`]).
 //!
-//! The brick CONTRACT IS UNTOUCHED: this module writes the same five log-quantized
-//! u8 channels + f16-Celsius temperature + 2-D planes + `run.json` manifest
-//! (`SSB_FORMAT_VERSION` 3) that the wrfout path writes, so an operational HRRR
+//! This module writes the same SSB v5 u8 channels + f16-Celsius temperature +
+//! 2-D planes + `run.json` manifest that the wrfout path writes, so an operational HRRR
 //! brick is indistinguishable from a WRF brick to every downstream consumer
 //! (visible/IR/WV/GeoColor/Sandwich/derived, geo + top-down, studio, Python).
 //!
@@ -22,7 +21,13 @@
 //!
 //! Physics mapping (per-species, the SAME `optics.rs` constants as WRF):
 //! CLMR -> ext_liquid; CIMIXR (HRRR, 0/1/82) or ICMR (RRFS, 0/1/23) -> ext_ice;
-//! RWMR + GRLE + SNMR -> ext_precip (each at its OWN beta, the SSB v3 rule);
+//! RWMR + GRLE + SNMR -> total ext_precip (each at its OWN beta, the SSB v3 rule).
+//! The v4+ snow-only auxiliary subset is conservatively unavailable for the initial
+//! GRIB path (`ext_snow = 0`). HRRR's native `cc` field (0/6/32) supplies trusted
+//! fractional coverage when it is a complete 1..N hybrid-level volume on the same
+//! vertical grid as the hydrometeors. Missing, partial, malformed, or differently
+//! scaled coverage retains the exact legacy fallback (`cloud_fraction = 255`,
+//! provenance false);
 //! SPFH -> the qvapor channel as a MIXING RATIO (`w = q / (1 - q)`); TMP is
 //! sensible temperature directly (no theta conversion); per-level geopotential
 //! height (HGT @ hybrid) is the native z coordinate directly (no destagger);
@@ -59,7 +64,7 @@ use crate::frame::{
 };
 use crate::ingest::{
     Extrap, GridGeometry, IngestConfig, IngestReport, integrate_tau_up_column, resample_column,
-    resample_column_conservative, source_identity,
+    resample_column_conservative, resample_column_fraction_max_overlap, source_identity,
 };
 use crate::optics::{self, HydrometeorClass};
 use crate::platform;
@@ -220,6 +225,8 @@ pub const CODE_RWMR: FieldCode = fc(0, 1, 24);
 pub const CODE_SNMR: FieldCode = fc(0, 1, 25);
 /// Graupel mixing ratio.
 pub const CODE_GRLE: FieldCode = fc(0, 1, 32);
+/// Fraction of cloud cover (`cc`, numeric fraction 0..1).
+pub const CODE_CLOUD_FRACTION: FieldCode = fc(0, 6, 32);
 /// Snow depth (m).
 pub const CODE_SNOD: FieldCode = fc(0, 1, 11);
 /// U wind component (m/s).
@@ -443,6 +450,82 @@ fn require_hybrid_volume_entries(
 }
 
 // ── value policies ─────────────────────────────────────────────────────────────
+
+/// Select HRRR's native cloud-fraction messages without weakening the required
+/// field rules used by the rest of the ingest. Coverage is optional, so every
+/// incompatibility is reported to the caller as a reason to use the all-255
+/// fallback rather than as a fatal ingest error.
+///
+/// The returned entries are explicitly sorted level 1 -> N (bottom -> top in
+/// HRRR native output), independent of message order in the GRIB envelope.
+fn optional_cloud_fraction_entries(
+    entries: &[CatalogEntry],
+    nz: usize,
+) -> Result<Option<Vec<CatalogEntry>>, String> {
+    let candidates: Vec<CatalogEntry> = entries
+        .iter()
+        .filter(|e| e.code == CODE_CLOUD_FRACTION && e.level_type == LEVEL_HYBRID)
+        .copied()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut by_level = BTreeMap::new();
+    for entry in candidates {
+        let rounded = entry.level_value.round();
+        if !entry.level_value.is_finite()
+            || rounded < 1.0
+            || rounded > u32::MAX as f64
+            || (entry.level_value - rounded).abs() > 1.0e-6
+        {
+            return Err(format!(
+                "cc (0/6/32) has invalid hybrid level {}",
+                entry.level_value
+            ));
+        }
+        let level = rounded as u32;
+        if by_level.insert(level, entry).is_some() {
+            return Err(format!("cc (0/6/32) has duplicate hybrid level {level}"));
+        }
+    }
+
+    let levels: Vec<u32> = by_level.keys().copied().collect();
+    validate_complete_levels(&levels, "cc (cloud fraction)").map_err(|e| e.to_string())?;
+    if by_level.len() != nz {
+        return Err(format!(
+            "cc (0/6/32) has {} hybrid levels, expected {nz} on the hydrometeor grid",
+            by_level.len()
+        ));
+    }
+    Ok(Some(by_level.into_values().collect()))
+}
+
+/// GRIB code 0/6/32 is defined as a numeric 0..1 fraction. Permit only tiny
+/// packing roundoff outside that interval, then clamp it. A percent-like value
+/// (for example 50) is not guessed or divided by 100: without units metadata
+/// proving that contract, treating it as native coverage would silently make a
+/// malformed field look trustworthy.
+const CLOUD_FRACTION_RANGE_TOLERANCE: f32 = 1.0e-4;
+
+fn normalize_native_cloud_fraction(values: &mut [f32]) -> Result<(), String> {
+    for (index, value) in values.iter_mut().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "cc (0/6/32) contains a non-finite value at native cell {index}"
+            ));
+        }
+        if *value < -CLOUD_FRACTION_RANGE_TOLERANCE || *value > 1.0 + CLOUD_FRACTION_RANGE_TOLERANCE
+        {
+            return Err(format!(
+                "cc (0/6/32) value {} at native cell {index} violates its 0..1 fraction contract; refusing to guess percent scaling",
+                *value
+            ));
+        }
+        *value = value.clamp(0.0, 1.0);
+    }
+    Ok(())
+}
 
 /// Specific humidity (kg/kg moist air) -> water-vapor MIXING RATIO (kg/kg dry
 /// air), the brick's qvapor convention (WRF QVAPOR): `w = q / (1 - q)`.
@@ -970,6 +1053,126 @@ fn read_hybrid_volume(
     Ok(out)
 }
 
+/// Decode the optional native cloud-fraction volume. Unlike required fields,
+/// any catalog/decode/value problem rejects only this auxiliary source and lets
+/// the caller retain the exact full-cell fallback.
+#[allow(clippy::too_many_arguments)]
+fn read_optional_cloud_fraction_volume(
+    file: &mut File,
+    catalog: &GribCatalog,
+    nz: usize,
+    rect: &CropRect,
+    buf: &mut Vec<u8>,
+) -> Result<Option<Vec<f32>>, String> {
+    let Some(entries) = optional_cloud_fraction_entries(&catalog.entries, nz)? else {
+        return Ok(None);
+    };
+    let full_nx = catalog.grid.nx as usize;
+    let plane = rect.nx() * rect.ny();
+    let mut out = vec![0.0f32; plane * nz];
+    for (k, entry) in entries.iter().enumerate() {
+        let values = decode_entry(file, catalog, entry, buf).map_err(|e| e.to_string())?;
+        let values = crop_values(values, full_nx, rect);
+        if values.len() != plane {
+            return Err(format!(
+                "cc (0/6/32) hybrid level {} decoded {} cropped cells, expected {plane}",
+                k + 1,
+                values.len()
+            ));
+        }
+        let dst = &mut out[k * plane..(k + 1) * plane];
+        for (d, &value) in dst.iter_mut().zip(values.iter()) {
+            *d = value as f32;
+        }
+    }
+    normalize_native_cloud_fraction(&mut out)?;
+    Ok(Some(out))
+}
+
+#[inline]
+fn encode_cloud_fraction_value(value: f64) -> u8 {
+    // Match bricks::encode_cloud_fraction exactly, including the f32 rounding
+    // chain and preservation of every tiny positive fraction as code 1.
+    let f = value as f32;
+    if !f.is_finite() || f <= 0.0 {
+        0
+    } else {
+        ((f.min(1.0) * 255.0).round() as u8).max(1)
+    }
+}
+
+fn cloud_fraction_channel_or_fallback(candidate: Option<Vec<u8>>, cells: usize) -> (Vec<u8>, bool) {
+    match candidate {
+        Some(codes) if codes.len() == cells => (codes, true),
+        _ => (vec![255u8; cells], false),
+    }
+}
+
+/// Maximum-overlap resample of the native intensive coverage profile directly
+/// into SSB v5's linear-u8 channel. This is the same vertical closure as the WRF
+/// ingest and avoids materializing a brick-resolution f32 volume.
+#[allow(clippy::too_many_arguments)]
+fn resample_encode_cloud_fraction(
+    native: &[f32],
+    z: &[f32],
+    nx: usize,
+    ny: usize,
+    nz_native: usize,
+    z_min: f64,
+    dz: f64,
+    nz_brick: usize,
+) -> Result<Vec<u8>, String> {
+    let plane = nx
+        .checked_mul(ny)
+        .ok_or_else(|| "cloud-fraction plane dimensions overflow".to_string())?;
+    let native_cells = plane
+        .checked_mul(nz_native)
+        .ok_or_else(|| "cloud-fraction native dimensions overflow".to_string())?;
+    if native.len() != native_cells || z.len() != native_cells {
+        return Err(format!(
+            "cc (0/6/32) volume shape is incompatible: fraction={} height={} expected={native_cells}",
+            native.len(),
+            z.len()
+        ));
+    }
+    if !z_min.is_finite() || !dz.is_finite() || dz <= 0.0 {
+        return Err(format!(
+            "cloud-fraction brick axis is invalid (z_min={z_min}, dz={dz})"
+        ));
+    }
+
+    let mut out = vec![0u8; plane * nz_brick];
+    let mut zc = vec![0f64; nz_native];
+    let mut fc = vec![0f64; nz_native];
+    let mut col = Vec::with_capacity(nz_brick);
+    for ci in 0..plane {
+        for k in 0..nz_native {
+            let idx = k * plane + ci;
+            zc[k] = z[idx] as f64;
+            fc[k] = native[idx] as f64;
+        }
+        if zc.iter().any(|v| !v.is_finite()) || zc.windows(2).any(|pair| pair[1] <= pair[0]) {
+            return Err(format!(
+                "cc (0/6/32) column {ci} is incompatible with a finite, bottom-to-top height grid"
+            ));
+        }
+        resample_column_fraction_max_overlap(
+            &zc,
+            &fc,
+            z_min,
+            dz,
+            nz_brick,
+            Extrap::Zero,
+            Extrap::Zero,
+            &mut col,
+        );
+        for (m, &value) in col.iter().enumerate() {
+            out[m * plane + ci] = encode_cloud_fraction_value(value);
+        }
+    }
+    Ok(out)
+}
+
 /// Fold one hydrometeor species into the native extinction buffer at its OWN
 /// optics (extinctions add linearly; the SSB v3 per-species rule). Missing
 /// species contribute nothing (like the wrfout `read_3d_opt` -> zeros path);
@@ -1181,9 +1384,10 @@ pub const GRIB_PEAK_RSS_BUDGET_BYTES: u64 = 2_500_000_000;
 /// brick: estimate 2.37 GB, measured 2.34 GB). Two candidate peaks:
 /// the FOLD phase (three native f32 volumes: z + rho + the per-channel beta,
 /// plus the f16 running total, the finished u8 channels, the f16 temperature)
-/// and the WRITE phase (`bricks::write_ssb` holds the brick struct AND its raw
-/// payload copy). The fixed term covers the one decoded full-grid f64 plane in
-/// flight plus process overhead.
+/// and the WRITE phase. SSB v5's writer streams directly into zlib, so WRITE no
+/// longer duplicates the complete raw payload; the two v4+ fallback channels are
+/// allocated only after native fold buffers are dropped. The fixed term covers
+/// the one decoded full-grid f64 plane in flight plus process overhead.
 pub fn estimated_ingest_peak_bytes(
     columns: usize,
     nz_native: usize,
@@ -1195,7 +1399,7 @@ pub fn estimated_ingest_peak_bytes(
     let nzb = nz_brick as u64;
     let fixed = 8 * full_plane_points as u64 + 150_000_000;
     let fold = c * (3 * nzn * 4 + 7 * nzb) + fixed;
-    let write = c * (2 * 7 * nzb) + fixed + 100_000_000;
+    let write = c * (9 * nzb) + fixed + 100_000_000;
     fold.max(write)
 }
 
@@ -1705,11 +1909,59 @@ pub fn ingest_grib_timestep_with(
         )
     };
     drop(beta);
+
+    // Optional native grid-cell cloud coverage. HRRR supplies `cc` (0/6/32)
+    // on the same 1..N hybrid levels as the hydrometeors. It is deliberately
+    // fail-closed: a missing/partial/malformed/incompatible field leaves the
+    // exact historical all-255 channel + false provenance, while the rest of
+    // the GRIB ingest continues unchanged.
+    let cloud_fraction_candidate = match read_optional_cloud_fraction_volume(
+        &mut file, &catalog, nz, &rect, &mut buf,
+    ) {
+        Ok(Some(native)) => {
+            match resample_encode_cloud_fraction(&native, &z, nx, ny, nz, z_min, dz, nz_brick) {
+                Ok(codes) => {
+                    crate::log_line!(
+                        "simsat grib ingest: native cloud fraction ON (cc 0/6/32, {nz} hybrid levels)"
+                    );
+                    Some(codes)
+                }
+                Err(reason) => {
+                    crate::log_line!(
+                        "simsat grib ingest: native cloud fraction rejected ({reason}); using full-cell fallback"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(None) => {
+            crate::log_line!(
+                "simsat grib ingest: native cloud fraction unavailable (cc 0/6/32 missing); using full-cell fallback"
+            );
+            None
+        }
+        Err(reason) => {
+            crate::log_line!(
+                "simsat grib ingest: native cloud fraction rejected ({reason}); using full-cell fallback"
+            );
+            None
+        }
+    };
     drop(z);
 
     // tau_up from the accumulated total extinction.
     let (qt, tau_up) = encode_tau_from_beta_total(&beta_total_f16, nx, ny, nz_brick, dz);
     drop(beta_total_f16);
+
+    // SNMR remains in total ext_precip exactly as before; the snow-only
+    // auxiliary subset is still conservatively unavailable.
+    let qs = LogQuant {
+        vmin: 0.0,
+        vmax: 0.0,
+    };
+    let ext_snow = vec![0u8; plane * nz_brick];
+    let (cloud_fraction, has_cloud_fraction) =
+        cloud_fraction_channel_or_fallback(cloud_fraction_candidate, plane * nz_brick);
 
     // 2-D planes.
     let mut hgt = read_plane(
@@ -1799,6 +2051,7 @@ pub fn ingest_grib_timestep_with(
     let mut quant_map = BTreeMap::new();
     quant_map.insert("ext_liquid".to_string(), ql);
     quant_map.insert("ext_ice".to_string(), qi);
+    quant_map.insert("ext_snow".to_string(), qs);
     quant_map.insert("ext_precip".to_string(), qp);
     quant_map.insert("tau_up".to_string(), qt);
     quant_map.insert("qvapor".to_string(), qv);
@@ -1814,9 +2067,12 @@ pub fn ingest_grib_timestep_with(
         quant: quant.clone(),
         ext_liquid,
         ext_ice,
+        ext_snow,
         ext_precip,
         tau_up,
         qvapor,
+        cloud_fraction,
+        has_cloud_fraction,
         temperature_f16,
         hgt,
         landmask,
@@ -1870,6 +2126,7 @@ pub fn ingest_grib_timestep_with(
         file: brick_file,
         time_iso: geom.time_iso,
         quant,
+        has_cloud_fraction,
         ssb_bytes,
         source_bytes,
         source_mtime_unix,
@@ -1993,6 +2250,103 @@ mod tests {
     }
 
     // ── value policies ─────────────────────────────────────────────────────────
+
+    fn cloud_fraction_entry(level: f64, loc: usize) -> CatalogEntry {
+        CatalogEntry {
+            loc,
+            sub: 0,
+            code: CODE_CLOUD_FRACTION,
+            level_type: LEVEL_HYBRID,
+            level_value: level,
+        }
+    }
+
+    #[test]
+    fn native_cloud_fraction_identity_and_level_order_are_guarded() {
+        assert_eq!(CODE_CLOUD_FRACTION, fc(0, 6, 32));
+
+        // Message order is irrelevant: native level 1 must occupy k=0, level 3
+        // k=2, matching HGT/hydrometeor bottom-to-top storage.
+        let entries = vec![
+            cloud_fraction_entry(3.0, 30),
+            CatalogEntry {
+                loc: 99,
+                sub: 0,
+                code: CODE_TMP,
+                level_type: LEVEL_HYBRID,
+                level_value: 1.0,
+            },
+            cloud_fraction_entry(1.0, 10),
+            cloud_fraction_entry(2.0, 20),
+        ];
+        let ordered = optional_cloud_fraction_entries(&entries, 3)
+            .unwrap()
+            .expect("complete native cc volume");
+        assert_eq!(
+            ordered.iter().map(|e| e.loc).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+
+        assert!(optional_cloud_fraction_entries(&[], 3).unwrap().is_none());
+        let gap = optional_cloud_fraction_entries(
+            &[cloud_fraction_entry(1.0, 1), cloud_fraction_entry(3.0, 3)],
+            3,
+        )
+        .unwrap_err();
+        assert!(gap.contains("expected level 2"), "{gap}");
+        let short = optional_cloud_fraction_entries(
+            &[cloud_fraction_entry(1.0, 1), cloud_fraction_entry(2.0, 2)],
+            3,
+        )
+        .unwrap_err();
+        assert!(short.contains("expected 3"), "{short}");
+        let duplicate = optional_cloud_fraction_entries(
+            &[cloud_fraction_entry(1.0, 1), cloud_fraction_entry(1.0, 2)],
+            1,
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+    }
+
+    #[test]
+    fn native_cloud_fraction_normalization_rejects_bad_scale_and_nonfinite() {
+        let mut valid = vec![-5.0e-5, 0.0, 0.25, 1.0, 1.0 + 5.0e-5];
+        normalize_native_cloud_fraction(&mut valid).unwrap();
+        assert_eq!(valid, vec![0.0, 0.0, 0.25, 1.0, 1.0]);
+
+        let mut nonfinite = vec![0.0, f32::NAN, 1.0];
+        assert!(
+            normalize_native_cloud_fraction(&mut nonfinite)
+                .unwrap_err()
+                .contains("non-finite")
+        );
+        let mut percent_like = vec![0.0, 50.0, 100.0];
+        let err = normalize_native_cloud_fraction(&mut percent_like).unwrap_err();
+        assert!(err.contains("refusing to guess percent scaling"), "{err}");
+    }
+
+    #[test]
+    fn native_cloud_fraction_resamples_bottom_to_top_and_preserves_provenance() {
+        let z = vec![0.0f32, 1000.0, 2000.0];
+        let native = vec![0.1f32, 0.5, 0.9];
+        let codes = resample_encode_cloud_fraction(&native, &z, 1, 1, 3, 0.0, 1000.0, 3)
+            .expect("compatible cloud fraction");
+        // Maximum overlap over the three brick layers yields 0.3, 0.7, 0.9.
+        assert_eq!(codes, bricks::encode_cloud_fraction(&[0.3f32, 0.7, 0.9]));
+        assert!(codes.windows(2).all(|pair| pair[1] > pair[0]));
+
+        let (channel, has_native) = cloud_fraction_channel_or_fallback(Some(codes.clone()), 3);
+        assert!(has_native);
+        assert_eq!(channel, codes);
+
+        // Missing or malformed candidates retain the exact historical channel.
+        let (missing, has_native) = cloud_fraction_channel_or_fallback(None, 4);
+        assert!(!has_native);
+        assert_eq!(missing, vec![255; 4]);
+        let (wrong_shape, has_native) = cloud_fraction_channel_or_fallback(Some(vec![0, 128]), 4);
+        assert!(!has_native);
+        assert_eq!(wrong_shape, vec![255; 4]);
+    }
 
     #[test]
     fn spfh_converts_to_mixing_ratio() {

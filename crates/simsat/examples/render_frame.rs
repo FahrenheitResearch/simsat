@@ -31,7 +31,10 @@
 //!   multiscatter=<b>   on | off  — M5 Wrenninge octaves   (default on).
 //!   beer-powder=<b>    on | off  — Schneider direct-sun shaping (default off).
 //!   clouds=<b>         on | off  — off = surface only (QA terrain/glint)  (default on).
-//!   cloud-optical-depth-scale=<f>  cloud OD sensitivity scale, 0.0..=4.0 (default 1.0).
+//!   fractional-clouds=<b> on | off — use model cloud fraction; off = legacy full cells
+//!                              (default on; falls back safely when the field is absent).
+//!   cloud-optical-depth-scale=<f>  cloud OD calibration, 0.0..=4.0 (shipped default 0.15;
+//!                      1.0 = unscaled model extinction).
 //!   granulation=<b>    on | off  — sub-grid cloud edge erosion (default off).
 //!   steps=<quality>    offline | interactive              (default offline).
 //!   sun-elev=<deg>     OPTIONAL sun-elevation override (else true solar geometry).
@@ -68,9 +71,11 @@
 //!                      perspective camera; `out` becomes a straight-alpha RGBA PNG (for
 //!                      compositing over a host 3-D map with a matching camera).
 //!                      A FLYOVER is N invocations along your own eye/look path.
-//!   ground-gain=<f>    OVERRIDE the baked GROUND LIFT (render::GROUND_DAY_LIFT); 1.0 = neutral.
-//!   cloud-softclip=<f> OVERRIDE the baked highlight soft-clip knee (render::CLOUD_SOFTCLIP_KNEE);
+//!   ground-gain=<f>    OVERRIDE the shipped GROUND LIFT (default 1.0 = neutral).
+//!   cloud-softclip=<f> OVERRIDE the shipped highlight knee (default 0.65);
 //!                      1.0 = disable the shoulder (hard clamp).
+//!   cloud-highlight-max=<f>  OVERRIDE the physical reflectance ceiling mapped to white
+//!                      (default 1.25); larger values preserve more detail.
 //!   topdown-cloudnorm=<f>  OVERRIDE the baked TOP-DOWN CLOUD NORMALIZATION
 //!                      (topdown::TOPDOWN_CLOUD_NORM); 1.0 = no normalization.
 //!   synthetic-green=<b> on | off (default off) — the ABI SYNTHETIC-GREEN display mode
@@ -90,10 +95,11 @@
 //!
 //! On completion it prints a one-line `SUMMARY ...` (dims, on-earth fraction, centre sun
 //! elevation, exposure, multiscatter, wall time, peak/median display luminance, the
-//! strided physical peak/median cloud reflectance, and `cloud_lum_p90_p10` — the WS2
-//! bright-cloud contrast metric: P90-P10 display luminance over strongly-cloudy output
-//! pixels, computed from the frame itself so it works for BOTH geo and top-down views)
-//! to stdout.
+//! strided physical cloud coverage/peak reflectance for the geostationary view (`n/a`
+//! for top-down, where that separate diagnostic march is not computed), and
+//! `cloud_lum_p90_p10` — the WS2 bright-cloud contrast metric: P90-P10 display
+//! luminance over strongly-cloudy output pixels, computed from the frame itself so it
+//! works for BOTH geo and top-down views) to stdout.
 //!
 //! NOTE: the old `supersample=` QA flag was REMOVED with the api refactor — it was a
 //! documented, tested-and-REJECTED anti-alias experiment (the cloud march is already
@@ -107,7 +113,7 @@ use image::{GrayImage, RgbImage, RgbaImage};
 use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams, SunOverride};
 use simsat::atmosphere::DEFAULT_AOD;
 use simsat::camera::{PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMode};
-use simsat::clouds::StepQuality;
+use simsat::clouds::{CloudFrameStats, DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality};
 use simsat::gpu::RenderedFrame;
 use simsat::ingest;
 use simsat::render::DEFAULT_EXPOSURE;
@@ -143,6 +149,7 @@ struct Opts {
     sun_elev_override: Option<f64>,
     sun_az_override: Option<f64>,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     exposure: f64,
@@ -186,6 +193,7 @@ struct Opts {
     /// knobs; the shipped look already comes from the baked constants.
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     topdown_cloud_norm: Option<f64>,
     /// QA/diagnostic: also dump the raw pre-tonemap reflectance bands to this path.
     bands_out: Option<PathBuf>,
@@ -202,7 +210,8 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!(
         "render_frame: input={} product={} view={} sat={} ts={} res={} margin={:.2} \
          aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
-         multiscatter={} beer-powder={} clouds={} cloud-od-scale={:.3} granulation={} \
+         multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
+         cloud-od-scale={:.3} granulation={} \
          steps={} sun-elev={} \
          exposure={:.3} canvas={} threads={}",
         opts.input.display(),
@@ -219,6 +228,7 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.multiscatter,
         opts.beer_powder,
         opts.clouds,
+        opts.fractional_clouds,
         opts.cloud_optical_depth_scale,
         opts.granulation,
         if opts.steps == StepQuality::Offline {
@@ -356,20 +366,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let (on_earth, peak_lum, median_lum) = display_luma_stats(rgba);
     let on_earth_frac = on_earth as f64 / (rnx * rny).max(1) as f64;
     let (cloud_lum_p90_p10, cloud_lum_frac) = cloud_contrast_stat(rgba);
-    let (cloud_frac, peak_refl, peak_sun_refl) = match &result.cloud_stats {
-        Some(s) => (s.cloud_fraction(), s.max_reflectance, s.max_sun_reflectance),
-        None => (0.0, 0.0, 0.0),
-    };
+    let (cloud_frac, peak_refl, peak_sun_refl) =
+        cloud_stat_summary_fields(result.cloud_stats.as_ref());
 
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
         "SUMMARY file={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
          sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
          atmosphere_correction={} terrain_atmosphere={} multiscatter={} beer_powder={} \
-         clouds={} cloud_optical_depth_scale={:.3} granulation={} steps={} synthetic_green={} \
+         clouds={} fractional_clouds_requested={} cloud_optical_depth_scale={:.3} granulation={} \
+         steps={} synthetic_green={} \
          on_earth_frac={:.3} \
-         peak_lum={:.3} median_lum={:.3} cloud_frac={:.3} peak_reflectance={:.4} \
-         peak_sun_reflectance={:.4} cloud_lum_p90_p10={:.4} cloud_lum_frac={:.3} wall_s={:.3}",
+         peak_lum={:.3} median_lum={:.3} cloud_frac={} peak_reflectance={} \
+         peak_sun_reflectance={} cloud_lum_p90_p10={:.4} cloud_lum_frac={:.3} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         opts.view.slug(),
         final_nx,
@@ -391,6 +400,7 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.multiscatter,
         opts.beer_powder,
         opts.clouds,
+        opts.fractional_clouds,
         opts.cloud_optical_depth_scale,
         opts.granulation,
         if opts.steps == StepQuality::Offline {
@@ -511,7 +521,8 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
     println!(
         "LAYERSUMMARY file={} dims={}x{} crs=EPSG:3857 corner_nw={:.4},{:.4} \
          corner_se={:.4},{:.4} sun_elev={:.1} cover_frac={:.3} mean_alpha={:.3} \
-         shadow_min={:.3} shadow_mean={:.3} beer_powder={} granulation={} wall_s={:.3}",
+         shadow_min={:.3} shadow_mean={:.3} beer_powder={} fractional_clouds_requested={} \
+         granulation={} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         nx,
         ny,
@@ -525,6 +536,7 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
         shadow_min,
         shadow_mean,
         opts.beer_powder,
+        opts.fractional_clouds,
         result.granulation,
         wall.as_secs_f64(),
     );
@@ -565,7 +577,7 @@ fn write_gray8_png(path: &Path, nx: usize, ny: usize, gray: &[u8]) -> Result<(),
 
 /// Display luminance threshold above which an output pixel is counted as
 /// STRONGLY CLOUDY for the [`cloud_contrast_stat`] metric. `0.70` display sits at
-/// `rho' ~ 0.49` (just under the soft-clip knee at exposure 1.6), so the population is
+/// `rho' ~ 0.49` (just under the soft-clip knee at neutral exposure 1.0), so the population is
 /// the bright cloud band whose texture the bounded shoulder is meant to preserve.
 const CLOUD_LUM_MIN: f64 = 0.70;
 
@@ -595,6 +607,21 @@ fn cloud_contrast_stat(rgba: &[u8]) -> (f64, f64) {
     let q = |p: f64| lums[((lums.len() - 1) as f64 * p).round() as usize];
     let frac = lums.len() as f64 / on_earth.max(1) as f64;
     (q(0.90) - q(0.10), frac)
+}
+
+/// Stable `SUMMARY` tokens for the optional physical cloud-march diagnostic. The API
+/// deliberately computes [`CloudFrameStats`] only for the geostationary view; top-down
+/// still has the view-independent output-frame metrics above. Preserve that distinction
+/// instead of serializing an absent diagnostic as three plausible-but-false zeroes.
+fn cloud_stat_summary_fields(stats: Option<&CloudFrameStats>) -> (String, String, String) {
+    match stats {
+        Some(s) => (
+            format!("{:.3}", s.cloud_fraction()),
+            format!("{:.4}", s.max_reflectance),
+            format!("{:.4}", s.max_sun_reflectance),
+        ),
+        None => ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
+    }
 }
 
 /// A short product label for the log line
@@ -650,6 +677,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         beer_powder: opts.beer_powder,
         steps: opts.steps,
         clouds: opts.clouds,
+        fractional_clouds: opts.fractional_clouds,
         cloud_optical_depth_scale: opts.cloud_optical_depth_scale,
         granulation: Some(opts.granulation),
         sun_override,
@@ -660,6 +688,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         raster_override: None,
         ground_gain: opts.ground_gain,
         cloud_softclip: opts.cloud_softclip,
+        cloud_highlight_max: opts.cloud_highlight_max,
         topdown_cloud_norm: opts.topdown_cloud_norm,
         perspective: perspective_camera_of(opts),
     }
@@ -781,7 +810,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut multiscatter = true;
     let mut beer_powder = false;
     let mut clouds = true;
-    let mut cloud_optical_depth_scale = 1.0f32;
+    let mut fractional_clouds = true;
+    let mut cloud_optical_depth_scale = DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
     let mut granulation = false;
     let mut steps = StepQuality::Offline;
     let mut sun_elev_override: Option<f64> = None;
@@ -808,6 +838,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut product_perspective = false;
     let mut ground_gain: Option<f64> = None;
     let mut cloud_softclip: Option<f64> = None;
+    let mut cloud_highlight_max: Option<f64> = None;
     let mut topdown_cloud_norm: Option<f64> = None;
     let mut bands_out: Option<PathBuf> = None;
     let mut synthetic_green = false;
@@ -853,6 +884,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
             "beer-powder" | "beer_powder" | "beerpowder" => beer_powder = parse_bool(v)?,
             "clouds" => clouds = parse_bool(v)?,
+            "fractional-clouds" | "fractional_clouds" | "model-cloud-fraction" => {
+                fractional_clouds = parse_bool(v)?
+            }
             "cloud-optical-depth-scale" | "cloud_optical_depth_scale" | "cloud-od-scale" => {
                 cloud_optical_depth_scale = v
                     .parse()
@@ -925,6 +959,12 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "cloud-softclip" | "cloud_softclip" | "softclip" => {
                 cloud_softclip = Some(v.parse().map_err(|_| format!("bad cloud-softclip '{v}'"))?)
             }
+            "cloud-highlight-max" | "cloud_highlight_max" | "highlight-max" => {
+                cloud_highlight_max = Some(
+                    v.parse()
+                        .map_err(|_| format!("bad cloud-highlight-max '{v}'"))?,
+                )
+            }
             "topdown-cloudnorm" | "topdown_cloudnorm" | "cloudnorm" => {
                 topdown_cloud_norm = Some(
                     v.parse()
@@ -961,6 +1001,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         sun_elev_override,
         sun_az_override,
         clouds,
+        fractional_clouds,
         cloud_optical_depth_scale,
         granulation,
         exposure,
@@ -984,6 +1025,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         perspective_layer,
         ground_gain,
         cloud_softclip,
+        cloud_highlight_max,
         topdown_cloud_norm,
         bands_out,
         synthetic_green,
@@ -1084,7 +1126,8 @@ fn print_usage() {
          \x20 multiscatter=<b>   on | off  (M5 octaves)             (default on)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
-         \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default 1.0)\n\
+         \x20 fractional-clouds=<b> on | off use model cloud fraction (default on; off = legacy)\n\
+         \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default {DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE}; 1.0 = unscaled)\n\
          \x20 granulation=<b>    on | off  sub-grid cloud detail    (default off)\n\
          \x20 steps=<quality>    offline | interactive              (default offline)\n\
          \x20 sun-elev=<deg>     OPTIONAL sun elevation override (else true solar)\n\
@@ -1108,11 +1151,14 @@ fn print_usage() {
          \x20 fov=<deg>          perspective horizontal FOV (default 40)\n\
          \x20 camsize=<WxH>      perspective image dims (default 1280x720)\n\
          \x20 perspective-layer=<b>  on|off cloud-field-only RGBA through the camera\n\
-         \x20 ground-gain=<f>    override the baked GROUND LIFT (1.0 = neutral)\n\
-         \x20 cloud-softclip=<f> override the highlight soft-clip knee (1.0 = disable)\n\
+         \x20 ground-gain=<f>    override shipped 1.0 GROUND LIFT (neutral)\n\
+         \x20 cloud-softclip=<f> override shipped 0.65 highlight knee (1.0 = disable)\n\
+         \x20 cloud-highlight-max=<f> override shipped 1.25 ceiling mapped to white\n\
          \x20 topdown-cloudnorm=<f>  override the top-down cloud normalization (1.0 = none)\n\
          \x20 synthetic-green=<b> on|off ABI synthetic-green display mode (G'=0.45R+0.45B+0.10G)\n\
-         \x20 bands-out=<path.bin>  QA: also dump raw pre-tonemap reflectance (f32le RGB)\n"
+         \x20 bands-out=<path.bin>  QA: also dump raw pre-tonemap reflectance (f32le RGB)\n\n\
+         SUMMARY: cloud_frac/peak[_sun]_reflectance are geostationary-only physical\n\
+         diagnostics and print n/a for top-down; cloud_lum_* works in both views.\n"
     );
 }
 
@@ -1127,22 +1173,85 @@ mod tests {
     }
 
     #[test]
-    fn cloud_appearance_switches_default_off() {
+    fn cloud_controls_have_intentional_defaults() {
         let opts = opts_with(&[]);
         assert!(!opts.beer_powder);
         assert!(!opts.granulation);
+        assert!(opts.fractional_clouds);
+        assert_eq!(
+            opts.cloud_optical_depth_scale,
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert!(opts.ground_gain.is_none());
+        assert!(opts.cloud_softclip.is_none());
+        assert!(opts.cloud_highlight_max.is_none());
         let params = render_params(&opts);
         assert!(!params.beer_powder);
         assert_eq!(params.granulation, Some(false));
+        assert!(params.fractional_clouds);
+        assert_eq!(
+            params.cloud_optical_depth_scale,
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert!(params.ground_gain.is_none());
+        assert!(params.cloud_softclip.is_none());
+        assert!(params.cloud_highlight_max.is_none());
     }
 
     #[test]
-    fn cloud_appearance_switches_parse_and_reach_render_params() {
-        let opts = opts_with(&["beer-powder=on", "granulation=yes"]);
+    fn cloud_controls_parse_and_reach_render_params() {
+        let opts = opts_with(&["beer-powder=on", "granulation=yes", "fractional-clouds=off"]);
         assert!(opts.beer_powder);
         assert!(opts.granulation);
+        assert!(!opts.fractional_clouds);
         let params = render_params(&opts);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
+        assert!(!params.fractional_clouds);
+    }
+
+    #[test]
+    fn display_controls_parse_and_reach_render_params() {
+        let opts = opts_with(&[
+            "ground-gain=1.6",
+            "cloud-softclip=0.65",
+            "cloud-highlight-max=1.25",
+        ]);
+        assert_eq!(opts.ground_gain, Some(1.6));
+        assert_eq!(opts.cloud_softclip, Some(0.65));
+        assert_eq!(opts.cloud_highlight_max, Some(1.25));
+
+        let params = render_params(&opts);
+        assert_eq!(params.ground_gain, Some(1.6));
+        assert_eq!(params.cloud_softclip, Some(0.65));
+        assert_eq!(params.cloud_highlight_max, Some(1.25));
+    }
+
+    #[test]
+    fn absent_topdown_cloud_stats_are_not_serialized_as_real_zeroes() {
+        assert_eq!(
+            cloud_stat_summary_fields(None),
+            ("n/a".to_string(), "n/a".to_string(), "n/a".to_string())
+        );
+    }
+
+    #[test]
+    fn present_geostationary_cloud_stats_keep_numeric_summary_precision() {
+        let stats = CloudFrameStats {
+            sampled: 8,
+            cloudy: 3,
+            all_finite: true,
+            max_inscatter: 12.0,
+            max_reflectance: 0.67894,
+            max_sun_reflectance: 0.12346,
+        };
+        assert_eq!(
+            cloud_stat_summary_fields(Some(&stats)),
+            (
+                "0.375".to_string(),
+                "0.6789".to_string(),
+                "0.1235".to_string()
+            )
+        );
     }
 }

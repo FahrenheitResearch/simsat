@@ -51,14 +51,31 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
 
+New in v0.1.4: **model-aware fractional-cloud coverage and visible calibration**.
+WRF `CLDFRA` is preserved where supplied; condensate cells with missing or
+contradictory zero coverage are repaired with WRF's Xu-Randall diagnostic. HRRR
+`wrfnat` now ingests its native 50-level cloud-fraction field. Both sources use
+maximum-overlap vertical remapping, so anvil margins and cloud tails can fade
+instead of filling every model cell as an opaque slab. Fractional coverage is on
+by default and has an explicit legacy off switch in Rust, the CLI, Python, and
+Studio. Sources without a complete trusted field retain the conservative
+full-cell fallback.
+
+The v0.1.4 visible preset uses cloud-OD scale `0.15`, neutral exposure/ground lift `1.0`,
+highlight knee `0.65`, and highlight ceiling `1.25`. The OD value is the owner's
+cross-file visual selection, superseding the earlier tied `0.20`/`0.30` midpoint
+candidate. It is not a claimed physical optimum; every value remains overridable. Raw visible bands, thermal
+products, and derived cloud optical depth do not consume these display controls.
+The SSB format is v5, so source-backed v0.1.3/v4 caches re-ingest once to acquire
+the corrected cloud-fraction semantics; a cached-only run needs its original
+source file to upgrade.
+
 New in v0.1.3: **atmosphere and cloud fidelity controls** — terrain-height
 atmospheric columns, consistent daytime aerial-veil correction across the
 surface and cloud-front airlight, optically-thin multi-scatter gating, and a
 bounded visible cloud optical-depth sensitivity scale. AOD, RH swelling,
 atmosphere correction, terrain atmosphere, clouds, multiscatter, Beer-powder,
-granulation, and cloud-OD scale now have matching controls in Studio, the CLI,
-and Python. Raw derived cloud optical depth and thermal products remain
-unscaled.
+granulation, and cloud-OD controls are available in Studio, the CLI, and Python.
 
 New in v0.1.2: **operational-model ingest** — NOAA **HRRR** native-level GRIB2
 (`wrfnat`) opens directly in the studio/CLI/Python exactly like a wrfout;
@@ -85,7 +102,7 @@ Two named binaries render without a GPU or GUI (`cargo build --release --bins`):
 ```
 simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
     sat=goes-east view=geo aod=0.05 rh-swelling=off \
-    atmosphere-correction=on terrain-atmosphere=on cloud-od-scale=1.0 \
+    atmosphere-correction=on terrain-atmosphere=on fractional-clouds=on cloud-od-scale=0.15 \
     multiscatter=on beer-powder=off granulation=off clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
     enhancement=rainbow
@@ -97,11 +114,17 @@ fields (`derived=pw|ctt|cod`). Both take `key=value` arguments (run with
 `--help` for the full list) and print a machine-readable `SUMMARY` line.
 Visible renders expose the same atmosphere/cloud QA controls as Studio and Python:
 numeric aerosol AOD (`0` disables aerosol), RH swelling, reduced-versus-full
-aerial airlight, terrain-height atmosphere, multiscatter, beer-powder, granulation,
-clouds, and a neutral-at-`1.0` cloud optical-depth scale (`0` disables visible cloud
-extinction, valid range `0.0..=4.0`). The scale is an explicit sensitivity control and
-does not alter the raw derived cloud-optical-depth product; beer-powder and granulation
-remain opt-in/off by default.
+aerial airlight, terrain-height atmosphere, model fractional clouds, multiscatter,
+beer-powder, granulation, clouds, and a shipped `0.15` cloud optical-depth scale
+(`1.0` is unscaled model extinction; `0` disables visible cloud extinction; valid
+range `0.0..=4.0`). The `0.15` default is an owner-selected cross-file visual
+calibration, not a claimed physical optimum. Finished RGB products also expose
+`exposure=`, `ground-gain=`, `cloud-softclip=`, and `cloud-highlight-max=`;
+omitting them keeps the shipped neutral `1.0` exposure/ground gain, `0.65`
+highlight knee, and `1.25` highlight ceiling.
+`fractional-clouds=off` restores legacy horizontally-full cloudy cells. The scale
+is an explicit sensitivity control and does not alter the raw derived cloud-optical-
+depth product; beer-powder and granulation remain opt-in/off by default.
 
 Animated GIF loops are exported from a completed store run:
 
@@ -127,7 +150,8 @@ rgb, geo = simsat.render_visible_rgb(
     rh_aerosol_swelling=False,
     atmosphere_correction=True,
     terrain_atmosphere=True,
-    cloud_optical_depth_scale=1.0,
+    fractional_clouds=True,
+    cloud_optical_depth_scale=0.15,
     beer_powder=False,
     granulation=False,
 )

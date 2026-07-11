@@ -46,14 +46,12 @@ pub const WATER_ALBEDO_DAY_SCALE: f64 = 0.35;
 /// to exactly `1` at every elevation (byte-identical). `0.0` = the old hard floor.
 pub const CLOUD_SHADOW_FLOOR: f64 = 0.25;
 
-/// Default display-side exposure gain (see [`radiance_to_rgba`]). A moderate
-/// brightening over the pre-exposure implicit `1.0` — the owner reported renders
-/// looked "too dark no matter the time", and this is the shipped first guess (the
-/// studio slider + the `render_frame` CLI both default to it). `1.0` exactly
-/// reproduces the pre-exposure output. Chosen deliberately below the level that
-/// clips a bright sunlit anvil to solid white; the exact value is tuned from real
-/// composited frames (notes/qa-notes.md), not from memory.
-pub const DEFAULT_EXPOSURE: f64 = 1.6;
+/// Default display-side exposure gain (see [`radiance_to_rgba`]). `1.0` keeps the
+/// modeled reflectance factor unchanged before the ABI square-root display stretch,
+/// matching the neutral operational-product transfer. The former `1.6` appearance
+/// preset blew out cloud tops and over-brightened terrain in the v0.1.4 cross-case
+/// review; it remains available as an explicit Studio/CLI/Python override.
+pub const DEFAULT_EXPOSURE: f64 = 1.0;
 
 /// Neutral flat albedo (sRGB) used when the Blue Marble texture is absent, so the
 /// studio still renders a lit sphere with a clear "texture missing" message.
@@ -150,7 +148,7 @@ pub const LAND_VIBRANCY: f64 = 1.45;
 /// round-1 de-hazed ground read a touch dark/muted vs the bright daylight land of the
 /// GOES true-color references, so the surface signal is lifted toward that brightness.
 /// This is a CALIBRATED TRUE-COLOR DISPLAY GAIN on the ground reflectance, NOT the
-/// owner-approved global exposure ([`DEFAULT_EXPOSURE`] = 1.6, unchanged) and NOT an
+/// global exposure ([`DEFAULT_EXPOSURE`] = 1.0) and NOT an
 /// albedo/physics change: it multiplies the assembled surface radiance before the
 /// aerial-perspective veil is added, so only the ground signal brightens (the additive
 /// haze is untouched). WATER is excluded (dark ocean stays dark; the glint has its own
@@ -181,12 +179,12 @@ pub const LAND_DAY_GAIN: f64 = 1.20;
 /// is sun-elevation-gated on the SAME ramp as the veil / land gain ([`ground_day_lift`]),
 /// so at/below [`AERIAL_VEIL_ELEV_LO_DEG`] it is exactly `1.0` — the whole twilight/
 /// terminator band is byte-unchanged and the M2 twilight tuning is preserved. `1.0` = the
-/// neutral no-op (reproduces the pre-lift ground). Value `2.0`: the iteration-1 experiment
-/// found a ground gain of ~2.0-2.2 made the basemap vivid green / the ocean visible
-/// without washing out; with the highlight soft-clip below, bright land keeps structure
-/// rather than pinning to white. The `render_frame` `ground-gain=` CLI knob overrides it
-/// (default = this baked value) for future tuning.
-pub const GROUND_DAY_LIFT: f64 = 2.0;
+/// neutral no-op (reproduces the pre-lift ground). The former `1.6` lift compounded
+/// with the land-only gain and display exposure, making terrain brighter than the
+/// visible-satellite references in the v0.1.4 cross-case review. It remains available
+/// through the `render_frame` `ground-gain=` CLI knob and equivalent Python/Studio
+/// controls.
+pub const GROUND_DAY_LIFT: f64 = 1.0;
 
 /// CLOUD/HIGHLIGHT SOFT-CLIP knee — a Reinhard highlight shoulder applied in
 /// [`radiance_to_rgba`] (the ONE tonemap both the surface pass and the cloud composite
@@ -198,10 +196,11 @@ pub const GROUND_DAY_LIFT: f64 = 2.0;
 /// `[knee, +inf) -> [knee, 1)` — a bright anvil at `rho = 1.3` and one at `rho = 1.0`
 /// land on distinct display values instead of both pinning to 1.0. `1.0` = the neutral
 /// no-op (identity below 1, the old hard clamp above 1 — reproduces the pre-soft-clip
-/// output). Value `0.75`: the knee below which the daytime surface / mid-tones sit, so
-/// only the brightest tops are compressed. The `render_frame` `cloud-softclip=` CLI knob
-/// overrides it (default = this baked value; `1.0` disables it).
-pub const CLOUD_SOFTCLIP_KNEE: f64 = 0.75;
+/// output). Value `0.65` is the cross-case v0.1.4 QA calibration: the shoulder begins
+/// before bright cloud tops flatten while leaving darker terrain and cloud texture
+/// unchanged. The `render_frame` `cloud-softclip=` CLI knob overrides it (default = this
+/// baked value; `1.0` disables it).
+pub const CLOUD_SOFTCLIP_KNEE: f64 = 0.65;
 
 /// Sun-GLINT brightness gain. The Cox-Munk specular glint over water is physically a
 /// thin, dim streak once band-averaged; real GOES shows a DISTINCT bright glint. This
@@ -378,6 +377,15 @@ pub struct FrameContext<'a> {
     /// together (both composite through [`radiance_to_rgba`]). `1.0` reproduces the
     /// pre-exposure output; [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
+    /// Sun-gated daytime surface-radiance lift. [`GROUND_DAY_LIFT`] is the shipped
+    /// default and `1.0` is the identity/no-lift value.
+    pub ground_day_lift: f64,
+    /// Highlight shoulder knee used by the visible display transform.
+    /// [`CLOUD_SOFTCLIP_KNEE`] is the shipped default and `1.0` disables the shoulder.
+    pub cloud_softclip_knee: f64,
+    /// Physical reflectance-factor ceiling mapped to display white by the bounded
+    /// shoulder. [`RHO_HIGHLIGHT_MAX`] is the shipped default.
+    pub cloud_highlight_max: f64,
     /// Apply the product-facing atmospheric correction (the daytime aerial-veil
     /// reduction, including the matching cloud-front correction). `false` retains the
     /// full modeled path airlight; it does not disable unrelated display transforms.
@@ -678,14 +686,13 @@ pub fn apply_low_sun_illuminant(
 /// The PHYSICAL reflectance ceiling the bounded highlight shoulder maps to display
 /// white (see [`soft_clip_highlight`]): `x_max = exposure * RHO_HIGHLIGHT_MAX` is the
 /// largest exposure-applied reflectance the shoulder resolves — everything at/above it
-/// pins to exactly `1.0`. Value `1.05`: measured low-sun composited peaks reach
-/// `rho ~ 1.065` (slightly above), so the very brightest ~1% of a frame honestly
-/// saturates to white (a real ABI bright top does too) while the whole `[knee, x_max]`
-/// band below keeps a NONZERO display slope. This is what makes the shoulder
+/// pins to exactly `1.0`. Value `1.25` is the cross-case v0.1.4 QA calibration: it
+/// preserves structure across a wider bright-cloud range while still allowing the
+/// strongest cloud tops to reach white. This is what makes the shoulder
 /// EXPOSURE-AWARE: the unbounded Reinhard wasted the display range asymptoting toward
 /// 1.0 for inputs that can never occur, crushing the real cloud band (rho 0.6..0.9 at
 /// exposure 1.6 collapsed to a 0.033 display delta — the "white square").
-pub const RHO_HIGHLIGHT_MAX: f64 = 1.05;
+pub const RHO_HIGHLIGHT_MAX: f64 = 1.25;
 
 /// BOUNDED HIGHLIGHT SOFT-CLIP of one display value `x >= 0` with knee `knee` in
 /// `(0, 1]` (see [`CLOUD_SOFTCLIP_KNEE`]) and a FINITE input ceiling `x_max` (see
@@ -1195,27 +1202,33 @@ pub fn surface_toa_radiance(
 /// so the surface and the cloud brighten consistently. A non-finite or non-positive
 /// `exposure` falls back to `1.0` (never darkens to nothing on a bad input).
 pub fn radiance_to_rgba(l_toa: [f64; 3], transform: OutputTransform, exposure: f64) -> [f32; 4] {
-    radiance_to_rgba_softclip(l_toa, transform, exposure, CLOUD_SOFTCLIP_KNEE)
+    radiance_to_rgba_softclip(
+        l_toa,
+        transform,
+        exposure,
+        CLOUD_SOFTCLIP_KNEE,
+        RHO_HIGHLIGHT_MAX,
+    )
 }
 
-/// Like [`radiance_to_rgba`] but with an explicit highlight soft-clip knee (see
-/// [`CLOUD_SOFTCLIP_KNEE`] / [`soft_clip_highlight`]). [`radiance_to_rgba`] delegates
-/// here with the baked default, so the plain surface path and the cloud/top-down RGB
-/// paths (which read the per-scene `MarchConfig` knob, overridable by the `render_frame`
-/// `cloud-softclip=` knob) all share ONE tonemap. `knee = 1.0` disables the shoulder
-/// (the old hard clamp above 1.0).
+/// Like [`radiance_to_rgba`] but with explicit highlight soft-clip controls (see
+/// [`CLOUD_SOFTCLIP_KNEE`], [`RHO_HIGHLIGHT_MAX`], and [`soft_clip_highlight`]).
+/// [`radiance_to_rgba`] delegates here with the baked defaults, so the plain surface
+/// path and the cloud/top-down RGB paths all share ONE tonemap. `knee = 1.0` disables
+/// the shoulder (the old hard clamp above 1.0); `highlight_max` is the physical
+/// reflectance-factor ceiling mapped to white.
 ///
 /// EXPOSURE-AWARE SHOULDER BOUND: the shoulder's input ceiling is derived INTERNALLY
-/// here as `x_max = gain * RHO_HIGHLIGHT_MAX` — the exposure gain is already applied to
-/// the reflectance, so the largest input the shoulder can ever see is the exposure times
-/// the physical reflectance ceiling. Deriving it here (the one seam that already
-/// receives the exposure) keeps this signature and every caller (clouds.rs, topdown.rs)
-/// unchanged.
+/// here as `x_max = gain * highlight_max` — the exposure gain is already applied to the
+/// reflectance, so the largest input the shoulder can ever see is the exposure times
+/// the selected physical reflectance ceiling. A non-finite or non-positive override
+/// falls back to [`RHO_HIGHLIGHT_MAX`].
 pub fn radiance_to_rgba_softclip(
     l_toa: [f64; 3],
     transform: OutputTransform,
     exposure: f64,
     softclip_knee: f64,
+    highlight_max: f64,
 ) -> [f32; 4] {
     let e_sun = SOLAR_IRRADIANCE_RGB;
     let gain = if exposure.is_finite() && exposure > 0.0 {
@@ -1223,11 +1236,16 @@ pub fn radiance_to_rgba_softclip(
     } else {
         1.0
     };
+    let highlight_max = if highlight_max.is_finite() && highlight_max > 0.0 {
+        highlight_max
+    } else {
+        RHO_HIGHLIGHT_MAX
+    };
     let mut rho = [0.0; 3];
     for c in 0..3 {
         rho[c] = gain * std::f64::consts::PI * l_toa[c] / e_sun[c];
     }
-    let out = apply_output_transform(rho, transform, softclip_knee, gain * RHO_HIGHLIGHT_MAX);
+    let out = apply_output_transform(rho, transform, softclip_knee, gain * highlight_max);
     [out[0], out[1], out[2], 1.0]
 }
 
@@ -1253,15 +1271,19 @@ pub fn reflectance_from_radiance(l_toa: [f64; 3]) -> [f32; 3] {
 /// beyond the atmosphere (the off-earth marker the store writer turns into a
 /// transparent/NaN plane value). Twin of `fs_main` in `surface.wgsl`.
 pub fn shade_surface(ctx: &FrameContext, px: &SurfacePixel) -> [f32; 4] {
-    // The clouds-off surface path bakes the shipped GROUND LIFT default (the composite
-    // paths pass their per-scene `MarchConfig` value); the tonemap bakes the soft-clip.
-    match surface_toa_radiance(ctx, px, 1.0, GROUND_DAY_LIFT) {
+    match surface_toa_radiance(ctx, px, 1.0, ctx.ground_day_lift) {
         None => [0.0, 0.0, 0.0, 0.0],
         Some(l_toa) => {
             // Low-sun illuminant correction at the display seam (on-earth only; the
             // limb keeps its physical color). Identity outside the 2-30 deg band.
             let l = apply_low_sun_illuminant(l_toa, px.on_earth, px.sun_elev_deg as f64, ctx.luts);
-            radiance_to_rgba(l, ctx.output_transform, ctx.exposure)
+            radiance_to_rgba_softclip(
+                l,
+                ctx.output_transform,
+                ctx.exposure,
+                ctx.cloud_softclip_knee,
+                ctx.cloud_highlight_max,
+            )
         }
     }
 }
@@ -1300,6 +1322,14 @@ pub fn normals_from_hgt(hgt: &[f32], nx: usize, ny: usize, dx: f64, dy: f64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_visible_display_calibration_is_rc_preset() {
+        assert_eq!(DEFAULT_EXPOSURE, 1.0);
+        assert_eq!(GROUND_DAY_LIFT, 1.0);
+        assert_eq!(CLOUD_SOFTCLIP_KNEE, 0.65);
+        assert_eq!(RHO_HIGHLIGHT_MAX, 1.25);
+    }
 
     #[test]
     fn srgb_round_trips_within_tolerance() {
@@ -1457,6 +1487,9 @@ mod tests {
             // the pre-exposure output (a moderated default is a display choice made in
             // the studio / CLI, not baked into the physics tests).
             exposure: 1.0,
+            ground_day_lift: GROUND_DAY_LIFT,
+            cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+            cloud_highlight_max: RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
         };
@@ -2205,7 +2238,7 @@ mod tests {
     #[test]
     fn soft_clip_highlight_identity_below_knee_bounded_and_monotone() {
         let knee = CLOUD_SOFTCLIP_KNEE;
-        let x_max = DEFAULT_EXPOSURE * RHO_HIGHLIGHT_MAX; // the shipped bound at 1.6
+        let x_max = DEFAULT_EXPOSURE * RHO_HIGHLIGHT_MAX;
         // Strictly identity at/below the knee (approved mid-tones/daytime/twilight).
         for &x in &[0.0, 0.1, 0.5, knee] {
             assert_eq!(
@@ -2217,14 +2250,14 @@ mod tests {
         // Above the knee: strictly monotone increasing, <= 1, exactly 1.0 at/above
         // x_max. Distinct bright tops below x_max land on distinct values (structure).
         let mut prev = knee;
-        for &x in &[0.8, 1.0, 1.3, x_max - 1e-6] {
+        for &x in &[0.8, 1.0, 1.15, x_max - 1e-6] {
             let y = soft_clip_highlight(x, knee, x_max);
             assert!(y > prev, "monotone increasing at {x}: {y} <= {prev}");
             assert!(y < 1.0, "below white short of x_max at {x}: {y}");
             prev = y;
         }
         assert!(
-            soft_clip_highlight(1.3, knee, x_max) > soft_clip_highlight(1.0, knee, x_max),
+            soft_clip_highlight(1.15, knee, x_max) > soft_clip_highlight(1.0, knee, x_max),
             "bright tops must keep structure (not both pin to white)"
         );
         // C1-continuous at the knee: the slope from just above is ~1 (matches identity).
@@ -2292,20 +2325,18 @@ mod tests {
     }
 
     #[test]
-    fn soft_clip_contrast_floor_recovers_the_cloud_band_at_shipped_exposure() {
+    fn soft_clip_contrast_floor_recovers_the_cloud_band_at_high_exposure_override() {
         // THE WHITE-SQUARE FIX, quantified. At exposure 1.6 the cloud-texture band
         // rho 0.6..0.85 lands at x = 0.96..1.36. The old unbounded Reinhard collapsed
         // it to a 0.033 display delta (the flat white square); the bounded shoulder
         // must keep >= 0.08 of LINEAR separation across the band (shoulder domain) and
         // measurably widen the final display (post-sqrt) delta.
         //
-        // NOTE (feasibility, documented in notes/ws2-tonemap-notes.md): a 0.08 POST-SQRT
-        // delta is unreachable for ANY monotone C1 concave shoulder with knee 0.75 and
-        // x_max = 1.68 (concavity caps it at ~0.058); the 0.08 floor is asserted on the
-        // shoulder output, and the display floor is asserted at the strongest feasible
-        // level (0.045, a 1.39x recovery over the 0.0334 baseline).
+        // NOTE (feasibility, documented in notes/ws2-tonemap-notes.md): the 0.08 floor
+        // is intentionally asserted in the linear shoulder domain; after the ABI sqrt
+        // stretch the shipped 0.65-knee / 1.25-ceiling curve uses a 0.045 display floor.
         let knee = CLOUD_SOFTCLIP_KNEE;
-        let exposure = DEFAULT_EXPOSURE;
+        let exposure = 1.6;
         let x_max = exposure * RHO_HIGHLIGHT_MAX;
         let (x_lo, x_hi) = (0.96, 1.36); // exposure-applied rho 0.6 / 0.85
         let y_lo = soft_clip_highlight(x_lo, knee, x_max);
@@ -2334,10 +2365,57 @@ mod tests {
             "display contrast floor: {d_hi} - {d_lo} = {} < 0.045",
             d_hi - d_lo
         );
-        // And the very top: the physical peak (rho ~ 1.065 > RHO_HIGHLIGHT_MAX) pins
-        // honestly to display white.
+        // The old ~1.07 peak now retains detail below the raised 1.25 ceiling; only a
+        // stronger super-bright top at/above the shipped physical ceiling reaches white.
         let d_peak = radiance_to_rgba(l_of(1.07), OutputTransform::AbiReflectance, exposure)[0];
-        assert_eq!(d_peak, 1.0, "the physical peak saturates to white");
+        assert!(d_peak < 1.0, "the ordinary bright peak keeps structure");
+        let d_super = radiance_to_rgba(l_of(1.26), OutputTransform::AbiReflectance, exposure)[0];
+        assert_eq!(d_super, 1.0, "a super-bright top still saturates to white");
+    }
+
+    #[test]
+    fn highlight_ceiling_override_preserves_bright_structure_and_has_safe_fallbacks() {
+        let e_sun = SOLAR_IRRADIANCE_RGB;
+        let rho = 1.27;
+        let l = [
+            rho * e_sun[0] / std::f64::consts::PI,
+            rho * e_sun[1] / std::f64::consts::PI,
+            rho * e_sun[2] / std::f64::consts::PI,
+        ];
+        let default = radiance_to_rgba_softclip(
+            l,
+            OutputTransform::AbiReflectance,
+            DEFAULT_EXPOSURE,
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX,
+        );
+        assert_eq!(default[0], 1.0, "the shipped ceiling clips this peak");
+
+        let raised = radiance_to_rgba_softclip(
+            l,
+            OutputTransform::AbiReflectance,
+            DEFAULT_EXPOSURE,
+            CLOUD_SOFTCLIP_KNEE,
+            1.50,
+        );
+        assert!(
+            raised[0] < 1.0 && raised[0] > 0.0,
+            "a raised physical ceiling should retain highlight structure: {raised:?}"
+        );
+
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert_eq!(
+                radiance_to_rgba_softclip(
+                    l,
+                    OutputTransform::AbiReflectance,
+                    DEFAULT_EXPOSURE,
+                    CLOUD_SOFTCLIP_KNEE,
+                    bad,
+                ),
+                default,
+                "invalid ceiling {bad} must use the baked calibration"
+            );
+        }
     }
 
     #[test]
@@ -2384,9 +2462,10 @@ mod tests {
             (ground_day_lift(AERIAL_VEIL_ELEV_HI_DEG, GROUND_DAY_LIFT) - GROUND_DAY_LIFT).abs()
                 < 1e-12
         );
-        assert!(
-            ground_day_lift(90.0, GROUND_DAY_LIFT) > 1.0,
-            "daytime must lift"
+        assert_eq!(
+            ground_day_lift(90.0, GROUND_DAY_LIFT),
+            1.0,
+            "the shipped ground calibration is neutral"
         );
         // Monotone non-decreasing as the sun rises.
         let mut prev = 0.0;
@@ -2399,6 +2478,7 @@ mod tests {
 
     #[test]
     fn ground_lift_brightens_day_surface_but_not_twilight() {
+        const TEST_GROUND_LIFT: f64 = 1.6;
         let view = nadir_view();
         let sum = |l: [f64; 3]| l[0] + l[1] + l[2];
         // Daytime (50 deg, above the veil HI): a > 1 ground_lift brightens BOTH the land
@@ -2417,7 +2497,7 @@ mod tests {
                 ..Default::default()
             };
             let base = surface_toa_radiance(&day_ctx, &px, 1.0, 1.0).expect("earth");
-            let lifted = surface_toa_radiance(&day_ctx, &px, 1.0, GROUND_DAY_LIFT).expect("earth");
+            let lifted = surface_toa_radiance(&day_ctx, &px, 1.0, TEST_GROUND_LIFT).expect("earth");
             assert!(
                 sum(lifted) > sum(base) + 1e-6,
                 "ground lift must brighten the daytime {} surface: {} !> {}",
@@ -2440,7 +2520,7 @@ mod tests {
             ..Default::default()
         };
         let base = surface_toa_radiance(&twi_ctx, &px, 1.0, 1.0).expect("earth");
-        let lifted = surface_toa_radiance(&twi_ctx, &px, 1.0, GROUND_DAY_LIFT).expect("earth");
+        let lifted = surface_toa_radiance(&twi_ctx, &px, 1.0, TEST_GROUND_LIFT).expect("earth");
         assert_eq!(
             base, lifted,
             "ground lift must be byte-identical at twilight"

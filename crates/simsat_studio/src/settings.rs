@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use simsat::atmosphere::OutputTransform;
 use simsat::camera::{ResolutionMode, SatellitePreset};
-use simsat::clouds::StepQuality;
+use simsat::clouds::{DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality};
 use simsat::derived::DerivedField;
 use simsat::ir_enhance::IrEnhancement;
 use simsat::wv::WvBand;
@@ -34,6 +34,11 @@ use crate::{RenderMode, StudioView};
 
 /// Maximum entries kept in the recent-files list.
 pub const RECENT_CAP: usize = 8;
+/// Visible-calibration settings epoch. Epoch 1 was the diagnostic v0.1.4 RC
+/// (`cloud_optical_depth_scale = 0.25`, exposure/ground = `1.6`); epoch 2 carries
+/// the owner-selected `0.15` plus the neutral ABI display/ground baseline. Older
+/// settings are preserved and surfaced instead of being silently overwritten.
+pub const VISIBLE_CALIBRATION_EPOCH: u32 = 2;
 
 /// One remembered open action: what kind of open it was + the path(s) involved
 /// (one path for a wrfout / cached run / sequence folder; several for a
@@ -81,6 +86,9 @@ impl RecentEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StudioSettings {
+    /// Calibration defaults the user has explicitly accepted. `0` denotes a settings
+    /// file written before this field existed and keeps the migration banner visible.
+    pub visible_calibration_epoch: u32,
     /// Sat-store root override; `None` = the app default beside the cache dir.
     pub store_root: Option<String>,
     pub sat: String,
@@ -100,14 +108,23 @@ pub struct StudioSettings {
     /// the physical default; `false` preserves the sea-level-column QA baseline.
     pub terrain_atmosphere: bool,
     pub clouds_enabled: bool,
+    /// Use model cloud fraction/subcolumns when the brick provides them. `true` is
+    /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
+    pub fractional_clouds: bool,
     pub multiscatter: bool,
-    /// Explicit QA/what-if multiplier on visible cloud optical depth. `1.0` keeps
-    /// the model-derived physical input unchanged.
+    /// Visible cloud optical-depth calibration. The shipped default is `0.15`;
+    /// `1.0` keeps the model-derived physical input unchanged.
     pub cloud_optical_depth_scale: f32,
     pub beer_powder: bool,
     /// Display-only sub-grid cloud-edge erosion. Explicitly opt-in/off by default.
     pub granulation: bool,
     pub exposure: f32,
+    /// Sun-gated daytime ground-radiance lift. `1.0` is neutral.
+    pub ground_gain: f32,
+    /// Finished-display highlight shoulder knee. `1.0` disables the shoulder.
+    pub cloud_softclip: f32,
+    /// Physical reflectance-factor ceiling mapped to display white.
+    pub cloud_highlight_max: f32,
     pub bm_month_override: u32,
     pub bm_allow_download: bool,
     pub play_fps: f32,
@@ -128,6 +145,7 @@ impl Default for StudioSettings {
     fn default() -> Self {
         // Mirrors SimSatStudioApp::new's defaults exactly (the honest baseline).
         Self {
+            visible_calibration_epoch: VISIBLE_CALIBRATION_EPOCH,
             store_root: None,
             sat: sat_token(SatellitePreset::GoesEast).to_string(),
             resolution: resolution_token(ResolutionMode::Native).to_string(),
@@ -142,11 +160,15 @@ impl Default for StudioSettings {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             clouds_enabled: true,
+            fractional_clouds: true,
             multiscatter: true,
-            cloud_optical_depth_scale: 1.0,
+            cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             beer_powder: false,
             granulation: false,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
+            ground_gain: simsat::render::GROUND_DAY_LIFT as f32,
+            cloud_softclip: simsat::render::CLOUD_SOFTCLIP_KNEE as f32,
+            cloud_highlight_max: simsat::render::RHO_HIGHLIGHT_MAX as f32,
             bm_month_override: 0,
             bm_allow_download: true,
             play_fps: 8.0,
@@ -179,6 +201,11 @@ impl StudioSettings {
     /// tokens to their defaults, and dedupe + cap the recent list. Idempotent.
     pub fn sanitize(&mut self) {
         let d = StudioSettings::default();
+        // Keep epoch 0 so the Studio can offer (rather than force) the new calibration.
+        // Unknown future epochs are treated as current by this older build.
+        self.visible_calibration_epoch = self
+            .visible_calibration_epoch
+            .min(VISIBLE_CALIBRATION_EPOCH);
         self.margin_pct = clamp_finite(self.margin_pct, 0.0, 100.0, d.margin_pct);
         self.aod = clamp_finite(self.aod, 0.0, 0.6, d.aod);
         self.cloud_optical_depth_scale = clamp_finite(
@@ -188,6 +215,10 @@ impl StudioSettings {
             d.cloud_optical_depth_scale,
         );
         self.exposure = clamp_finite(self.exposure, 0.25, 4.0, d.exposure);
+        self.ground_gain = clamp_finite(self.ground_gain, 0.25, 4.0, d.ground_gain);
+        self.cloud_softclip = clamp_finite(self.cloud_softclip, 0.05, 1.0, d.cloud_softclip);
+        self.cloud_highlight_max =
+            clamp_finite(self.cloud_highlight_max, 0.25, 4.0, d.cloud_highlight_max);
         self.play_fps = clamp_finite(self.play_fps, 1.0, 30.0, d.play_fps);
         self.frame_cap = self.frame_cap.clamp(8, 480);
         // Perspective orbit params: the UI slider ranges (the render-time mapping
@@ -375,7 +406,17 @@ pub fn settings_path() -> PathBuf {
 pub fn load(path: &Path) -> StudioSettings {
     let mut s = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<StudioSettings>(&text).ok())
+        .and_then(|text| {
+            let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+            let had_calibration_epoch = value.get("visible_calibration_epoch").is_some();
+            let mut settings = serde_json::from_value::<StudioSettings>(value).ok()?;
+            if !had_calibration_epoch {
+                // Preserve every old user-selected value. Epoch zero merely asks the UI
+                // to offer the new shipped preset or explicitly keep those saved values.
+                settings.visible_calibration_epoch = 0;
+            }
+            Some(settings)
+        })
         .unwrap_or_default();
     s.sanitize();
     s
@@ -420,6 +461,27 @@ pub fn prune_recent(list: &mut Vec<RecentEntry>, exists: &dyn Fn(&str) -> bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_rc_defaults_match_the_reviewed_preset() {
+        let s = StudioSettings::default();
+        assert_eq!(s.visible_calibration_epoch, VISIBLE_CALIBRATION_EPOCH);
+        assert_eq!(s.aod, simsat::atmosphere::DEFAULT_AOD as f32);
+        assert!(!s.rh_swelling);
+        assert!(s.atmosphere_correction);
+        assert!(s.terrain_atmosphere);
+        assert_eq!(s.output_transform, "abi-reflectance");
+        assert!(s.clouds_enabled);
+        assert!(s.multiscatter);
+        assert!(!s.beer_powder);
+        assert_eq!(s.cloud_optical_depth_scale, 0.15);
+        assert_eq!(s.exposure, 1.0);
+        assert_eq!(s.ground_gain, 1.0);
+        assert_eq!(s.cloud_softclip, 0.65);
+        assert_eq!(s.cloud_highlight_max, 1.25);
+        assert!(s.fractional_clouds);
+        assert!(!s.granulation);
+    }
 
     #[test]
     fn tokens_round_trip_every_variant() {
@@ -474,13 +536,73 @@ mod tests {
         assert_eq!(s.sat, "himawari");
         assert_eq!(s.exposure, 2.0);
         assert_eq!(s.mode, StudioSettings::default().mode);
+        assert_eq!(
+            s.visible_calibration_epoch, 0,
+            "pre-epoch files must preserve values and request an explicit migration choice"
+        );
         // Backward compatibility: settings written before these controls existed
         // receive the new shipped defaults field-by-field via `#[serde(default)]`.
         assert!(s.atmosphere_correction);
         assert!(s.terrain_atmosphere);
-        assert_eq!(s.cloud_optical_depth_scale, 1.0);
+        assert!(s.fractional_clouds);
+        assert_eq!(
+            s.cloud_optical_depth_scale,
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
         assert!(!s.beer_powder);
         assert!(!s.granulation);
+        assert_eq!(s.ground_gain, StudioSettings::default().ground_gain);
+        assert_eq!(s.cloud_softclip, StudioSettings::default().cloud_softclip);
+        assert_eq!(
+            s.cloud_highlight_max,
+            StudioSettings::default().cloud_highlight_max
+        );
+        // A pre-epoch file's explicit calibration is never silently rewritten. The
+        // Studio uses epoch zero to show its apply/keep banner.
+        let legacy = dir.join("legacy-calibration.json");
+        std::fs::write(
+            &legacy,
+            r#"{
+                "cloud_optical_depth_scale": 0.5,
+                "exposure": 1.5,
+                "ground_gain": 2.0,
+                "cloud_softclip": 0.75,
+                "cloud_highlight_max": 1.05,
+                "fractional_clouds": false,
+                "granulation": true
+            }"#,
+        )
+        .unwrap();
+        let old = load(&legacy);
+        assert_eq!(old.visible_calibration_epoch, 0);
+        assert_eq!(old.cloud_optical_depth_scale, 0.5);
+        assert_eq!(old.exposure, 1.5);
+        assert_eq!(old.ground_gain, 2.0);
+        assert_eq!(old.cloud_softclip, 0.75);
+        assert_eq!(old.cloud_highlight_max, 1.05);
+        assert!(!old.fractional_clouds);
+        assert!(old.granulation);
+
+        // The earlier diagnostic RC wrote epoch 1 with OD 0.25. Loading it must
+        // preserve that explicit value while leaving the epoch behind the current
+        // one, so the Studio offers the owner-selected 0.15 release preset.
+        let diagnostic_rc = dir.join("diagnostic-rc.json");
+        std::fs::write(
+            &diagnostic_rc,
+            r#"{
+                "visible_calibration_epoch": 1,
+                "cloud_optical_depth_scale": 0.25,
+                "exposure": 1.6,
+                "ground_gain": 1.6
+            }"#,
+        )
+        .unwrap();
+        let old_rc = load(&diagnostic_rc);
+        assert_eq!(old_rc.visible_calibration_epoch, 1);
+        assert_eq!(old_rc.cloud_optical_depth_scale, 0.25);
+        assert_eq!(old_rc.exposure, 1.6);
+        assert_eq!(old_rc.ground_gain, 1.6);
+        assert!(old_rc.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -490,7 +612,11 @@ mod tests {
             margin_pct: 250.0,
             aod: -3.0,
             cloud_optical_depth_scale: 99.0,
+            fractional_clouds: false,
             exposure: 99.0,
+            ground_gain: 99.0,
+            cloud_softclip: -3.0,
+            cloud_highlight_max: f32::NAN,
             play_fps: 0.0,
             frame_cap: 1,
             bm_month_override: 13,
@@ -506,7 +632,17 @@ mod tests {
         assert_eq!(s.margin_pct, 100.0);
         assert_eq!(s.aod, 0.0);
         assert_eq!(s.cloud_optical_depth_scale, 4.0);
+        assert!(
+            !s.fractional_clouds,
+            "sanitize must preserve an explicit legacy A/B"
+        );
         assert_eq!(s.exposure, 4.0);
+        assert_eq!(s.ground_gain, 4.0);
+        assert_eq!(s.cloud_softclip, 0.05);
+        assert_eq!(
+            s.cloud_highlight_max,
+            StudioSettings::default().cloud_highlight_max
+        );
         assert_eq!(s.play_fps, 1.0);
         assert_eq!(s.frame_cap, 8);
         assert_eq!(s.bm_month_override, 0);
@@ -518,10 +654,13 @@ mod tests {
         assert_eq!(s.persp_width, 4096);
         assert_eq!(s.persp_height, 2);
         // Non-finite scale cannot enter JSON normally, but sanitize is defensive
-        // for programmatic callers too and restores the neutral physical value.
+        // for programmatic callers too and restores the shipped calibration.
         s.cloud_optical_depth_scale = f32::NAN;
         s.sanitize();
-        assert_eq!(s.cloud_optical_depth_scale, 1.0);
+        assert_eq!(
+            s.cloud_optical_depth_scale,
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
         // Idempotent.
         let once = s.clone();
         s.sanitize();
@@ -586,9 +725,13 @@ mod tests {
             exposure: 2.5,
             atmosphere_correction: false,
             terrain_atmosphere: false,
+            fractional_clouds: false,
             cloud_optical_depth_scale: 0.5,
             beer_powder: true,
             granulation: true,
+            ground_gain: 1.6,
+            cloud_softclip: 0.65,
+            cloud_highlight_max: 1.25,
             recent: vec![RecentEntry {
                 kind: "sequence".to_string(),
                 paths: vec!["C:/runs/enderlin".to_string()],

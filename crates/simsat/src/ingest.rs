@@ -3,9 +3,11 @@
 //! Hard memory discipline (docs/bowecho-precedents.md sections 2, 5): NEVER
 //! `getvar` a 3-D field — wrf-core's `WrfFile` memoizes every 3-D f64 intermediate
 //! (measured 8.87 GB peak). We read raw variables one at a time via
-//! `WrfFile::read_var`, do the cheap arithmetic ourselves in f32, fold each field
-//! into the (brick-resolution) accumulation buffers, and drop it before the next
-//! read. netcrust is used only as the metadata/`IVGTYP` fallback, mirroring
+//! `WrfFile::read_var`, do the cheap arithmetic ourselves in f32, and fold fields
+//! into brick-resolution accumulation buffers. The cloud-fraction consistency pass
+//! is the one bounded exception: it briefly combines two phase fields, compacts only
+//! contradictory cells, drops those volumes, and then reads humidity. netcrust is
+//! used only as the metadata/`IVGTYP` fallback, mirroring
 //! `local_import.rs`'s split. The ingest worker lowers its thread priority
 //! (`platform::lower_ingest_thread_priority`) and the peak RSS is logged and, in
 //! the env-gated fixture test, asserted < 2.5 GB (the design contract).
@@ -558,6 +560,141 @@ fn resample_volume(
     out
 }
 
+/// Value of a piecewise-linear native profile at one height with explicit
+/// extrapolation. Queries are monotonically increasing in the fraction resampler,
+/// so `hint` advances through the native segments in O(n) total time.
+fn native_linear_at(
+    z_native: &[f64],
+    f_native: &[f64],
+    z: f64,
+    below: Extrap,
+    above: Extrap,
+    hint: &mut usize,
+) -> f64 {
+    let n = z_native.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if z < z_native[0] {
+        return match below {
+            Extrap::Zero => 0.0,
+            Extrap::ClampEdge => f_native[0],
+        };
+    }
+    if z > z_native[n - 1] {
+        return match above {
+            Extrap::Zero => 0.0,
+            Extrap::ClampEdge => f_native[n - 1],
+        };
+    }
+    if n == 1 || z == z_native[0] {
+        return f_native[0];
+    }
+    if z == z_native[n - 1] {
+        return f_native[n - 1];
+    }
+    let mut k = (*hint).min(n - 2);
+    while k < n - 2 && z_native[k + 1] < z {
+        k += 1;
+    }
+    while k > 0 && z_native[k] > z {
+        k -= 1;
+    }
+    *hint = k;
+    let span = z_native[k + 1] - z_native[k];
+    if span > 0.0 {
+        f_native[k] + (z - z_native[k]) / span * (f_native[k + 1] - f_native[k])
+    } else {
+        f_native[k]
+    }
+}
+
+/// Maximum-overlap vertical aggregation of an intensive cloud-fraction profile.
+///
+/// Brick extinction is the layer mean over `[z-dz/2, z+dz/2)`. The matching
+/// coverage of multiple native sublayers under maximum overlap is their maximum,
+/// not the fraction at only the target centre (which can be zero while the layer
+/// contains real cloud). A piecewise-linear profile reaches its maximum at a cell
+/// endpoint or an enclosed native node, so this scan is exact and O(n_native +
+/// n_brick) for the usual monotone WRF height column.
+#[allow(clippy::too_many_arguments)]
+pub fn resample_column_fraction_max_overlap(
+    z_native: &[f64],
+    f_native: &[f64],
+    z_min: f64,
+    dz: f64,
+    nz_brick: usize,
+    below: Extrap,
+    above: Extrap,
+    out: &mut Vec<f64>,
+) {
+    out.clear();
+    if z_native.is_empty() || f_native.is_empty() {
+        out.resize(nz_brick, 0.0);
+        return;
+    }
+    let n = z_native.len().min(f_native.len());
+    let mut hint = 0usize;
+    let mut first_node = 0usize;
+    for m in 0..nz_brick {
+        let center = z_min + m as f64 * dz;
+        let za = center - 0.5 * dz;
+        let zb = center + 0.5 * dz;
+        while first_node < n && z_native[first_node] < za {
+            first_node += 1;
+        }
+        let mut maximum =
+            native_linear_at(&z_native[..n], &f_native[..n], za, below, above, &mut hint).max(
+                native_linear_at(&z_native[..n], &f_native[..n], zb, below, above, &mut hint),
+            );
+        let mut k = first_node;
+        while k < n && z_native[k] <= zb {
+            maximum = maximum.max(f_native[k]);
+            k += 1;
+        }
+        out.push(if maximum.is_finite() {
+            maximum.clamp(0.0, 1.0)
+        } else {
+            0.0
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resample_volume_fraction_max_overlap(
+    native: &[f32],
+    z: &[f32],
+    nx: usize,
+    ny: usize,
+    nz_native: usize,
+    z_min: f64,
+    dz: f64,
+    nz_brick: usize,
+    below: Extrap,
+    above: Extrap,
+) -> Vec<f32> {
+    let mut out = vec![0f32; nx * ny * nz_brick];
+    let mut zc = vec![0f64; nz_native];
+    let mut fc = vec![0f64; nz_native];
+    let mut col = Vec::with_capacity(nz_brick);
+    for y in 0..ny {
+        for x in 0..nx {
+            for (k, (zc_k, fc_k)) in zc.iter_mut().zip(fc.iter_mut()).enumerate() {
+                let idx = (k * ny + y) * nx + x;
+                *zc_k = z[idx] as f64;
+                *fc_k = native[idx] as f64;
+            }
+            resample_column_fraction_max_overlap(
+                &zc, &fc, z_min, dz, nz_brick, below, above, &mut col,
+            );
+            for (m, &value) in col.iter().enumerate() {
+                out[(m * ny + y) * nx + x] = value as f32;
+            }
+        }
+    }
+    out
+}
+
 /// Cumulative native integral `F(z) = integral[z_native[0], z] f dz` for the
 /// piecewise-linear profile `(z_native, f_native)`, honoring the `below`/`above`
 /// extrapolation policy outside the native span. `cum[k]` must be the prefilled
@@ -762,8 +899,9 @@ fn beta_from_q(q: &[f32], rho: &[f32], effective_radius_m: f64) -> Vec<f32> {
 
 /// Add a second species' extinction into an existing beta buffer at its OWN
 /// effective radius. Extinctions add linearly, so a shared brick channel can carry
-/// several species as long as each converts at its own optics before the sum (the
-/// SSB v3 snow-optics fix: QSNOW joins ext_precip at the snow aggregate beta).
+/// several species as long as each converts at its own optics before the sum.
+/// In SSB v4+ QSNOW remains part of total `ext_precip` for exact legacy behavior,
+/// while a duplicate snow-only auxiliary channel is encoded separately.
 fn add_beta_from_q(beta: &mut [f32], q: &[f32], rho: &[f32], effective_radius_m: f64) {
     for ((b, &qi), &ri) in beta.iter_mut().zip(q.iter()).zip(rho.iter()) {
         *b += optics::extinction_coefficient(ri as f64, qi as f64, effective_radius_m) as f32;
@@ -777,6 +915,321 @@ fn accumulate_and_encode(beta_total: &mut [f32], ext: &[f32]) -> (bricks::LogQua
         *bt += *e;
     }
     bricks::encode_log_channel(ext)
+}
+
+/// Diagnose grid-cell cloud fraction with WRF's Xu--Randall `cal_cldfra1`
+/// parameterization.
+///
+/// All moisture arguments are mixing ratios (kg/kg), `temperature_k` is Kelvin,
+/// and `pressure_pa` is Pa. Cloud condensate is `qc + qi + qs`; the ice-weighted
+/// saturation mixing ratio uses WRF's Murray water/ice vapor-pressure constants.
+/// Unlike WRF radiation, SimSat deliberately does **not** hard-clip diagnosed
+/// fractions below 0.01 to zero: those small positive fractions are the wispy
+/// cloud tails this diagnostic is intended to retain.
+pub(crate) fn xu_randall_cloud_fraction(
+    qv: f64,
+    qc: f64,
+    qi: f64,
+    qs: f64,
+    temperature_k: f64,
+    pressure_pa: f64,
+) -> f64 {
+    const QCLD_MIN: f64 = 1.0e-12;
+    const ALPHA: f64 = 100.0;
+    const GAMMA: f64 = 0.49;
+    const RH_EXPONENT: f64 = 0.25;
+
+    // Fail closed on missing/fill-like inputs: fabricating a cloud fraction from
+    // invalid thermodynamics is worse than leaving the source contradiction for
+    // the renderer's counted fallback. Small negative numerical moisture is safely
+    // clamped to zero after this validity gate.
+    if !qv.is_finite()
+        || !qc.is_finite()
+        || !qi.is_finite()
+        || !qs.is_finite()
+        || !temperature_k.is_finite()
+        || !pressure_pa.is_finite()
+        || qv > 1.0
+        || qc > 1.0
+        || qi > 1.0
+        || qs > 1.0
+        || !(100.0..=400.0).contains(&temperature_k)
+        || !(100.0..=200_000.0).contains(&pressure_pa)
+    {
+        return 0.0;
+    }
+    let sane_mixing_ratio = |value: f64| {
+        if value <= 0.0 { 0.0 } else { value }
+    };
+
+    let qv = sane_mixing_ratio(qv);
+    let qc = sane_mixing_ratio(qc);
+    let qi = sane_mixing_ratio(qi);
+    let qs = sane_mixing_ratio(qs);
+    let qcld = qc + qi + qs;
+    if qcld < QCLD_MIN {
+        return 0.0;
+    }
+
+    // WRF cal_cldfra1 constants (Murray, 1966). The large finite fallback is
+    // deliberately dry/cloud-free for invalid thermodynamic states and avoids
+    // propagating infinities through the weighted saturation calculation.
+    fn saturation_mixing_ratio(
+        temperature_k: f64,
+        pressure_pa: f64,
+        exponent_coefficient: f64,
+        denominator_offset_k: f64,
+    ) -> Option<f64> {
+        const SVP1_KPA: f64 = 0.61078;
+        const SVPT0_K: f64 = 273.15;
+        const RD_OVER_RV: f64 = 287.0 / 461.6;
+
+        if !temperature_k.is_finite() || !pressure_pa.is_finite() || pressure_pa <= 0.0 {
+            return None;
+        }
+        let exponent = exponent_coefficient * (temperature_k - SVPT0_K)
+            / (temperature_k - denominator_offset_k);
+        if !exponent.is_finite() {
+            return None;
+        }
+        // This guard is inactive throughout atmospheric temperatures but keeps
+        // exp finite for adversarial input near the empirical formula's pole.
+        let vapor_pressure_pa = 1000.0 * SVP1_KPA * exponent.clamp(-80.0, 80.0).exp();
+        let pressure_gap = pressure_pa - vapor_pressure_pa;
+        if !vapor_pressure_pa.is_finite() || vapor_pressure_pa <= 0.0 || pressure_gap <= 0.0 {
+            return None;
+        }
+        let qvs = RD_OVER_RV * vapor_pressure_pa / pressure_gap;
+        if qvs.is_finite() && qvs > 0.0 {
+            Some(qvs)
+        } else {
+            None
+        }
+    }
+
+    let Some(qvs_water) = saturation_mixing_ratio(temperature_k, pressure_pa, 17.2693882, 35.86)
+    else {
+        return 0.0;
+    };
+    let Some(qvs_ice) = saturation_mixing_ratio(temperature_k, pressure_pa, 21.8745584, 7.66)
+    else {
+        return 0.0;
+    };
+    let ice_weight = ((qi + qs) / qcld).clamp(0.0, 1.0);
+    let qvs = if ice_weight <= 0.0 {
+        qvs_water
+    } else if ice_weight >= 1.0 {
+        qvs_ice
+    } else {
+        (1.0 - ice_weight) * qvs_water + ice_weight * qvs_ice
+    };
+
+    let relative_humidity = qv / qvs;
+    if relative_humidity >= 1.0 {
+        return 1.0;
+    }
+
+    let subsaturation = (qvs - qv).max(1.0e-10);
+    let denominator = subsaturation.powf(GAMMA);
+    let argument = (-ALPHA * qcld / denominator).max(-6.9);
+    let rh_factor = relative_humidity.max(1.0e-10).powf(RH_EXPONENT);
+    // `-expm1(argument)` is algebraically `1-exp(argument)`, but preserves a
+    // positive result for the very small arguments found in wispy cloud tails.
+    let fraction = rh_factor * -argument.exp_m1();
+    if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Sparse native-cell condensate carried from the normal extinction reads into the
+/// Xu--Randall CLDFRA consistency pass. Entries are sorted by native cell index.
+/// Keeping only nonpositive/invalid-CLDFRA cells with positive condensate avoids a
+/// second full QCLOUD/QICE/QSNOW decode without materializing another dense volume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct XuCondensateCandidate {
+    index: usize,
+    liquid: f32,
+    frozen: f32,
+}
+
+/// A compact, thermodynamically complete Xu--Randall repair candidate. Pressure and
+/// temperature are copied only for actual condensate contradictions, allowing their
+/// native dense volumes to be released before the normal QVAPOR read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct XuRepairCandidate {
+    index: usize,
+    qcld: f32,
+    frozen: f32,
+    temperature_k: f32,
+    pressure_pa: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct XuRepairStats {
+    contradictions: usize,
+    repaired: usize,
+    subpercent: usize,
+    full: usize,
+}
+
+#[inline]
+fn xu_fraction_needs_repair(fraction: f32) -> bool {
+    !fraction.is_finite() || fraction <= 0.0
+}
+
+#[inline]
+fn xu_positive_condensate(value: f32) -> Option<f32> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Start the sparse repair accumulator while QCLOUD is already resident for the
+/// normal liquid-extinction channel.
+fn xu_collect_liquid_candidates(
+    cloud_fraction: &[f32],
+    liquid: &[f32],
+) -> Vec<XuCondensateCandidate> {
+    debug_assert_eq!(cloud_fraction.len(), liquid.len());
+    cloud_fraction
+        .iter()
+        .zip(liquid.iter())
+        .enumerate()
+        .filter_map(|(index, (&fraction, &value))| {
+            if !xu_fraction_needs_repair(fraction) {
+                return None;
+            }
+            xu_positive_condensate(value).map(|liquid| XuCondensateCandidate {
+                index,
+                liquid,
+                frozen: 0.0,
+            })
+        })
+        .collect()
+}
+
+/// Merge one already-resident frozen species (QICE or QSNOW) into the sorted sparse
+/// accumulator. The merge is linear in the native volume plus candidate count and
+/// preserves native cell order, which is also the eager pre-optimization order.
+fn xu_merge_frozen_candidates(
+    candidates: &mut Vec<XuCondensateCandidate>,
+    cloud_fraction: &[f32],
+    frozen_species: &[f32],
+) {
+    debug_assert_eq!(cloud_fraction.len(), frozen_species.len());
+    let previous = std::mem::take(candidates);
+    let previous_len = previous.len();
+    let mut previous = previous.into_iter().peekable();
+    let mut merged = Vec::with_capacity(previous_len);
+
+    for (index, (&fraction, &value)) in cloud_fraction.iter().zip(frozen_species.iter()).enumerate()
+    {
+        let existing = if previous
+            .peek()
+            .is_some_and(|candidate| candidate.index == index)
+        {
+            previous.next()
+        } else {
+            None
+        };
+        let positive = xu_positive_condensate(value);
+        match (existing, positive) {
+            (Some(mut candidate), Some(value)) => {
+                candidate.frozen += value;
+                merged.push(candidate);
+            }
+            (Some(candidate), None) => merged.push(candidate),
+            (None, Some(value)) if xu_fraction_needs_repair(fraction) => {
+                merged.push(XuCondensateCandidate {
+                    index,
+                    liquid: 0.0,
+                    frozen: value,
+                });
+            }
+            (None, Some(_) | None) => {}
+        }
+    }
+    // Production inputs have identical native shapes. Preserve any prior tail in
+    // debug/adversarial helper use rather than silently dropping accumulated data.
+    merged.extend(previous);
+    *candidates = merged;
+}
+
+/// Filter the sparse positive-species union to the eager pass's exact QCLD threshold
+/// and compact the thermodynamic inputs needed after the dense pressure/temperature
+/// volumes are released.
+fn xu_prepare_repair_candidates(
+    candidates: Vec<XuCondensateCandidate>,
+    temperature_k: &[f32],
+    pressure_pa: &[f32],
+) -> Vec<XuRepairCandidate> {
+    debug_assert_eq!(temperature_k.len(), pressure_pa.len());
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let qcld = candidate.liquid + candidate.frozen;
+            (qcld >= 1.0e-12).then(|| XuRepairCandidate {
+                index: candidate.index,
+                qcld,
+                frozen: candidate.frozen,
+                temperature_k: temperature_k[candidate.index],
+                pressure_pa: pressure_pa[candidate.index],
+            })
+        })
+        .collect()
+}
+
+fn xu_apply_repair_candidates(
+    cloud_fraction: &mut [f32],
+    qvapor: &[f32],
+    candidates: &[XuRepairCandidate],
+) -> XuRepairStats {
+    let mut stats = XuRepairStats {
+        contradictions: candidates.len(),
+        ..XuRepairStats::default()
+    };
+    for candidate in candidates {
+        let liquid = (candidate.qcld - candidate.frozen).max(0.0);
+        let diagnosed = xu_randall_cloud_fraction(
+            qvapor[candidate.index] as f64,
+            liquid as f64,
+            candidate.frozen as f64,
+            0.0,
+            candidate.temperature_k as f64,
+            candidate.pressure_pa as f64,
+        ) as f32;
+        if diagnosed > 0.0 {
+            cloud_fraction[candidate.index] = diagnosed;
+            stats.repaired += 1;
+            stats.subpercent += usize::from(diagnosed < 0.01);
+            stats.full += usize::from(diagnosed >= 1.0);
+        }
+    }
+    stats
+}
+
+/// Warn when NSSL MP18 was run with an advection pairing that its WRF documentation
+/// does not recommend for keeping hydrometeor mass and number moments consistent at
+/// precipitation edges. This is provenance, not a rejection: SimSat preserves the
+/// supplied fields, but users should not mistake numerical streaks for a render defect.
+fn nssl_advection_warning(
+    mp_physics: Option<i32>,
+    moist_adv_opt: Option<i32>,
+    scalar_adv_opt: Option<i32>,
+) -> Option<String> {
+    if mp_physics != Some(18) || (moist_adv_opt == Some(4) && scalar_adv_opt == Some(3)) {
+        return None;
+    }
+    let value = |option: Option<i32>| {
+        option
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    Some(format!(
+        "NSSL MP18 source uses MOIST_ADV_OPT={} / SCALAR_ADV_OPT={}; WRF NSSL guidance recommends 4/3 to keep mass and number moments consistent at precipitation edges. SimSat preserves the source cloud structure, including any numerical streaks.",
+        value(moist_adv_opt),
+        value(scalar_adv_opt),
+    ))
 }
 
 fn read_geometry<R: GeomReader>(wrf: &R, timestep: usize) -> Result<GridGeometry, IngestError> {
@@ -923,13 +1376,22 @@ pub fn probe_wrf(path: &Path) -> Result<WrfProbe, IngestError> {
     })
 }
 
-/// Ingest one wrfout timestep into an `.ssb` brick + `run.json`. Streaming, f32,
-/// one 3-D field resident at a time; logs wall time and peak RSS.
+/// Ingest one wrfout timestep into an `.ssb` brick + `run.json`. The main channel
+/// pipeline is streaming/f32; the cloud-fraction consistency pass briefly retains
+/// only the scratch fields it needs and compacts repair candidates before reading
+/// humidity. Logs wall time and peak RSS.
 pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestReport, IngestError> {
     platform::lower_ingest_thread_priority();
     let start = Instant::now();
 
     let wrf = WrfFile::open(path).map_err(|e| IngestError::Wrf(e.to_string()))?;
+    if let Some(warning) = nssl_advection_warning(
+        wrf.global_attr_i32("MP_PHYSICS").ok(),
+        wrf.global_attr_i32("MOIST_ADV_OPT").ok(),
+        wrf.global_attr_i32("SCALAR_ADV_OPT").ok(),
+    ) {
+        crate::log_line!("simsat ingest warning: {warning}");
+    }
     let geom = read_geometry(&wrf, config.timestep)?;
     let (nx, ny, nz, nz_stag) = (geom.nx, geom.ny, geom.nz, geom.nz_stag);
     let (z_min, dz, nz_brick) = (config.z_min_m, config.dz_m, config.nz_brick);
@@ -962,7 +1424,9 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     }
     drop(pb);
 
-    // Temperature (K) and air density (kg/m^3) at native levels.
+    // Temperature (K) and air density (kg/m^3) at native levels. Density is formed
+    // from the full-f64 temperature before its f32 storage cast; retaining it through
+    // the CLDFRA pass preserves byte-identical legacy extinction/quantization.
     let theta = read_3d_required(&wrf, "T", nz, ny, nx, t)?;
     let mut t_kelvin = vec![0f32; ncell];
     let mut rho = vec![0f32; ncell];
@@ -977,12 +1441,114 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         *rho_out = optics::air_density(pp as f64, tk) as f32;
     }
     drop(theta);
-    drop(p);
+
+    // CLDFRA is evaluated on the radiation cadence and WRF's ICLOUD=1
+    // Xu--Randall path hard-clips diagnosed fractions below 0.01 to exact zero.
+    // At an arbitrary output time that leaves two distinct zero/condensate cases:
+    // thick newly-updated cores (fresh diagnostic ~= 1) and extremely thin frozen
+    // tails (fresh diagnostic << 0.01). Re-diagnose ONLY those contradictions from
+    // the co-timed state, preserving every positive model CLDFRA value unchanged.
+    // Omitting the final 0.01 clip retains a smooth, physically-derived wispy tail.
+    //
+    // PERFORMANCE: the old consistency pass decoded QCLOUD/QICE/QSNOW/QVAPOR here,
+    // then the normal channel pipeline decoded all four again below. Keep CLDFRA and
+    // the thermodynamics only when repair is eligible; the normal species reads feed
+    // a sparse candidate accumulator, and the normal QVAPOR read applies the repair.
+    let icloud = wrf.global_attr_i32("ICLOUD").unwrap_or(1);
+    let mut cf_native = read_3d_opt(&wrf, "CLDFRA", nz, ny, nx, t)?;
+    let has_cloud_fraction = cf_native.is_some();
+    let original_positive = cf_native.as_ref().map_or(0, |fraction| {
+        fraction
+            .iter()
+            .filter(|value| value.is_finite() && **value > 0.0)
+            .count()
+    });
+    let xu_repair_enabled = if let Some(fraction) = cf_native.as_ref() {
+        if icloud != 1 {
+            crate::log_line!(
+                "simsat ingest: ICLOUD={icloud}; preserving source CLDFRA without the \
+                 ICLOUD=1 Xu-Randall consistency refresh"
+            );
+            false
+        } else if !wrf.has_var("QSNOW") {
+            crate::log_line!(
+                "simsat ingest: CLDFRA is present but QSNOW is unavailable; skipping the \
+                 Xu-Randall consistency refresh"
+            );
+            false
+        } else if !wrf.has_var("QICE") {
+            crate::log_line!(
+                "simsat ingest: CLDFRA is present but QICE is unavailable; skipping \
+                 the Xu-Randall consistency refresh"
+            );
+            false
+        } else if !wrf.has_var("QCLOUD") {
+            crate::log_line!(
+                "simsat ingest: CLDFRA is present but QCLOUD is unavailable; \
+                 skipping the Xu-Randall consistency refresh"
+            );
+            false
+        } else if fraction
+            .iter()
+            .all(|&value| !xu_fraction_needs_repair(value))
+        {
+            crate::log_line!(
+                "simsat ingest: CLDFRA has no nonpositive/invalid condensate \
+                 contradictions; Xu-Randall refresh not needed \
+                 ({original_positive} positive source values retained)"
+            );
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    let encode_cloud_fraction = |mut native: Vec<f32>| {
+        // Never pass NaN/fill values into max-overlap aggregation. Keep every
+        // finite positive model/diagnosed value, bounded to the physical fraction
+        // range; all other values become explicit zero.
+        for value in &mut native {
+            *value = if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+        let fraction = resample_volume_fraction_max_overlap(
+            &native,
+            &z,
+            nx,
+            ny,
+            nz,
+            z_min,
+            dz,
+            nz_brick,
+            Extrap::Zero,
+            Extrap::Zero,
+        );
+        bricks::encode_cloud_fraction(&fraction)
+    };
+    let mut cloud_fraction = if xu_repair_enabled {
+        None
+    } else {
+        Some(match cf_native.take() {
+            Some(native) => encode_cloud_fraction(native),
+            None => vec![255u8; nx * ny * nz_brick],
+        })
+    };
+    let mut xu_condensate = xu_repair_enabled.then(Vec::new);
+    // Move (or immediately drop) pressure now. Temperature remains through its
+    // normal brick resample and is retained only for an eligible repair.
+    let p_for_repair = xu_repair_enabled.then_some(p);
 
     // Peak-RSS discipline: resample temperature first and drop the native field,
     // then build each extinction channel and quantize it to u8 immediately (adding
-    // it into `beta_total` for tau_up) so no five-channel-wide f32 buffer set is
-    // ever resident at once. One native 3-D field is read at a time and dropped.
+    // it into `beta_total` for tau_up) so no channel-wide f32 buffer set is
+    // ever resident at once. One NEW native 3-D field is decoded at a time; an
+    // eligible Xu repair temporarily retains CLDFRA + thermodynamics and only a
+    // sparse condensate union so the source hydrometeors themselves are not reread.
     let temp_k_f32 = resample_volume(
         &t_kelvin,
         &z,
@@ -997,14 +1563,21 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     );
     let temperature_f16 = bricks::encode_temperature_celsius(&temp_k_f32);
     drop(temp_k_f32);
-    drop(t_kelvin);
+    let t_for_repair = xu_repair_enabled.then_some(t_kelvin);
 
     let mut beta_total = vec![0f32; nx * ny * nz_brick];
 
     // ext_liquid = QCLOUD.
     let (ql, ext_liquid) = {
         let beta = match read_3d_opt(&wrf, "QCLOUD", nz, ny, nx, t)? {
-            Some(q) => beta_from_q(&q, &rho, HydrometeorClass::CloudLiquid.effective_radius_m()),
+            Some(q) => {
+                if let (Some(candidates), Some(fraction)) =
+                    (xu_condensate.as_mut(), cf_native.as_ref())
+                {
+                    *candidates = xu_collect_liquid_candidates(fraction, &q);
+                }
+                beta_from_q(&q, &rho, HydrometeorClass::CloudLiquid.effective_radius_m())
+            }
             None => vec![0f32; ncell],
         };
         let ext = resample_volume_conservative(
@@ -1024,11 +1597,18 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     // ext_ice = QICE only (small pristine ice). SSB v3 snow-optics fix: QSNOW no
     // longer shares cloud-ice optics here — sharing them inflated snow's visible
     // extinction 3.75x wherever QSNOW dominates (anvil plates, stratiform shields,
-    // deep decks), the "clouds too thick" defect. Snow now enters ext_precip below
-    // at its own aggregate beta (see `optics::HydrometeorClass::Snow`).
+    // deep decks), the "clouds too thick" defect. Snow enters total ext_precip
+    // below at its own aggregate beta (see `optics::HydrometeorClass::Snow`).
     let (qi, ext_ice) = {
         let beta = match read_3d_opt(&wrf, "QICE", nz, ny, nx, t)? {
-            Some(q) => beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m()),
+            Some(q) => {
+                if let (Some(candidates), Some(fraction)) =
+                    (xu_condensate.as_mut(), cf_native.as_ref())
+                {
+                    xu_merge_frozen_candidates(candidates, fraction, &q);
+                }
+                beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m())
+            }
             None => vec![0f32; ncell],
         };
         let ext = resample_volume_conservative(
@@ -1045,15 +1625,54 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         );
         accumulate_and_encode(&mut beta_total, &ext)
     };
-    // ext_precip = QRAIN + QGRAUP (rain optics) + QSNOW (snow aggregate optics).
-    // The channel is the LARGE-PARTICLE class: extinctions add linearly, so each
-    // species converts at its OWN beta before the sum, and the single
+
+    // Read QSNOW at its normal single acquisition point, but convert it before the
+    // rain/graupel block. This lets the sparse repair union become complete and the
+    // retained dense pressure/temperature volumes be released one species-volume
+    // earlier, bounding the optimization's peak RSS without changing snow beta.
+    let mut snow_beta =
+        read_3d_opt(&wrf, "QSNOW", nz, ny, nx, t)?.unwrap_or_else(|| vec![0f32; ncell]);
+    if let (Some(candidates), Some(fraction)) = (xu_condensate.as_mut(), cf_native.as_ref()) {
+        xu_merge_frozen_candidates(candidates, fraction, &snow_beta);
+    }
+    for (snow, &ri) in snow_beta.iter_mut().zip(rho.iter()) {
+        *snow = optics::extinction_coefficient(
+            ri as f64,
+            *snow as f64,
+            HydrometeorClass::Snow.effective_radius_m(),
+        ) as f32;
+    }
+
+    // All three cloud condensate species have now passed through their normal reads.
+    // Compact pressure/temperature only for real contradictions, then release the
+    // dense thermodynamic volumes before the remaining precipitation work and QVAPOR.
+    let xu_candidates = match xu_condensate.take() {
+        Some(candidates) => xu_prepare_repair_candidates(
+            candidates,
+            t_for_repair
+                .as_deref()
+                .expect("eligible Xu repair retains native temperature"),
+            p_for_repair
+                .as_deref()
+                .expect("eligible Xu repair retains native pressure"),
+        ),
+        None => Vec::new(),
+    };
+    drop(t_for_repair);
+    drop(p_for_repair);
+
+    // ext_precip = QRAIN + QGRAUP + QSNOW
+    // (snow aggregate optics). This remains the LEGACY TOTAL large-particle
+    // channel. SSB v4+ additionally records ext_snow as a duplicate QSNOW-only
+    // auxiliary subset; it is NOT accumulated into beta_total a second time.
+    // Extinctions add linearly, so each species converts at its OWN beta before
+    // the sum, and the single
     // per-unit-extinction IR recovery `ir.rs` applies to this channel (ratio
     // ~0.467) stays exact for all three because Q_abs/Q_ext is size-independent
     // in the geometric regime (see the optics.rs IR table). The visible march is
     // untouched: it consumes total extinction, and ext_ice + ext_precip already
     // share the ice phase lobe.
-    let (qp, ext_precip) = {
+    let (qs, ext_snow, qp, ext_precip) = {
         let mut beta = match read_3d_opt(&wrf, "QRAIN", nz, ny, nx, t)? {
             Some(q) => beta_from_q(&q, &rho, HydrometeorClass::Rain.effective_radius_m()),
             None => vec![0f32; ncell],
@@ -1066,14 +1685,26 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
                 HydrometeorClass::Graupel.effective_radius_m(),
             );
         }
-        if let Some(qsnow) = read_3d_opt(&wrf, "QSNOW", nz, ny, nx, t)? {
-            add_beta_from_q(
-                &mut beta,
-                &qsnow,
-                &rho,
-                HydrometeorClass::Snow.effective_radius_m(),
-            );
+        // QSNOW was converted above so the repair thermodynamics could be dropped;
+        // add that unchanged beta into the legacy total, then encode its auxiliary.
+        for (snow, total) in snow_beta.iter().zip(beta.iter_mut()) {
+            *total += *snow;
         }
+        let snow_ext = resample_volume_conservative(
+            &snow_beta,
+            &z,
+            nx,
+            ny,
+            nz,
+            z_min,
+            dz,
+            nz_brick,
+            Extrap::Zero,
+            Extrap::Zero,
+        );
+        let (qs, ext_snow) = bricks::encode_log_channel(&snow_ext);
+        drop(snow_ext);
+        drop(snow_beta);
         let ext = resample_volume_conservative(
             &beta,
             &z,
@@ -1086,7 +1717,8 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::Zero,
             Extrap::Zero,
         );
-        accumulate_and_encode(&mut beta_total, &ext)
+        let (qp, ext_precip) = accumulate_and_encode(&mut beta_total, &ext);
+        (qs, ext_snow, qp, ext_precip)
     };
     drop(rho);
 
@@ -1098,8 +1730,43 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     // avoids dropping a thin moist layer between brick nodes. (Temperature, an
     // intensive quantity, stays point-sampled/linear below.)
     let (qv, qvapor) = {
-        let qvraw =
-            read_3d_opt(&wrf, "QVAPOR", nz, ny, nx, t)?.unwrap_or_else(|| vec![0f32; ncell]);
+        let qvraw = read_3d_opt(&wrf, "QVAPOR", nz, ny, nx, t)?;
+        if xu_repair_enabled {
+            let contradictions = xu_candidates.len();
+            if contradictions == 0 {
+                crate::log_line!(
+                    "simsat ingest: CLDFRA has no nonpositive/invalid condensate \
+                     contradictions; Xu-Randall refresh not needed \
+                     ({original_positive} positive source values retained)"
+                );
+            } else if let Some(qvapor) = qvraw.as_deref() {
+                let stats = xu_apply_repair_candidates(
+                    cf_native
+                        .as_mut()
+                        .expect("eligible Xu repair retains native CLDFRA"),
+                    qvapor,
+                    &xu_candidates,
+                );
+                let remained = stats.contradictions - stats.repaired;
+                let repaired = stats.repaired;
+                let subpercent = stats.subpercent;
+                let full = stats.full;
+                crate::log_line!(
+                    "simsat ingest: refreshed {repaired} / {contradictions} \
+                     nonpositive/invalid CLDFRA condensate cells with WRF \
+                     Xu-Randall ({subpercent} wispy <1%; {full} saturated/full; \
+                     {remained} remained zero; {original_positive} positive \
+                     source values retained)"
+                );
+            } else {
+                crate::log_line!(
+                    "simsat ingest: CLDFRA has {contradictions} condensate \
+                     contradictions but QVAPOR is unavailable; skipping the \
+                     Xu-Randall consistency refresh"
+                );
+            }
+        }
+        let qvraw = qvraw.unwrap_or_else(|| vec![0f32; ncell]);
         let qvb = resample_volume_conservative(
             &qvraw,
             &z,
@@ -1114,6 +1781,16 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         );
         bricks::encode_log_channel(&qvb)
     };
+
+    if cloud_fraction.is_none() {
+        cloud_fraction = Some(encode_cloud_fraction(
+            cf_native
+                .take()
+                .expect("eligible Xu repair retains native CLDFRA"),
+        ));
+    }
+    let cloud_fraction = cloud_fraction.expect("cloud-fraction channel is always prepared");
+
     drop(z);
 
     // tau_up from the accumulated total brick extinction.
@@ -1140,6 +1817,7 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     let mut quant_map = std::collections::BTreeMap::new();
     quant_map.insert("ext_liquid".to_string(), ql);
     quant_map.insert("ext_ice".to_string(), qi);
+    quant_map.insert("ext_snow".to_string(), qs);
     quant_map.insert("ext_precip".to_string(), qp);
     quant_map.insert("tau_up".to_string(), qt);
     quant_map.insert("qvapor".to_string(), qv);
@@ -1155,9 +1833,12 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         quant: quant.clone(),
         ext_liquid,
         ext_ice,
+        ext_snow,
         ext_precip,
         tau_up,
         qvapor,
+        cloud_fraction,
+        has_cloud_fraction,
         temperature_f16,
         hgt,
         landmask,
@@ -1206,6 +1887,7 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         file: brick_file,
         time_iso: geom.time_iso,
         quant,
+        has_cloud_fraction,
         ssb_bytes,
         source_bytes,
         source_mtime_unix,
@@ -1281,6 +1963,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nssl_advection_provenance_warns_only_for_nonrecommended_mp18_pairing() {
+        assert!(nssl_advection_warning(Some(18), Some(4), Some(3)).is_none());
+        assert!(nssl_advection_warning(Some(8), Some(1), Some(1)).is_none());
+
+        let warning = nssl_advection_warning(Some(18), Some(1), Some(1)).unwrap();
+        assert!(warning.contains("MOIST_ADV_OPT=1 / SCALAR_ADV_OPT=1"));
+        assert!(warning.contains("recommends 4/3"));
+        assert!(warning.contains("preserves the source cloud structure"));
+
+        let missing = nssl_advection_warning(Some(18), None, None).unwrap();
+        assert!(missing.contains("unknown / SCALAR_ADV_OPT=unknown"));
+    }
+
+    #[test]
     fn vertical_destagger_averages_faces() {
         // nz_stag=3, ny=1, nx=2. Faces at 0,100,300 (col A) and 0,200,600 (col B).
         let stag = vec![0.0, 0.0, 100.0, 200.0, 300.0, 600.0];
@@ -1334,6 +2030,64 @@ mod tests {
     }
 
     #[test]
+    fn fraction_resample_uses_the_maximum_over_each_brick_layer() {
+        let z = [0.0, 100.0, 200.0];
+        let f = [0.0, 1.0, 0.0];
+        let mut maximum = Vec::new();
+        resample_column_fraction_max_overlap(
+            &z,
+            &f,
+            50.0,
+            100.0,
+            2,
+            Extrap::Zero,
+            Extrap::Zero,
+            &mut maximum,
+        );
+        assert_eq!(maximum, vec![1.0, 1.0]);
+
+        // Point sampling sees only 0.5 at both target centres. The maximum support
+        // is what prevents a layer-mean extinction cell from receiving f=0 merely
+        // because its centre falls between native cloud-fraction nodes.
+        let mut point = Vec::new();
+        resample_column(
+            &z,
+            &f,
+            50.0,
+            100.0,
+            2,
+            Extrap::Zero,
+            Extrap::Zero,
+            &mut point,
+        );
+        assert_eq!(point, vec![0.5, 0.5]);
+
+        let constant = [0.3, 0.3, 0.3];
+        resample_column_fraction_max_overlap(
+            &z,
+            &constant,
+            50.0,
+            100.0,
+            2,
+            Extrap::Zero,
+            Extrap::Zero,
+            &mut maximum,
+        );
+        assert!(maximum.iter().all(|&v| (v - 0.3).abs() < 1.0e-12));
+        resample_column_fraction_max_overlap(
+            &z,
+            &f,
+            -100.0,
+            50.0,
+            1,
+            Extrap::Zero,
+            Extrap::Zero,
+            &mut maximum,
+        );
+        assert_eq!(maximum, vec![0.0]);
+    }
+
+    #[test]
     fn tau_up_on_analytic_slab() {
         // Uniform beta = 0.02 /m over 10 levels at dz=250 m.
         let beta = vec![0.02f64; 10];
@@ -1366,6 +2120,217 @@ mod tests {
         assert_eq!(beta[1], 0.0);
     }
 
+    #[test]
+    fn xu_randall_clear_cell_is_zero() {
+        // Condensate, not humidity alone, is required to diagnose a cloud.
+        assert_eq!(
+            xu_randall_cloud_fraction(0.05, 0.0, 0.0, 0.0, 280.0, 90_000.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn xu_randall_saturated_cloud_is_full() {
+        assert_eq!(
+            xu_randall_cloud_fraction(0.02, 1.0e-5, 0.0, 0.0, 280.0, 90_000.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn xu_randall_preserves_tiny_positive_tail() {
+        let fraction = xu_randall_cloud_fraction(1.0e-3, 1.1e-12, 0.0, 0.0, 260.0, 70_000.0);
+        assert!(fraction > 0.0, "tiny condensate tail was clipped to zero");
+        assert!(
+            fraction < 0.01,
+            "test must exercise the sub-0.01 tail, got {fraction}"
+        );
+    }
+
+    #[test]
+    fn xu_randall_matches_the_wrf_literal_reference_anchor() {
+        let fraction = xu_randall_cloud_fraction(0.0015, 1.0e-4, 0.0, 0.0, 280.0, 90_000.0);
+        assert!(
+            (fraction - 0.082_472_709_119_998_64).abs() < 1.0e-14,
+            "Xu-Randall formula drifted: {fraction:.17}"
+        );
+    }
+
+    #[test]
+    fn xu_randall_compacted_frozen_phase_matches_separate_ice_and_snow() {
+        // The ingest repair compacts QICE+QSNOW before it reads QVAPOR. The WRF
+        // diagnostic depends only on their sum, so that memory-saving transform
+        // must preserve a thin frozen-anvil result.
+        let separate = xu_randall_cloud_fraction(4.0e-4, 0.0, 1.0e-7, 3.0e-7, 245.0, 40_000.0);
+        let compacted = xu_randall_cloud_fraction(4.0e-4, 0.0, 4.0e-7, 0.0, 245.0, 40_000.0);
+        assert!(
+            separate > 0.0 && separate < 0.01,
+            "expected a wispy frozen tail"
+        );
+        assert!(
+            (separate - compacted).abs() < 1.0e-15,
+            "phase compaction changed Xu-Randall: {separate:.17} vs {compacted:.17}"
+        );
+    }
+
+    #[test]
+    fn xu_randall_is_monotonic_in_condensate() {
+        let diagnose = |qc| xu_randall_cloud_fraction(1.0e-3, qc, 0.0, 0.0, 260.0, 70_000.0);
+        let thin = diagnose(1.0e-10);
+        let medium = diagnose(1.0e-8);
+        let thick = diagnose(1.0e-6);
+        assert!(thin > 0.0 && thin < medium && medium < thick);
+    }
+
+    #[test]
+    fn xu_randall_hostile_inputs_stay_finite_and_bounded() {
+        let cases = [
+            (f64::NAN, 1.0e-4, 0.0, 0.0, 260.0, 70_000.0),
+            (f64::INFINITY, 1.0e-4, 0.0, 0.0, 260.0, 70_000.0),
+            (0.001, f64::INFINITY, f64::NAN, -1.0, 260.0, 70_000.0),
+            (0.001, 1.0e-4, 0.0, 0.0, f64::NAN, 70_000.0),
+            (0.001, 1.0e-4, 0.0, 0.0, 260.0, f64::NEG_INFINITY),
+            (0.001, 1.0e-4, 0.0, 0.0, 35.86, 10.0),
+        ];
+        for (qv, qc, qi, qs, temperature_k, pressure_pa) in cases {
+            let fraction = xu_randall_cloud_fraction(qv, qc, qi, qs, temperature_k, pressure_pa);
+            assert_eq!(fraction, 0.0, "invalid input fabricated cloud fraction");
+        }
+    }
+
+    /// Reference the pre-optimization eager repair literally: dense QSNOW sanitized
+    /// first, QICE added into it, then QCLOUD combined and Xu--Randall applied in
+    /// ascending native-cell order. The sparse normal-read accumulator must produce
+    /// the same candidates, output bits, and diagnostic counts across positive source
+    /// CLDFRA, zero/nonfinite contradictions, hostile condensate, and sub-threshold
+    /// condensate. This would fail before the sparse accumulator existed.
+    #[test]
+    fn xu_sparse_normal_read_accumulator_matches_eager_repair() {
+        let source_fraction: Vec<f32> = vec![0.4, 0.0, f32::NAN, -1.0, 0.0, 0.0, 0.0, 0.0];
+        let liquid: Vec<f32> = vec![1.0e-4, 1.0e-4, 0.0, 0.0, 0.0, f32::NAN, 1.1e-12, 0.9e-12];
+        let ice: Vec<f32> = vec![0.0, 0.0, 2.0e-7, 0.0, 0.0, -1.0, 0.0, 0.0];
+        let snow: Vec<f32> = vec![0.0, 0.0, 3.0e-7, 2.0e-6, 0.0, f32::INFINITY, 0.0, 0.0];
+        let qvapor: Vec<f32> = vec![0.0015, 0.0015, 4.0e-4, 0.02, 0.001, 0.001, 1.0e-3, 0.001];
+        let temperature: Vec<f32> = vec![280.0, 280.0, 245.0, 280.0, 260.0, 260.0, 260.0, 260.0];
+        let pressure: Vec<f32> = vec![
+            90_000.0, 90_000.0, 40_000.0, 90_000.0, 70_000.0, 70_000.0, 70_000.0, 70_000.0,
+        ];
+
+        // Old eager candidate construction, kept in the test as an independent
+        // semantic oracle for the reordered production pipeline.
+        let mut eager_frozen = snow.clone();
+        for value in &mut eager_frozen {
+            *value = if value.is_finite() && *value > 0.0 {
+                *value
+            } else {
+                0.0
+            };
+        }
+        for (frozen, &value) in eager_frozen.iter_mut().zip(ice.iter()) {
+            if value.is_finite() && value > 0.0 {
+                *frozen += value;
+            }
+        }
+        let mut eager_candidates = Vec::new();
+        for (index, ((&fraction, &liquid), &frozen)) in source_fraction
+            .iter()
+            .zip(liquid.iter())
+            .zip(eager_frozen.iter())
+            .enumerate()
+        {
+            if fraction.is_finite() && fraction > 0.0 {
+                continue;
+            }
+            let liquid = if liquid.is_finite() && liquid > 0.0 {
+                liquid
+            } else {
+                0.0
+            };
+            let qcld = liquid + frozen;
+            if qcld >= 1.0e-12 {
+                eager_candidates.push(XuRepairCandidate {
+                    index,
+                    qcld,
+                    frozen,
+                    temperature_k: temperature[index],
+                    pressure_pa: pressure[index],
+                });
+            }
+        }
+
+        let mut sparse = xu_collect_liquid_candidates(&source_fraction, &liquid);
+        xu_merge_frozen_candidates(&mut sparse, &source_fraction, &ice);
+        xu_merge_frozen_candidates(&mut sparse, &source_fraction, &snow);
+        let sparse_candidates = xu_prepare_repair_candidates(sparse, &temperature, &pressure);
+        assert_eq!(sparse_candidates, eager_candidates);
+        assert_eq!(
+            sparse_candidates
+                .iter()
+                .map(|c| c.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 6]
+        );
+
+        let mut eager_fraction = source_fraction.clone();
+        let mut eager_stats = XuRepairStats {
+            contradictions: eager_candidates.len(),
+            ..XuRepairStats::default()
+        };
+        for candidate in &eager_candidates {
+            let diagnosed = xu_randall_cloud_fraction(
+                qvapor[candidate.index] as f64,
+                (candidate.qcld - candidate.frozen).max(0.0) as f64,
+                candidate.frozen as f64,
+                0.0,
+                candidate.temperature_k as f64,
+                candidate.pressure_pa as f64,
+            ) as f32;
+            if diagnosed > 0.0 {
+                eager_fraction[candidate.index] = diagnosed;
+                eager_stats.repaired += 1;
+                eager_stats.subpercent += usize::from(diagnosed < 0.01);
+                eager_stats.full += usize::from(diagnosed >= 1.0);
+            }
+        }
+        let mut sparse_fraction = source_fraction.clone();
+        let sparse_stats =
+            xu_apply_repair_candidates(&mut sparse_fraction, &qvapor, &sparse_candidates);
+        assert_eq!(sparse_stats, eager_stats);
+        assert_eq!(sparse_stats.contradictions, 4);
+        assert_eq!(
+            sparse_fraction
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            eager_fraction
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sparse_fraction[0], 0.4, "positive source CLDFRA changed");
+        assert_eq!(sparse_fraction[4], 0.0, "clear zero fabricated cloud");
+        assert_eq!(
+            sparse_fraction[5], 0.0,
+            "hostile condensate fabricated cloud"
+        );
+    }
+
+    /// I/O regression guard for the optimization's actual purpose. The four native
+    /// fields are each decoded at exactly one production call site; the old eager
+    /// consistency block made this count two for every field.
+    #[test]
+    fn xu_repair_reuses_each_normal_native_field_read_once() {
+        let source = include_str!("ingest.rs");
+        for field in ["QCLOUD", "QICE", "QSNOW", "QVAPOR"] {
+            let needle = format!("read_3d_opt(&wrf, \"{field}\"");
+            assert_eq!(
+                source.matches(&needle).count(),
+                1,
+                "{field} acquired more than once in the WRF ingest"
+            );
+        }
+    }
+
     /// SSB v3 snow-optics fix, the synthetic two-layer proof: through the real
     /// ingest kernels (`beta_from_q`/`add_beta_from_q` + `integrate_tau_up_column`),
     /// an equal-mass SNOW column now carries exactly r_snow/r_ice = 3.75x LESS
@@ -1380,8 +2345,8 @@ mod tests {
         let q = vec![1.0e-3f32; nz]; // 1 g/kg through the whole column
         let rho = vec![1.0f32; nz];
         let ice_beta = beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m());
-        // The snow column enters through the SAME accumulation path the ingest
-        // uses for ext_precip (rain absent -> zero base, snow added on top).
+        // The snow column uses the same per-species conversion that feeds both
+        // total ext_precip and SSB v4+'s duplicate ext_snow auxiliary subset.
         let mut snow_beta = vec![0.0f32; nz];
         add_beta_from_q(
             &mut snow_beta,
@@ -1415,6 +2380,17 @@ mod tests {
         // The fix factor: the equal-mass snow layer is exactly 3.75x thinner than
         // it was under the old shared-ice-optics treatment (which produced ice_tau).
         assert!(((ice_tau[0] / snow_tau[0]) - 3.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ssb_v4_snow_subset_is_not_double_counted_in_tau_total() {
+        let snow = vec![0.01f32, 0.02, 0.03, 0.04];
+        let mut total = vec![0.0f32; snow.len()];
+        // Legacy total precip is the additive channel used by tau_up.
+        let _total_codes = accumulate_and_encode(&mut total, &snow);
+        // ext_snow is encoded as auxiliary metadata only and must not accumulate.
+        let _snow_codes = bricks::encode_log_channel(&snow);
+        assert_eq!(total, snow);
     }
 
     #[test]

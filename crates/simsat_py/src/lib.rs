@@ -154,12 +154,18 @@ impl Georef {
 /// Visible-family atmosphere/cloud controls are shared by RGB, bands, GeoColor,
 /// Sandwich, cloud-layer, and perspective renders: `aerosol_optical_depth` (default
 /// 0.05), `rh_aerosol_swelling` (1.5x when true), `atmosphere_correction`,
-/// `terrain_atmosphere`, and `cloud_optical_depth_scale` (0..=4, default 1). The OD
-/// scale is a visible sensitivity control and does not alter the quantitative
+/// `terrain_atmosphere`, `fractional_clouds` (default true), and
+/// `cloud_optical_depth_scale` (0..=4, shipped default 0.15 by owner cross-file visual
+/// calibration; 1.0 is unscaled model extinction). Fractional clouds
+/// use the model cloud
+/// fraction when present; false restores legacy horizontally-full cells. The OD scale is
+/// a visible sensitivity control and does not alter the quantitative
 /// `render_cloud_optical_depth` product. `clouds` remains the explicit feature bypass;
 /// `multiscatter` controls the higher scattering octaves without changing transmittance.
 /// `beer_powder` enables the optional direct-sun shaping, and `granulation` enables
-/// display-only sub-grid cloud-edge erosion; both default off.
+/// display-only sub-grid cloud-edge erosion; both default off. Finished visible display
+/// products also accept `ground_gain`, `cloud_softclip`, and `cloud_highlight_max` as
+/// optional calibration overrides; raw visible bands deliberately do not.
 ///
 /// `threads` (default None = all cores, or RAYON_NUM_THREADS) caps the render worker
 /// threads for THIS PROCESS. The pool is global and built ONCE — the first render call's
@@ -170,8 +176,10 @@ impl Georef {
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
-    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -189,10 +197,14 @@ fn render_visible_rgb<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -215,10 +227,14 @@ fn render_visible_rgb<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
         multiscatter,
         beer_powder,
         steps,
         clouds,
+        fractional_clouds,
         cloud_optical_depth_scale,
         granulation,
         sun_elev,
@@ -255,8 +271,10 @@ fn render_visible_rgb<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
-    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -274,10 +292,14 @@ fn render_geocolor<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -300,10 +322,14 @@ fn render_geocolor<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
         multiscatter,
         beer_powder,
         steps,
         clouds,
+        fractional_clouds,
         cloud_optical_depth_scale,
         granulation,
         sun_elev,
@@ -341,8 +367,10 @@ fn render_geocolor<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
-    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    granulation=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -360,10 +388,14 @@ fn render_sandwich<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -386,10 +418,14 @@ fn render_sandwich<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
         multiscatter,
         beer_powder,
         steps,
         clouds,
+        fractional_clouds,
         cloud_optical_depth_scale,
         granulation,
         sun_elev,
@@ -424,7 +460,8 @@ fn render_sandwich<'py>(
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, multiscatter=true, beer_powder=false, steps="offline", clouds=true,
-    cloud_optical_depth_scale=1.0, granulation=false, sun_elev=None, sun_az=None, cache=None,
+    fractional_clouds=true, cloud_optical_depth_scale=0.15, granulation=false, sun_elev=None,
+    sun_az=None, cache=None,
     bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -445,6 +482,7 @@ fn render_visible_bands<'py>(
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -467,10 +505,14 @@ fn render_visible_bands<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         None,
+        None,
+        None,
+        None,
         multiscatter,
         beer_powder,
         steps,
         clouds,
+        fractional_clouds,
         cloud_optical_depth_scale,
         granulation,
         sun_elev,
@@ -773,7 +815,7 @@ fn render_cloud_optical_depth<'py>(
 ///
 /// TOP-DOWN by definition (there is no `view=` — the host map is the ground; no Blue
 /// Marble is rendered). The sun / aerosol / exposure / steps / multiscatter /
-/// beer-powder / granulation / cloud-optical-depth controls drive the cloud march
+/// beer-powder / granulation / fractional-cloud / cloud-optical-depth controls drive the cloud march
 /// exactly like `render_visible_rgb`;
 /// `clouds=False` returns a transparent cloud image and neutral shadow. Datum note:
 /// lat/lon are on the WRF
@@ -782,8 +824,10 @@ fn render_cloud_optical_depth<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", timestep=0, margin=0.0, aerosol_optical_depth=0.05,
     rh_aerosol_swelling=false, atmosphere_correction=true, terrain_atmosphere=true,
-    exposure=None, multiscatter=true, beer_powder=false, steps="offline", clouds=true,
-    cloud_optical_depth_scale=1.0, granulation=false, sun_elev=None, sun_az=None, cache=None,
+    exposure=None, ground_gain=None, cloud_softclip=None, cloud_highlight_max=None,
+    multiscatter=true, beer_powder=false, steps="offline", clouds=true,
+    fractional_clouds=true, cloud_optical_depth_scale=0.15, granulation=false, sun_elev=None,
+    sun_az=None, cache=None,
     premultiplied=false, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -798,10 +842,14 @@ fn render_cloud_layer<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -809,11 +857,7 @@ fn render_cloud_layer<'py>(
     cache: Option<String>,
     premultiplied: bool,
     threads: Option<usize>,
-) -> PyResult<(
-    Bound<'py, PyArray3<u8>>,
-    Bound<'py, PyArray2<f32>>,
-    Georef,
-)> {
+) -> PyResult<(Bound<'py, PyArray3<u8>>, Bound<'py, PyArray2<f32>>, Georef)> {
     let mut params = RenderParams::new(PathBuf::from(&input));
     params.satellite = parse_sat(sat)?;
     params.timestep = timestep;
@@ -824,13 +868,18 @@ fn render_cloud_layer<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        fractional_clouds,
         cloud_optical_depth_scale,
         beer_powder,
         granulation,
     )?;
-    if let Some(e) = exposure {
-        params.exposure = e;
-    }
+    apply_visible_display_controls(
+        &mut params,
+        exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
+    );
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
@@ -894,8 +943,10 @@ fn render_cloud_layer<'py>(
 #[pyo3(signature = (
     input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
-    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    terrain_atmosphere=true, exposure=None, ground_gain=None, cloud_softclip=None,
+    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    granulation=false,
     cloud_layer_only=false, sun_elev=None, sun_az=None,
     cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -913,10 +964,14 @@ fn render_perspective<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     cloud_layer_only: bool,
@@ -936,13 +991,18 @@ fn render_perspective<'py>(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        fractional_clouds,
         cloud_optical_depth_scale,
         beer_powder,
         granulation,
     )?;
-    if let Some(e) = exposure {
-        params.exposure = e;
-    }
+    apply_visible_display_controls(
+        &mut params,
+        exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
+    );
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
@@ -1104,10 +1164,14 @@ fn build_visible_params(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
     multiscatter: bool,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -1129,13 +1193,18 @@ fn build_visible_params(
         rh_aerosol_swelling,
         atmosphere_correction,
         terrain_atmosphere,
+        fractional_clouds,
         cloud_optical_depth_scale,
         beer_powder,
         granulation,
     )?;
-    if let Some(e) = exposure {
-        params.exposure = e;
-    }
+    apply_visible_display_controls(
+        &mut params,
+        exposure,
+        ground_gain,
+        cloud_softclip,
+        cloud_highlight_max,
+    );
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
@@ -1169,6 +1238,7 @@ fn apply_visible_physics_controls(
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
+    fractional_clouds: bool,
     cloud_optical_depth_scale: f32,
     beer_powder: bool,
     granulation: bool,
@@ -1179,9 +1249,7 @@ fn apply_visible_physics_controls(
              {aerosol_optical_depth}"
         )));
     }
-    if !cloud_optical_depth_scale.is_finite()
-        || !(0.0..=4.0).contains(&cloud_optical_depth_scale)
-    {
+    if !cloud_optical_depth_scale.is_finite() || !(0.0..=4.0).contains(&cloud_optical_depth_scale) {
         return Err(value_err(format!(
             "cloud_optical_depth_scale must be finite and in 0.0..=4.0, got \
              {cloud_optical_depth_scale}"
@@ -1191,10 +1259,30 @@ fn apply_visible_physics_controls(
     params.rh_aerosol_swelling = rh_aerosol_swelling;
     params.atmosphere_correction = atmosphere_correction;
     params.terrain_atmosphere = terrain_atmosphere;
+    params.fractional_clouds = fractional_clouds;
     params.cloud_optical_depth_scale = cloud_optical_depth_scale;
     params.beer_powder = beer_powder;
     params.granulation = Some(granulation);
     Ok(())
+}
+
+/// Apply optional finished-display calibration controls. `None` preserves the engine's
+/// shipped constant, while an explicit value is recorded on `RenderParams`. These are
+/// intentionally separate from the physical controls because raw visible bands expose
+/// none of these arguments and pass `None` for every value, remaining pre-tonemap diagnostics.
+fn apply_visible_display_controls(
+    params: &mut RenderParams,
+    exposure: Option<f64>,
+    ground_gain: Option<f64>,
+    cloud_softclip: Option<f64>,
+    cloud_highlight_max: Option<f64>,
+) {
+    if let Some(value) = exposure {
+        params.exposure = value;
+    }
+    params.ground_gain = ground_gain;
+    params.cloud_softclip = cloud_softclip;
+    params.cloud_highlight_max = cloud_highlight_max;
 }
 
 /// Build the Python [`Georef`] from a render result: scalars + the projection dict + the
@@ -1440,12 +1528,23 @@ mod tests {
     #[test]
     fn visible_physics_helper_assigns_every_binding_control() {
         let mut params = RenderParams::new(PathBuf::from("input"));
-        apply_visible_physics_controls(&mut params, 0.2, true, false, false, 0.5, true, true)
-            .unwrap();
+        apply_visible_physics_controls(
+            &mut params,
+            0.2,
+            true,
+            false,
+            false,
+            false,
+            0.5,
+            true,
+            true,
+        )
+        .unwrap();
         assert_eq!(params.aerosol_optical_depth, 0.2);
         assert!(params.rh_aerosol_swelling);
         assert!(!params.atmosphere_correction);
         assert!(!params.terrain_atmosphere);
+        assert!(!params.fractional_clouds);
         assert_eq!(params.cloud_optical_depth_scale, 0.5);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
@@ -1460,7 +1559,8 @@ mod tests {
             false,
             true,
             true,
-            1.0,
+            true,
+            simsat_engine::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             false,
             false,
         )
@@ -1472,9 +1572,34 @@ mod tests {
         assert!(!params.rh_aerosol_swelling);
         assert!(params.atmosphere_correction);
         assert!(params.terrain_atmosphere);
-        assert_eq!(params.cloud_optical_depth_scale, 1.0);
+        assert!(params.fractional_clouds);
+        assert_eq!(
+            params.cloud_optical_depth_scale,
+            simsat_engine::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
         assert!(!params.beer_powder);
         assert_eq!(params.granulation, Some(false));
+    }
+
+    #[test]
+    fn visible_display_helper_preserves_defaults_when_omitted() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        let default_exposure = params.exposure;
+        apply_visible_display_controls(&mut params, None, None, None, None);
+        assert_eq!(params.exposure, default_exposure);
+        assert!(params.ground_gain.is_none());
+        assert!(params.cloud_softclip.is_none());
+        assert!(params.cloud_highlight_max.is_none());
+    }
+
+    #[test]
+    fn visible_display_helper_assigns_every_override() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        apply_visible_display_controls(&mut params, Some(1.4), Some(1.6), Some(0.65), Some(1.25));
+        assert_eq!(params.exposure, 1.4);
+        assert_eq!(params.ground_gain, Some(1.6));
+        assert_eq!(params.cloud_softclip, Some(0.65));
+        assert_eq!(params.cloud_highlight_max, Some(1.25));
     }
 }
 

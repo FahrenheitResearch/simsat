@@ -1,10 +1,8 @@
 # SimSat CI — MANUAL DISPATCH ONLY.
 #
-# No push/PR triggers on purpose: this repo's real gate is the node verify trio
-# (see CLAUDE.md "Node procedure"), and while the repo is private, Actions
-# minutes are limited. This workflow exists so a public release has a
-# world-visible CI story; consider adding a pull_request trigger after the repo
-# goes public (see RELEASING.md).
+# No push/PR triggers on purpose: the development repository has its own exact-SHA
+# integration gate. This manual workflow independently verifies each clean public
+# mirror release and leaves a world-visible CI record.
 #
 # Job scope: the full repo-root workspace (crates/simsat + crates/simsat_studio).
 # The studio's Linux build needs a handful of desktop dev headers for

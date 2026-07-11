@@ -9,8 +9,9 @@
 //! south->north, so image rows are flipped so north is at the top. The files are
 //! `{prefix}_tauup_maxz_sqrt.png` (max-over-z of `tau_up`, i.e. full-column
 //! optical depth to space), `{prefix}_ext_liquid_maxz_sqrt.png` (max-over-z
-//! cloud-liquid extinction), `{prefix}_ext_ice_maxz_sqrt.png` (ice+snow),
-//! `{prefix}_ext_precip_maxz_sqrt.png` (rain+graupel), and
+//! cloud-liquid extinction), `{prefix}_ext_ice_maxz_sqrt.png` (small/pristine ice),
+//! `{prefix}_ext_snow_maxz_sqrt.png` (the snow-only auxiliary subset),
+//! `{prefix}_ext_precip_maxz_sqrt.png` (the total rain+graupel+snow channel), and
 //! `{prefix}_temp_kmid_linear.png` (a mid-level temperature slice in K).
 //!
 //! Each image is auto-scaled to its own finite min/max; the scale type (sqrt or
@@ -64,6 +65,7 @@ fn main() {
     for (name, codes) in [
         ("ext_liquid", &brick.ext_liquid),
         ("ext_ice", &brick.ext_ice),
+        ("ext_snow", &brick.ext_snow),
         ("ext_precip", &brick.ext_precip),
     ] {
         let plane = max_over_z(&brick, codes, brick.quant.get(name));

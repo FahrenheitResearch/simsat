@@ -78,8 +78,8 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 // (gpu-clouds activation): rho = exposure * pi * L / E_sun, and the shoulder bound is
 // x_max = exposure * RHO_HIGHLIGHT_MAX — the exact seam of the CPU
 // render::radiance_to_rgba_softclip. A non-positive uniform falls back to 1.0.
-const CLOUD_SOFTCLIP_KNEE: f32 = 0.75;   // identity below; bounded Mobius shoulder above
-const RHO_HIGHLIGHT_MAX: f32 = 1.05;     // physical reflectance ceiling -> display 1.0
+const CLOUD_SOFTCLIP_KNEE: f32 = 0.65;   // identity below; bounded Mobius shoulder above
+const RHO_HIGHLIGHT_MAX: f32 = 1.25;     // physical reflectance ceiling -> display 1.0
 // WS2 diffuse cloud-shadow floor (twin of render::CLOUD_SHADOW_FLOOR /
 // effective_cloud_shadow): day-gated on the shared 20->30 deg ramp; the specular
 // glint keeps the RAW shadow. Was deliberately CPU-only until this activation.
@@ -622,8 +622,8 @@ fn synthesize_abi_green(rho: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// The display EXPOSURE gain (u.m1.x; the owner-approved display control, default 1.6
-// in the studio). Twin of render::radiance_to_rgba_softclip's gain guard: a
+// The display EXPOSURE gain (u.m1.x; neutral default 1.0 in the studio). Twin of
+// render::radiance_to_rgba_softclip's gain guard: a
 // non-finite/non-positive uniform falls back to 1.0 (never darkens to nothing).
 fn exposure_gain() -> f32 {
     if (u.m1.x > 0.0) {
@@ -1314,13 +1314,18 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         // Sun source: Wrenninge multi-scatter octaves (M5) over the single depth-
         // resolved cloud sun optical depth (octaves=1 == fix2 single scatter).
         let tau_cloud_sun = cloud_sun_optical_depth(pm, sun);
-        // Column OD preserves the higher-order buildup at a thick cloud's sunlit top.
-        // The sun-aligned raw OD map covers slanted and legacy/analytic zero-tau_up
-        // data; it supports the gate only and never replaces sample-to-sun tau.
+        // Smooth vertical column OD preserves the higher-order buildup at a thick
+        // cloud's sunlit top. The coarse sun-aligned map is primarily a ground-shadow
+        // raster; using max(real_column, map) imprinted its texel lattice on HRRR cloud
+        // light. It remains a support-only fallback for legacy/analytic zero-tau_up
+        // data and never replaces sample-to-sun tau.
         let col_total = sample_volume(vec3<f32>(bm.x, bm.y, 0.0)).w;
-        let sun_column_tau = sun_od_sample(pm) * od_scale;
+        var column_support_tau = sun_od_sample(pm) * od_scale;
+        if (col_total > 0.0) {
+            column_support_tau = col_total * od_scale;
+        }
         let support_tau = max(
-            max(max(col_total * od_scale, sun_column_tau), tau_cloud_sun),
+            max(column_support_tau, tau_cloud_sun),
             sigma_eff * u.dims.w,
         );
         let sun_src = octave_sun_source(

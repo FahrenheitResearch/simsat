@@ -61,8 +61,8 @@ use simsat::ingest_grib;
 use simsat::ir::{self, IrConfig, IrScene, IrVolume};
 use simsat::ir_enhance::{IrEnhancement, render_ir_rgba};
 use simsat::render::{
-    FLAT_ALBEDO_SRGB, FrameContext, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt,
-    snow_fraction,
+    CLOUD_SOFTCLIP_KNEE, FLAT_ALBEDO_SRGB, FrameContext, GROUND_DAY_LIFT, RHO_HIGHLIGHT_MAX,
+    SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt, shade_surface, snow_fraction,
 };
 use simsat::sandwich;
 use simsat::solar::{self, SolarFrame};
@@ -856,9 +856,12 @@ struct SimSatStudioApp {
     output_transform: OutputTransform,
     // M4 cloud controls (design section 4) + M5 multi-scatter (section 4/6).
     clouds_enabled: bool,
+    /// Use model cloud fraction/subcolumns when available. On is the physical default;
+    /// off is the legacy full-horizontal-cell cloud coverage A/B.
+    fractional_clouds: bool,
     multiscatter: bool,
-    /// Explicit visible cloud optical-depth QA/what-if multiplier. A neutral 1.0
-    /// uses the model-derived extinction without tuning.
+    /// Visible cloud optical-depth calibration. The shipped 0.15 is the owner's
+    /// cross-file visual selection; 1.0 uses model extinction without scaling.
     cloud_optical_depth_scale: f32,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the clouds.rs
@@ -867,7 +870,7 @@ struct SimSatStudioApp {
     /// Clouds-group toggle until the tune-2 rework re-earns the default (matches the
     /// api's opt-in scoping; raw-Kelvin thermal modes never granulate regardless).
     /// The amplitude is dx-derived, so a fine (250 m) run is near-neutral and a
-    /// coarse (2-3 km) run granulates strongly. Session-scoped (not persisted).
+    /// coarse (2-3 km) run granulates strongly. Persisted as an explicit opt-in.
     granulation: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL "GPU clouds" toggle (the M5-GPU cloud-pass activation): when on,
@@ -884,10 +887,15 @@ struct SimSatStudioApp {
     /// The last parity report (summary + heatmap texture), shown in the drawer.
     parity: Option<ParityReport>,
     /// Display-side exposure gain applied before the ABI stretch (see
-    /// `render::radiance_to_rgba`). Affects the clouds-on CPU composite (surface +
-    /// cloud together); the clouds-off GPU surface pass keeps the implicit 1.0 (a
-    /// documented CPU/GPU divergence, like the M4/M5 cloud passes).
+    /// `render::radiance_to_rgba`). Affects surface + cloud together. A clear-sky
+    /// configuration the GPU surface shader cannot represent routes through CPU.
     exposure: f32,
+    /// Sun-gated daytime ground-radiance lift (`1.0` is neutral).
+    ground_gain: f32,
+    /// Finished-display highlight shoulder knee (`1.0` disables the shoulder).
+    cloud_softclip: f32,
+    /// Physical reflectance-factor ceiling mapped to display white.
+    cloud_highlight_max: f32,
     /// "Fake sun" / what-if OVERRIDE (a deliberate, NON-PHYSICAL visualization aid): when
     /// on, the whole frame is lit by a single sun direction at `sun_override_elev` /
     /// `sun_override_az` over the domain centre (uniform sun-at-infinity, exactly like the
@@ -911,6 +919,9 @@ struct SimSatStudioApp {
     export_busy: bool,
     /// Settings persistence (WS4 item 2): the settings.json path, the last-saved
     /// snapshot (save-on-change compares against it), and the debounce timer.
+    /// Epoch zero preserves a pre-v0.1.4 calibration until the user explicitly
+    /// accepts the new preset or keeps their saved controls in the migration banner.
+    visible_calibration_epoch: u32,
     settings_path: PathBuf,
     last_saved: settings::StudioSettings,
     settings_dirty_since: Option<Instant>,
@@ -1000,10 +1011,12 @@ impl SimSatStudioApp {
             terrain_atmosphere: true,
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: true,
+            // Model fractional cloud coverage ON by default; missing fields fall back safely.
+            fractional_clouds: true,
             // Wrenninge multi-scatter octaves ON by default (M5): the bright-anvil look.
             multiscatter: true,
-            // Neutral unless the user deliberately makes a QA/what-if override.
-            cloud_optical_depth_scale: 1.0,
+            // Owner-selected v0.1.4 cross-file visible calibration.
+            cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
             // scatter buildup, so powder-on would double-darken (design M5 decision).
             beer_powder: false,
@@ -1017,9 +1030,12 @@ impl SimSatStudioApp {
             gpu_clouds: false,
             parity_pending: false,
             parity: None,
-            // A moderate display brightening over the pre-exposure 1.0 (the owner
-            // reported "too dark no matter the time"); tuned from real frames.
+            // Neutral reflectance-factor gain before the ABI square-root display
+            // stretch; brighter appearance presets remain explicit controls.
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
+            ground_gain: GROUND_DAY_LIFT as f32,
+            cloud_softclip: CLOUD_SOFTCLIP_KNEE as f32,
+            cloud_highlight_max: RHO_HIGHLIGHT_MAX as f32,
             // Fake-sun override OFF by default (honest real-timestamp sun). Defaults when
             // toggled on: a mid daytime sun from the south (a clear "what-if daylight").
             sun_override: false,
@@ -1032,6 +1048,7 @@ impl SimSatStudioApp {
             pack_busy: false,
             export_rx: None,
             export_busy: false,
+            visible_calibration_epoch: loaded.visible_calibration_epoch,
             settings_path,
             last_saved: loaded.clone(),
             settings_dirty_since: None,
@@ -1067,6 +1084,7 @@ impl SimSatStudioApp {
     /// `unwrap_or` defaults are pure defense. The fake-sun override is DELIBERATELY
     /// absent (never persisted — sessions always start with the honest sun).
     fn apply_settings(&mut self, s: &settings::StudioSettings) {
+        self.visible_calibration_epoch = s.visible_calibration_epoch;
         if let Some(root) = &s.store_root {
             self.store_root = PathBuf::from(root);
         }
@@ -1093,11 +1111,15 @@ impl SimSatStudioApp {
         self.atmosphere_correction = s.atmosphere_correction;
         self.terrain_atmosphere = s.terrain_atmosphere;
         self.clouds_enabled = s.clouds_enabled;
+        self.fractional_clouds = s.fractional_clouds;
         self.multiscatter = s.multiscatter;
         self.cloud_optical_depth_scale = s.cloud_optical_depth_scale;
         self.beer_powder = s.beer_powder;
         self.granulation = s.granulation;
         self.exposure = s.exposure;
+        self.ground_gain = s.ground_gain;
+        self.cloud_softclip = s.cloud_softclip;
+        self.cloud_highlight_max = s.cloud_highlight_max;
         self.bm_month_override = s.bm_month_override;
         self.bm_allow_download = s.bm_allow_download;
         self.play_fps = s.play_fps;
@@ -1108,6 +1130,7 @@ impl SimSatStudioApp {
     /// Capture the current persistable state (the inverse of `apply_settings`).
     fn settings_snapshot(&self) -> settings::StudioSettings {
         settings::StudioSettings {
+            visible_calibration_epoch: self.visible_calibration_epoch,
             store_root: Some(self.store_root.display().to_string()),
             sat: settings::sat_token(self.preset).to_string(),
             resolution: settings::resolution_token(self.resolution).to_string(),
@@ -1122,11 +1145,15 @@ impl SimSatStudioApp {
             atmosphere_correction: self.atmosphere_correction,
             terrain_atmosphere: self.terrain_atmosphere,
             clouds_enabled: self.clouds_enabled,
+            fractional_clouds: self.fractional_clouds,
             multiscatter: self.multiscatter,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             exposure: self.exposure,
+            ground_gain: self.ground_gain,
+            cloud_softclip: self.cloud_softclip,
+            cloud_highlight_max: self.cloud_highlight_max,
             bm_month_override: self.bm_month_override,
             bm_allow_download: self.bm_allow_download,
             play_fps: self.play_fps,
@@ -1199,16 +1226,7 @@ impl SimSatStudioApp {
     // ── open dialogs (shared by the Open menu and the first-run CTA) ─────────
 
     fn dialog_open_wrfout(&mut self) {
-        // wrfout files are frequently EXTENSION-LESS, so "All files" must be the
-        // FIRST (default) filter — a model-output extension filter as the default
-        // hid every wrfout in the picker (owner-reported in the v0.1.2 preview).
-        // The GRIB2 filter stays as an optional narrowing in the type dropdown.
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("All files (wrfout / GRIB2)", &["*"])
-            .add_filter("GRIB2", &["grib2", "grb2", "grib", "grb"])
-            .set_title("Open a wrfout or GRIB2 file")
-            .pick_file()
-        {
+        if let Some(path) = model_input_dialog("Open a wrfout or GRIB2 file").pick_file() {
             self.open_wrfout(path);
         }
     }
@@ -1233,9 +1251,8 @@ impl SimSatStudioApp {
     }
 
     fn dialog_open_sequence_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
-            .set_title("Select wrfout files for a sequence")
-            .pick_files()
+        if let Some(files) =
+            model_input_dialog("Select wrfout or GRIB2 files for a sequence").pick_files()
         {
             self.open_sequence(files);
         }
@@ -1716,12 +1733,23 @@ impl SimSatStudioApp {
         self.parity_pending = false;
         if atmo.parity {
             self.parity = None;
-            self.logline("GPU parity check: rendering BOTH paths (CPU reference + GPU pass)...");
+            if !atmo.fractional_clouds {
+                self.logline(
+                    "GPU parity check: rendering BOTH paths (CPU reference + GPU pass)...",
+                );
+            }
         }
-        if (atmo.gpu_clouds || atmo.parity) && atmo.granulation {
+        if (atmo.gpu_clouds || atmo.parity) && atmo.fractional_clouds {
             self.logline(
-                "Note: granulation is CPU-only; the GPU cloud pass renders without it \
-                 (parity compares granulation-off).",
+                "GPU clouds: model cloud fraction/subcolumns are CPU-only; using the CPU \
+                 composite. Turn off 'Use model cloud fraction' only for a legacy GPU preview.",
+            );
+        }
+        if (atmo.gpu_clouds || atmo.parity) && !gpu_granulation_preview_compatible(atmo.granulation)
+        {
+            self.logline(
+                "GPU clouds: granulation is CPU-only; using the CPU composite so the requested \
+                 sub-grid detail is not ignored. Turn off Granulation only for a legacy GPU preview.",
             );
         }
         if (atmo.gpu_clouds || atmo.parity) && atmo.terrain_atmosphere {
@@ -1730,13 +1758,32 @@ impl SimSatStudioApp {
                  physical correction re-enables the experimental GPU preview.",
             );
         }
+        if (atmo.gpu_clouds || atmo.parity)
+            && !gpu_cloud_tonemap_compatible(atmo.cloud_softclip, atmo.cloud_highlight_max)
+        {
+            self.logline(
+                "GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU \
+                 composite so the requested display calibration is not ignored.",
+            );
+        }
         if atmo.clouds_enabled
             && atmo.render_mode.uses_visible_controls()
-            && (atmo.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON
+            && !atmo.fractional_clouds
+        {
+            self.logline(
+                "Legacy cloud coverage active: model cloud fraction disabled; every non-zero \
+                 cloudy cell is horizontally full.",
+            );
+        }
+        if atmo.clouds_enabled
+            && atmo.render_mode.uses_visible_controls()
+            && (atmo.cloud_optical_depth_scale - clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE).abs()
+                > f32::EPSILON
         {
             self.logline(format!(
-                "QA override: visible cloud optical depth scaled by {:.2} (neutral = 1.00).",
-                atmo.cloud_optical_depth_scale
+                "Visible cloud optical-depth scale {:.2} (shipped {:.2}; 1.00 = unscaled).",
+                atmo.cloud_optical_depth_scale,
+                clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
             ));
         }
         let Some(job) = self.job_for_timestep(&ts) else {
@@ -1894,6 +1941,7 @@ impl SimSatStudioApp {
             terrain_atmosphere: self.terrain_atmosphere,
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
+            fractional_clouds: self.fractional_clouds,
             multiscatter: self.multiscatter,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             beer_powder: self.beer_powder,
@@ -1902,6 +1950,9 @@ impl SimSatStudioApp {
             gpu_clouds: self.gpu_clouds,
             parity: self.parity_pending,
             exposure: self.exposure as f64,
+            ground_gain: self.ground_gain as f64,
+            cloud_softclip: self.cloud_softclip as f64,
+            cloud_highlight_max: self.cloud_highlight_max as f64,
             // Fake-sun what-if override: Some((elev_deg, az_deg)) when on, else the file's
             // real solar geometry. Uniform sun direction across the frame (sun at infinity).
             sun_override: if self.sun_override {
@@ -2188,12 +2239,14 @@ impl SimSatStudioApp {
         }
         if atmo.clouds_enabled
             && atmo.render_mode.uses_visible_controls()
-            && (atmo.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON
+            && (atmo.cloud_optical_depth_scale - clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE).abs()
+                > f32::EPSILON
         {
             self.logline(format!(
-                "QA override for batch: visible cloud optical depth scaled by {:.2} \
-                 (neutral = 1.00).",
-                atmo.cloud_optical_depth_scale
+                "Batch visible cloud optical-depth scale {:.2} (shipped {:.2}; \
+                 1.00 = unscaled).",
+                atmo.cloud_optical_depth_scale,
+                clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
             ));
         }
         atmo.gpu_clouds = false;
@@ -2730,6 +2783,57 @@ impl SimSatStudioApp {
             });
     }
 
+    /// Non-destructive calibration migration. Settings written before the v0.1.4
+    /// epoch keep every saved value; this banner makes that fact visible and asks the
+    /// user to either apply the new RC preset or deliberately keep their controls.
+    fn calibration_epoch_banner(&mut self, ui: &mut egui::Ui) {
+        if self.visible_calibration_epoch >= settings::VISIBLE_CALIBRATION_EPOCH {
+            return;
+        }
+        ui.add_space(2.0);
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(55, 45, 18))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .corner_radius(3.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(245, 210, 120),
+                        "v0.1.4 has a new visible calibration. Your saved controls are still active.",
+                    );
+                    if ui.button("Use v0.1.4 RC preset").clicked() {
+                        let d = settings::StudioSettings::default();
+                        self.aod = d.aod;
+                        self.rh_swelling = d.rh_swelling;
+                        self.atmosphere_correction = d.atmosphere_correction;
+                        self.terrain_atmosphere = d.terrain_atmosphere;
+                        self.output_transform =
+                            settings::output_transform_from_token(&d.output_transform)
+                                .unwrap_or(OutputTransform::AbiReflectance);
+                        self.clouds_enabled = d.clouds_enabled;
+                        self.fractional_clouds = d.fractional_clouds;
+                        self.multiscatter = d.multiscatter;
+                        self.cloud_optical_depth_scale = d.cloud_optical_depth_scale;
+                        self.beer_powder = d.beer_powder;
+                        self.granulation = d.granulation;
+                        self.exposure = d.exposure;
+                        self.ground_gain = d.ground_gain;
+                        self.cloud_softclip = d.cloud_softclip;
+                        self.cloud_highlight_max = d.cloud_highlight_max;
+                        self.visible_calibration_epoch = settings::VISIBLE_CALIBRATION_EPOCH;
+                    }
+                    if ui.button("Keep my saved controls").clicked() {
+                        self.visible_calibration_epoch = settings::VISIBLE_CALIBRATION_EPOCH;
+                    }
+                });
+                ui.weak(
+                    "Full shipped visible baseline: AOD/atmosphere/output/cloud toggles plus \
+                     OD 0.15 (owner-selected cross-file calibration), exposure 1.00, ground 1.00, \
+                     knee 0.65, ceiling 1.25, fractional clouds on, granulation off.",
+                );
+            });
+    }
+
     /// A slim, colored one-line note under the strip explaining the current product and which
     /// drawer groups apply — only shown for the modes whose controls differ from plain Visible
     /// (so the owner knows why the Sun / atmosphere / cloud groups are absent in a thermal or
@@ -2998,6 +3102,64 @@ impl SimSatStudioApp {
                     });
                 });
 
+            // Finished-display calibration. These persisted controls change only the
+            // visible RGB-family tonemap/surface lift; raw bands and thermal/derived
+            // products never consume them.
+            egui::CollapsingHeader::new("Advanced display calibration")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.ground_gain, 0.25..=4.0)
+                                .text("Ground lift"),
+                        )
+                        .on_hover_text(
+                            "Sun-gated daytime surface-radiance lift. 1.0 is neutral. It does \
+                             not brighten cloud radiance and does not alter raw bands.",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.cloud_softclip, 0.05..=1.0)
+                                .text("Highlight knee"),
+                        )
+                        .on_hover_text(
+                            "Start of the finished-display highlight shoulder. 1.0 disables \
+                             the shoulder and restores a hard clamp.",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.cloud_highlight_max, 0.25..=4.0)
+                                .text("Highlight ceiling"),
+                        )
+                        .on_hover_text(
+                            "Physical reflectance factor mapped to display white. Raising it \
+                             keeps more structure in bright anvils; this is display-only.",
+                        );
+                    });
+                    let calibrated = display_calibration_is_dirty(
+                        self.exposure,
+                        self.ground_gain,
+                        self.cloud_softclip,
+                        self.cloud_highlight_max,
+                    );
+                    if ui
+                        .add_enabled(calibrated, egui::Button::new("Restore shipped display calibration"))
+                        .on_hover_text(
+                            "Reset exposure, ground lift, highlight knee, and highlight ceiling \
+                             to the engine's shipped constants.",
+                        )
+                        .clicked()
+                    {
+                        (
+                            self.exposure,
+                            self.ground_gain,
+                            self.cloud_softclip,
+                            self.cloud_highlight_max,
+                        ) = shipped_display_calibration();
+                    }
+                    ui.weak(
+                        "Display-only: raw visible bands, IR, water vapor, and derived fields are unchanged.",
+                    );
+                });
+
             // Atmosphere.
             egui::CollapsingHeader::new("Atmosphere")
                 .default_open(false)
@@ -3069,6 +3231,27 @@ impl SimSatStudioApp {
                             "Volumetric cloud raymarch (M4). Off = the M2 clear-sky surface.",
                         );
                         ui.add_enabled_ui(self.clouds_enabled, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.fractional_clouds,
+                                    "Use model cloud fraction",
+                                )
+                                .on_hover_text(
+                                     "Use the source model cloud-fraction field to render \
+                                     fractional subcolumns and wispy cloud edges. On is the \
+                                     physical default; files without the field safely fall \
+                                     back to full-cell coverage. Off reproduces the legacy \
+                                     behavior where every non-zero cloudy cell fills the \
+                                     horizontal cell.",
+                                )
+                                .changed()
+                                && self.fractional_clouds
+                            {
+                                // The current WGSL preview has no fractional-subcolumn closure.
+                                // Do not leave a now-disabled preview silently checked.
+                                self.gpu_clouds = false;
+                                self.parity_pending = false;
+                            }
                             ui.checkbox(&mut self.multiscatter, "Multi-scatter")
                                 .on_hover_text(
                                     "Wrenninge multi-scatter octaves (M5) — the bright-anvil \
@@ -3079,22 +3262,41 @@ impl SimSatStudioApp {
                                     &mut self.cloud_optical_depth_scale,
                                     0.0..=4.0,
                                 )
-                                .text("Cloud optical-depth scale (QA override)")
+                                .text("Cloud optical-depth scale")
                                 .fixed_decimals(2),
                             )
                             .on_hover_text(
-                                "Explicit what-if multiplier applied consistently to visible \
-                                 cloud extinction, sunlight attenuation, and shadows. 1.00 uses \
-                                 the model-derived physical input unchanged; 0 disables visible \
-                                 cloud optical extinction. This does not change IR products.",
+                                "Applied consistently to visible cloud extinction, sunlight \
+                                 attenuation, and shadows. The shipped 0.15 is the owner's \
+                                 cross-file visual calibration; 1.00 uses model \
+                                 extinction unchanged, and 0 disables visible cloud extinction. \
+                                 This does not change IR or derived products.",
                             );
+                            if ui
+                                .add_enabled(
+                                    (self.cloud_optical_depth_scale
+                                        - clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE)
+                                        .abs()
+                                        > f32::EPSILON,
+                                    egui::Button::new("Reset scale to shipped 0.15"),
+                                )
+                                .on_hover_text(
+                                    "Restore the owner-selected shipped calibration.",
+                                )
+                                .clicked()
+                            {
+                                self.cloud_optical_depth_scale =
+                                    clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
+                            }
                             if ui
                                 .add_enabled(
                                     (self.cloud_optical_depth_scale - 1.0).abs()
                                         > f32::EPSILON,
-                                    egui::Button::new("Reset scale to 1.00"),
+                                    egui::Button::new("Use unscaled 1.00"),
                                 )
-                                .on_hover_text("Restore the neutral, model-derived cloud depth.")
+                                .on_hover_text(
+                                    "Use the model-derived extinction without the shipped scale.",
+                                )
                                 .clicked()
                             {
                                 self.cloud_optical_depth_scale = 1.0;
@@ -3106,14 +3308,24 @@ impl SimSatStudioApp {
                                      the forward-scatter buildup it used to fake, so leaving it \
                                      on double-darkens.",
                                 );
-                            ui.checkbox(&mut self.granulation, "Granulation (sub-grid detail)")
+                            if ui
+                                .checkbox(&mut self.granulation, "Granulation (sub-grid detail)")
                                 .on_hover_text(
                                     "Edge-erosion detail noise: carves the unresolved sub-km \
                                      texture of boundary-layer cumulus (Worley octaves, \
                                      subtract-only — never adds cloud). Amplitude follows the \
                                      model grid: near-neutral on a 250 m run, strong on 2-3 km. \
-                                     Ice anvils/cirrus and thermal IR are untouched.",
-                                );
+                                     Ice anvils/cirrus and thermal IR are untouched. This \
+                                     physical control is CPU-only.",
+                                )
+                                .changed()
+                                && self.granulation
+                            {
+                                // The current WGSL preview has no granulation field. Do not
+                                // leave a now-inapplicable preview silently checked.
+                                self.gpu_clouds = false;
+                                self.parity_pending = false;
+                            }
                             ui.label("Steps:");
                             egui::ComboBox::from_id_salt("stepq")
                                 .selected_text(match self.step_quality {
@@ -3134,16 +3346,33 @@ impl SimSatStudioApp {
                                 });
                         });
                     });
+                    if self.clouds_enabled {
+                        ui.weak(if self.fractional_clouds {
+                            "Model cloud fraction: CPU physical path (missing fields fall back safely)."
+                        } else {
+                            "Legacy cloud coverage: each non-zero cloudy cell is horizontally full."
+                        });
+                    }
                     // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): geostationary
                     // Visible clouds-on only; the CPU composite stays the shipping default
                     // and the ONLY stored-frame path.
+                    let gpu_tonemap_ok = (self.cloud_softclip
+                        - CLOUD_SOFTCLIP_KNEE as f32)
+                        .abs()
+                        <= f32::EPSILON
+                        && (self.cloud_highlight_max - RHO_HIGHLIGHT_MAX as f32).abs()
+                            <= f32::EPSILON;
                     let gpu_applicable = self.gpu.is_some()
                         && matches!(self.render_mode, RenderMode::Visible)
                         && self.view == StudioView::Geostationary
                         && self.clouds_enabled
                         // The current WGSL path supports the true-color correction
-                        // toggle, but not per-pixel terrain elevation.
-                        && !self.terrain_atmosphere;
+                        // toggle, but not per-pixel terrain elevation, fractional
+                        // cloud subcolumns, or granulation.
+                        && !self.terrain_atmosphere
+                        && gpu_fractional_preview_compatible(self.fractional_clouds)
+                        && gpu_granulation_preview_compatible(self.granulation)
+                        && gpu_tonemap_ok;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
                     // cluster was unexplained (owner-reported) — name the unmet
                     // conditions inline and on the disabled-hover instead.
@@ -3163,6 +3392,15 @@ impl SimSatStudioApp {
                         if self.terrain_atmosphere {
                             unmet.push("terrain-height atmosphere off");
                         }
+                        if self.fractional_clouds {
+                            unmet.push("Use model cloud fraction off");
+                        }
+                        if self.granulation {
+                            unmet.push("Granulation off");
+                        }
+                        if !gpu_tonemap_ok {
+                            unmet.push("shipped highlight calibration");
+                        }
                         if unmet.is_empty() {
                             String::new()
                         } else {
@@ -3171,8 +3409,10 @@ impl SimSatStudioApp {
                     };
                     const GPU_DISABLED_HINT: &str =
                         "Enabled in Visible mode + Geostationary view with Clouds on \
-                         and terrain-height atmosphere off. Also needs a GPU device, \
-                         a loaded run, and no render in progress.";
+                         terrain-height atmosphere off, Use model cloud fraction off, and \
+                         Granulation off. Fractional subcolumns, granulation, and custom \
+                         highlight calibration are CPU-only. Also needs a GPU device, a loaded \
+                         run, and no render in progress.";
                     ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(gpu_applicable, |ui| {
                             ui.checkbox(&mut self.gpu_clouds, "GPU clouds (experimental)")
@@ -3180,8 +3420,8 @@ impl SimSatStudioApp {
                                     "Render the DISPLAYED frame through the GPU cloud pass \
                                      (clouds.wgsl, Interactive sun schedule) instead of the CPU \
                                      composite — the fast live preview. Stored frames and \
-                                     sequence renders ALWAYS use the CPU path. Known preview \
-                                     divergences: no granulation on GPU; terrain shadows / \
+                                     sequence renders ALWAYS use the CPU path. Granulation routes \
+                                     to CPU. Other known preview divergences: terrain shadows / \
                                      ambient aperture / per-pixel wind / snow use flat-open \
                                      defaults; hardware-trilinear volume sampling; f32 math. \
                                      Geostationary Visible mode only.",
@@ -3698,6 +3938,7 @@ impl eframe::App for SimSatStudioApp {
                         });
                     });
             }
+            self.calibration_epoch_banner(ui);
             self.context_note(ui);
             self.size_gate_confirms(ui);
             ui.separator();
@@ -4079,9 +4320,12 @@ struct AtmoSettings {
     terrain_atmosphere: bool,
     output_transform: OutputTransform,
     clouds_enabled: bool,
+    /// Use the source's cloud-fraction/subcolumn closure when available. The CPU
+    /// renderer consumes this; `false` requests the legacy horizontally-full cells.
+    fractional_clouds: bool,
     /// M5 Wrenninge multi-scatter octaves on/off (the A/B knob: DEFAULT_OCTAVES vs 1).
     multiscatter: bool,
-    /// Explicit visible cloud optical-depth QA/what-if scale. Neutral is 1.0.
+    /// Visible cloud optical-depth scale. Shipped = 0.15; 1.0 is unscaled.
     cloud_optical_depth_scale: f32,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise): when on, the visible
@@ -4098,6 +4342,12 @@ struct AtmoSettings {
     parity: bool,
     /// Display-side exposure gain (before the ABI stretch) for the CPU composite.
     exposure: f64,
+    /// Sun-gated daytime surface-radiance lift (`1.0` is neutral).
+    ground_gain: f64,
+    /// Highlight shoulder knee (`1.0` disables the shoulder).
+    cloud_softclip: f64,
+    /// Physical reflectance-factor ceiling mapped to display white.
+    cloud_highlight_max: f64,
     /// "Fake sun" what-if OVERRIDE: `Some((elev_deg, az_deg))` places a single uniform
     /// sun over the domain centre at that elevation/azimuth (sun at infinity) regardless
     /// of the file's time; `None` uses the real timestamp solar geometry. A deliberate,
@@ -4425,18 +4675,65 @@ fn prepare_render(
     // The GPU shader honors the true-color-correction flag, but it has no per-pixel
     // terrain elevation. Never silently ignore that physical control.
     let gpu_atmosphere_ok = !atmo.terrain_atmosphere;
+    // Fractional cloud/subcolumn closure is CPU-only until the GPU path gains the
+    // cloud-fraction volume. Never silently render legacy full cells while the
+    // physical control is active.
+    let gpu_fractional_clouds_ok = gpu_fractional_preview_compatible(atmo.fractional_clouds);
+    // Granulation changes both view extinction and the sunlight OD field. The WGSL
+    // preview has neither, so never silently drop this physical control.
+    let gpu_granulation_ok = gpu_granulation_preview_compatible(atmo.granulation);
+    // The cloud shader consumes exposure and ground lift through `CloudMarchParams`, but
+    // its highlight knee/ceiling remain baked. Route custom values through CPU rather
+    // than displaying a plausible-looking frame that silently ignored the controls.
+    let gpu_cloud_tonemap_ok =
+        gpu_cloud_tonemap_compatible(atmo.cloud_softclip, atmo.cloud_highlight_max);
+    // The clear-sky surface shader has implicit exposure/ground calibration as well as
+    // baked highlight constants. It is usable only at that exact neutral calibration.
+    let gpu_surface_display_ok = gpu_surface_display_compatible(
+        atmo.exposure,
+        atmo.ground_gain,
+        atmo.cloud_softclip,
+        atmo.cloud_highlight_max,
+    );
     let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
         && atmo.clouds_enabled
         && !is_topdown
         && !is_persp
         && matches!(atmo.render_mode, RenderMode::Visible)
         && gpu_projection_ok
-        && gpu_atmosphere_ok;
+        && gpu_atmosphere_ok
+        && gpu_fractional_clouds_ok
+        && gpu_granulation_ok
+        && gpu_cloud_tonemap_ok;
     if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
         status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
     }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_atmosphere_ok {
         status("GPU clouds: terrain-height atmosphere is CPU-only; using the CPU composite.");
+    }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_fractional_clouds_ok {
+        status(
+            "GPU clouds: model cloud fraction/subcolumns are CPU-only; using the CPU \
+             composite (turn off Use model cloud fraction for the legacy GPU preview).",
+        );
+    }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_granulation_ok {
+        status(
+            "GPU clouds: granulation is CPU-only; using the CPU composite so the requested \
+             sub-grid detail is not ignored.",
+        );
+    }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_tonemap_ok {
+        status("GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU composite.");
+    }
+    if !atmo.clouds_enabled
+        && matches!(atmo.render_mode, RenderMode::Visible)
+        && !gpu_surface_display_ok
+    {
+        status(
+            "Clear-sky display calibration is not representable by the GPU surface pass; \
+             using the CPU surface path.",
+        );
     }
     let bm_cache_dir = ingest::default_cache_dir();
     let (bluemarble, bm_status, season_line): (Option<BmGround>, BmStatus, String) = match raster
@@ -4737,7 +5034,7 @@ fn prepare_render(
         let vol = IrVolume::from_brick(&brick, horiz_pitch_m);
         // The occupancy mip (from the same brick's extinction) drives coarse empty-
         // space skipping in the thermal march (conservative — no cloud is stepped over).
-        let dv = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
+        let dv = clouds::DecodedVolume::from_brick_legacy(&brick, horiz_pitch_m);
         let mip = clouds::OccupancyMip::build(&dv, clouds::OCCUPANCY_MIP_FACTOR);
         let scene = IrScene {
             vol: &vol,
@@ -4769,7 +5066,7 @@ fn prepare_render(
         // CPU composite remains the shipping default and the ONLY stored path; a
         // parity render ALSO marches the CPU reference here for the diff.
         status("Preparing GPU cloud volume...");
-        let vol = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
+        let vol = clouds::DecodedVolume::from_brick_legacy(&brick, horiz_pitch_m);
         let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
         let scan_rect = clouds::scan_rect_of(&raster.scan);
         let froxel = atmosphere::build_aerial_froxel(
@@ -4782,12 +5079,15 @@ fn prepare_render(
         );
         let pitch = vol.voxel_pitch_m();
         // The GPU pass always renders the INTERACTIVE schedule — the wgsl's
-        // documented sun-march constants are the Interactive (6, 2.0) pair. NOTE:
-        // granulation is NOT wired on the GPU (GRAN_AMPLITUDE = 0.0 in the shader);
-        // the studio toggle is ignored by this preview (logged at Render).
+        // documented sun-march constants are the Interactive (6, 2.0) pair.
+        // Eligibility above guarantees granulation is off; a requested granulated
+        // render is routed to CPU rather than silently changing the cloud field.
         let icfg = MarchConfig {
             beer_powder: atmo.beer_powder,
             cloud_optical_depth_scale: atmo.cloud_optical_depth_scale,
+            ground_day_lift: atmo.ground_gain,
+            cloud_softclip_knee: atmo.cloud_softclip,
+            cloud_highlight_max: atmo.cloud_highlight_max,
             octaves: if atmo.multiscatter {
                 clouds::DEFAULT_OCTAVES
             } else {
@@ -4861,6 +5161,9 @@ fn prepare_render(
                 flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
                 raymarch_steps: 16,
                 exposure: atmo.exposure,
+                ground_day_lift: atmo.ground_gain,
+                cloud_softclip_knee: atmo.cloud_softclip,
+                cloud_highlight_max: atmo.cloud_highlight_max,
                 atmosphere_correction: atmo.atmosphere_correction,
                 terrain_atmosphere: atmo.terrain_atmosphere,
             };
@@ -4962,6 +5265,7 @@ fn prepare_render(
         || is_persp
         || is_visible_ir_composite
         || !gpu_atmosphere_ok
+        || !gpu_surface_display_ok
     {
         // ── CPU VISIBLE composite. Geostationary clouds-ON composites the M4/M5 cloud
         // march over the M2/M3 surface radiance (the tested CPU render path; the GPU
@@ -5001,14 +5305,38 @@ fn prepare_render(
         } else {
             None
         };
-        match granulation {
-            Some(g) => status(&format!(
-                "Marching clouds (granulation amp {:.2})...",
-                g.amplitude
-            )),
-            None => status("Marching clouds..."),
+        if atmo.clouds_enabled {
+            match granulation {
+                Some(g) => status(&format!(
+                    "Marching clouds (granulation amp {:.2})...",
+                    g.amplitude
+                )),
+                None => status("Marching clouds..."),
+            }
+        } else {
+            status("Rendering clear-sky surface (clouds off)...");
         }
-        let vol = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
+        let fractional_clouds =
+            atmo.clouds_enabled && atmo.fractional_clouds && brick.has_cloud_fraction;
+        let mut vol = if fractional_clouds {
+            clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m)
+        } else {
+            clouds::DecodedVolume::from_brick_legacy(&brick, horiz_pitch_m)
+        };
+        if fractional_clouds {
+            let stats = vol.apply_fractional_clouds();
+            let ratio = if stats.raw_fractional_tau > 0.0 {
+                stats.effective_fractional_tau / stats.raw_fractional_tau
+            } else {
+                1.0
+            };
+            status(&format!(
+                "Marching clouds (model fraction adjusted {}/{} columns, tau {:.2}x)...",
+                stats.columns_modified, stats.columns_total, ratio
+            ));
+        } else if atmo.clouds_enabled && atmo.fractional_clouds {
+            status("Marching clouds (model fraction unavailable; legacy coverage)...");
+        }
         let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
         let sun_od = clouds::accumulate_sun_od_granulated(
             &vol,
@@ -5021,6 +5349,9 @@ fn prepare_render(
         let cfg = MarchConfig {
             beer_powder: atmo.beer_powder,
             cloud_optical_depth_scale: atmo.cloud_optical_depth_scale,
+            ground_day_lift: atmo.ground_gain,
+            cloud_softclip_knee: atmo.cloud_softclip,
+            cloud_highlight_max: atmo.cloud_highlight_max,
             // Multi-scatter A/B (M5): DEFAULT_OCTAVES = the bright multiple-scatter look,
             // 1 = the fix2 single scatter.
             octaves: if atmo.multiscatter {
@@ -5067,6 +5398,9 @@ fn prepare_render(
             raymarch_steps: 16,
             // One display exposure for the whole composited frame (surface + cloud).
             exposure: atmo.exposure,
+            ground_day_lift: atmo.ground_gain,
+            cloud_softclip_knee: atmo.cloud_softclip,
+            cloud_highlight_max: atmo.cloud_highlight_max,
             atmosphere_correction: atmo.atmosphere_correction,
             terrain_atmosphere: atmo.terrain_atmosphere,
         };
@@ -5171,16 +5505,18 @@ fn prepare_render(
                 assemble,
             )
         } else {
-            let scan_rect = clouds::scan_rect_of(&raster.scan);
-            let froxel = atmosphere::build_aerial_froxel(
-                luts,
-                &params,
-                &cam_geo,
-                sun_ecef,
-                scan_rect,
-                atmosphere::AERIAL_FROXEL_DIM,
-            );
-            clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+            render_geo_visible_rgba(atmo.clouds_enabled, &surf, raster, &assemble, |assemble| {
+                let scan_rect = clouds::scan_rect_of(&raster.scan);
+                let froxel = atmosphere::build_aerial_froxel(
+                    luts,
+                    &params,
+                    &cam_geo,
+                    sun_ecef,
+                    scan_rect,
+                    atmosphere::AERIAL_FROXEL_DIM,
+                );
+                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+            })
         };
         status("Render complete.");
         if is_visible_ir_composite {
@@ -5480,6 +5816,114 @@ fn rendered_clouds_on(clouds_enabled: bool, is_ir: bool, is_derived: bool) -> bo
     clouds_enabled && !is_ir && !is_derived
 }
 
+/// Render geostationary visible pixels with the cloud toggle as a real renderer branch.
+/// The disabled branch is the same surface-only row-parallel path used by the public API;
+/// the cloud callback is lazy so a disabled render cannot accidentally enter the volume march.
+fn render_geo_visible_rgba<F, C>(
+    clouds_enabled: bool,
+    surf: &FrameContext,
+    raster: &SurfaceRaster,
+    assemble: &F,
+    render_clouds: C,
+) -> Vec<u8>
+where
+    F: Fn(usize, usize) -> SurfacePixel + Sync,
+    C: FnOnce(&F) -> Vec<u8>,
+{
+    if clouds_enabled {
+        render_clouds(assemble)
+    } else {
+        render_geo_surface_rgba(surf, raster, assemble)
+    }
+}
+
+/// Geostationary M2/M3 surface-only render (clouds off). Each assembled pixel gets
+/// the actual scan-ray view direction before going through [`shade_surface`].
+fn render_geo_surface_rgba<F>(surf: &FrameContext, raster: &SurfaceRaster, assemble: &F) -> Vec<u8>
+where
+    F: Fn(usize, usize) -> SurfacePixel + Sync,
+{
+    use rayon::prelude::*;
+
+    let scan = &raster.scan;
+    let rows: Vec<Vec<u8>> = (0..scan.ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = Vec::with_capacity(scan.nx * 4);
+            for px in 0..scan.nx {
+                let (sx, sy) = scan.scan_angle(px, py);
+                let mut pixel = assemble(px, py);
+                pixel.view_dir = surf.cam.view_dir(sx, sy);
+                let rgba = shade_surface(surf, &pixel);
+                for &value in &rgba {
+                    row.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
+/// The exact engine-owned defaults restored by the Studio display-calibration button.
+/// Keeping the values in one pure helper prevents the UI's dirty predicate and reset
+/// action from drifting apart as controls are added.
+fn shipped_display_calibration() -> (f32, f32, f32, f32) {
+    (
+        simsat::render::DEFAULT_EXPOSURE as f32,
+        GROUND_DAY_LIFT as f32,
+        CLOUD_SOFTCLIP_KNEE as f32,
+        RHO_HIGHLIGHT_MAX as f32,
+    )
+}
+
+fn display_calibration_is_dirty(
+    exposure: f32,
+    ground_gain: f32,
+    cloud_softclip: f32,
+    cloud_highlight_max: f32,
+) -> bool {
+    let shipped = shipped_display_calibration();
+    (exposure - shipped.0).abs() > f32::EPSILON
+        || (ground_gain - shipped.1).abs() > f32::EPSILON
+        || (cloud_softclip - shipped.2).abs() > f32::EPSILON
+        || (cloud_highlight_max - shipped.3).abs() > f32::EPSILON
+}
+
+/// The experimental WGSL preview does not yet carry the cloud-fraction volume or
+/// subcolumn closure. Keep UI enablement and worker-side fallback on one predicate.
+fn gpu_fractional_preview_compatible(fractional_clouds: bool) -> bool {
+    !fractional_clouds
+}
+
+/// The experimental WGSL preview does not sample the granulated cloud field for
+/// either the camera or sunlight march. A requested granulated render must use CPU.
+fn gpu_granulation_preview_compatible(granulation: bool) -> bool {
+    !granulation
+}
+
+/// The cloud WGSL path has baked highlight shoulder constants. Exposure and ground
+/// lift are uniforms, so only the two baked values constrain GPU preview eligibility.
+fn gpu_cloud_tonemap_compatible(cloud_softclip: f64, cloud_highlight_max: f64) -> bool {
+    const EPS: f64 = 1.0e-6; // controls round-trip through persisted/UI f32 values
+    (cloud_softclip - CLOUD_SOFTCLIP_KNEE).abs() <= EPS
+        && (cloud_highlight_max - RHO_HIGHLIGHT_MAX).abs() <= EPS
+}
+
+/// The clear-sky surface WGSL path additionally has implicit neutral exposure and
+/// ground lift. Use it only when it can reproduce every requested display control.
+fn gpu_surface_display_compatible(
+    exposure: f64,
+    ground_gain: f64,
+    cloud_softclip: f64,
+    cloud_highlight_max: f64,
+) -> bool {
+    const EPS: f64 = 1.0e-6;
+    (exposure - 1.0).abs() <= EPS
+        && (ground_gain - 1.0).abs() <= EPS
+        && gpu_cloud_tonemap_compatible(cloud_softclip, cloud_highlight_max)
+}
+
 /// Default sat-store root under the SimSat Studio data dir (sibling of the brick
 /// cache). Shown in the UI and changeable; the owner points BowEcho here.
 fn default_store_root() -> PathBuf {
@@ -5550,6 +5994,35 @@ fn frame_time_label(year: i32, month: u32, day: u32, hhmm: u16) -> String {
         hhmm / 100,
         hhmm % 100
     )
+}
+
+/// Native model-input picker with a useful Windows default filter.
+///
+/// WRF's conventional `wrfout_dNN_...` files have no extension. `rfd` models filters
+/// as extensions and its Windows backend prefixes each entry with `*.`; the second
+/// semicolon-delimited entry therefore deliberately expands to the native COM filter
+/// `*.grib2;*.grb2;*.grib;*.grb;wrfout*`. This keeps unrelated files out of the
+/// default view while retaining extensionless WRF output. "All files" remains an
+/// explicit fallback for nonstandard names. Other platforms retain the extensionless-
+/// safe all-files default because their backends do not share this Windows expansion.
+fn model_input_dialog(title: &str) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new().set_title(title);
+    #[cfg(target_os = "windows")]
+    {
+        dialog
+            .add_filter(
+                "WRF / GRIB2 model files",
+                &["grib2", "grb2;*.grib;*.grb;wrfout*"],
+            )
+            .add_filter("GRIB2", &["grib2", "grb2", "grib", "grb"])
+            .add_filter("All files", &["*"])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dialog
+            .add_filter("All files (wrfout / GRIB2)", &["*"])
+            .add_filter("GRIB2", &["grib2", "grb2", "grib", "grb"])
+    }
 }
 
 /// List candidate wrfout files in a directory: regular files whose name looks like a
@@ -5630,12 +6103,163 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn studio_test_surface_context() -> FrameContext<'static> {
+        static OPTICS: std::sync::OnceLock<(AtmosphereParams, AtmosphereLuts, SkyShTable)> =
+            std::sync::OnceLock::new();
+        let (params, luts, sky_sh) = OPTICS.get_or_init(|| {
+            let params = AtmosphereParams::default();
+            let luts = AtmosphereLuts::build(&params);
+            let sky_sh = SkyShTable::build(&luts, &params, 16);
+            (params, luts, sky_sh)
+        });
+        FrameContext {
+            luts,
+            params,
+            sky_sh,
+            cam: CameraGeometry::from_sub_lon(-75.2),
+            sun_ecef: atmosphere::sun_enu_to_ecef([0.0, 0.0, 1.0], 0.0, -75.2),
+            output_transform: OutputTransform::AbiReflectance,
+            bm_present: true,
+            water_scale: WATER_ALBEDO_SCALE as f64,
+            flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
+            raymarch_steps: 8,
+            exposure: simsat::render::DEFAULT_EXPOSURE,
+            ground_day_lift: GROUND_DAY_LIFT,
+            cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+            cloud_highlight_max: RHO_HIGHLIGHT_MAX,
+            atmosphere_correction: true,
+            terrain_atmosphere: false,
+        }
+    }
+
+    #[test]
+    fn geo_clouds_off_renders_real_surface_pixels_without_entering_cloud_callback() {
+        let surf = studio_test_surface_context();
+        let camera = GeoCamera::new(SatellitePreset::GoesEast);
+        let (sx, sy) = camera
+            .forward(0.0, -75.2)
+            .expect("sub-satellite point is visible");
+        let scan = simsat::camera::ScanGrid {
+            nx: 2,
+            ny: 1,
+            x_min: sx,
+            y_max: sy,
+            pitch_x: 1.0e-5,
+            pitch_y: 1.0e-5,
+        };
+        let raster = SurfaceRaster {
+            nx: 2,
+            ny: 1,
+            scan,
+            lat: vec![0.0; 2],
+            lon: vec![-75.2; 2],
+            grid_i: vec![0.0; 2],
+            grid_j: vec![0.0; 2],
+        };
+        let assemble = |px: usize, _py: usize| SurfacePixel {
+            on_earth: true,
+            base_srgb: if px == 0 {
+                [0.18, 0.32, 0.12]
+            } else {
+                [0.62, 0.20, 0.08]
+            },
+            normal_enu: [0.0, 0.0, 1.0],
+            sun_enu: [0.0, 0.0, 1.0],
+            sun_elev_deg: 90.0,
+            sky_openness: 1.0,
+            bent_normal_enu: [0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+
+        let expected: Vec<u8> = (0..scan.nx)
+            .flat_map(|px| {
+                let (scan_x, scan_y) = scan.scan_angle(px, 0);
+                let mut pixel = assemble(px, 0);
+                pixel.view_dir = surf.cam.view_dir(scan_x, scan_y);
+                shade_surface(&surf, &pixel)
+                    .into_iter()
+                    .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            })
+            .collect();
+        let actual = render_geo_visible_rgba(false, &surf, &raster, &assemble, |_| {
+            panic!("cloud volume renderer must not run when Studio clouds are off")
+        });
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2 * 4);
+        assert_ne!(&actual[0..3], &actual[4..7], "surface colors must survive");
+    }
+
     #[test]
     fn rendered_cloud_status_uses_the_requested_toggle_not_frame_buffer_presence() {
         assert!(rendered_clouds_on(true, false, false));
         assert!(!rendered_clouds_on(false, false, false));
         assert!(!rendered_clouds_on(true, true, false));
         assert!(!rendered_clouds_on(true, false, true));
+    }
+
+    #[test]
+    fn gpu_preview_requires_legacy_full_cell_cloud_coverage() {
+        assert!(!gpu_fractional_preview_compatible(true));
+        assert!(gpu_fractional_preview_compatible(false));
+    }
+
+    #[test]
+    fn gpu_preview_never_silently_drops_granulation() {
+        assert!(gpu_granulation_preview_compatible(false));
+        assert!(!gpu_granulation_preview_compatible(true));
+    }
+
+    #[test]
+    fn shipped_display_reset_and_dirty_check_include_exposure() {
+        let shipped = shipped_display_calibration();
+        assert_eq!(shipped.0, simsat::render::DEFAULT_EXPOSURE as f32);
+        assert_eq!(shipped.1, GROUND_DAY_LIFT as f32);
+        assert_eq!(shipped.2, CLOUD_SOFTCLIP_KNEE as f32);
+        assert_eq!(shipped.3, RHO_HIGHLIGHT_MAX as f32);
+        assert!(!display_calibration_is_dirty(
+            shipped.0, shipped.1, shipped.2, shipped.3
+        ));
+        assert!(display_calibration_is_dirty(
+            shipped.0 + 0.25,
+            shipped.1,
+            shipped.2,
+            shipped.3
+        ));
+    }
+
+    #[test]
+    fn gpu_preview_never_ignores_display_calibration() {
+        assert!(gpu_cloud_tonemap_compatible(
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX
+        ));
+        // Studio values pass through f32 persistence before capture.
+        assert!(gpu_cloud_tonemap_compatible(
+            CLOUD_SOFTCLIP_KNEE as f32 as f64,
+            RHO_HIGHLIGHT_MAX as f32 as f64
+        ));
+        assert!(!gpu_cloud_tonemap_compatible(0.75, RHO_HIGHLIGHT_MAX));
+        assert!(!gpu_cloud_tonemap_compatible(CLOUD_SOFTCLIP_KNEE, 1.05));
+
+        assert!(gpu_surface_display_compatible(
+            simsat::render::DEFAULT_EXPOSURE,
+            GROUND_DAY_LIFT,
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX
+        ));
+        assert!(!gpu_surface_display_compatible(
+            1.1,
+            1.0,
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX
+        ));
+        assert!(!gpu_surface_display_compatible(
+            1.0,
+            1.1,
+            CLOUD_SOFTCLIP_KNEE,
+            RHO_HIGHLIGHT_MAX
+        ));
     }
 
     #[test]

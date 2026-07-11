@@ -224,9 +224,16 @@ pub struct RenderParams {
     /// Composite volumetric clouds (visible only; `false` = surface-only for RGB/bands,
     /// and a transparent/neutral [`Product::CloudLayer`]).
     pub clouds: bool,
-    /// Multiplicative cloud optical-depth QA control (visible only). `1.0` consumes the
-    /// model-derived extinction unchanged; `0.0` makes cloud extinction transparent;
-    /// values up to `4.0` support bounded sensitivity tests. Applied consistently to the
+    /// Use the model cloud-fraction field for fractional/subcolumn cloud rendering when
+    /// the source carries one (visible-family products only). `true` is the physical
+    /// default; a source without cloud fraction falls back to full-cell coverage. Set
+    /// `false` for the legacy behavior that treats every non-zero cloudy grid cell as
+    /// horizontally full. Thermal and quantitative derived products are unchanged.
+    pub fractional_clouds: bool,
+    /// Multiplicative cloud optical-depth calibration (visible only). The shipped default
+    /// is [`crate::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE`]; `1.0` consumes the
+    /// model-derived extinction unchanged, while `0.0` makes cloud extinction transparent.
+    /// Values up to `4.0` support bounded sensitivity tests. Applied consistently to the
     /// view, secondary-sun, ambient, and ground-shadow optical depths. The quantitative
     /// derived cloud-optical-depth product remains the unscaled physical input.
     pub cloud_optical_depth_scale: f32,
@@ -258,14 +265,19 @@ pub struct RenderParams {
     /// (the `render_frame` supersample QA path; geostationary visible only). `None` =
     /// build it. NEVER set this from the Python binding.
     pub raster_override: Option<SurfaceRaster>,
-    /// Optional `render_frame` appearance-tuning override for the GROUND LIFT
-    /// ([`crate::render::GROUND_DAY_LIFT`]). `None` (default) = the baked constant. The
-    /// `render_frame` `ground-gain=` knob sets it; NOT exposed by the Python binding.
+    /// Optional display-only GROUND LIFT override ([`crate::render::GROUND_DAY_LIFT`]).
+    /// `None` (default) = the baked constant; `1.0` is neutral. Visible RGB-family
+    /// products consume it; raw visible bands, thermal, and derived products ignore it.
     pub ground_gain: Option<f64>,
-    /// Optional `render_frame` override for the highlight soft-clip knee
+    /// Optional display-only highlight soft-clip knee
     /// ([`crate::render::CLOUD_SOFTCLIP_KNEE`]; `1.0` disables the shoulder). `None`
-    /// (default) = the baked constant. The `render_frame` `cloud-softclip=` knob sets it.
+    /// (default) = the baked constant. Visible RGB-family products consume it.
     pub cloud_softclip: Option<f64>,
+    /// Optional physical reflectance-factor ceiling mapped to display white by the
+    /// bounded highlight shoulder ([`crate::render::RHO_HIGHLIGHT_MAX`]). `None` keeps
+    /// the baked calibration. Display-only; raw visible bands, IR, and derived fields
+    /// are unaffected.
+    pub cloud_highlight_max: Option<f64>,
     /// Optional `render_frame` override for the TOP-DOWN CLOUD NORMALIZATION
     /// ([`crate::topdown::TOPDOWN_CLOUD_NORM`]; `1.0` = no normalization). `None` (default)
     /// = the baked constant. The `render_frame` `topdown-cloudnorm=` knob sets it.
@@ -277,9 +289,9 @@ pub struct RenderParams {
 
 impl RenderParams {
     /// Shipped defaults: GOES-East, timestep 0, TOP-DOWN map (the integration default),
-    /// native resolution, the owner-approved exposure, multi-scatter + offline steps +
-    /// clouds on, beer-powder + granulation off, the seasonal Blue Marble (download on),
-    /// no sun override, no IR enhancement, the studio cache dir.
+    /// native resolution, neutral ABI display exposure, multi-scatter + offline steps +
+    /// clouds + model cloud fraction on, beer-powder + granulation off, the seasonal Blue
+    /// Marble (download on), no sun override, no IR enhancement, the studio cache dir.
     pub fn new(input: PathBuf) -> Self {
         Self {
             input,
@@ -297,7 +309,8 @@ impl RenderParams {
             beer_powder: false,
             steps: StepQuality::Offline,
             clouds: true,
-            cloud_optical_depth_scale: 1.0,
+            fractional_clouds: true,
+            cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             granulation: None,
             sun_override: None,
             cache: ingest::default_cache_dir(),
@@ -307,6 +320,7 @@ impl RenderParams {
             raster_override: None,
             ground_gain: None,
             cloud_softclip: None,
+            cloud_highlight_max: None,
             topdown_cloud_norm: None,
             perspective: None,
         }
@@ -646,7 +660,19 @@ fn render_visible_scene(
     let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
 
     // M4/M5 cloud volume + scene.
-    let vol = DecodedVolume::from_brick(brick, horiz_pitch_m);
+    let fractional_requested = params.clouds && params.fractional_clouds;
+    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+    let mut vol = if fractional_clouds {
+        DecodedVolume::from_brick(brick, horiz_pitch_m)
+    } else {
+        DecodedVolume::from_brick_legacy(brick, horiz_pitch_m)
+    };
+    apply_fractional_clouds_for_visible(
+        &mut vol,
+        fractional_clouds,
+        fractional_requested,
+        "visible",
+    );
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     // Sub-grid cloud GRANULATION (edge-erosion detail noise): OPT-IN (default OFF)
     // as of v0.1.1 — the round-1 default-ON look was owner-rejected on coarse-grid
@@ -706,14 +732,22 @@ fn render_visible_scene(
     // (byte-identical no-op at margin 0); the ground-lift / soft-clip / top-down-cloud-norm
     // levers keep their baked defaults unless a `render_frame` CLI knob overrides them.
     cfg.edge_feather_cells = clouds::edge_feather_cells_for_margin(margin, nx, ny);
-    if let Some(g) = params.ground_gain {
-        cfg.ground_day_lift = g;
-    }
-    if let Some(k) = params.cloud_softclip {
-        cfg.cloud_softclip_knee = k;
-    }
-    if let Some(n) = params.topdown_cloud_norm {
-        cfg.topdown_cloud_norm = n;
+    // Display-only appearance overrides are deliberately ignored by VisibleBands.
+    // That product remains the stable pre-tonemap diagnostic even when the same
+    // RenderParams is reused for an RGB A/B render.
+    if matches!(product, Product::VisibleRgb) {
+        if let Some(g) = params.ground_gain {
+            cfg.ground_day_lift = g;
+        }
+        if let Some(k) = params.cloud_softclip {
+            cfg.cloud_softclip_knee = k;
+        }
+        if let Some(m) = params.cloud_highlight_max {
+            cfg.cloud_highlight_max = m;
+        }
+        if let Some(n) = params.topdown_cloud_norm {
+            cfg.topdown_cloud_norm = n;
+        }
     }
     let scene = CloudScene {
         vol: &vol,
@@ -737,6 +771,9 @@ fn render_visible_scene(
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
         raymarch_steps: 16,
         exposure: params.exposure,
+        ground_day_lift: cfg.ground_day_lift,
+        cloud_softclip_knee: cfg.cloud_softclip_knee,
+        cloud_highlight_max: cfg.cloud_highlight_max,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
     };
@@ -894,7 +931,7 @@ fn render_ir_scene(
 
     let horiz_pitch_m = horiz_pitch_m(proj);
     let vol = IrVolume::from_brick(brick, horiz_pitch_m);
-    let dv = DecodedVolume::from_brick(brick, horiz_pitch_m);
+    let dv = DecodedVolume::from_brick_legacy(brick, horiz_pitch_m);
     let mip = OccupancyMip::build(&dv, clouds::OCCUPANCY_MIP_FACTOR);
     let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
     let band = cfg.band;
@@ -1221,7 +1258,19 @@ fn render_cloud_layer_scene(
     // M4/M5 cloud volume + scene (granulation scoping: the layer is a DISPLAY product —
     // the same opt-in rule as VisibleRgb).
     let horiz_pitch = horiz_pitch_m(proj);
-    let vol = DecodedVolume::from_brick(brick, horiz_pitch);
+    let fractional_requested = params.clouds && params.fractional_clouds;
+    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+    let mut vol = if fractional_clouds {
+        DecodedVolume::from_brick(brick, horiz_pitch)
+    } else {
+        DecodedVolume::from_brick_legacy(brick, horiz_pitch)
+    };
+    apply_fractional_clouds_for_visible(
+        &mut vol,
+        fractional_clouds,
+        fractional_requested,
+        "cloud layer",
+    );
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     let gran_on = params.clouds && params.granulation.unwrap_or(false);
     let granulation = if gran_on {
@@ -1258,6 +1307,9 @@ fn render_cloud_layer_scene(
     cfg.edge_feather_cells = clouds::edge_feather_cells_for_margin(margin, nx, ny);
     if let Some(k) = params.cloud_softclip {
         cfg.cloud_softclip_knee = k;
+    }
+    if let Some(m) = params.cloud_highlight_max {
+        cfg.cloud_highlight_max = m;
     }
     if let Some(n) = params.topdown_cloud_norm {
         cfg.topdown_cloud_norm = n;
@@ -1439,7 +1491,19 @@ fn render_perspective_scene(
     };
     let luts = AtmosphereLuts::build(&atmo_params);
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
-    let vol = DecodedVolume::from_brick(brick, horiz_pitch);
+    let fractional_requested = params.clouds && params.fractional_clouds;
+    let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+    let mut vol = if fractional_clouds {
+        DecodedVolume::from_brick(brick, horiz_pitch)
+    } else {
+        DecodedVolume::from_brick_legacy(brick, horiz_pitch)
+    };
+    apply_fractional_clouds_for_visible(
+        &mut vol,
+        fractional_clouds,
+        fractional_requested,
+        "perspective",
+    );
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     // Granulation scoping: a DISPLAY product (the same opt-in rule as VisibleRgb).
     let gran_on = params.clouds && params.granulation.unwrap_or(false);
@@ -1477,6 +1541,9 @@ fn render_perspective_scene(
     if let Some(k) = params.cloud_softclip {
         cfg.cloud_softclip_knee = k;
     }
+    if let Some(m) = params.cloud_highlight_max {
+        cfg.cloud_highlight_max = m;
+    }
     if let Some(g) = params.ground_gain {
         cfg.ground_day_lift = g;
     }
@@ -1505,6 +1572,9 @@ fn render_perspective_scene(
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
         raymarch_steps: 16,
         exposure: params.exposure,
+        ground_day_lift: cfg.ground_day_lift,
+        cloud_softclip_knee: cfg.cloud_softclip_knee,
+        cloud_highlight_max: cfg.cloud_highlight_max,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
     };
@@ -1655,6 +1725,38 @@ fn horiz_pitch_m(proj: &WrfProjectionParams) -> f64 {
     } else {
         proj.dx_m.min(proj.dy_m)
     }
+}
+
+/// Resolve the visible-only fractional-cloud switch before any acceleration or
+/// lighting structure is built, so every consumer sees the same extinction field.
+fn apply_fractional_clouds_for_visible(
+    vol: &mut DecodedVolume,
+    effective: bool,
+    requested: bool,
+    label: &str,
+) {
+    if !effective {
+        if requested {
+            crate::log_line!(
+                "simsat api: {label} model cloud fraction unavailable; using legacy full-cell clouds"
+            );
+        }
+        return;
+    }
+    let stats = vol.apply_fractional_clouds();
+    let ratio = if stats.raw_fractional_tau > 0.0 {
+        stats.effective_fractional_tau / stats.raw_fractional_tau
+    } else {
+        1.0
+    };
+    crate::log_line!(
+        "simsat api: {label} model cloud fraction ON ({} / {} columns adjusted; {} partial layers; \
+         {} invalid zero-fraction layers repaired; partial-column tau ratio {ratio:.3})",
+        stats.columns_modified,
+        stats.columns_total,
+        stats.fractional_layer_count,
+        stats.repaired_zero_count,
+    );
 }
 
 /// `(dx, dy)` in metres (a lat/lon grid stores them in degrees).
@@ -2208,11 +2310,18 @@ mod tests {
         assert!(!p.rh_aerosol_swelling);
         assert!(p.atmosphere_correction);
         assert!(p.terrain_atmosphere);
-        assert_eq!(p.cloud_optical_depth_scale, 1.0);
+        assert_eq!(
+            p.cloud_optical_depth_scale,
+            clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
         assert!(p.multiscatter);
         assert!(!p.beer_powder);
         assert!(p.clouds);
+        assert!(p.fractional_clouds);
         assert!(p.granulation.is_none());
+        assert!(p.ground_gain.is_none());
+        assert!(p.cloud_softclip.is_none());
+        assert!(p.cloud_highlight_max.is_none());
     }
 
     /// A tiny synthetic CONUS-centred Lambert scene: a clear brick (no cloud) with a
@@ -2233,7 +2342,14 @@ mod tests {
             vmax: 0.0,
         };
         let mut q = BTreeMap::new();
-        for name in ["ext_liquid", "ext_ice", "ext_precip", "tau_up", "qvapor"] {
+        for name in [
+            "ext_liquid",
+            "ext_ice",
+            "ext_snow",
+            "ext_precip",
+            "tau_up",
+            "qvapor",
+        ] {
             q.insert(name.to_string(), zero);
         }
         let brick = VolumeBrick {
@@ -2246,9 +2362,12 @@ mod tests {
             quant: ChannelQuant(q),
             ext_liquid: vec![0u8; n3],
             ext_ice: vec![0u8; n3],
+            ext_snow: vec![0u8; n3],
             ext_precip: vec![0u8; n3],
             tau_up: vec![0u8; n3],
             qvapor: vec![0u8; n3],
+            cloud_fraction: vec![255u8; n3],
+            has_cloud_fraction: false,
             temperature_f16: encode_temperature_celsius(&kelvin),
             hgt: vec![0.0f32; n2],
             landmask: vec![1.0f32; n2], // all land
@@ -2345,6 +2464,34 @@ mod tests {
             }
             other => panic!("expected Bands, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn visible_bands_ignore_display_only_ground_and_highlight_controls() {
+        let src = synthetic_source(16, 16, 16, 3000.0);
+        let baseline_params = synthetic_params(ViewMode::TopDownMap);
+        let baseline = render_visible_scene(&src, &baseline_params, Product::VisibleBands)
+            .expect("baseline bands");
+
+        let mut adjusted_params = baseline_params;
+        adjusted_params.ground_gain = Some(0.5);
+        adjusted_params.cloud_softclip = Some(0.4);
+        adjusted_params.cloud_highlight_max = Some(2.0);
+        adjusted_params.topdown_cloud_norm = Some(0.5);
+        let adjusted = render_visible_scene(&src, &adjusted_params, Product::VisibleBands)
+            .expect("bands with display overrides");
+
+        let bits = |result: &RenderResult| match &result.data {
+            FrameData::Bands { reflectance } => {
+                reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Bands, got {other:?}"),
+        };
+        assert_eq!(
+            bits(&baseline),
+            bits(&adjusted),
+            "display calibration controls must not mutate raw reflectance bands"
+        );
     }
 
     #[test]
@@ -2872,7 +3019,7 @@ mod tests {
         // The visible what-if scale is applied only by visible cloud consumers. The
         // quantitative derived COD must remain byte-for-byte physical/unscaled.
         let mut scaled_params = p;
-        scaled_params.cloud_optical_depth_scale = 0.25;
+        scaled_params.cloud_optical_depth_scale = 1.0;
         let scaled = render_derived_scene(&storm_source, &scaled_params, field).unwrap();
         assert_eq!(
             sv,
@@ -3038,6 +3185,7 @@ mod tests {
             file,
             time_iso,
             quant: brick.quant.clone(),
+            has_cloud_fraction: brick.has_cloud_fraction,
             ssb_bytes: 1,
             source_bytes: None,
             source_mtime_unix: None,
@@ -3214,6 +3362,74 @@ mod tests {
         src.brick.ext_liquid = codes;
         src.brick.quant.0.insert("ext_liquid".to_string(), lq);
         src
+    }
+
+    /// A model-fraction-aware cloud deck: the condensate is grid-mean and each cloudy
+    /// layer covers exactly 20% of the cell (code 51). This gives the public visible
+    /// path a deterministic on/off target without any file or network dependency.
+    fn fractional_liquid_source(nx: usize, ny: usize, nz: usize, dx: f64) -> SceneSource {
+        let mut src = moderate_liquid_source(nx, ny, nz, dx);
+        let n2 = nx * ny;
+        src.brick.cloud_fraction.fill(0);
+        for k in 2..5.min(nz) {
+            src.brick.cloud_fraction[k * n2..(k + 1) * n2].fill(51);
+        }
+        src.brick.has_cloud_fraction = true;
+        src
+    }
+
+    #[test]
+    fn fractional_cloud_switch_changes_visible_only_and_missing_field_falls_back_exactly() {
+        let src = fractional_liquid_source(10, 10, 10, 3000.0);
+        let mut on_params = synthetic_params(ViewMode::TopDownMap);
+        on_params.steps = StepQuality::Interactive;
+        on_params.fractional_clouds = true;
+        let mut off_params = on_params.clone();
+        off_params.fractional_clouds = false;
+
+        let on = render_visible_scene(&src, &on_params, Product::VisibleBands).unwrap();
+        let off = render_visible_scene(&src, &off_params, Product::VisibleBands).unwrap();
+        let band_bits = |r: &RenderResult| match &r.data {
+            FrameData::Bands { reflectance } => {
+                reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Bands, got {other:?}"),
+        };
+        assert_ne!(
+            band_bits(&on),
+            band_bits(&off),
+            "model cloud fraction must reach the visible march"
+        );
+
+        let ir_on = render_ir_scene(&src, &on_params, IrConfig::band13()).unwrap();
+        let ir_off = render_ir_scene(&src, &off_params, IrConfig::band13()).unwrap();
+        let bt_bits = |r: &RenderResult| match &r.data {
+            FrameData::Ir { bt_kelvin, .. } => {
+                bt_kelvin.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Ir, got {other:?}"),
+        };
+        assert_eq!(bt_bits(&ir_on), bt_bits(&ir_off));
+
+        let field = DerivedField::CloudOpticalDepth;
+        let derived_on = render_derived_scene(&src, &on_params, field).unwrap();
+        let derived_off = render_derived_scene(&src, &off_params, field).unwrap();
+        let scalar_bits = |r: &RenderResult| match &r.data {
+            FrameData::Scalar { values, .. } => {
+                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        assert_eq!(scalar_bits(&derived_on), scalar_bits(&derived_off));
+
+        // A source with no trusted coverage field is an exact legacy fallback even
+        // though the physical switch defaults on.
+        let fallback = moderate_liquid_source(10, 10, 10, 3000.0);
+        let fallback_on =
+            render_visible_scene(&fallback, &on_params, Product::VisibleBands).unwrap();
+        let fallback_off =
+            render_visible_scene(&fallback, &off_params, Product::VisibleBands).unwrap();
+        assert_eq!(band_bits(&fallback_on), band_bits(&fallback_off));
     }
 
     #[test]

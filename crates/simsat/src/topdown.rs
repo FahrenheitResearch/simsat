@@ -39,10 +39,11 @@ use crate::atmosphere::OutputTransform;
 use crate::camera::topdown_nadir_ray;
 use crate::clouds::{CloudScene, ground_cloud_shadow, march_cloud};
 use crate::ir::{IrScene, march_ir_bt};
+#[cfg(test)]
+use crate::render::{CLOUD_SOFTCLIP_KNEE, GROUND_DAY_LIFT};
 use crate::render::{
-    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, apply_low_sun_illuminant,
-    day_lerp_ramp, effective_cloud_shadow, radiance_to_rgba_softclip, reflectance_from_radiance,
-    surface_toa_radiance,
+    FrameContext, SurfacePixel, apply_low_sun_illuminant, day_lerp_ramp, effective_cloud_shadow,
+    radiance_to_rgba_softclip, reflectance_from_radiance, surface_toa_radiance,
 };
 
 /// TOP-DOWN CLOUD NORMALIZATION — a sun-gated multiplier on the top-down (near-nadir)
@@ -90,6 +91,9 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         flat_albedo_srgb: base.flat_albedo_srgb,
         raymarch_steps: base.raymarch_steps,
         exposure: base.exposure,
+        ground_day_lift: base.ground_day_lift,
+        cloud_softclip_knee: base.cloud_softclip_knee,
+        cloud_highlight_max: base.cloud_highlight_max,
         atmosphere_correction: base.atmosphere_correction,
         terrain_atmosphere: base.terrain_atmosphere,
     }
@@ -124,7 +128,10 @@ pub fn render_topdown_frame_rgba(
         .unwrap_or(TOPDOWN_CLOUD_NORM);
     let softclip_knee = scene
         .map(|s| s.cfg.cloud_softclip_knee)
-        .unwrap_or(CLOUD_SOFTCLIP_KNEE);
+        .unwrap_or(surf.cloud_softclip_knee);
+    let highlight_max = scene
+        .map(|s| s.cfg.cloud_highlight_max)
+        .unwrap_or(surf.cloud_highlight_max);
     let rows: Vec<Vec<u8>> = (0..ny)
         .into_par_iter()
         .map(|py| {
@@ -153,6 +160,7 @@ pub fn render_topdown_frame_rgba(
                             surf.output_transform,
                             surf.exposure,
                             softclip_knee,
+                            highlight_max,
                         )
                     }
                 };
@@ -237,7 +245,7 @@ fn topdown_pixel_radiance(
     // on, else the baked default (a clouds-off top-down basemap still gets the lift).
     let ground_lift = scene
         .map(|s| s.cfg.ground_day_lift)
-        .unwrap_or(GROUND_DAY_LIFT);
+        .unwrap_or(surf.ground_day_lift);
     let shadow = match scene {
         Some(sc) => ground_cloud_shadow(sc, cam, view),
         None => 1.0,
@@ -405,6 +413,7 @@ pub fn render_cloud_layer_frame(
                     output_transform,
                     exposure,
                     scene.cfg.cloud_softclip_knee,
+                    scene.cfg.cloud_highlight_max,
                 );
                 let o = px * 4;
                 for c in 0..3 {
@@ -468,10 +477,13 @@ pub fn render_perspective_frame_rgba(
     let (nx, ny) = (basis.width, basis.height);
     let ground_lift = scene
         .map(|s| s.cfg.ground_day_lift)
-        .unwrap_or(GROUND_DAY_LIFT);
+        .unwrap_or(surf.ground_day_lift);
     let softclip_knee = scene
         .map(|s| s.cfg.cloud_softclip_knee)
-        .unwrap_or(CLOUD_SOFTCLIP_KNEE);
+        .unwrap_or(surf.cloud_softclip_knee);
+    let highlight_max = scene
+        .map(|s| s.cfg.cloud_highlight_max)
+        .unwrap_or(surf.cloud_highlight_max);
     let rows: Vec<Vec<u8>> = (0..ny)
         .into_par_iter()
         .map(|py| {
@@ -519,6 +531,7 @@ pub fn render_perspective_frame_rgba(
                             surf.output_transform,
                             surf.exposure,
                             softclip_knee,
+                            highlight_max,
                         )
                     }
                 };
@@ -578,6 +591,7 @@ pub fn render_perspective_cloud_layer(
                     output_transform,
                     exposure,
                     scene.cfg.cloud_softclip_knee,
+                    scene.cfg.cloud_highlight_max,
                 );
                 let o = px * 4;
                 for c in 0..3 {
@@ -746,8 +760,15 @@ mod tests {
             horiz_pitch_m: horiz,
             ext_liquid,
             ext_ice,
+            ext_snow: vec![0; n],
+            ext_snow_quant: crate::bricks::LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
             ext_precip,
             tau_up: vec![0.0f32; n],
+            cloud_fraction: vec![255; n],
+            has_cloud_fraction: false,
         }
     }
 
@@ -771,6 +792,9 @@ mod tests {
             flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
             raymarch_steps: 16,
             exposure: DEFAULT_EXPOSURE,
+            ground_day_lift: GROUND_DAY_LIFT,
+            cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+            cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
         }
@@ -931,6 +955,9 @@ mod tests {
         let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (0.0, 0.0, 0.0));
         let mip = OccupancyMip::build(&vol, 4);
         let sun_od = accumulate_sun_od(&vol, &georef, sun_ecef, 32);
+        let mut clear_cfg = MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m());
+        // This test owns an analytic slab; do not inherit the product appearance scale.
+        clear_cfg.cloud_optical_depth_scale = 1.0;
         let scene = CloudScene {
             vol: &vol,
             mip: &mip,
@@ -939,7 +966,7 @@ mod tests {
             luts: &luts,
             sky_sh: &sky_sh,
             sun_ecef,
-            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+            cfg: clear_cfg,
         };
         let with_clear =
             render_topdown_frame_rgba(&surf, Some(&scene), &map.lat, &map.lon, nx, ny, assemble);
@@ -1116,8 +1143,15 @@ mod tests {
             horiz_pitch_m: 3000.0,
             ext_liquid: ext_l.clone(),
             ext_ice: ext_i.clone(),
+            ext_snow: vec![0; nx * ny * nz],
+            ext_snow_quant: crate::bricks::LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
             ext_precip: ext_p.clone(),
             tau_up: vec![0.0; nx * ny * nz],
+            cloud_fraction: vec![255; nx * ny * nz],
+            has_cloud_fraction: false,
         };
         let mip = OccupancyMip::build(&dv, 8);
         let mut cfg = IrConfig::band13();
@@ -1171,8 +1205,15 @@ mod tests {
             horiz_pitch_m: 3000.0,
             ext_liquid: vec![0.0; nx * ny * nz],
             ext_ice: ext_i,
+            ext_snow: vec![0; nx * ny * nz],
+            ext_snow_quant: crate::bricks::LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
             ext_precip: vec![0.0; nx * ny * nz],
             tau_up: vec![0.0; nx * ny * nz],
+            cloud_fraction: vec![255; nx * ny * nz],
+            has_cloud_fraction: false,
         };
         let mip2 = OccupancyMip::build(&dv2, 8);
         let scene2 = IrScene {
@@ -1267,7 +1308,11 @@ mod tests {
             luts: &luts,
             sky_sh: &sky_sh,
             sun_ecef,
-            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+            cfg: MarchConfig {
+                // The opacity/shadow assertions below use the raw analytic OD 4.5.
+                cloud_optical_depth_scale: 1.0,
+                ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+            },
         };
         let layer = render_cloud_layer_frame(
             &scene,
@@ -1522,6 +1567,8 @@ mod tests {
         });
         let mip2 = OccupancyMip::build(&vol2, 4);
         let sun_od2 = accumulate_sun_od(&vol2, &georef, sun_ecef, 32);
+        let mut cloudy_cfg = MarchConfig::new(StepQuality::Offline, vol2.voxel_pitch_m());
+        cloudy_cfg.cloud_optical_depth_scale = 1.0;
         let scene2 = CloudScene {
             vol: &vol2,
             mip: &mip2,
@@ -1530,7 +1577,7 @@ mod tests {
             luts: &luts,
             sky_sh: &sky_sh,
             sun_ecef,
-            cfg: MarchConfig::new(StepQuality::Offline, vol2.voxel_pitch_m()),
+            cfg: cloudy_cfg,
         };
         let layer2 = render_perspective_cloud_layer(
             &scene2,

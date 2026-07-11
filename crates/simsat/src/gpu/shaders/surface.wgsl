@@ -67,8 +67,8 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 // WS2 bright-cloud tonemap + water lighting (twins of render.rs). This pass has an
 // implicit exposure of 1.0, so the exposure-aware shoulder bound is RHO_HIGHLIGHT_MAX
 // itself (the CPU paths derive x_max = exposure * RHO_HIGHLIGHT_MAX at their seam).
-const CLOUD_SOFTCLIP_KNEE: f32 = 0.75;   // identity below; bounded Mobius shoulder above
-const RHO_HIGHLIGHT_MAX: f32 = 1.05;     // physical reflectance ceiling -> display 1.0
+const CLOUD_SOFTCLIP_KNEE: f32 = 0.65;   // identity below; bounded Mobius shoulder above
+const RHO_HIGHLIGHT_MAX: f32 = 1.25;     // physical reflectance ceiling -> display 1.0
 const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daytime water-body albedo scale (twilight anchor = u.p1.y)
 // Low-sun visible pass (twins of render.rs): the SUNRISE veil ramp (satpy-idiom — the
 // Rayleigh de-haze is reduced toward the terminator, never hard-disabled at 20 deg)

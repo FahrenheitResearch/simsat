@@ -37,8 +37,9 @@ use rayon::prelude::*;
 use crate::atmosphere::{
     self, AerialFroxel, AtmosphereLuts, GROUND_ALBEDO, R_GROUND_M, SOLAR_IRRADIANCE_RGB, SkyShTable,
 };
-use crate::bricks::VolumeBrick;
+use crate::bricks::{LogQuant, VolumeBrick};
 use crate::camera::ScanGrid;
+use crate::fractional_clouds::maximum_overlap_closure;
 use crate::frame::GridGeoref;
 use crate::render::{
     CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, radiance_to_rgba_softclip,
@@ -153,15 +154,20 @@ pub const OCTAVE_BRIGHTNESS_SCALE: f64 = 0.85;
 /// The stored brick extinction and derived cloud-optical-depth products remain raw.
 pub const CLOUD_OPTICAL_DEPTH_SCALE_MIN: f32 = 0.0;
 pub const CLOUD_OPTICAL_DEPTH_SCALE_MAX: f32 = 4.0;
+/// Shipped visible-cloud optical-depth calibration: `0.15`, selected by the owner
+/// after broad cross-file visual review. This supersedes the earlier tied
+/// `0.20`/`0.30` midpoint candidate and is not a claimed physical optimum. `1.0`
+/// remains available as the unscaled model-extinction A/B.
+pub const DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE: f32 = 0.15;
 
 /// Validate a user-facing visible-cloud optical-depth scale. Non-finite values fall
-/// back to the neutral physical default rather than silently erasing/saturating cloud.
+/// back to the shipped calibration rather than silently erasing/saturating cloud.
 #[inline]
 pub fn validated_cloud_optical_depth_scale(scale: f32) -> f32 {
     if scale.is_finite() {
         scale.clamp(CLOUD_OPTICAL_DEPTH_SCALE_MIN, CLOUD_OPTICAL_DEPTH_SCALE_MAX)
     } else {
-        1.0
+        DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
     }
 }
 
@@ -654,6 +660,40 @@ pub fn granulation_erosion_noise(u_m: f64, v_m: f64) -> f64 {
     let e = smooth01((w.clamp(0.0, 1.0) - GRAN_CARVE_LO) / (GRAN_CARVE_HI - GRAN_CARVE_LO));
     MEMO.with(|m| m.set((key.0, key.1, e)));
     e
+}
+
+/// Pixel-footprint-filtered granulation erosion field.
+///
+/// The raw field contains 250 m and 500 m octaves. Sampling those once per 500 m
+/// model/output cell aliases them into square islands. This deterministic 2x2
+/// Gauss-Legendre quadrature approximates the area mean over a square footprint,
+/// preserving the larger-scale structure while band-limiting detail that the grid
+/// cannot resolve. A non-positive or non-finite footprint is the exact legacy point
+/// sample.
+pub fn granulation_erosion_noise_footprint(u_m: f64, v_m: f64, footprint_m: f64) -> f64 {
+    if !footprint_m.is_finite() || footprint_m <= 0.0 {
+        return granulation_erosion_noise(u_m, v_m);
+    }
+    thread_local! {
+        static MEMO: std::cell::Cell<(u64, u64, u64, f64)> =
+            const { std::cell::Cell::new((0, 0, 0, -1.0)) };
+    }
+    let key = (u_m.to_bits(), v_m.to_bits(), footprint_m.to_bits());
+    let hit = MEMO.with(|m| m.get());
+    if hit.3 >= 0.0 && hit.0 == key.0 && hit.1 == key.1 && hit.2 == key.2 {
+        return hit.3;
+    }
+
+    // Two-point Gauss-Legendre nodes mapped from [-1, 1] to a square of full
+    // width `footprint_m`: +/- footprint/(2*sqrt(3)) on each axis.
+    let d = footprint_m / (2.0 * 3.0_f64.sqrt());
+    let filtered = 0.25
+        * (granulation_erosion_noise(u_m - d, v_m - d)
+            + granulation_erosion_noise(u_m + d, v_m - d)
+            + granulation_erosion_noise(u_m - d, v_m + d)
+            + granulation_erosion_noise(u_m + d, v_m + d));
+    MEMO.with(|m| m.set((key.0, key.1, key.2, filtered)));
+    filtered
 }
 
 /// The SPECIES/HEIGHT gate in `[0, 1]`: the LIQUID share of the sample's extinction
@@ -1305,8 +1345,32 @@ pub struct DecodedVolume {
     pub horiz_pitch_m: f64,
     pub ext_liquid: Vec<f32>,
     pub ext_ice: Vec<f32>,
+    /// QSNOW-only auxiliary subset of `ext_precip`. This is metadata for the
+    /// fractional-cloud closure and must never be added to total extinction.
+    pub ext_snow: Vec<u8>,
+    /// Quantization scale for the encoded `ext_snow` auxiliary.
+    pub ext_snow_quant: LogQuant,
     pub ext_precip: Vec<f32>,
     pub tau_up: Vec<f32>,
+    /// Linear-u8 model cloud coverage, one code per voxel.
+    pub cloud_fraction: Vec<u8>,
+    /// True only when `cloud_fraction` came from a trusted model field.
+    pub has_cloud_fraction: bool,
+}
+
+/// Diagnostics from applying model fractional cloud cover to a decoded volume.
+///
+/// The closure preserves the legacy field when coverage is unavailable, when all
+/// covered condensate has code 255, or when the caller leaves the feature off.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FractionalCloudStats {
+    pub available: bool,
+    pub columns_total: usize,
+    pub columns_modified: usize,
+    pub fractional_layer_count: usize,
+    pub repaired_zero_count: usize,
+    pub raw_fractional_tau: f64,
+    pub effective_fractional_tau: f64,
 }
 
 /// One trilinearly-sampled cloud voxel (physical extinction, m^-1).
@@ -1333,8 +1397,20 @@ impl DecodedVolume {
     /// used for the march step pitch (min of dx/dy; the caller passes it, since the
     /// brick itself does not carry the projection spacing).
     pub fn from_brick(brick: &VolumeBrick, horiz_pitch_m: f64) -> Self {
+        Self::decode_brick(brick, horiz_pitch_m, true)
+    }
+
+    /// Decode only the channels needed by legacy visible/thermal occupancy paths.
+    /// This avoids cloning fractional auxiliaries when the switch is off or a caller
+    /// only needs total extinction.
+    pub fn from_brick_legacy(brick: &VolumeBrick, horiz_pitch_m: f64) -> Self {
+        Self::decode_brick(brick, horiz_pitch_m, false)
+    }
+
+    fn decode_brick(brick: &VolumeBrick, horiz_pitch_m: f64, fractional_aux: bool) -> Self {
         let ql = brick.quant.get("ext_liquid");
         let qi = brick.quant.get("ext_ice");
+        let qs = brick.quant.get("ext_snow");
         let qp = brick.quant.get("ext_precip");
         let qt = brick.quant.get("tau_up");
         Self {
@@ -1346,9 +1422,131 @@ impl DecodedVolume {
             horiz_pitch_m,
             ext_liquid: brick.ext_liquid.iter().map(|&c| ql.decode(c)).collect(),
             ext_ice: brick.ext_ice.iter().map(|&c| qi.decode(c)).collect(),
+            ext_snow: if fractional_aux && brick.has_cloud_fraction {
+                brick.ext_snow.clone()
+            } else {
+                Vec::new()
+            },
+            ext_snow_quant: qs,
             ext_precip: brick.ext_precip.iter().map(|&c| qp.decode(c)).collect(),
             tau_up: brick.tau_up.iter().map(|&c| qt.decode(c)).collect(),
+            cloud_fraction: if fractional_aux && brick.has_cloud_fraction {
+                brick.cloud_fraction.clone()
+            } else {
+                Vec::new()
+            },
+            has_cloud_fraction: fractional_aux && brick.has_cloud_fraction,
         }
+    }
+
+    /// Apply the model cloud-fraction field using a maximum-overlap column closure.
+    ///
+    /// WRF condensate is grid-mean mass. For each `(i, j)` column, partially covered
+    /// liquid, ice, and snow layers are converted to the homogeneous optical depth
+    /// with the same exact area-mean vertical transmittance. A single column scale is
+    /// used so species ratios and vertical structure remain intact. Rain, graupel,
+    /// and other precipitation remain full-cell; `ext_snow` identifies only the snow share inside
+    /// the legacy total `ext_precip` channel, avoiding double counting. Code-zero
+    /// layers with positive cloud extinction are conservatively repaired to full
+    /// coverage by [`maximum_overlap_closure`].
+    ///
+    /// This is exact for the vertical maximum-overlap transfer and an intentionally
+    /// deterministic homogeneous equivalent for slant rays. `tau_up` is recomputed
+    /// in each changed column so ambient light and the view/sun marches consume one
+    /// consistent extinction field.
+    pub fn apply_fractional_clouds(&mut self) -> FractionalCloudStats {
+        let cells = self.nx.saturating_mul(self.ny).saturating_mul(self.nz);
+        let available = self.has_cloud_fraction
+            && self.ext_liquid.len() == cells
+            && self.ext_ice.len() == cells
+            && self.ext_snow.len() == cells
+            && self.ext_precip.len() == cells
+            && self.tau_up.len() == cells
+            && self.cloud_fraction.len() == cells;
+        let mut stats = FractionalCloudStats {
+            available,
+            columns_total: self.nx.saturating_mul(self.ny),
+            ..FractionalCloudStats::default()
+        };
+        if !available || self.nz == 0 {
+            return stats;
+        }
+
+        let dz = self.dz_m.max(0.0);
+        for j in 0..self.ny {
+            for i in 0..self.nx {
+                let closure = maximum_overlap_closure((0..self.nz).map(|k| {
+                    let c = self.cell(i, j, k);
+                    // Independent log quantization can put the snow auxiliary a few
+                    // ulps above the total precip channel. Cap it to its parent so the
+                    // auxiliary can never invent extinction.
+                    let snow = (self.ext_snow_quant.decode(self.ext_snow[c]) as f64)
+                        .max(0.0)
+                        .min((self.ext_precip[c] as f64).max(0.0));
+                    let cloud_ext = (self.ext_liquid[c] as f64).max(0.0)
+                        + (self.ext_ice[c] as f64).max(0.0)
+                        + snow;
+                    (cloud_ext * dz, self.cloud_fraction[c])
+                }));
+
+                stats.fractional_layer_count += closure.fractional_layer_count;
+                stats.repaired_zero_count += closure.repaired_zero_count;
+                stats.raw_fractional_tau += closure.raw_fractional_tau;
+                stats.effective_fractional_tau += closure.effective_fractional_tau;
+
+                if closure.raw_fractional_tau <= 0.0 || closure.scale >= 1.0 {
+                    continue;
+                }
+                let scale = closure.scale as f32;
+                let mut changed = false;
+                for k in 0..self.nz {
+                    let c = self.cell(i, j, k);
+                    if !(1..=254).contains(&self.cloud_fraction[c]) {
+                        continue;
+                    }
+                    let liquid = self.ext_liquid[c].max(0.0);
+                    let ice = self.ext_ice[c].max(0.0);
+                    let precip = self.ext_precip[c].max(0.0);
+                    let snow = self
+                        .ext_snow_quant
+                        .decode(self.ext_snow[c])
+                        .max(0.0)
+                        .min(precip);
+                    if liquid + ice + snow <= 0.0 {
+                        continue;
+                    }
+                    self.ext_liquid[c] = liquid * scale;
+                    self.ext_ice[c] = ice * scale;
+                    self.ext_precip[c] = (precip - snow) + snow * scale;
+                    changed = true;
+                }
+                if !changed {
+                    continue;
+                }
+
+                stats.columns_modified += 1;
+                let top = self.cell(i, j, self.nz - 1);
+                self.tau_up[top] = 0.0;
+                for k in (0..self.nz - 1).rev() {
+                    let c0 = self.cell(i, j, k);
+                    let c1 = self.cell(i, j, k + 1);
+                    let beta0 = self.ext_liquid[c0] as f64
+                        + self.ext_ice[c0] as f64
+                        + self.ext_precip[c0] as f64;
+                    let beta1 = self.ext_liquid[c1] as f64
+                        + self.ext_ice[c1] as f64
+                        + self.ext_precip[c1] as f64;
+                    self.tau_up[c0] = (self.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * dz) as f32;
+                }
+            }
+        }
+        // These encoded auxiliaries are ingest metadata, not sampled render fields.
+        // Release them after the one-shot closure to keep large-domain peak residency
+        // bounded during the expensive ray march.
+        self.ext_snow = Vec::new();
+        self.cloud_fraction = Vec::new();
+        self.has_cloud_fraction = false;
+        stats
     }
 
     #[inline]
@@ -1500,7 +1698,7 @@ impl DecodedVolume {
         // (fi, fj) — and so the same erosion — for a physical point regardless of the
         // view/ray that sampled it).
         let pitch = self.horiz_pitch_m.max(1.0);
-        let noise = granulation_erosion_noise(fi * pitch, fj * pitch);
+        let noise = granulation_erosion_noise_footprint(fi * pitch, fj * pitch, pitch);
         let e = (g.amplitude * GRAN_EROSION_GAIN * gate * protection * coh * noise)
             .min(GRAN_EROSION_MAX);
         if e <= 0.0 {
@@ -1714,9 +1912,10 @@ impl OccupancyMip {
 /// sun transmittance any more — a 2-D total-column scalar cannot give a per-depth
 /// transmittance, which killed the direct-sun term for thick clouds (M4 review FINDING
 /// 1); that now uses the depth-resolved secondary light march in
-/// [`cloud_sun_optical_depth`]. The raw total is also safe as a support-only answer to
-/// “is this column thick enough for higher scattering orders?”; it gates their thin
-/// limit without standing in for sample-to-sun transmittance.
+/// [`cloud_sun_optical_depth`]. The raw total is retained as a missing-data fallback
+/// for higher-order support only when a legacy/synthetic volume has no positive
+/// whole-column `tau_up`; real ingested volumes use that smooth native column and
+/// never let this coarse shadow raster modulate cloud radiance.
 ///
 /// M5 adds `occ_dist` (per texel: the extinction-weighted mean SLANT distance from the
 /// ground to the occluding cloud along the sun ray) so [`SunOdMap::penumbral_shadow`]
@@ -2182,7 +2381,9 @@ pub struct MarchConfig {
     /// Runtime QA/calibration multiplier for VISIBLE cloud optical depth. Applied at
     /// render consumption to view extinction, cloud self-shadow, ground shadow, and
     /// ambient attenuation. It deliberately does not mutate the decoded volume,
-    /// derived COD products, or thermal-IR opacity. Default `1.0`; validated to
+    /// derived COD products, or thermal-IR opacity. The shipped default is
+    /// [`DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE`]; `1.0` remains the explicit unscaled
+    /// model-extinction value. Validated to
     /// [`CLOUD_OPTICAL_DEPTH_SCALE_MIN`]..=[`CLOUD_OPTICAL_DEPTH_SCALE_MAX`].
     pub cloud_optical_depth_scale: f32,
     /// GROUND LIFT (top-down/basemap appearance pass, [`crate::render::GROUND_DAY_LIFT`]):
@@ -2197,6 +2398,11 @@ pub struct MarchConfig {
     /// structure. Default = the baked `CLOUD_SOFTCLIP_KNEE`; the `render_frame`
     /// `cloud-softclip=` knob overrides it. `1.0` = disables the shoulder (hard clamp).
     pub cloud_softclip_knee: f64,
+    /// Physical reflectance-factor ceiling mapped to display white by the bounded
+    /// highlight shoulder ([`crate::render::RHO_HIGHLIGHT_MAX`]). The
+    /// `render_frame` `cloud-highlight-max=` knob can override it for display-only
+    /// headroom A/B tests; it does not change extinction, transmittance, IR, or derived COD.
+    pub cloud_highlight_max: f64,
     /// TOP-DOWN CLOUD NORMALIZATION ([`crate::topdown::TOPDOWN_CLOUD_NORM`]): the
     /// sun-gated multiplier on the top-down cloud radiance (fixes the near-nadir "white
     /// square"; the geostationary path ignores it). Default = the baked
@@ -2245,12 +2451,13 @@ impl MarchConfig {
             beer_powder: false,
             ground_albedo: GROUND_ALBEDO,
             transmittance_floor: 0.003,
-            cloud_optical_depth_scale: 1.0,
+            cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             // Appearance-pass baked defaults (the studio's `..MarchConfig::new()` inherits
             // these; the render_frame CLI knobs override them). Edge feather off by default
             // (activated only by a zoom-out margin, via `edge_feather_cells_for_margin`).
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+            cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             topdown_cloud_norm: crate::topdown::TOPDOWN_CLOUD_NORM,
             edge_feather_cells: 0.0,
             granulation: None,
@@ -2332,9 +2539,10 @@ impl CloudMarch {
 /// which handed every sample `0.5 *` the WHOLE-column optical depth and so killed the
 /// direct-sun term for the top/sun-facing samples of any thick cloud (M4 review
 /// FINDING 1). A single 2-D total-column scalar fundamentally cannot give a per-depth
-/// transmittance, so the map is no longer consulted here; it survives only for the
-/// ground cloud-shadow ([`ground_cloud_shadow`]), where the whole column IS the cloud
-/// between the ground and the sun.
+/// transmittance, so the map is no longer consulted here; outside this function it
+/// survives for the ground cloud-shadow ([`ground_cloud_shadow`]), where the whole
+/// column IS the cloud between the ground and the sun, and as a missing-`tau_up`
+/// support fallback for legacy/synthetic volumes.
 fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
     let cfg = &scene.cfg;
     let n = cfg.sun_march_steps.max(1);
@@ -2508,18 +2716,20 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         // makes a thick anvil brilliant. Beer-powder (OFF by default in M5) applies per
         // octave when on.
         let tau_cloud_sun = cloud_sun_optical_depth(scene, pm);
-        // The vertical whole-column OD is the best support measure for whether
+        // The smooth vertical whole-column OD is the best support measure for whether
         // multiple scattering is possible (including at a thick cloud's sunlit top).
-        // The sun-aligned raw OD map supplies the same column-support fact for slanted
-        // cloud and for synthetic/legacy volumes whose tau_up channel is absent/zero;
-        // it is NOT used as the sample-to-sun transmittance. `tau_sun` and one local
-        // voxel remain conservative fallbacks.
+        // The 512-texel sun-aligned map is a ground-shadow raster: taking its maximum
+        // with a real `tau_up` imprinted that raster's dash/moire texture on HRRR cloud
+        // radiance. Consult it ONLY when a legacy/synthetic volume has no positive
+        // whole-column channel. It remains support-only, never sample-to-sun
+        // transmittance; `tau_sun` and one local voxel are additional fallbacks.
         let col_total = vol.sample(mi, mj, 0.0).tau_up; // raw OD of whole column at (i,j)
-        let sun_column_tau = scene.sun_od.sample(pm) * od_scale;
-        let multiscatter_support_tau = (col_total * od_scale)
-            .max(sun_column_tau)
-            .max(tau_cloud_sun)
-            .max(sigma_eff * pitch);
+        let column_support_tau = if col_total.is_finite() && col_total > 0.0 {
+            col_total * od_scale
+        } else {
+            scene.sun_od.sample(pm) * od_scale
+        };
+        let multiscatter_support_tau = column_support_tau.max(tau_cloud_sun).max(sigma_eff * pitch);
         let sun_src = octave_sun_source_thin_gated(
             cos_vs,
             sample.ext_liquid,
@@ -2714,6 +2924,7 @@ pub fn shade_cloud_pixel(
             surf.output_transform,
             surf.exposure,
             scene.cfg.cloud_softclip_knee,
+            scene.cfg.cloud_highlight_max,
         ),
     }
 }
@@ -3077,9 +3288,129 @@ mod tests {
             horiz_pitch_m: horiz,
             ext_liquid,
             ext_ice,
+            ext_snow: vec![0; n],
+            ext_snow_quant: LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
             ext_precip,
             tau_up,
+            cloud_fraction: vec![255; n],
+            has_cloud_fraction: false,
         }
+    }
+
+    /// Rebuild the ingestion-style vertical optical-depth channel for a synthetic
+    /// test volume.  A positive value at `k=0` is the marker that whole-column
+    /// support is genuinely available to the visible cloud march.
+    fn rebuild_test_tau_up(vol: &mut DecodedVolume) {
+        if vol.nz == 0 {
+            return;
+        }
+        for j in 0..vol.ny {
+            for i in 0..vol.nx {
+                let top = vol.cell(i, j, vol.nz - 1);
+                vol.tau_up[top] = 0.0;
+                for k in (0..vol.nz - 1).rev() {
+                    let c0 = vol.cell(i, j, k);
+                    let c1 = vol.cell(i, j, k + 1);
+                    let beta0 = vol.ext_liquid[c0] as f64
+                        + vol.ext_ice[c0] as f64
+                        + vol.ext_precip[c0] as f64;
+                    let beta1 = vol.ext_liquid[c1] as f64
+                        + vol.ext_ice[c1] as f64
+                        + vol.ext_precip[c1] as f64;
+                    vol.tau_up[c0] =
+                        (vol.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * vol.dz_m) as f32;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_clouds_unavailable_and_full_cover_are_exact_noops() {
+        let mut unavailable = build_volume(2, 1, 3, 250.0, 500.0, |i, _, k| {
+            (1.0e-3 * (i + 1) as f64, 2.0e-4 * k as f64, 3.0e-4)
+        });
+        unavailable.tau_up = vec![1.25, 0.75, 0.0, 1.5, 0.5, 0.0];
+        let before = unavailable.clone();
+        let stats = unavailable.apply_fractional_clouds();
+        assert!(!stats.available);
+        assert_eq!(unavailable.ext_liquid, before.ext_liquid);
+        assert_eq!(unavailable.ext_ice, before.ext_ice);
+        assert_eq!(unavailable.ext_snow, before.ext_snow);
+        assert_eq!(unavailable.ext_precip, before.ext_precip);
+        assert_eq!(unavailable.tau_up, before.tau_up);
+
+        let mut full = before;
+        full.has_cloud_fraction = true;
+        full.cloud_fraction.fill(255);
+        let full_before = full.clone();
+        let stats = full.apply_fractional_clouds();
+        assert!(stats.available);
+        assert_eq!(stats.columns_modified, 0);
+        assert_eq!(stats.fractional_layer_count, 0);
+        assert_eq!(full.ext_liquid, full_before.ext_liquid);
+        assert_eq!(full.ext_ice, full_before.ext_ice);
+        assert_eq!(full.ext_precip, full_before.ext_precip);
+        assert_eq!(full.tau_up, full_before.tau_up);
+        assert!(full.ext_snow.is_empty());
+        assert!(full.cloud_fraction.is_empty());
+    }
+
+    #[test]
+    fn fractional_clouds_thin_partial_layers_and_recompute_tau_up() {
+        let mut vol = build_volume(1, 1, 3, 100.0, 500.0, |_, _, _| (0.01, 0.0, 0.0));
+        vol.has_cloud_fraction = true;
+        vol.cloud_fraction.fill(51); // exactly f = 0.2
+        vol.tau_up.fill(99.0); // proves the cumulative channel is rebuilt
+        let raw = vol.ext_liquid.clone();
+        let stats = vol.apply_fractional_clouds();
+        assert!(stats.available);
+        assert_eq!(stats.columns_modified, 1);
+        assert_eq!(stats.fractional_layer_count, 3);
+        assert!(stats.effective_fractional_tau < stats.raw_fractional_tau);
+        let scale = stats.effective_fractional_tau / stats.raw_fractional_tau;
+        for (&after, &before) in vol.ext_liquid.iter().zip(&raw) {
+            assert!(((after as f64 / before as f64) - scale).abs() < 2.0e-7);
+        }
+        assert_eq!(vol.tau_up[2], 0.0);
+        let beta = vol.ext_liquid[0] as f64;
+        assert!((vol.tau_up[1] as f64 - beta * 100.0).abs() < 2.0e-7);
+        assert!((vol.tau_up[0] as f64 - beta * 200.0).abs() < 4.0e-7);
+    }
+
+    #[test]
+    fn fractional_clouds_scale_only_the_snow_share_of_total_precip() {
+        let mut vol = build_volume(1, 1, 2, 100.0, 500.0, |_, _, _| (0.0, 0.0, 0.03));
+        let (snow_quant, snow_codes) = crate::bricks::encode_log_channel(&[0.01, 0.01]);
+        vol.ext_snow_quant = snow_quant;
+        vol.ext_snow = snow_codes;
+        vol.has_cloud_fraction = true;
+        vol.cloud_fraction.fill(51);
+        let stats = vol.apply_fractional_clouds();
+        let scale = (stats.effective_fractional_tau / stats.raw_fractional_tau) as f32;
+        for c in 0..2 {
+            assert!((vol.ext_precip[c] - (0.02 + 0.01 * scale)).abs() < 1.0e-8);
+            assert_eq!(vol.ext_liquid[c], 0.0);
+            assert_eq!(vol.ext_ice[c], 0.0);
+            assert!(vol.ext_precip[c] <= 0.03);
+        }
+        assert!(vol.ext_snow.is_empty());
+    }
+
+    #[test]
+    fn fractional_clouds_repair_zero_fraction_condensate_to_full_cover() {
+        let mut vol = build_volume(1, 1, 2, 100.0, 500.0, |_, _, _| (0.01, 0.0, 0.0));
+        vol.has_cloud_fraction = true;
+        vol.cloud_fraction.fill(0);
+        vol.tau_up = vec![7.0, 3.0];
+        let before = vol.clone();
+        let stats = vol.apply_fractional_clouds();
+        assert_eq!(stats.repaired_zero_count, 2);
+        assert_eq!(stats.columns_modified, 0);
+        assert_eq!(vol.ext_liquid, before.ext_liquid);
+        assert_eq!(vol.tau_up, before.tau_up);
     }
 
     fn shared_luts() -> &'static (AtmosphereLuts, SkyShTable) {
@@ -3203,14 +3534,27 @@ mod tests {
     }
 
     #[test]
-    fn visible_cloud_optical_depth_scale_defaults_neutral_and_is_bounded() {
+    fn visible_cloud_optical_depth_scale_defaults_shipped_and_is_bounded() {
         let cfg = MarchConfig::new(StepQuality::Offline, 250.0);
-        assert_eq!(cfg.cloud_optical_depth_scale, 1.0);
-        assert_eq!(cfg.validated_cloud_optical_depth_scale(), 1.0);
+        assert_eq!(
+            cfg.cloud_optical_depth_scale,
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert_eq!(
+            cfg.validated_cloud_optical_depth_scale(),
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE as f64
+        );
         assert_eq!(validated_cloud_optical_depth_scale(-3.0), 0.0);
         assert_eq!(validated_cloud_optical_depth_scale(99.0), 4.0);
-        assert_eq!(validated_cloud_optical_depth_scale(f32::NAN), 1.0);
-        assert_eq!(validated_cloud_optical_depth_scale(f32::INFINITY), 1.0);
+        assert_eq!(
+            validated_cloud_optical_depth_scale(f32::NAN),
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert_eq!(
+            validated_cloud_optical_depth_scale(f32::INFINITY),
+            DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert_eq!(validated_cloud_optical_depth_scale(1.0), 1.0);
     }
 
     #[test]
@@ -3302,7 +3646,12 @@ mod tests {
             luts,
             sky_sh,
             sun_ecef: sun,
-            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+            cfg: MarchConfig {
+                // This analytic Beer-Lambert probe compares against raw model
+                // extinction, not the shipped visible-display calibration.
+                cloud_optical_depth_scale: 1.0,
+                ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+            },
         };
         let cam = CameraGeometry::from_sub_lon(-100.0);
         // Two rays crossing the slab at different slant angles/positions.
@@ -3485,7 +3834,10 @@ mod tests {
         let sun = norm3(center); // local zenith over the box
         let sun_od = accumulate_sun_od(&vol, &georef, sun, 32);
         let (luts, sky_sh) = shared_luts();
-        let scene = scene_ref(&vol, &mip, &sun_od, &georef, luts, sky_sh, sun);
+        let mut scene = scene_ref(&vol, &mip, &sun_od, &georef, luts, sky_sh, sun);
+        // This is an analytic physical-depth probe, not a shipped appearance-preset
+        // test. Keep the slab unscaled when the product default is recalibrated.
+        scene.cfg.cloud_optical_depth_scale = 1.0;
         let top = brick_to_ecef(&georef, 12.0, 12.0, 43.0, 0.0, dz).unwrap();
         let base = brick_to_ecef(&georef, 12.0, 12.0, 5.0, 0.0, dz).unwrap();
         let tau_top = cloud_sun_optical_depth(&scene, top);
@@ -3800,6 +4152,9 @@ mod tests {
             flat_albedo_srgb: 0.5,
             raymarch_steps: 8,
             exposure: 1.0,
+            ground_day_lift: GROUND_DAY_LIFT,
+            cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+            cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             atmosphere_correction: true,
             terrain_atmosphere: true,
         };
@@ -3910,6 +4265,9 @@ mod tests {
                 flat_albedo_srgb: 0.5,
                 raymarch_steps: 8,
                 exposure,
+                ground_day_lift: GROUND_DAY_LIFT,
+                cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+                cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
             };
@@ -4061,6 +4419,179 @@ mod tests {
         assert!(
             (gated_thick - old_thick).abs() < 1.0e-7 * old_thick,
             "thick-cloud gate must converge to the established octave result: {gated_thick} vs {old_thick}"
+        );
+    }
+
+    #[test]
+    fn real_column_multiscatter_is_invariant_to_coarse_sun_od_values() {
+        // HRRR exposed a release-blocking 512-texel dash pattern when the coarse
+        // ground-shadow map was also allowed to modulate higher-order cloud light.
+        // A real ingested volume has a smooth whole-column `tau_up` value, so two
+        // otherwise-identical cloud marches must be byte-identical even if the
+        // auxiliary shadow map is changed from clear to extremely opaque.
+        let (nx, ny, nz) = (16usize, 16usize, 24usize);
+        let dz = 250.0;
+        let mut vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (5.0e-5, 0.0, 0.0));
+        rebuild_test_tau_up(&mut vol);
+        assert!(vol.sample(8.0, 8.0, 0.0).tau_up > 0.0);
+
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let sample = brick_to_ecef(&georef, 8.0, 8.0, 12.0, 0.0, dz).unwrap();
+        let sun = norm3(sample);
+        let mut clear_map = accumulate_sun_od(&vol, &georef, sun, 32);
+        clear_map.od.fill(0.0);
+        let mut opaque_map = clear_map.clone();
+        opaque_map.od.fill(12.0);
+        let (luts, sky_sh) = shared_luts();
+        let cam = CameraGeometry::from_sub_lon(-100.0);
+        let ground = brick_to_ecef(&georef, 8.0, 8.0, 0.0, 0.0, dz).unwrap();
+        let view = norm3([
+            ground[0] - cam.camera[0],
+            ground[1] - cam.camera[1],
+            ground[2] - cam.camera[2],
+        ]);
+        let cfg = MarchConfig {
+            cloud_optical_depth_scale: 1.0,
+            sun_march_jitter_amp: 0.0,
+            octaves: DEFAULT_OCTAVES,
+            ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+        };
+        let march_with = |sun_od: &SunOdMap| {
+            let scene = CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef: sun,
+                cfg,
+            };
+            march_cloud(&scene, cam.camera, view)
+        };
+        let clear = march_with(&clear_map);
+        let opaque = march_with(&opaque_map);
+        assert_eq!(
+            clear.transmittance.to_bits(),
+            opaque.transmittance.to_bits()
+        );
+        for band in 0..3 {
+            assert_eq!(
+                clear.sun_inscatter[band].to_bits(),
+                opaque.sun_inscatter[band].to_bits(),
+                "coarse sun-OD leaked into real-column cloud light in band {band}: {} vs {}",
+                clear.sun_inscatter[band],
+                opaque.sun_inscatter[band]
+            );
+            assert_eq!(
+                clear.inscatter[band].to_bits(),
+                opaque.inscatter[band].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn zero_column_multiscatter_retains_the_legacy_sun_od_fallback() {
+        // Synthetic/legacy volumes can lack `tau_up` (all zero). In that explicit
+        // missing-data case the sun-aligned map remains the best available column
+        // support estimate, so it must still enable higher scattering orders.
+        let (nx, ny, nz) = (16usize, 16usize, 24usize);
+        let dz = 250.0;
+        let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (5.0e-5, 0.0, 0.0));
+        assert_eq!(vol.sample(8.0, 8.0, 0.0).tau_up, 0.0);
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let sample = brick_to_ecef(&georef, 8.0, 8.0, 12.0, 0.0, dz).unwrap();
+        let sun = norm3(sample);
+        let mut clear_map = accumulate_sun_od(&vol, &georef, sun, 32);
+        clear_map.od.fill(0.0);
+        let mut opaque_map = clear_map.clone();
+        opaque_map.od.fill(12.0);
+        let (luts, sky_sh) = shared_luts();
+        let cam = CameraGeometry::from_sub_lon(-100.0);
+        let ground = brick_to_ecef(&georef, 8.0, 8.0, 0.0, 0.0, dz).unwrap();
+        let view = norm3([
+            ground[0] - cam.camera[0],
+            ground[1] - cam.camera[1],
+            ground[2] - cam.camera[2],
+        ]);
+        let cfg = MarchConfig {
+            cloud_optical_depth_scale: 1.0,
+            sun_march_jitter_amp: 0.0,
+            octaves: DEFAULT_OCTAVES,
+            ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+        };
+        let march_with = |sun_od: &SunOdMap| {
+            let scene = CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef: sun,
+                cfg,
+            };
+            march_cloud(&scene, cam.camera, view)
+        };
+        let clear: f64 = march_with(&clear_map).sun_inscatter.iter().sum();
+        let opaque: f64 = march_with(&opaque_map).sun_inscatter.iter().sum();
+        assert!(
+            opaque > clear * 1.25,
+            "missing tau_up must retain sun-OD support fallback: {opaque} vs {clear}"
+        );
+    }
+
+    #[test]
+    fn ground_shadow_still_consumes_the_sun_od_map() {
+        // The release fix is scoped only to cloud-volume higher-order support. The
+        // whole sun-aligned column remains exactly the correct ground-shadow source.
+        let (nx, ny, nz) = (16usize, 16usize, 24usize);
+        let dz = 250.0;
+        let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (5.0e-5, 0.0, 0.0));
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let sample = brick_to_ecef(&georef, 8.0, 8.0, 12.0, 0.0, dz).unwrap();
+        let sun = norm3(sample);
+        let mut clear_map = accumulate_sun_od(&vol, &georef, sun, 32);
+        clear_map.od.fill(0.0);
+        let mut opaque_map = clear_map.clone();
+        opaque_map.od.fill(12.0);
+        let (luts, sky_sh) = shared_luts();
+        let cam = CameraGeometry::from_sub_lon(-100.0);
+        let ground = brick_to_ecef(&georef, 8.0, 8.0, 0.0, 0.0, dz).unwrap();
+        let view = norm3([
+            ground[0] - cam.camera[0],
+            ground[1] - cam.camera[1],
+            ground[2] - cam.camera[2],
+        ]);
+        let cfg = MarchConfig {
+            cloud_optical_depth_scale: 1.0,
+            ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+        };
+        let shadow_with = |sun_od: &SunOdMap| {
+            let scene = CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef: sun,
+                cfg,
+            };
+            ground_cloud_shadow(&scene, cam.camera, view)
+        };
+        let clear = shadow_with(&clear_map);
+        let opaque = shadow_with(&opaque_map);
+        assert!(
+            clear > 0.999,
+            "zero sun-OD should leave clear ground: {clear}"
+        );
+        assert!(
+            opaque < 1.0e-4,
+            "large sun-OD must still shadow the ground: {opaque}"
         );
     }
 
@@ -4394,6 +4925,8 @@ mod tests {
         let tau_at = |quality: StepQuality| {
             let cfg = MarchConfig {
                 sun_march_jitter_amp: 0.0,
+                // The convergence reference is the unscaled analytic optical depth.
+                cloud_optical_depth_scale: 1.0,
                 ..MarchConfig::new(quality, vol.voxel_pitch_m())
             };
             let scene = CloudScene {
@@ -4448,6 +4981,8 @@ mod tests {
         let tau_amp = |amp: f64| {
             let cfg = MarchConfig {
                 sun_march_jitter_amp: amp,
+                // The independently computed midpoint schedule is unscaled.
+                cloud_optical_depth_scale: 1.0,
                 ..MarchConfig::new(StepQuality::Interactive, vol.voxel_pitch_m())
             };
             let scene = CloudScene {
@@ -4636,7 +5171,9 @@ mod tests {
         let (luts, sky_sh) = shared_luts();
         let sun = [0.0, 0.0, 1.0];
         let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
-        let scene = scene_ref(&vol, &mip, &sun_od, &georef, luts, sky_sh, sun);
+        let mut scene = scene_ref(&vol, &mip, &sun_od, &georef, luts, sky_sh, sun);
+        // The fine-step reference integrates raw model extinction.
+        scene.cfg.cloud_optical_depth_scale = 1.0;
         let cam = CameraGeometry::from_sub_lon(-100.0);
         // Targets in the NORTH-CENTRE so the slant ray from the (southern) GOES
         // camera descends fully inside the domain (no side-boundary crossings).
@@ -4847,6 +5384,60 @@ mod tests {
         assert!(
             zero_frac > 0.30,
             "most of the field should be untouched grain interior: {zero_frac}"
+        );
+    }
+
+    #[test]
+    fn granulation_footprint_filter_reduces_500m_native_alias_energy() {
+        let pitch = 500.0;
+        let n = 48usize;
+        let mut raw = vec![0.0f64; n * n];
+        let mut filtered = vec![0.0f64; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let u = (x as f64 + 0.5) * pitch;
+                let v = (y as f64 + 0.5) * pitch;
+                let c = y * n + x;
+                raw[c] = granulation_erosion_noise(u, v);
+                filtered[c] = granulation_erosion_noise_footprint(u, v, pitch);
+                assert!((0.0..=1.0).contains(&filtered[c]));
+                assert_eq!(
+                    filtered[c].to_bits(),
+                    granulation_erosion_noise_footprint(u, v, pitch).to_bits(),
+                    "footprint filter must be deterministic"
+                );
+                assert_eq!(
+                    granulation_erosion_noise_footprint(u, v, 0.0).to_bits(),
+                    raw[c].to_bits(),
+                    "zero footprint must be the exact point sample"
+                );
+            }
+        }
+        let neighbor_energy = |field: &[f64]| {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for y in 0..n {
+                for x in 0..n {
+                    let c = y * n + x;
+                    if x + 1 < n {
+                        let d = field[c] - field[c + 1];
+                        sum += d * d;
+                        count += 1;
+                    }
+                    if y + 1 < n {
+                        let d = field[c] - field[c + n];
+                        sum += d * d;
+                        count += 1;
+                    }
+                }
+            }
+            sum / count as f64
+        };
+        let raw_energy = neighbor_energy(&raw);
+        let filtered_energy = neighbor_energy(&filtered);
+        assert!(
+            filtered_energy < 0.5 * raw_energy,
+            "500 m footprint did not suppress native-grid alias energy: raw={raw_energy}, filtered={filtered_energy}"
         );
     }
 
@@ -5589,7 +6180,11 @@ mod tests {
                 let d = total / peak;
                 let gate = granulation_gate(raw.ext_liquid, raw.ext_ice, raw.ext_precip, 750.0);
                 let prot = granulation_interior_protection(d);
-                let noise = granulation_erosion_noise(fi * 3000.0, fj * 3000.0);
+                let noise = granulation_erosion_noise_footprint(
+                    fi * vol.horiz_pitch_m,
+                    fj * vol.horiz_pitch_m,
+                    vol.horiz_pitch_m,
+                );
                 let e = (amp * GRAN_EROSION_GAIN * gate * prot * noise).min(GRAN_EROSION_MAX);
                 if e <= 0.05 || d >= 0.999 {
                     continue;

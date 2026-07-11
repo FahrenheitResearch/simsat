@@ -80,6 +80,17 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
     assert_eq!(brick.nz, config.nz_brick);
     assert_eq!(brick.hgt.len(), geom.nx * geom.ny);
     assert_eq!(brick.ext_liquid.len(), geom.nx * geom.ny * config.nz_brick);
+    assert_eq!(brick.ext_snow.len(), geom.nx * geom.ny * config.nz_brick);
+    assert_eq!(
+        brick.cloud_fraction.len(),
+        geom.nx * geom.ny * config.nz_brick
+    );
+    if !brick.has_cloud_fraction {
+        assert!(
+            brick.cloud_fraction.iter().all(|&v| v == 255),
+            "unavailable coverage must use the full-cell fallback"
+        );
+    }
     assert_eq!(
         brick.temperature_f16.len(),
         geom.nx * geom.ny * config.nz_brick
@@ -161,7 +172,10 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
         };
 
         let horiz = geom.params.dx_m.min(geom.params.dy_m);
-        let vol = DecodedVolume::from_brick(&brick, horiz);
+        let mut vol = DecodedVolume::from_brick(&brick, horiz);
+        if brick.has_cloud_fraction {
+            vol.apply_fractional_clouds();
+        }
         let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
         let camera_g = GeoCamera::new(SatellitePreset::GoesEast);
         let raster = build_surface_raster(
@@ -338,6 +352,9 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
                 raymarch_steps: 16,
                 exposure: 1.0,
+                ground_day_lift: simsat::render::GROUND_DAY_LIFT,
+                cloud_softclip_knee: simsat::render::CLOUD_SOFTCLIP_KNEE,
+                cloud_highlight_max: simsat::render::RHO_HIGHLIGHT_MAX,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
             };

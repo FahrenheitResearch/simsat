@@ -161,6 +161,7 @@ fn optional_rrfs_fixture_crop_ingests_and_ratchets() {
     assert_eq!((brick.nx, brick.ny), (geom.nx, geom.ny));
     let liquid = brick.quant.get("ext_liquid");
     let ice = brick.quant.get("ext_ice");
+    let snow = brick.quant.get("ext_snow");
     let precip = brick.quant.get("ext_precip");
     let qv = brick.quant.get("qvapor");
     println!(
@@ -169,6 +170,13 @@ fn optional_rrfs_fixture_crop_ingests_and_ratchets() {
         liquid.vmax, ice.vmax, precip.vmax, qv.vmax
     );
     assert!(liquid.vmax > 0.0 && ice.vmax > 0.0 && precip.vmax > 0.0);
+    assert_eq!(
+        snow.vmax, 0.0,
+        "initial GRIB v4+ snow subset is unavailable"
+    );
+    assert!(brick.ext_snow.iter().all(|&v| v == 0));
+    assert!(!brick.has_cloud_fraction);
+    assert!(brick.cloud_fraction.iter().all(|&v| v == 255));
     assert!(qv.vmax > 1.0e-3);
     let (mut sum, mut n) = (0f64, 0u64);
     for &t in &brick.tsk {
@@ -285,6 +293,7 @@ fn ingest_and_check(path: &Path) {
 
     let liquid_quant = brick.quant.get("ext_liquid");
     let ice_quant = brick.quant.get("ext_ice");
+    let snow_quant = brick.quant.get("ext_snow");
     let precip_quant = brick.quant.get("ext_precip");
     let qv_quant = brick.quant.get("qvapor");
     println!(
@@ -304,6 +313,17 @@ fn ingest_and_check(path: &Path) {
         "CONUS afternoon should have precip"
     );
     assert!(qv_quant.vmax > 1.0e-3, "qvapor should be moist somewhere");
+    assert_eq!(
+        snow_quant.vmax, 0.0,
+        "initial GRIB v4+ snow subset is unavailable"
+    );
+    assert!(brick.ext_snow.iter().all(|&c| c == 0));
+    assert!(
+        brick.has_cloud_fraction,
+        "HRRR wrfnat carries complete cc (0/6/32) hybrid levels"
+    );
+    assert!(brick.cloud_fraction.iter().any(|&c| c < 255));
+    assert!(brick.cloud_fraction.iter().any(|&c| c > 0));
     assert!(brick.ext_liquid.iter().any(|&c| c > 0));
     assert!(brick.tau_up.iter().any(|&c| c > 0));
 

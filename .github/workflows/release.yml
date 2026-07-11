@@ -2,13 +2,12 @@
 #
 # This workflow BUILDS the distributable artifacts and uploads them as WORKFLOW
 # ARTIFACTS. It NEVER creates a GitHub release, tag, or any public object —
-# publishing is the owner's held button (see RELEASING.md, which is the go-live
-# checklist that dispatches this).
+# publishing remains a separate, explicit owner-controlled step after these
+# artifacts have been downloaded and smoke-tested.
 #
-# STATUS NOTE: reviewed but never dispatched during release prep (the Windows
-# and maturin legs are expensive on private-repo minutes). ci.yml — the cheap
-# ubuntu fmt/clippy/test gate — WAS dispatched and proven. Budget one iteration
-# for first-run issues here (see RELEASING.md step 2).
+# The workflow was first proven for v0.1.2 and is rerun on every public mirror
+# release. Its Windows executable is a reproducibility check; the release asset
+# remains the exact locally built and owner-tested static executable.
 name: Release artifacts (manual, no publish)
 
 on:

@@ -41,8 +41,8 @@ Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), 
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default), `margin=0.0`
 (zoom-out fraction added on each side — real surrounding earth, clear sky, frames the
 domain), `cache=<dir>`, `threads=<n>`. The visible-family functions additionally take
-`exposure=1.6`, `multiscatter=True`, `beer_powder=False`, `granulation=False`,
-`steps` (`offline`/`interactive`), `clouds=True`,
+`exposure=1.0`, `multiscatter=True`, `beer_powder=False`, `granulation=False`,
+`steps` (`offline`/`interactive`), `clouds=True`, `fractional_clouds=True`,
 `sun_elev`/`sun_az` (what-if sun override), `bluemarble=<path>` (single-file ground),
 `bluemarble_month`, `bluemarble_download=True`. Thermal functions (`render_ir`,
 `render_water_vapor`) take `enhancement=` (`cimss`/`bd`/`avn`/`funktop`/`rainbow`/`gray`);
@@ -57,14 +57,32 @@ also expose the atmosphere/cloud QA controls directly:
 | `rh_aerosol_swelling` | `False` | apply the documented 1.5x aerosol-extinction multiplier |
 | `atmosphere_correction` | `True` | product-facing daytime aerial-veil correction; `False` retains full modeled path airlight (other display transforms remain) |
 | `terrain_atmosphere` | `True` | shorten atmosphere columns to the WRF terrain elevation |
-| `cloud_optical_depth_scale` | `1.0` | multiply visible cloud OD consistently in view/sun/ambient/shadow paths (`0.0..=4.0`) |
+| `fractional_clouds` | `True` | use model cloud fraction/subcolumns when available; `False` restores legacy horizontally-full cloudy cells |
+| `cloud_optical_depth_scale` | `0.15` | owner-selected cross-file visible calibration, applied consistently in view/sun/ambient/shadow paths (`0.0..=4.0`; `1.0` = unscaled model extinction) |
 | `beer_powder` | `False` | optional Schneider shaping of the direct cloud-sun term; does not change transmittance |
 | `granulation` | `False` | display-only sub-grid cloud-edge erosion; quantitative bands/thermal/derived products remain unmodified |
 
-`cloud_optical_depth_scale` is a labeled sensitivity control: `1.0` preserves the
-model-derived extinction and `0.0` makes its visible optical effects transparent. It does
-not alter `render_cloud_optical_depth`, which intentionally returns the unscaled physical
-input. `clouds=False` remains the explicit feature bypass, while `multiscatter=False`
+Finished visible display products (`render_visible_rgb`, `render_geocolor`,
+`render_sandwich`, `render_cloud_layer`, and `render_perspective`) also accept these
+optional display-calibration overrides. Omitting them preserves the shipped engine
+constants; they are intentionally absent from `render_visible_bands` so raw reflectance
+cannot be changed by a tonemap choice.
+
+| keyword | omitted behavior | effect |
+|---|---:|---|
+| `ground_gain` | shipped `1.0` | sun-gated daytime surface-radiance lift (`1.0` is neutral; accepted but irrelevant for ground-free cloud layers) |
+| `cloud_softclip` | shipped `0.65` | highlight shoulder knee (`1.0` disables the shoulder/hard-clamps) |
+| `cloud_highlight_max` | shipped `1.25` | physical reflectance factor mapped to display white; raising it retains structure in brighter cloud tops |
+
+`cloud_optical_depth_scale` is a labeled calibration/sensitivity control: the shipped
+`0.15` is an owner-selected visual calibration after broad cross-file review, not a
+claimed physical optimum. It supersedes the earlier tied `0.20`/`0.30` midpoint candidate.
+`1.0` preserves the model-derived extinction unchanged, and
+`0.0` makes its visible optical effects transparent. It does not alter
+`render_cloud_optical_depth`, which intentionally returns the unscaled physical input.
+`fractional_clouds=True` consumes model cloud fraction when the input supplies it
+and safely falls back to full-cell coverage otherwise; set it false for the legacy A/B.
+`clouds=False` remains the explicit feature bypass, while `multiscatter=False`
 disables the higher cloud-scattering octaves without changing cloud transmittance.
 `beer_powder` and `granulation` are explicit opt-in appearance controls and remain off
 unless requested.

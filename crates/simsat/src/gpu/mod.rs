@@ -2108,7 +2108,10 @@ mod tests {
         assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
         let mut invalid = test_cloud_inputs(test_surface_uniforms());
         invalid.march.cloud_optical_depth_scale = f32::NAN;
-        assert_eq!(cloud_uniform_quads(&invalid)[24][3], 1.0);
+        assert_eq!(
+            cloud_uniform_quads(&invalid)[24][3],
+            crate::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
         invalid.march.cloud_optical_depth_scale = 99.0;
         assert_eq!(cloud_uniform_quads(&invalid)[24][3], 4.0);
         // 25 vec4 = 400 bytes, little-endian f32s in order.
@@ -2119,6 +2122,25 @@ mod tests {
             f32::from_le_bytes(bytes[9 * 16..9 * 16 + 4].try_into().unwrap()),
             80.0
         );
+    }
+
+    #[test]
+    fn wgsl_highlight_calibration_matches_rust_defaults() {
+        assert_eq!(crate::render::CLOUD_SOFTCLIP_KNEE, 0.65);
+        assert_eq!(crate::render::RHO_HIGHLIGHT_MAX, 1.25);
+        for (name, shader) in [
+            ("clouds", include_str!("shaders/clouds.wgsl")),
+            ("surface", include_str!("shaders/surface.wgsl")),
+        ] {
+            assert!(
+                shader.contains("const CLOUD_SOFTCLIP_KNEE: f32 = 0.65;"),
+                "{name} WGSL highlight knee drifted from Rust"
+            );
+            assert!(
+                shader.contains("const RHO_HIGHLIGHT_MAX: f32 = 1.25;"),
+                "{name} WGSL highlight ceiling drifted from Rust"
+            );
+        }
     }
 
     #[test]

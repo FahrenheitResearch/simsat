@@ -271,7 +271,7 @@ fn write_coherence_map(input: &Path, timestep: usize, out: &Path) -> Result<(), 
         p.dx_m.min(p.dy_m)
     };
     let (nx, ny) = (brick.nx, brick.ny);
-    let vol = DecodedVolume::from_brick(&brick, pitch);
+    let vol = DecodedVolume::from_brick_legacy(&brick, pitch);
     let coh = GranCoherence::build(&vol);
     let (open, partial, closed) = coh.stats();
     println!(

@@ -4,22 +4,32 @@
 //! (`z(k) = z_min_m + k*dz_m`, MSL) over the native WRF `(i, j)` horizontal grid
 //! (NO decimation/windowing in M0 — that is M7).
 //!
-//! Payload channels (Texture A) are four log-quantized u8 3-D channels with
-//! per-volume scales in the header: `ext_liquid` (cloud-liquid extinction, m^-1,
-//! from `QCLOUD`), `ext_ice` (small-ice extinction, `QICE` only since SSB v3),
-//! `ext_precip` (the large-particle extinction: `QRAIN + QGRAUP` at rain optics
-//! plus — since SSB v3, the snow-optics fix — `QSNOW` at its own aggregate beta;
-//! each species converts at its own optics before the sum), and `tau_up`
+//! Payload extinction channels are log-quantized u8 3-D channels with per-volume
+//! scales in the header: `ext_liquid` (cloud-liquid extinction, m^-1, from
+//! `QCLOUD`), `ext_ice` (small-ice extinction, `QICE` only since SSB v3),
+//! `ext_snow` (since SSB v4: a QSNOW-only AUXILIARY SUBSET of `ext_precip`, not an
+//! independently additive phase), `ext_precip` (the legacy total large-particle
+//! extinction: `QRAIN + QGRAUP + QSNOW`, each converted at
+//! its own optics before the sum), and `tau_up`
 //! (cumulative optical depth from brick-top down to each level, precomputed at
-//! ingest; feeds cloud ambient, the IR fast path, and shadows).
+//! ingest from liquid + ice + total precip only; feeds cloud ambient, the IR fast
+//! path, and shadows). Keeping snow duplicated inside total precip preserves the
+//! exact legacy/GPU/IR path while allowing fractional-cloud rendering to isolate
+//! the snow share as `precip - snow + scaled_snow`.
 //!
 //! The QVAPOR channel (owner decision 6 — a full channel now, for a later 6.2 um
-//! water-vapor IR band) is its OWN fifth log-quantized u8 channel, `qvapor`
+//! water-vapor IR band) remains its OWN log-quantized u8 channel, `qvapor`
 //! (mixing ratio kg/kg). Representation choice (recorded in the manifest as
 //! `qvapor`): a u8 log channel, not an f16 plane. Rationale — the bandwidth-lean
 //! rule (owner decision 1) favors u8; a WV IR band is coarse-tolerance, and the
 //! fixed log window still gives it usable dynamic range. f16 was the alternative,
 //! rejected on bandwidth.
+//!
+//! SSB v4+ also carries `cloud_fraction`, a LINEAR u8 channel (`round(clamp(f,
+//! 0,1)*255)`, with every finite positive value floored to code 1 so wispy tails
+//! survive quantization). `has_cloud_fraction` records provenance. When a source
+//! has no trusted coverage field, every byte is 255 and the flag is false, making
+//! the fallback explicitly equivalent to full-cell coverage.
 //!
 //! Texture B is temperature as f16 stored in degrees CELSIUS. Storing Kelvin in
 //! f16 would only resolve ~0.25 K near 300 K (aliasing the 1 K IR enhancement
@@ -46,11 +56,11 @@
 //! A sibling `run.json` (see `RunManifest`) indexes all timesteps of a run.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
+use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
 
@@ -66,12 +76,21 @@ pub const CELSIUS_OFFSET_K: f64 = 273.15;
 
 /// Sanity ceiling on the decompressed payload size an `.ssb` header may describe
 /// (64 GiB — an order of magnitude above any real brick; the Enderlin 800x800x80
-/// payload is ~0.36 GB). Bounds the [`read_ssb`] decompress so corrupt dims cannot
+/// v4/v5 payload is ~0.48 GB). Bounds the [`read_ssb`] decompress so corrupt dims cannot
 /// balloon memory (checked, never trusted).
 pub const MAX_SSB_PAYLOAD_BYTES: u64 = 64 << 30;
 
-/// The ordered 3-D quantized channel names (Texture A + the QVAPOR channel).
-pub const CHANNELS_3D: [&str; 5] = ["ext_liquid", "ext_ice", "ext_precip", "tau_up", "qvapor"];
+/// The ordered 3-D u8 channel names. All except `cloud_fraction` use the
+/// per-volume log quantization map; cloud fraction is linear by definition.
+pub const CHANNELS_3D: [&str; 7] = [
+    "ext_liquid",
+    "ext_ice",
+    "ext_snow",
+    "ext_precip",
+    "tau_up",
+    "qvapor",
+    "cloud_fraction",
+];
 
 /// Per-channel log-quantization scale (per volume). Code 0 is reserved for an
 /// exact zero / below-floor value; codes 1..=255 are log-uniform in `[vmin, vmax]`.
@@ -139,7 +158,8 @@ impl LogQuant {
     }
 }
 
-/// The five per-volume channel scales, keyed by channel name.
+/// The per-volume log-channel scales, keyed by channel name. The linear
+/// `cloud_fraction` channel deliberately has no entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelQuant(pub BTreeMap<String, LogQuant>);
 
@@ -158,6 +178,30 @@ pub fn encode_log_channel(values: &[f32]) -> (LogQuant, Vec<u8>) {
     let quant = LogQuant::from_values(values);
     let codes = values.iter().map(|&v| quant.encode(v)).collect();
     (quant, codes)
+}
+
+/// Encode model cloud coverage to SSB v4+'s linear u8 representation.
+/// Every finite positive sample is kept at code 1 or above so a wispy positive
+/// tail cannot round to zero and be mistaken for missing model coverage. Non-finite
+/// and non-positive samples encode as zero; source-level absence is represented
+/// separately by an all-255 channel plus `has_cloud_fraction = false`.
+pub fn encode_cloud_fraction(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .map(|&f| {
+            if !f.is_finite() || f <= 0.0 {
+                0
+            } else {
+                ((f.min(1.0) * 255.0).round() as u8).max(1)
+            }
+        })
+        .collect()
+}
+
+/// Decode one SSB v4+ linear cloud-fraction code.
+#[inline]
+pub fn decode_cloud_fraction(code: u8) -> f32 {
+    code as f32 / 255.0
 }
 
 /// Encode a Kelvin temperature channel as f16 (Celsius) bits.
@@ -250,6 +294,7 @@ pub struct BrickHeader {
     pub planes_2d: Vec<String>,
     pub has_snowh: bool,
     pub has_ivgtyp: bool,
+    pub has_cloud_fraction: bool,
     pub time_iso: Option<String>,
 }
 
@@ -266,9 +311,15 @@ pub struct VolumeBrick {
     /// 3-D quantized channels, index `(k*ny + y)*nx + x`.
     pub ext_liquid: Vec<u8>,
     pub ext_ice: Vec<u8>,
+    /// QSNOW-only auxiliary subset of `ext_precip`; do not add it to totals twice.
+    pub ext_snow: Vec<u8>,
     pub ext_precip: Vec<u8>,
     pub tau_up: Vec<u8>,
     pub qvapor: Vec<u8>,
+    /// Linear u8 cloud coverage. All 255 with `has_cloud_fraction == false` is the
+    /// source-unavailable full-coverage fallback.
+    pub cloud_fraction: Vec<u8>,
+    pub has_cloud_fraction: bool,
     /// Temperature as f16 (Celsius) bits, same indexing as the 3-D channels.
     pub temperature_f16: Vec<u16>,
     /// 2-D planes, index `y*nx + x`.
@@ -282,20 +333,15 @@ pub struct VolumeBrick {
 }
 
 impl VolumeBrick {
-    fn cells_3d(&self) -> usize {
-        self.nx * self.ny * self.nz
-    }
-    fn cells_2d(&self) -> usize {
-        self.nx * self.ny
-    }
-
     fn channel_3d(&self, name: &str) -> &[u8] {
         match name {
             "ext_liquid" => &self.ext_liquid,
             "ext_ice" => &self.ext_ice,
+            "ext_snow" => &self.ext_snow,
             "ext_precip" => &self.ext_precip,
             "tau_up" => &self.tau_up,
             "qvapor" => &self.qvapor,
+            "cloud_fraction" => &self.cloud_fraction,
             other => panic!("unknown 3-D channel {other}"),
         }
     }
@@ -344,6 +390,7 @@ impl VolumeBrick {
                 .collect(),
             has_snowh: self.snowh.is_some(),
             has_ivgtyp: self.ivgtyp.is_some(),
+            has_cloud_fraction: self.has_cloud_fraction,
             time_iso: self.time_iso.clone(),
         }
     }
@@ -433,36 +480,94 @@ pub fn run_dir(cache_dir: &Path, run_id: &str) -> PathBuf {
     cache_dir.join(run_id)
 }
 
-/// Serialize a brick to its raw (uncompressed) payload bytes.
-fn payload_bytes(brick: &VolumeBrick) -> Vec<u8> {
-    let cells_3d = brick.cells_3d();
-    let cells_2d = brick.cells_2d();
-    let planes = brick.planes_2d_list();
-    let mut out =
-        Vec::with_capacity(cells_3d * (CHANNELS_3D.len() + 2) + planes.len() * cells_2d * 4);
+/// Stream a brick's raw payload in the canonical v4+ order retained by v5. Numeric planes use a
+/// small conversion buffer rather than materializing a second brick-sized byte
+/// vector; this is what keeps full-domain HRRR writes inside the ingest RSS budget.
+fn write_payload<W: Write>(out: &mut W, brick: &VolumeBrick) -> Result<(), std::io::Error> {
     for name in CHANNELS_3D {
-        out.extend_from_slice(brick.channel_3d(name));
+        out.write_all(brick.channel_3d(name))?;
     }
-    for &bits in &brick.temperature_f16 {
-        out.extend_from_slice(&bits.to_le_bytes());
+    const NUMERIC_CHUNK: usize = 16 * 1024;
+    let mut bytes = Vec::with_capacity(NUMERIC_CHUNK * 4);
+    for chunk in brick.temperature_f16.chunks(NUMERIC_CHUNK) {
+        bytes.clear();
+        for &bits in chunk {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        out.write_all(&bytes)?;
     }
-    for (_, plane) in planes {
-        for &v in plane {
-            out.extend_from_slice(&v.to_le_bytes());
+    for (_, plane) in brick.planes_2d_list() {
+        for chunk in plane.chunks(NUMERIC_CHUNK) {
+            bytes.clear();
+            for &v in chunk {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            out.write_all(&bytes)?;
         }
     }
-    out
+    Ok(())
+}
+
+/// Validate every in-memory channel/plane length before serializing. This keeps a
+/// malformed programmatic `VolumeBrick` from writing a file whose header promises
+/// more (or fewer) bytes than its payload contains, and applies the same 64-GiB
+/// ceiling as the untrusted reader path.
+fn validate_brick_payload(brick: &VolumeBrick) -> Result<(), BrickError> {
+    let cells_2d = brick.nx.checked_mul(brick.ny).ok_or_else(|| {
+        BrickError::Truncated(format!("brick dims {}x{} overflow", brick.nx, brick.ny))
+    })?;
+    let cells_3d = cells_2d.checked_mul(brick.nz).ok_or_else(|| {
+        BrickError::Truncated(format!(
+            "brick dims {}x{}x{} overflow",
+            brick.nx, brick.ny, brick.nz
+        ))
+    })?;
+    for name in CHANNELS_3D {
+        let found = brick.channel_3d(name).len();
+        if found != cells_3d {
+            return Err(BrickError::Truncated(format!(
+                "{name}: expected {cells_3d} bytes, got {found}"
+            )));
+        }
+    }
+    if brick.temperature_f16.len() != cells_3d {
+        return Err(BrickError::Truncated(format!(
+            "temperature: expected {cells_3d} samples, got {}",
+            brick.temperature_f16.len()
+        )));
+    }
+    for (name, plane) in brick.planes_2d_list() {
+        if plane.len() != cells_2d {
+            return Err(BrickError::Truncated(format!(
+                "{name}: expected {cells_2d} samples, got {}",
+                plane.len()
+            )));
+        }
+    }
+    if !brick.has_cloud_fraction && brick.cloud_fraction.iter().any(|&v| v != 255) {
+        return Err(BrickError::Truncated(
+            "cloud_fraction provenance is false but fallback bytes are not all 255".to_string(),
+        ));
+    }
+    let n_planes = brick.planes_2d_list().len();
+    cells_3d
+        .checked_mul(CHANNELS_3D.len() + 2)
+        .and_then(|v| v.checked_add(cells_2d.checked_mul(n_planes.checked_mul(4)?)?))
+        .filter(|&v| (v as u64) <= MAX_SSB_PAYLOAD_BYTES)
+        .ok_or_else(|| {
+            BrickError::Truncated(format!(
+                "brick describes an implausible payload ({}x{}x{})",
+                brick.nx, brick.ny, brick.nz
+            ))
+        })?;
+    Ok(())
 }
 
 /// Write a brick to `path` as an `.ssb` file.
 pub fn write_ssb(path: &Path, brick: &VolumeBrick) -> Result<u64, BrickError> {
+    validate_brick_payload(brick)?;
     let header = brick.header();
     let header_json = serde_json::to_vec(&header)?;
-    let raw = payload_bytes(brick);
-
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&raw)?;
-    let compressed = encoder.finish()?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -472,63 +577,205 @@ pub fn write_ssb(path: &Path, brick: &VolumeBrick) -> Result<u64, BrickError> {
     file.write_all(&SSB_FORMAT_VERSION.to_le_bytes())?;
     file.write_all(&(header_json.len() as u32).to_le_bytes())?;
     file.write_all(&header_json)?;
-    file.write_all(&compressed)?;
+    let mut encoder = ZlibEncoder::new(file, Compression::default());
+    write_payload(&mut encoder, brick)?;
+    let mut file = encoder.finish()?;
     file.flush()?;
     Ok(std::fs::metadata(path)?.len())
 }
 
-fn take<'a>(
-    buf: &'a [u8],
-    cursor: &mut usize,
-    n: usize,
+// Keep compressed input residency bounded while providing zlib with reasonably
+// large sequential chunks. Full-domain HRRR `.ssb` files can exceed 200 MiB.
+const SSB_READ_BUFFER_BYTES: usize = 64 * 1024;
+
+fn read_file_exact<R: Read>(
+    reader: &mut R,
+    cursor: &mut u64,
+    bytes: &mut [u8],
     what: &str,
-) -> Result<&'a [u8], BrickError> {
+    file_len: u64,
+) -> Result<(), BrickError> {
+    let n = bytes.len();
     let end = cursor
-        .checked_add(n)
+        .checked_add(n as u64)
         .ok_or_else(|| BrickError::Truncated(format!("{what}: length overflow")))?;
-    if end > buf.len() {
+    if end > file_len {
         return Err(BrickError::Truncated(format!(
-            "{what}: need {n} bytes at {cursor}, have {}",
-            buf.len()
+            "{what}: need {n} bytes at {cursor}, have {file_len}"
         )));
     }
-    let slice = &buf[*cursor..end];
+    reader.read_exact(bytes).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            BrickError::Truncated(format!(
+                "{what}: need {n} bytes at {cursor}, have {file_len}"
+            ))
+        } else {
+            BrickError::Io(e)
+        }
+    })?;
     *cursor = end;
-    Ok(slice)
+    Ok(())
 }
 
-fn read_plane_f32(
-    raw: &[u8],
-    cursor: &mut usize,
+fn check_file_bytes_available(
+    cursor: u64,
+    n: usize,
+    file_len: u64,
+    what: &str,
+) -> Result<(), BrickError> {
+    let end = cursor
+        .checked_add(n as u64)
+        .ok_or_else(|| BrickError::Truncated(format!("{what}: length overflow")))?;
+    if end > file_len {
+        return Err(BrickError::Truncated(format!(
+            "{what}: need {n} bytes at {cursor}, have {file_len}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_payload_exact<R: Read>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    what: &str,
+) -> Result<(), BrickError> {
+    reader.read_exact(bytes).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            BrickError::Truncated(format!("{what}: expected {} payload bytes", bytes.len()))
+        } else {
+            BrickError::Io(e)
+        }
+    })
+}
+
+fn read_payload_bytes<R: Read>(
+    reader: &mut R,
+    n: usize,
+    what: &str,
+) -> Result<Vec<u8>, BrickError> {
+    let mut out = vec![0u8; n];
+    read_payload_exact(reader, &mut out, what)?;
+    Ok(out)
+}
+
+fn read_temperature_u16<R: Read>(reader: &mut R, cells_3d: usize) -> Result<Vec<u16>, BrickError> {
+    const CHUNK: usize = 16 * 1024;
+    let mut out = Vec::with_capacity(cells_3d);
+    let mut buf = vec![0u8; CHUNK * 2];
+    let mut remaining = cells_3d;
+    while remaining > 0 {
+        let samples = remaining.min(CHUNK);
+        let bytes = &mut buf[..samples * 2];
+        read_payload_exact(reader, bytes, "temperature")?;
+        out.extend(
+            bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]])),
+        );
+        remaining -= samples;
+    }
+    Ok(out)
+}
+
+fn read_plane_f32<R: Read>(
+    reader: &mut R,
     cells_2d: usize,
     name: &str,
 ) -> Result<Vec<f32>, BrickError> {
-    let bytes = take(raw, cursor, cells_2d * 4, name)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    const CHUNK: usize = 16 * 1024;
+    let mut out = Vec::with_capacity(cells_2d);
+    let mut buf = vec![0u8; CHUNK * 4];
+    let mut remaining = cells_2d;
+    while remaining > 0 {
+        let samples = remaining.min(CHUNK);
+        let bytes = &mut buf[..samples * 4];
+        read_payload_exact(reader, bytes, name)?;
+        out.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
+        remaining -= samples;
+    }
+    Ok(out)
 }
 
 /// Read an `.ssb` file back into a `VolumeBrick`.
 pub fn read_ssb(path: &Path) -> Result<VolumeBrick, BrickError> {
-    let bytes = std::fs::read(path)?;
-    let mut cursor = 0usize;
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let reader = BufReader::with_capacity(SSB_READ_BUFFER_BYTES, file);
+    read_ssb_stream(reader, file_len)
+}
 
-    let magic = take(&bytes, &mut cursor, 4, "magic")?;
+fn read_ssb_stream<R: BufRead>(mut reader: R, file_len: u64) -> Result<VolumeBrick, BrickError> {
+    let mut cursor = 0u64;
+
+    let mut magic = [0u8; 4];
+    read_file_exact(&mut reader, &mut cursor, &mut magic, "magic", file_len)?;
     if magic != SSB_MAGIC {
-        let mut m = [0u8; 4];
-        m.copy_from_slice(magic);
-        return Err(BrickError::BadMagic(m));
+        return Err(BrickError::BadMagic(magic));
     }
-    let version = u32::from_le_bytes(take(&bytes, &mut cursor, 4, "version")?.try_into().unwrap());
+    let mut version_bytes = [0u8; 4];
+    read_file_exact(
+        &mut reader,
+        &mut cursor,
+        &mut version_bytes,
+        "version",
+        file_len,
+    )?;
+    let version = u32::from_le_bytes(version_bytes);
     if version != SSB_FORMAT_VERSION {
         return Err(BrickError::UnsupportedVersion(version));
     }
-    let header_len_bytes = take(&bytes, &mut cursor, 4, "header_len")?;
-    let header_len = u32::from_le_bytes(header_len_bytes.try_into().unwrap()) as usize;
-    let header_bytes = take(&bytes, &mut cursor, header_len, "header")?;
-    let header: BrickHeader = serde_json::from_slice(header_bytes)?;
+    let mut header_len_bytes = [0u8; 4];
+    read_file_exact(
+        &mut reader,
+        &mut cursor,
+        &mut header_len_bytes,
+        "header_len",
+        file_len,
+    )?;
+    let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+    check_file_bytes_available(cursor, header_len, file_len, "header")?;
+    let mut header_bytes = vec![0u8; header_len];
+    read_file_exact(
+        &mut reader,
+        &mut cursor,
+        &mut header_bytes,
+        "header",
+        file_len,
+    )?;
+    let header: BrickHeader = serde_json::from_slice(&header_bytes)?;
+    if header.format_version != version {
+        return Err(BrickError::Truncated(format!(
+            "header format_version {} disagrees with file version {version}",
+            header.format_version
+        )));
+    }
+    let expected_channels: Vec<String> = CHANNELS_3D.iter().map(|s| s.to_string()).collect();
+    if header.channels_3d != expected_channels {
+        return Err(BrickError::Truncated(format!(
+            "header channel order {:?} does not match SSB v{version} {:?}",
+            header.channels_3d, expected_channels
+        )));
+    }
+    let mut expected_planes = vec!["hgt", "landmask", "tsk", "u10", "v10"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if header.has_snowh {
+        expected_planes.push("snowh".to_string());
+    }
+    if header.has_ivgtyp {
+        expected_planes.push("ivgtyp".to_string());
+    }
+    if header.planes_2d != expected_planes {
+        return Err(BrickError::Truncated(format!(
+            "header plane order {:?} does not match flags {:?}",
+            header.planes_2d, expected_planes
+        )));
+    }
 
     // Corrupt-header hardening: the dims are untrusted bytes, so the cell products are
     // computed CHECKED (the plain product overflow-panics in a debug build and wraps to
@@ -546,7 +793,7 @@ pub fn read_ssb(path: &Path) -> Result<VolumeBrick, BrickError> {
     })?;
     let n_planes = 5usize + usize::from(header.has_snowh) + usize::from(header.has_ivgtyp);
     let expected_payload = cells_3d
-        .checked_mul(CHANNELS_3D.len() + 2) // five u8 channels + the u16 temperature
+        .checked_mul(CHANNELS_3D.len() + 2) // seven u8 channels + the u16 temperature
         .and_then(|v| v.checked_add(cells_2d.checked_mul(n_planes * 4)?))
         .filter(|&v| (v as u64) <= MAX_SSB_PAYLOAD_BYTES)
         .ok_or_else(|| {
@@ -556,43 +803,47 @@ pub fn read_ssb(path: &Path) -> Result<VolumeBrick, BrickError> {
             ))
         })?;
 
-    let mut decoder = ZlibDecoder::new(&bytes[cursor..]).take(expected_payload as u64 + 1);
-    let mut raw = Vec::new();
-    decoder.read_to_end(&mut raw)?;
-    if raw.len() > expected_payload {
-        return Err(BrickError::Truncated(format!(
-            "payload exceeds the {expected_payload} bytes the header describes"
-        )));
+    // Decode directly into final channel/plane allocations. The pre-v4 reader
+    // first materialized the whole raw payload and then cloned every field out of
+    // it, temporarily doubling brick memory; seven v4+ volume channels make that
+    // avoidable spike especially costly on full HRRR domains.
+    let mut decoder = ZlibDecoder::new(reader).take(expected_payload as u64 + 1);
+    let ext_liquid = read_payload_bytes(&mut decoder, cells_3d, "ext_liquid")?;
+    let ext_ice = read_payload_bytes(&mut decoder, cells_3d, "ext_ice")?;
+    let ext_snow = read_payload_bytes(&mut decoder, cells_3d, "ext_snow")?;
+    let ext_precip = read_payload_bytes(&mut decoder, cells_3d, "ext_precip")?;
+    let tau_up = read_payload_bytes(&mut decoder, cells_3d, "tau_up")?;
+    let qvapor = read_payload_bytes(&mut decoder, cells_3d, "qvapor")?;
+    let cloud_fraction = read_payload_bytes(&mut decoder, cells_3d, "cloud_fraction")?;
+    if !header.has_cloud_fraction && cloud_fraction.iter().any(|&v| v != 255) {
+        return Err(BrickError::Truncated(
+            "cloud_fraction provenance is false but fallback bytes are not all 255".to_string(),
+        ));
     }
-    let mut p = 0usize;
 
-    let ext_liquid = take(&raw, &mut p, cells_3d, "ext_liquid")?.to_vec();
-    let ext_ice = take(&raw, &mut p, cells_3d, "ext_ice")?.to_vec();
-    let ext_precip = take(&raw, &mut p, cells_3d, "ext_precip")?.to_vec();
-    let tau_up = take(&raw, &mut p, cells_3d, "tau_up")?.to_vec();
-    let qvapor = take(&raw, &mut p, cells_3d, "qvapor")?.to_vec();
+    let temperature_f16 = read_temperature_u16(&mut decoder, cells_3d)?;
 
-    let temp_bytes = take(&raw, &mut p, cells_3d * 2, "temperature")?;
-    let temperature_f16: Vec<u16> = temp_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    let hgt = read_plane_f32(&raw, &mut p, cells_2d, "hgt")?;
-    let landmask = read_plane_f32(&raw, &mut p, cells_2d, "landmask")?;
-    let tsk = read_plane_f32(&raw, &mut p, cells_2d, "tsk")?;
-    let u10 = read_plane_f32(&raw, &mut p, cells_2d, "u10")?;
-    let v10 = read_plane_f32(&raw, &mut p, cells_2d, "v10")?;
+    let hgt = read_plane_f32(&mut decoder, cells_2d, "hgt")?;
+    let landmask = read_plane_f32(&mut decoder, cells_2d, "landmask")?;
+    let tsk = read_plane_f32(&mut decoder, cells_2d, "tsk")?;
+    let u10 = read_plane_f32(&mut decoder, cells_2d, "u10")?;
+    let v10 = read_plane_f32(&mut decoder, cells_2d, "v10")?;
     let snowh = if header.has_snowh {
-        Some(read_plane_f32(&raw, &mut p, cells_2d, "snowh")?)
+        Some(read_plane_f32(&mut decoder, cells_2d, "snowh")?)
     } else {
         None
     };
     let ivgtyp = if header.has_ivgtyp {
-        Some(read_plane_f32(&raw, &mut p, cells_2d, "ivgtyp")?)
+        Some(read_plane_f32(&mut decoder, cells_2d, "ivgtyp")?)
     } else {
         None
     };
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra)? != 0 {
+        return Err(BrickError::Truncated(format!(
+            "payload exceeds the {expected_payload} bytes the header describes"
+        )));
+    }
 
     Ok(VolumeBrick {
         nx: header.nx,
@@ -604,9 +855,12 @@ pub fn read_ssb(path: &Path) -> Result<VolumeBrick, BrickError> {
         quant: header.quant,
         ext_liquid,
         ext_ice,
+        ext_snow,
         ext_precip,
         tau_up,
         qvapor,
+        cloud_fraction,
+        has_cloud_fraction: header.has_cloud_fraction,
         temperature_f16,
         hgt,
         landmask,
@@ -669,6 +923,10 @@ pub struct ManifestTimestep {
     /// The per-volume quantization scales for this timestep (design: run.json
     /// carries the quantization scales).
     pub quant: ChannelQuant,
+    /// Whether `cloud_fraction` came from a trusted model field. False means the
+    /// brick carries the explicit all-255 full-coverage fallback.
+    #[serde(default)]
+    pub has_cloud_fraction: bool,
     pub ssb_bytes: u64,
     /// Source-wrfout identity at ingest time (byte length), the staleness gate: a
     /// re-run WRF writing over the same path changes it, so a cache hit can detect
@@ -767,8 +1025,8 @@ impl RunManifest {
                 Ok(m) => m,
                 // An OLD-FORMAT manifest found during INGEST is a regenerable cache
                 // being re-populated by a newer build: SUPERSEDE it with a fresh
-                // manifest instead of erroring (the v2 -> v3 self-heal; owner-reported
-                // "Render failed: unsupported .ssb version: 2"). The old-format .ssb
+                // manifest instead of erroring (the source-backed format self-heal).
+                // The old-format .ssb
                 // files alongside it are refused by `read_ssb` and re-ingested per
                 // timestep through the same path; only the READ paths (a cached
                 // run.json open) keep the hard remedy-bearing refusal, because there
@@ -872,6 +1130,8 @@ impl RunManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -881,6 +1141,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("simsat-ssb-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: Arc<AtomicU64>,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+            Ok(read)
+        }
     }
 
     #[test]
@@ -917,6 +1190,30 @@ mod tests {
         assert_eq!(quant.vmax, 0.0);
         assert!(codes.iter().all(|&c| c == 0));
         assert_eq!(quant.decode(200), 0.0);
+    }
+
+    #[test]
+    fn cloud_fraction_linear_u8_clamps_rounds_and_decodes() {
+        let codes = encode_cloud_fraction(&[
+            -1.0,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+        ]);
+        assert_eq!(codes, vec![0, 0, 128, 255, 255, 0, 0, 0]);
+        assert_eq!(decode_cloud_fraction(0), 0.0);
+        assert_eq!(decode_cloud_fraction(255), 1.0);
+        assert!((decode_cloud_fraction(128) - 128.0 / 255.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cloud_fraction_tiny_positive_tail_never_encodes_as_clear() {
+        let codes = encode_cloud_fraction(&[f32::MIN_POSITIVE, 1.0e-8, 0.49 / 255.0, 0.5 / 255.0]);
+        assert_eq!(codes, vec![1, 1, 1, 1]);
     }
 
     #[test]
@@ -959,6 +1256,7 @@ mod tests {
         let cells_2d = nx * ny;
         let ext_liquid_f32: Vec<f32> = (0..cells_3d).map(|i| (i as f32) * 1.0e-3).collect();
         let ext_ice_f32: Vec<f32> = (0..cells_3d).map(|i| (i as f32) * 2.0e-4).collect();
+        let ext_snow_f32: Vec<f32> = (0..cells_3d).map(|i| (i as f32) * 3.0e-5).collect();
         let ext_precip_f32: Vec<f32> = vec![0.0; cells_3d];
         let tau_f32: Vec<f32> = (0..cells_3d).map(|i| 0.1 * i as f32).collect();
         let qv_f32: Vec<f32> = (0..cells_3d).map(|i| 1.0e-3 + 1.0e-5 * i as f32).collect();
@@ -966,12 +1264,14 @@ mod tests {
 
         let (ql, ext_liquid) = encode_log_channel(&ext_liquid_f32);
         let (qi, ext_ice) = encode_log_channel(&ext_ice_f32);
+        let (qs, ext_snow) = encode_log_channel(&ext_snow_f32);
         let (qp, ext_precip) = encode_log_channel(&ext_precip_f32);
         let (qt, tau_up) = encode_log_channel(&tau_f32);
         let (qv, qvapor) = encode_log_channel(&qv_f32);
         let mut map = BTreeMap::new();
         map.insert("ext_liquid".to_string(), ql);
         map.insert("ext_ice".to_string(), qi);
+        map.insert("ext_snow".to_string(), qs);
         map.insert("ext_precip".to_string(), qp);
         map.insert("tau_up".to_string(), qt);
         map.insert("qvapor".to_string(), qv);
@@ -986,9 +1286,16 @@ mod tests {
             quant: ChannelQuant(map),
             ext_liquid,
             ext_ice,
+            ext_snow,
             ext_precip,
             tau_up,
             qvapor,
+            cloud_fraction: encode_cloud_fraction(
+                &(0..cells_3d)
+                    .map(|i| i as f32 / (cells_3d - 1) as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            has_cloud_fraction: true,
             temperature_f16: encode_temperature_celsius(&kelvin),
             hgt: (0..cells_2d).map(|i| 10.0 * i as f32).collect(),
             landmask: vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
@@ -1014,11 +1321,173 @@ mod tests {
     }
 
     #[test]
+    fn write_ssb_rejects_bad_channel_lengths_and_false_provenance_payload() {
+        let dir = temp_dir();
+        let path = dir.join("bad.ssb");
+        let mut short = tiny_brick();
+        short.ext_snow.pop();
+        assert!(matches!(
+            write_ssb(&path, &short),
+            Err(BrickError::Truncated(_))
+        ));
+
+        let mut bad_fallback = tiny_brick();
+        bad_fallback.has_cloud_fraction = false;
+        assert!(bad_fallback.cloud_fraction.iter().any(|&v| v != 255));
+        assert!(matches!(
+            write_ssb(&path, &bad_fallback),
+            Err(BrickError::Truncated(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn ssb_rejects_bad_magic() {
         let dir = temp_dir();
         let path = dir.join("garbage.ssb");
         std::fs::write(&path, b"NOTSSBanythinggoeshere").unwrap();
         assert!(matches!(read_ssb(&path), Err(BrickError::BadMagic(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssb_refuses_older_and_newer_versions_without_reading_the_whole_file() {
+        for version in [SSB_FORMAT_VERSION - 1, SSB_FORMAT_VERSION + 1] {
+            let mut bytes = Vec::with_capacity(SSB_READ_BUFFER_BYTES * 8);
+            bytes.extend_from_slice(&SSB_MAGIC);
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.resize(SSB_READ_BUFFER_BYTES * 8, 0xa5);
+            let file_len = bytes.len() as u64;
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let counted = CountingReader {
+                inner: Cursor::new(bytes),
+                bytes_read: Arc::clone(&bytes_read),
+            };
+            let reader = BufReader::with_capacity(SSB_READ_BUFFER_BYTES, counted);
+
+            assert!(matches!(
+                read_ssb_stream(reader, file_len),
+                Err(BrickError::UnsupportedVersion(found)) if found == version
+            ));
+            let consumed = bytes_read.load(Ordering::Relaxed);
+            assert!(
+                consumed <= SSB_READ_BUFFER_BYTES as u64,
+                "version rejection read {consumed} bytes instead of one bounded buffer"
+            );
+            assert!(
+                consumed < file_len,
+                "version rejection must not read the whole {file_len}-byte file"
+            );
+        }
+    }
+
+    #[test]
+    fn read_ssb_rejects_truncated_fixed_and_json_headers() {
+        let dir = temp_dir();
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&SSB_MAGIC);
+        prefix.extend_from_slice(&SSB_FORMAT_VERSION.to_le_bytes());
+        prefix.extend_from_slice(&32u32.to_le_bytes());
+        prefix.extend_from_slice(b"short");
+
+        for (cut, expected) in [
+            (0usize, "magic: need 4 bytes at 0, have 0"),
+            (3, "magic: need 4 bytes at 0, have 3"),
+            (4, "version: need 4 bytes at 4, have 4"),
+            (7, "version: need 4 bytes at 4, have 7"),
+            (8, "header_len: need 4 bytes at 8, have 8"),
+            (11, "header_len: need 4 bytes at 8, have 11"),
+            (12, "header: need 32 bytes at 12, have 12"),
+            (15, "header: need 32 bytes at 12, have 15"),
+            (prefix.len(), "header: need 32 bytes at 12, have 17"),
+        ] {
+            let path = dir.join(format!("header-{cut}.ssb"));
+            std::fs::write(&path, &prefix[..cut]).unwrap();
+            let Err(BrickError::Truncated(message)) = read_ssb(&path) else {
+                panic!("a header truncated at byte {cut} must be reported as truncated");
+            };
+            assert_eq!(message, expected);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_rejects_impossible_header_len_before_allocation() {
+        let dir = temp_dir();
+        let path = dir.join("impossible-header.ssb");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SSB_MAGIC);
+        bytes.extend_from_slice(&SSB_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let Err(BrickError::Truncated(message)) = read_ssb(&path) else {
+            panic!("an impossible header length must be rejected before allocation");
+        };
+        assert_eq!(
+            message,
+            format!("header: need {} bytes at 12, have 12", u32::MAX)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_accepts_trailing_compressed_garbage_like_the_legacy_reader() {
+        let dir = temp_dir();
+        let path = dir.join("trailing.ssb");
+        let brick = tiny_brick();
+        write_ssb(&path, &brick).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"trailing bytes after the complete zlib stream");
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(read_ssb(&path).unwrap(), brick);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_refuses_header_channel_reordering() {
+        let dir = temp_dir();
+        let good_path = dir.join("good.ssb");
+        write_ssb(&good_path, &tiny_brick()).unwrap();
+        let good = std::fs::read(&good_path).unwrap();
+        let old_len = u32::from_le_bytes(good[8..12].try_into().unwrap()) as usize;
+        let mut header: BrickHeader = serde_json::from_slice(&good[12..12 + old_len]).unwrap();
+        header.channels_3d.swap(2, 3);
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&good[0..8]);
+        bad.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        bad.extend_from_slice(&header_json);
+        bad.extend_from_slice(&good[12 + old_len..]);
+        let bad_path = dir.join("reordered.ssb");
+        std::fs::write(&bad_path, bad).unwrap();
+        let err = read_ssb(&bad_path).unwrap_err();
+        assert!(matches!(err, BrickError::Truncated(_)), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_refuses_header_version_disagreement() {
+        let dir = temp_dir();
+        let good_path = dir.join("good.ssb");
+        write_ssb(&good_path, &tiny_brick()).unwrap();
+        let good = std::fs::read(&good_path).unwrap();
+        let old_len = u32::from_le_bytes(good[8..12].try_into().unwrap()) as usize;
+        let mut header: BrickHeader = serde_json::from_slice(&good[12..12 + old_len]).unwrap();
+        header.format_version = SSB_FORMAT_VERSION + 1;
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&good[0..8]);
+        bad.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        bad.extend_from_slice(&header_json);
+        bad.extend_from_slice(&good[12 + old_len..]);
+        let bad_path = dir.join("disagrees.ssb");
+        std::fs::write(&bad_path, bad).unwrap();
+
+        let err = read_ssb(&bad_path).unwrap_err();
+        assert!(matches!(err, BrickError::Truncated(_)), "{err:?}");
+        assert!(err.to_string().contains("disagrees"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1056,6 +1525,7 @@ mod tests {
             file: brick_file_name(key),
             time_iso: Some(iso.to_string()),
             quant: quant.clone(),
+            has_cloud_fraction: false,
             ssb_bytes: bytes,
             source_bytes: None,
             source_mtime_unix: None,
@@ -1137,6 +1607,7 @@ mod tests {
             file: brick_file_name("20250621_0215"),
             time_iso: Some("2025-06-21T02:15:00Z".to_string()),
             quant: ChannelQuant(BTreeMap::new()),
+            has_cloud_fraction: true,
             ssb_bytes: 100,
             source_bytes: Some(2_047_845_048),
             source_mtime_unix: Some(1_750_470_000),
@@ -1179,16 +1650,18 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let back: ManifestTimestep = serde_json::from_str(&json).unwrap();
         assert_eq!(back, entry);
-        // Strip the WS3 fields to simulate a pre-WS3 v2 manifest entry.
+        // Strip optional fields to exercise their conservative defaults.
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = value.as_object_mut().unwrap();
         obj.remove("source_bytes");
         obj.remove("source_mtime_unix");
         obj.remove("anchor");
+        obj.remove("has_cloud_fraction");
         let old: ManifestTimestep = serde_json::from_value(value).unwrap();
         assert_eq!(old.source_bytes, None);
         assert_eq!(old.source_mtime_unix, None);
         assert_eq!(old.anchor, None);
+        assert!(!old.has_cloud_fraction);
         assert_eq!(old.key, entry.key);
     }
 
@@ -1220,23 +1693,33 @@ mod tests {
             RunManifest::load(&path),
             Err(BrickError::UnsupportedManifestVersion { found: 0, .. })
         ));
-        // The v3 snow-optics bump: a v2 manifest (schema-compatible, but its bricks
-        // carry the inflated pre-fix snow extinction) is refused the same way — the
-        // remedy is a re-ingest from the source wrfout, never a silent reuse.
+        // A v3 manifest lacks SSB v4+'s snow-subset / cloud-fraction payload and is
+        // refused the same way. The remedy is a source re-ingest, never silent reuse.
         std::fs::write(
             &path,
-            r#"{ "format_version": 2, "run_id": "pre_snow_fix" }"#,
+            r#"{ "format_version": 3, "run_id": "pre_fractional_clouds" }"#,
         )
         .unwrap();
         assert!(matches!(
             RunManifest::load(&path),
-            Err(BrickError::UnsupportedManifestVersion { found: 2, .. })
+            Err(BrickError::UnsupportedManifestVersion { found: 3, .. })
+        ));
+        // v4 has the same byte layout as v5 but predates the corrected WRF/HRRR
+        // cloud-fraction semantics, so it too must be rejected and regenerated.
+        std::fs::write(
+            &path,
+            r#"{ "format_version": 4, "run_id": "old_fraction_semantics" }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RunManifest::load(&path),
+            Err(BrickError::UnsupportedManifestVersion { found: 4, .. })
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The v2 -> v3 INGEST self-heal (owner-reported "Render failed: unsupported .ssb
-    /// version: 2"): `load_or_new` SUPERSEDES an old-format manifest with a fresh one
+    /// The v4 -> v5 INGEST self-heal: `load_or_new` SUPERSEDES an old-format
+    /// manifest with a fresh one
     /// at the current version instead of propagating the read refusal — during ingest
     /// the source wrfout is present, so the regenerable cache regenerates. The READ
     /// paths (`RunManifest::load` direct, a cached run.json open) keep the hard
@@ -1246,7 +1729,7 @@ mod tests {
         let dir = temp_dir();
         let path = RunManifest::path(&dir, "old_run");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{ "format_version": 2, "run_id": "old_run" }"#).unwrap();
+        std::fs::write(&path, r#"{ "format_version": 4, "run_id": "old_run" }"#).unwrap();
         let manifest = RunManifest::load_or_new(
             &path,
             "old_run",
@@ -1373,6 +1856,56 @@ mod tests {
         assert!(
             read_ssb(&chopped_path).is_err(),
             "a truncated payload must error, not panic or return a partial brick"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_rejects_corrupt_zlib_payload_cleanly() {
+        let dir = temp_dir();
+        let path = dir.join("whole.ssb");
+        write_ssb(&path, &tiny_brick()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let payload_start = 12 + header_len;
+        bytes[payload_start] = 0;
+        let corrupt_path = dir.join("corrupt.ssb");
+        std::fs::write(&corrupt_path, bytes).unwrap();
+
+        let err = read_ssb(&corrupt_path).unwrap_err();
+        assert!(
+            matches!(&err, BrickError::Io(_)),
+            "a corrupt zlib stream must remain an I/O error, got {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_ssb_rejects_one_extra_decompressed_payload_byte() {
+        let dir = temp_dir();
+        let path = dir.join("extra-payload.ssb");
+        let brick = tiny_brick();
+        let header_json = serde_json::to_vec(&brick.header()).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        write_payload(&mut encoder, &brick).unwrap();
+        encoder.write_all(&[0xa5]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SSB_MAGIC);
+        bytes.extend_from_slice(&SSB_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header_json);
+        bytes.extend_from_slice(&compressed);
+        std::fs::write(&path, bytes).unwrap();
+
+        let expected_payload = brick.ext_liquid.len() * (CHANNELS_3D.len() + 2)
+            + brick.hgt.len() * brick.planes_2d_list().len() * 4;
+        let Err(BrickError::Truncated(message)) = read_ssb(&path) else {
+            panic!("one extra decompressed byte must be rejected as an oversized payload");
+        };
+        assert_eq!(
+            message,
+            format!("payload exceeds the {expected_payload} bytes the header describes")
         );
         std::fs::remove_dir_all(&dir).ok();
     }

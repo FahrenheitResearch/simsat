@@ -425,6 +425,13 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("ext_liquid".to_string(), ql);
         map.insert("ext_ice".to_string(), qi);
+        map.insert(
+            "ext_snow".to_string(),
+            LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
+        );
         map.insert("ext_precip".to_string(), qp);
         map.insert(
             "tau_up".to_string(),
@@ -444,9 +451,12 @@ mod tests {
             quant: ChannelQuant(map),
             ext_liquid,
             ext_ice,
+            ext_snow: vec![0u8; n3],
             ext_precip,
             tau_up: vec![0u8; n3],
             qvapor,
+            cloud_fraction: vec![255u8; n3],
+            has_cloud_fraction: false,
             temperature_f16: encode_temperature_celsius(&kelvin),
             hgt: vec![0.0f32; n2],
             landmask: vec![1.0f32; n2],

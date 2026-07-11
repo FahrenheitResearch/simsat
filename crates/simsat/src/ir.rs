@@ -623,8 +623,15 @@ mod tests {
             horiz_pitch_m: vol.horiz_pitch_m,
             ext_liquid: vol.ext_liquid.clone(),
             ext_ice: vol.ext_ice.clone(),
+            ext_snow: vec![0; vol.ext_liquid.len()],
+            ext_snow_quant: crate::bricks::LogQuant {
+                vmin: 0.0,
+                vmax: 0.0,
+            },
             ext_precip: vol.ext_precip.clone(),
             tau_up: vec![0.0; vol.ext_liquid.len()],
+            cloud_fraction: vec![255; vol.ext_liquid.len()],
+            has_cloud_fraction: false,
         };
         OccupancyMip::build(&dv, OCCUPANCY_MIP_FACTOR)
     }
@@ -1154,6 +1161,7 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("ext_liquid".to_string(), zero);
         map.insert("ext_ice".to_string(), zero);
+        map.insert("ext_snow".to_string(), zero);
         map.insert("ext_precip".to_string(), zero);
         map.insert("tau_up".to_string(), zero);
         map.insert("qvapor".to_string(), qv);
@@ -1167,9 +1175,12 @@ mod tests {
             quant: ChannelQuant(map),
             ext_liquid: vec![0u8; n3],
             ext_ice: vec![0u8; n3],
+            ext_snow: vec![0u8; n3],
             ext_precip: vec![0u8; n3],
             tau_up: vec![0u8; n3],
             qvapor,
+            cloud_fraction: vec![255u8; n3],
+            has_cloud_fraction: false,
             temperature_f16: encode_temperature_celsius(&kelvin),
             hgt: vec![hgt_m; n2],
             landmask: vec![1.0f32; n2],

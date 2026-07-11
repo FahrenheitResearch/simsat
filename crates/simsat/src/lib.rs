@@ -128,6 +128,7 @@ pub mod bricks;
 pub mod camera;
 pub mod clouds;
 pub mod derived;
+pub mod fractional_clouds;
 pub mod frame;
 pub mod geocolor;
 pub mod gpu;
@@ -166,7 +167,23 @@ pub mod wv;
 /// The channel SET and layout are unchanged — only the extinction CONTENT — but a
 /// v2 brick renders wrong optical depths, so v2 caches are refused on read and
 /// re-ingested from the source wrfout.
-pub const SSB_FORMAT_VERSION: u32 = 3;
+///
+/// v4 (fractional-cloud foundation): `ext_snow` records a QSNOW-only auxiliary
+/// subset while the legacy `ext_precip` channel remains the total large-particle
+/// extinction (rain + graupel + snow). This deliberate duplicate
+/// keeps legacy/GPU/IR totals byte-compatible while allowing fractional-cloud
+/// rendering to scale just the snow share. A linear-u8 `cloud_fraction` channel
+/// and explicit source provenance distinguish real model coverage from the
+/// all-covered fallback. The payload layout therefore changes; v3 bricks are
+/// refused and regenerable source-backed caches self-heal by re-ingesting.
+///
+/// v5 (fraction semantics): the byte layout is intentionally unchanged, but WRF
+/// zero-fraction condensate cells are repaired with the scheme-consistent Xu-Randall
+/// diagnostic and HRRR native cloud fractions are vertically remapped with the same
+/// overlap semantics used by the renderer. A v4 brick therefore contains materially
+/// different cloud-coverage content and must be regenerated even though a v5 reader
+/// could parse its bytes.
+pub const SSB_FORMAT_VERSION: u32 = 5;
 
 /// Four-byte magic at the head of every `.ssb` brick file: `SSB` + format epoch.
 pub const SSB_MAGIC: [u8; 4] = *b"SSB1";
@@ -176,9 +193,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssb_format_version_is_v3() {
-        // v3 = the snow-optics fix (extinction CONTENT changed; see the const doc).
-        assert_eq!(SSB_FORMAT_VERSION, 3);
+    fn ssb_format_version_is_v5() {
+        // v5 invalidates v4 cloud-fraction semantics without changing its channel layout.
+        assert_eq!(SSB_FORMAT_VERSION, 5);
     }
 
     #[test]
