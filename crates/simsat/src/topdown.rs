@@ -90,6 +90,8 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         flat_albedo_srgb: base.flat_albedo_srgb,
         raymarch_steps: base.raymarch_steps,
         exposure: base.exposure,
+        atmosphere_correction: base.atmosphere_correction,
+        terrain_atmosphere: base.terrain_atmosphere,
     }
 }
 
@@ -769,6 +771,8 @@ mod tests {
             flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
             raymarch_steps: 16,
             exposure: DEFAULT_EXPOSURE,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
         }
     }
 

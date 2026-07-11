@@ -53,7 +53,8 @@ use crate::ir::{self, IrConfig, IrScene, IrVolume};
 use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::render::{
     DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow,
-    normals_from_hgt, shade_surface, snow_fraction,
+    normals_from_hgt, reflectance_from_radiance, shade_surface, snow_fraction,
+    surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::SolarFrame;
@@ -115,7 +116,7 @@ pub enum Product {
     /// needs (on [`Georef::mercator_corners_lonlat`]; extent in EPSG:3857 metres,
     /// [`ExtentKind::WebMercatorMeters`]). NO Blue Marble / surface / ground atmosphere —
     /// the HOST map is the ground. TOP-DOWN by definition ([`RenderParams::view`] is
-    /// ignored); the sun / exposure / steps / multiscatter / margin / granulation
+    /// ignored); the sun / exposure / steps / multiscatter / beer-powder / margin / granulation
     /// controls drive the cloud march like the visible product. Returned as
     /// [`FrameData::CloudLayer`]. See [`crate::web_layer`] for the alpha model + datum
     /// notes and [`crate::topdown::render_cloud_layer_frame`] for the render.
@@ -196,20 +197,44 @@ pub struct RenderParams {
     /// trivial swap. See [`crate::camera::build_surface_raster_mode`] /
     /// [`crate::camera::build_map_raster`].
     pub margin_frac: f32,
+    /// Aerosol optical depth for the visible atmosphere. The shipped default is
+    /// [`crate::atmosphere::DEFAULT_AOD`]. This controls the Mie aerosol column only;
+    /// molecular Rayleigh scattering remains present at zero AOD.
+    pub aerosol_optical_depth: f32,
+    /// Apply the documented 1.5x relative-humidity swelling multiplier to the aerosol
+    /// extinction. Off by default so a requested AOD is used literally.
+    pub rh_aerosol_swelling: bool,
+    /// Apply the product-facing daytime aerial-veil correction. Disable this to retain
+    /// the full modeled path airlight; display/low-sun transforms remain independently
+    /// controlled by their existing product paths.
+    pub atmosphere_correction: bool,
+    /// Shorten surface atmosphere columns to the WRF terrain elevation. Disable this to
+    /// reproduce the legacy mean-sea-level atmosphere geometry.
+    pub terrain_atmosphere: bool,
     /// Display exposure gain (visible only). [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
     /// M5 Wrenninge multi-scatter octaves (visible only).
     pub multiscatter: bool,
+    /// Schneider beer-powder shaping of the direct cloud-sun term (visible only).
+    /// Off by default; this is an appearance/QA switch and does not change cloud
+    /// transmittance or the quantitative derived cloud-optical-depth product.
+    pub beer_powder: bool,
     /// Cloud march step quality (visible only).
     pub steps: StepQuality,
-    /// Composite volumetric clouds (visible only; `false` = surface-only, geostationary
-    /// QA). Top-down and the bands product always composite clouds.
+    /// Composite volumetric clouds (visible only; `false` = surface-only for RGB/bands,
+    /// and a transparent/neutral [`Product::CloudLayer`]).
     pub clouds: bool,
+    /// Multiplicative cloud optical-depth QA control (visible only). `1.0` consumes the
+    /// model-derived extinction unchanged; `0.0` makes cloud extinction transparent;
+    /// values up to `4.0` support bounded sensitivity tests. Applied consistently to the
+    /// view, secondary-sun, ambient, and ground-shadow optical depths. The quantitative
+    /// derived cloud-optical-depth product remains the unscaled physical input.
+    pub cloud_optical_depth_scale: f32,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise — see the granulation
-    /// section of [`crate::clouds`]). `None` (the default) = the PRODUCT SCOPING:
-    /// ON for the DISPLAY products ([`Product::VisibleRgb`], and through it the
-    /// GeoColor day half and the Sandwich visible base), OFF for the quantitative
-    /// raw-reflectance [`Product::VisibleBands`]. The raw-Kelvin thermal products
+    /// section of [`crate::clouds`]). `None` (the default) and `Some(false)` keep it
+    /// OFF; `Some(true)` enables it for DISPLAY products ([`Product::VisibleRgb`], and
+    /// through it the GeoColor day half and the Sandwich visible base). Quantitative
+    /// raw-reflectance [`Product::VisibleBands`] stays OFF. The raw-Kelvin thermal products
     /// ([`Product::Ir`] / [`Product::WaterVapor`]) and [`Product::Derived`] never
     /// granulate — they read the un-eroded brick by construction, so quantitative BT
     /// verification always reflects model skill, not display texturing. `Some(bool)`
@@ -253,8 +278,8 @@ pub struct RenderParams {
 impl RenderParams {
     /// Shipped defaults: GOES-East, timestep 0, TOP-DOWN map (the integration default),
     /// native resolution, the owner-approved exposure, multi-scatter + offline steps +
-    /// clouds on, the seasonal Blue Marble (download on), no sun override, no IR
-    /// enhancement, the studio cache dir.
+    /// clouds on, beer-powder + granulation off, the seasonal Blue Marble (download on),
+    /// no sun override, no IR enhancement, the studio cache dir.
     pub fn new(input: PathBuf) -> Self {
         Self {
             input,
@@ -263,10 +288,16 @@ impl RenderParams {
             view: ViewMode::TopDownMap,
             resolution: ResolutionMode::Native,
             margin_frac: 0.0,
+            aerosol_optical_depth: atmosphere::DEFAULT_AOD as f32,
+            rh_aerosol_swelling: false,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
             exposure: DEFAULT_EXPOSURE,
             multiscatter: true,
+            beer_powder: false,
             steps: StepQuality::Offline,
             clouds: true,
+            cloud_optical_depth_scale: 1.0,
             granulation: None,
             sun_override: None,
             cache: ingest::default_cache_dir(),
@@ -605,9 +636,9 @@ fn render_visible_scene(
     // M2 atmosphere.
     let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
     let atmo_params = AtmosphereParams {
-        aod: atmosphere::DEFAULT_AOD,
+        aod: params.aerosol_optical_depth as f64,
         pw_ratio,
-        aerosol_swelling: 1.0,
+        aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
     };
     let luts = AtmosphereLuts::build(&atmo_params);
@@ -627,7 +658,9 @@ fn render_visible_scene(
     // thermal products never granulate regardless. The SAME Option feeds the sun-OD
     // accumulation AND rides MarchConfig into the view + sun marches, so every march
     // of this composite samples ONE eroded field.
-    let gran_on = params.granulation.unwrap_or(false) && matches!(product, Product::VisibleRgb);
+    let gran_on = params.clouds
+        && params.granulation.unwrap_or(false)
+        && matches!(product, Product::VisibleRgb);
     let granulation = if gran_on {
         Some(clouds::Granulation::for_grid(horiz_pitch_m))
     } else {
@@ -659,7 +692,8 @@ fn render_visible_scene(
         AERIAL_FROXEL_DIM,
     );
     let mut cfg = MarchConfig {
-        beer_powder: false,
+        beer_powder: params.beer_powder,
+        cloud_optical_depth_scale: params.cloud_optical_depth_scale,
         octaves: if params.multiscatter {
             clouds::DEFAULT_OCTAVES
         } else {
@@ -703,6 +737,8 @@ fn render_visible_scene(
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
         raymarch_steps: 16,
         exposure: params.exposure,
+        atmosphere_correction: params.atmosphere_correction,
+        terrain_atmosphere: params.terrain_atmosphere,
     };
 
     // The per-pixel surface assembler (twin of the studio's `assemble`).
@@ -719,8 +755,8 @@ fn render_visible_scene(
     );
 
     // Render the requested product. RGB uses the shipped display path (byte-identical to
-    // the studio/PNG); Bands uses the pre-tonemap reflectance path. Top-down always
-    // composites clouds; geostationary honors the clouds flag (clouds-off = surface only).
+    // the studio/PNG); Bands uses the pre-tonemap reflectance path. Both views and both
+    // visible products honor the clouds flag (`false` = surface only).
     let (rnx, rny) = (raster.nx, raster.ny);
     let data = match product {
         Product::VisibleRgb => {
@@ -758,8 +794,10 @@ fn render_visible_scene(
                     rny,
                     assemble,
                 )
-            } else {
+            } else if params.clouds {
                 render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster.scan, assemble)
+            } else {
+                render_geo_surface_reflectance(&surf, &raster, assemble)
             };
             FrameData::Bands { reflectance }
         }
@@ -1172,9 +1210,9 @@ fn render_cloud_layer_scene(
     // M2 atmosphere (sun transmittance + the SH sky ambient the cloud march reads).
     let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
     let atmo_params = AtmosphereParams {
-        aod: atmosphere::DEFAULT_AOD,
+        aod: params.aerosol_optical_depth as f64,
         pw_ratio,
-        aerosol_swelling: 1.0,
+        aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
     };
     let luts = AtmosphereLuts::build(&atmo_params);
@@ -1185,7 +1223,7 @@ fn render_cloud_layer_scene(
     let horiz_pitch = horiz_pitch_m(proj);
     let vol = DecodedVolume::from_brick(brick, horiz_pitch);
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
-    let gran_on = params.granulation.unwrap_or(false);
+    let gran_on = params.clouds && params.granulation.unwrap_or(false);
     let granulation = if gran_on {
         Some(clouds::Granulation::for_grid(horiz_pitch))
     } else {
@@ -1207,7 +1245,8 @@ fn render_cloud_layer_scene(
         granulation,
     );
     let mut cfg = MarchConfig {
-        beer_powder: false,
+        beer_powder: params.beer_powder,
+        cloud_optical_depth_scale: params.cloud_optical_depth_scale,
         octaves: if params.multiscatter {
             clouds::DEFAULT_OCTAVES
         } else {
@@ -1235,15 +1274,24 @@ fn render_cloud_layer_scene(
     };
 
     // 1. The native cloud layer + shadow on the Lambert map raster.
-    let native = crate::topdown::render_cloud_layer_frame(
-        &scene,
-        OutputTransform::AbiReflectance,
-        params.exposure,
-        &raster.lat,
-        &raster.lon,
-        raster.nx,
-        raster.ny,
-    );
+    let native = if params.clouds {
+        crate::topdown::render_cloud_layer_frame(
+            &scene,
+            OutputTransform::AbiReflectance,
+            params.exposure,
+            &raster.lat,
+            &raster.lon,
+            raster.nx,
+            raster.ny,
+        )
+    } else {
+        crate::topdown::CloudLayerFrame {
+            nx: raster.nx,
+            ny: raster.ny,
+            rgba_premul: vec![0; raster.nx * raster.ny * 4],
+            shadow: vec![1.0; raster.nx * raster.ny],
+        }
+    };
 
     // 2. The Web-Mercator delivery grid over the raster's geodetic bbox, ~native pitch.
     let (la0, la1, lo0, lo1) = raster
@@ -1384,9 +1432,9 @@ fn render_perspective_scene(
     let horizon_map = HorizonMap::build(&brick.hgt, nx, ny, dx_m_m, dy_m_m);
     let pw_ratio = atmosphere::pw_ratio_from_brick(brick);
     let atmo_params = AtmosphereParams {
-        aod: atmosphere::DEFAULT_AOD,
+        aod: params.aerosol_optical_depth as f64,
         pw_ratio,
-        aerosol_swelling: 1.0,
+        aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
     };
     let luts = AtmosphereLuts::build(&atmo_params);
@@ -1394,7 +1442,7 @@ fn render_perspective_scene(
     let vol = DecodedVolume::from_brick(brick, horiz_pitch);
     let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
     // Granulation scoping: a DISPLAY product (the same opt-in rule as VisibleRgb).
-    let gran_on = params.granulation.unwrap_or(false);
+    let gran_on = params.clouds && params.granulation.unwrap_or(false);
     let granulation = if gran_on {
         Some(clouds::Granulation::for_grid(horiz_pitch))
     } else {
@@ -1416,7 +1464,8 @@ fn render_perspective_scene(
         granulation,
     );
     let mut cfg = MarchConfig {
-        beer_powder: false,
+        beer_powder: params.beer_powder,
+        cloud_optical_depth_scale: params.cloud_optical_depth_scale,
         octaves: if params.multiscatter {
             clouds::DEFAULT_OCTAVES
         } else {
@@ -1456,6 +1505,8 @@ fn render_perspective_scene(
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
         raymarch_steps: 16,
         exposure: params.exposure,
+        atmosphere_correction: params.atmosphere_correction,
+        terrain_atmosphere: params.terrain_atmosphere,
     };
     let assemble = make_assemble(
         brick,
@@ -1469,13 +1520,15 @@ fn render_perspective_scene(
         ny,
     );
 
-    let rgba = if cloud_layer_only {
+    let rgba = if cloud_layer_only && params.clouds {
         crate::topdown::render_perspective_cloud_layer(
             &scene,
             &basis,
             OutputTransform::AbiReflectance,
             params.exposure,
         )
+    } else if cloud_layer_only {
+        vec![0; raster.nx * raster.ny * 4]
     } else {
         let persp_scene = if params.clouds { Some(&scene) } else { None };
         crate::topdown::render_perspective_frame_rgba(&surf, persp_scene, &basis, assemble)
@@ -1782,34 +1835,48 @@ fn make_assemble<'a>(
             Some(bm) if bm.width > 0 && bm.height > 0 => bm.sample_bilinear(g[0], g[1]),
             _ => [FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB],
         };
-        let (normal_enu, is_water, terrain_horizon_rad, sky_openness, bent_normal_enu, wind_speed) =
-            if g[2] >= 0.0 {
-                let fi_f = (g[2] as f64 * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
-                let fj_f = (g[3] as f64 * ny as f64 - 0.5).clamp(0.0, (ny - 1) as f64);
-                let cell = fj_f.round() as usize * nx + fi_f.round() as usize;
-                let is_water = brick.landmask[cell] < 0.5;
-                let sun_az = (sun_enu[1] as f64).atan2(sun_enu[0] as f64);
-                let horizon = horizon_map.horizon_angle_at(fi_f, fj_f, sun_az) as f32;
-                let (openness, bent) = horizon_map.aperture_at(fi_f, fj_f);
-                let wind = (brick.u10[cell].powi(2) + brick.v10[cell].powi(2)).sqrt();
-                if !is_water {
-                    let snow = brick
-                        .snowh
-                        .as_ref()
-                        .map_or(0.0, |s| snow_fraction(s[cell] as f64));
-                    base = blend_snow(base, snow);
-                }
-                (
-                    normals[cell],
-                    is_water,
-                    horizon,
-                    openness as f32,
-                    [bent[0] as f32, bent[1] as f32, bent[2] as f32],
-                    wind,
-                )
+        let (
+            normal_enu,
+            is_water,
+            terrain_horizon_rad,
+            sky_openness,
+            bent_normal_enu,
+            wind_speed,
+            surface_elevation_m,
+        ) = if g[2] >= 0.0 {
+            let fi_f = (g[2] as f64 * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
+            let fj_f = (g[3] as f64 * ny as f64 - 0.5).clamp(0.0, (ny - 1) as f64);
+            let cell = fj_f.round() as usize * nx + fi_f.round() as usize;
+            let is_water = brick.landmask[cell] < 0.5;
+            let sun_az = (sun_enu[1] as f64).atan2(sun_enu[0] as f64);
+            let horizon = horizon_map.horizon_angle_at(fi_f, fj_f, sun_az) as f32;
+            let (openness, bent) = horizon_map.aperture_at(fi_f, fj_f);
+            let wind = (brick.u10[cell].powi(2) + brick.v10[cell].powi(2)).sqrt();
+            let elevation = brick.hgt[cell];
+            let elevation = if elevation.is_finite() {
+                elevation
             } else {
-                ([0.0, 0.0, 1.0], false, 0.0, 1.0, [0.0, 0.0, 1.0], 0.0)
+                0.0
             };
+            if !is_water {
+                let snow = brick
+                    .snowh
+                    .as_ref()
+                    .map_or(0.0, |s| snow_fraction(s[cell] as f64));
+                base = blend_snow(base, snow);
+            }
+            (
+                normals[cell],
+                is_water,
+                horizon,
+                openness as f32,
+                [bent[0] as f32, bent[1] as f32, bent[2] as f32],
+                wind,
+                elevation,
+            )
+        } else {
+            ([0.0, 0.0, 1.0], false, 0.0, 1.0, [0.0, 0.0, 1.0], 0.0, 0.0)
+        };
         SurfacePixel {
             on_earth: true,
             base_srgb: base,
@@ -1822,6 +1889,7 @@ fn make_assemble<'a>(
             sky_openness,
             bent_normal_enu,
             wind_speed,
+            surface_elevation_m,
         }
     }
 }
@@ -1848,6 +1916,37 @@ fn render_geo_surface_rgba(
                 for &v in &rgba {
                     row.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
                 }
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
+/// Render geostationary pre-tonemap reflectance with the cloud feature explicitly off.
+/// This is the quantitative twin of [`render_geo_surface_rgba`], so the public
+/// `RenderParams::clouds` switch has the same meaning for RGB and visible bands.
+fn render_geo_surface_reflectance(
+    surf: &FrameContext,
+    raster: &SurfaceRaster,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let scan = &raster.scan;
+    let (nx, ny) = (scan.nx, scan.ny);
+    let rows: Vec<Vec<f32>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = Vec::with_capacity(nx * 3);
+            for px in 0..nx {
+                let (sx, sy) = scan.scan_angle(px, py);
+                let mut pixel = assemble(px, py);
+                pixel.view_dir = surf.cam.view_dir(sx, sy);
+                let reflectance =
+                    surface_toa_radiance(surf, &pixel, 1.0, crate::render::GROUND_DAY_LIFT)
+                        .map(reflectance_from_radiance)
+                        .unwrap_or([0.0; 3]);
+                row.extend_from_slice(&reflectance);
             }
             row
         })
@@ -2098,6 +2197,23 @@ mod tests {
     use crate::bricks::{ChannelQuant, LogQuant, encode_temperature_celsius};
     use crate::frame::MapProjection;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn render_params_default_visible_controls_are_intentional() {
+        let p = RenderParams::new(PathBuf::from("input"));
+        assert_eq!(
+            p.aerosol_optical_depth.to_bits(),
+            (atmosphere::DEFAULT_AOD as f32).to_bits()
+        );
+        assert!(!p.rh_aerosol_swelling);
+        assert!(p.atmosphere_correction);
+        assert!(p.terrain_atmosphere);
+        assert_eq!(p.cloud_optical_depth_scale, 1.0);
+        assert!(p.multiscatter);
+        assert!(!p.beer_powder);
+        assert!(p.clouds);
+        assert!(p.granulation.is_none());
+    }
 
     /// A tiny synthetic CONUS-centred Lambert scene: a clear brick (no cloud) with a
     /// realistic lapse-rate temperature profile + warm ground, so the visible render is a
@@ -2740,7 +2856,8 @@ mod tests {
         let p = synthetic_params(ViewMode::TopDownMap);
         let field = DerivedField::CloudOpticalDepth;
         let clear = render_derived_scene(&synthetic_source(16, 16, 24, 3000.0), &p, field).unwrap();
-        let storm = render_derived_scene(&cold_top_source(16, 16, 48, 3000.0), &p, field).unwrap();
+        let storm_source = cold_top_source(16, 16, 48, 3000.0);
+        let storm = render_derived_scene(&storm_source, &p, field).unwrap();
         let vals = |r: &RenderResult| match &r.data {
             FrameData::Scalar { values, .. } => values.clone(),
             other => panic!("expected Scalar, got {other:?}"),
@@ -2751,6 +2868,17 @@ mod tests {
         );
         let sv = vals(&storm);
         assert!(sv[(16 / 2) * 16 + 16 / 2] > 5.0, "storm COD not thick");
+
+        // The visible what-if scale is applied only by visible cloud consumers. The
+        // quantitative derived COD must remain byte-for-byte physical/unscaled.
+        let mut scaled_params = p;
+        scaled_params.cloud_optical_depth_scale = 0.25;
+        let scaled = render_derived_scene(&storm_source, &scaled_params, field).unwrap();
+        assert_eq!(
+            sv,
+            vals(&scaled),
+            "visible cloud scale altered raw derived COD"
+        );
     }
 
     #[test]
@@ -3072,6 +3200,45 @@ mod tests {
         src
     }
 
+    /// A spatially coherent, optically moderate liquid layer for the beer-powder
+    /// control. Its sun optical depths sit in the regime where beer-powder differs
+    /// materially from pure Beer (unlike a saturated storm core).
+    fn moderate_liquid_source(nx: usize, ny: usize, nz: usize, dx: f64) -> SceneSource {
+        let mut src = synthetic_source(nx, ny, nz, dx);
+        let n2 = nx * ny;
+        let mut ext = vec![0f32; nx * ny * nz];
+        for k in 2..5.min(nz) {
+            ext[k * n2..(k + 1) * n2].fill(8.0e-4);
+        }
+        let (lq, codes) = crate::bricks::encode_log_channel(&ext);
+        src.brick.ext_liquid = codes;
+        src.brick.quant.0.insert("ext_liquid".to_string(), lq);
+        src
+    }
+
+    #[test]
+    fn beer_powder_render_param_reaches_the_visible_cloud_march() {
+        let src = moderate_liquid_source(12, 12, 12, 3000.0);
+        let mut off_params = synthetic_params(ViewMode::TopDownMap);
+        off_params.steps = StepQuality::Interactive;
+        let mut on_params = off_params.clone();
+        on_params.beer_powder = true;
+        let off = render_visible_scene(&src, &off_params, Product::VisibleBands).unwrap();
+        let on = render_visible_scene(&src, &on_params, Product::VisibleBands).unwrap();
+        let center_sum = |r: &RenderResult| match &r.data {
+            FrameData::Bands { reflectance } => {
+                let o = ((r.ny / 2) * r.nx + r.nx / 2) * 3;
+                reflectance[o..o + 3].iter().sum::<f32>()
+            }
+            other => panic!("expected Bands, got {other:?}"),
+        };
+        let (off_sum, on_sum) = (center_sum(&off), center_sum(&on));
+        assert!(
+            on_sum < off_sum - 1.0e-6,
+            "beer-powder should darken the moderate cloud sun term: on={on_sum}, off={off_sum}"
+        );
+    }
+
     #[test]
     fn granulation_scopes_by_product_and_is_live_in_the_display_rgb() {
         // v0.1.1 OPT-IN scoping: granulation is OFF unless explicitly requested
@@ -3262,6 +3429,23 @@ mod tests {
             res.sun_elev_deg > 40.0,
             "the 45-deg override drives the sun"
         );
+
+        // The public clouds toggle has the same explicit-bypass meaning for this
+        // layer product as it does for RGB/bands: transparent cloud + neutral shadow.
+        let mut off_params = p;
+        off_params.clouds = false;
+        let off = render_cloud_layer_scene(&src, &off_params).unwrap();
+        match &off.data {
+            FrameData::CloudLayer {
+                rgba_premul,
+                shadow,
+            } => {
+                assert!(rgba_premul.iter().all(|&v| v == 0));
+                assert!(shadow.iter().all(|&v| v == 1.0));
+            }
+            other => panic!("expected CloudLayer, got {other:?}"),
+        }
+        assert!(!off.granulation);
     }
 
     // ── free-perspective frame (Product::Perspective) ──────────────────────────

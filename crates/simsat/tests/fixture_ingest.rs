@@ -338,6 +338,8 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
                 raymarch_steps: 16,
                 exposure: 1.0,
+                atmosphere_correction: true,
+                terrain_atmosphere: true,
             };
             let sun_enu = [0.0f32, e.cos() as f32, e.sin() as f32];
             let rnx = native.nx;

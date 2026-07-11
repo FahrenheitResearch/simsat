@@ -21,8 +21,18 @@
 //!   resolution=<mode>  native | abi1km | abi2km           (default native)
 //!   margin=<frac>      zoom-out margin, a FRACTION of the domain added on each side
 //!                      (default 0.0 = edge-to-edge; 0.3 = the domain in a 30% earth margin).
+//!   aerosol-optical-depth=<f>  aerosol AOD, 0.0..=0.6 (default DEFAULT_AOD = 0.05).
+//!   rh-aerosol-swelling=<b>    on | off — apply the documented 1.5x aerosol swelling
+//!                              multiplier (default off).
+//!   atmosphere-correction=<b>  on | off — product-facing daytime aerial-veil
+//!                              correction (default on; off = full airlight).
+//!   terrain-atmosphere=<b>     on | off — shorten atmospheric columns to WRF terrain
+//!                              elevation (default on; off = legacy sea-level geometry).
 //!   multiscatter=<b>   on | off  — M5 Wrenninge octaves   (default on).
+//!   beer-powder=<b>    on | off  — Schneider direct-sun shaping (default off).
 //!   clouds=<b>         on | off  — off = surface only (QA terrain/glint)  (default on).
+//!   cloud-optical-depth-scale=<f>  cloud OD sensitivity scale, 0.0..=4.0 (default 1.0).
+//!   granulation=<b>    on | off  — sub-grid cloud edge erosion (default off).
 //!   steps=<quality>    offline | interactive              (default offline).
 //!   sun-elev=<deg>     OPTIONAL sun-elevation override (else true solar geometry).
 //!   sun-az=<deg>       OPTIONAL sun-azimuth override (deg from north).
@@ -95,6 +105,7 @@ use std::time::Instant;
 
 use image::{GrayImage, RgbImage, RgbaImage};
 use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams, SunOverride};
+use simsat::atmosphere::DEFAULT_AOD;
 use simsat::camera::{PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMode};
 use simsat::clouds::StepQuality;
 use simsat::gpu::RenderedFrame;
@@ -122,11 +133,18 @@ struct Opts {
     resolution: ResolutionMode,
     /// Zoom-out / domain margin as a FRACTION added on each side (0.0 = edge-to-edge).
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     multiscatter: bool,
+    beer_powder: bool,
     steps: StepQuality,
     sun_elev_override: Option<f64>,
     sun_az_override: Option<f64>,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     exposure: f64,
     cache: PathBuf,
     bluemarble: Option<PathBuf>,
@@ -183,7 +201,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let opts = parse_opts(args)?;
     eprintln!(
         "render_frame: input={} product={} view={} sat={} ts={} res={} margin={:.2} \
-         multiscatter={} clouds={} steps={} sun-elev={} exposure={:.3} canvas={} threads={}",
+         aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
+         multiscatter={} beer-powder={} clouds={} cloud-od-scale={:.3} granulation={} \
+         steps={} sun-elev={} \
+         exposure={:.3} canvas={} threads={}",
         opts.input.display(),
         product_label(&opts),
         opts.view.slug(),
@@ -191,8 +212,15 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.timestep,
         opts.resolution.label(),
         opts.margin,
+        opts.aerosol_optical_depth,
+        opts.rh_aerosol_swelling,
+        opts.atmosphere_correction,
+        opts.terrain_atmosphere,
         opts.multiscatter,
+        opts.beer_powder,
         opts.clouds,
+        opts.cloud_optical_depth_scale,
+        opts.granulation,
         if opts.steps == StepQuality::Offline {
             "offline"
         } else {
@@ -336,7 +364,9 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
         "SUMMARY file={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
-         sun_elev={:.1} exposure={:.3} multiscatter={} steps={} synthetic_green={} \
+         sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
+         atmosphere_correction={} terrain_atmosphere={} multiscatter={} beer_powder={} \
+         clouds={} cloud_optical_depth_scale={:.3} granulation={} steps={} synthetic_green={} \
          on_earth_frac={:.3} \
          peak_lum={:.3} median_lum={:.3} cloud_frac={:.3} peak_reflectance={:.4} \
          peak_sun_reflectance={:.4} cloud_lum_p90_p10={:.4} cloud_lum_frac={:.3} wall_s={:.3}",
@@ -354,7 +384,15 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.sat.slug(),
         result.sun_elev_deg,
         opts.exposure,
+        opts.aerosol_optical_depth,
+        opts.rh_aerosol_swelling,
+        opts.atmosphere_correction,
+        opts.terrain_atmosphere,
         opts.multiscatter,
+        opts.beer_powder,
+        opts.clouds,
+        opts.cloud_optical_depth_scale,
+        opts.granulation,
         if opts.steps == StepQuality::Offline {
             "offline"
         } else {
@@ -473,7 +511,7 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
     println!(
         "LAYERSUMMARY file={} dims={}x{} crs=EPSG:3857 corner_nw={:.4},{:.4} \
          corner_se={:.4},{:.4} sun_elev={:.1} cover_frac={:.3} mean_alpha={:.3} \
-         shadow_min={:.3} shadow_mean={:.3} granulation={} wall_s={:.3}",
+         shadow_min={:.3} shadow_mean={:.3} beer_powder={} granulation={} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         nx,
         ny,
@@ -486,6 +524,7 @@ fn run_cloud_layer(opts: &Opts, params: &RenderParams) -> Result<(), String> {
         mean_alpha,
         shadow_min,
         shadow_mean,
+        opts.beer_powder,
         result.granulation,
         wall.as_secs_f64(),
     );
@@ -602,11 +641,17 @@ fn render_params(opts: &Opts) -> RenderParams {
         view: opts.view,
         resolution: opts.resolution,
         margin_frac: opts.margin as f32,
+        aerosol_optical_depth: opts.aerosol_optical_depth,
+        rh_aerosol_swelling: opts.rh_aerosol_swelling,
+        atmosphere_correction: opts.atmosphere_correction,
+        terrain_atmosphere: opts.terrain_atmosphere,
         exposure: opts.exposure,
         multiscatter: opts.multiscatter,
+        beer_powder: opts.beer_powder,
         steps: opts.steps,
         clouds: opts.clouds,
-        granulation: None, // the api product-scoping default (display products granulate)
+        cloud_optical_depth_scale: opts.cloud_optical_depth_scale,
+        granulation: Some(opts.granulation),
         sun_override,
         cache: opts.cache.clone(),
         bluemarble,
@@ -729,8 +774,15 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
     let mut margin = 0.0f64;
+    let mut aerosol_optical_depth = DEFAULT_AOD as f32;
+    let mut rh_aerosol_swelling = false;
+    let mut atmosphere_correction = true;
+    let mut terrain_atmosphere = true;
     let mut multiscatter = true;
+    let mut beer_powder = false;
     let mut clouds = true;
+    let mut cloud_optical_depth_scale = 1.0f32;
+    let mut granulation = false;
     let mut steps = StepQuality::Offline;
     let mut sun_elev_override: Option<f64> = None;
     let mut sun_az_override: Option<f64> = None;
@@ -776,8 +828,45 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     return Err(format!("margin must be 0.0..=4.0 (fraction), got {margin}"));
                 }
             }
+            "aerosol-optical-depth" | "aerosol_optical_depth" | "aod" => {
+                aerosol_optical_depth = v
+                    .parse()
+                    .map_err(|_| format!("bad aerosol-optical-depth '{v}'"))?;
+                if !aerosol_optical_depth.is_finite()
+                    || !(0.0..=0.6).contains(&aerosol_optical_depth)
+                {
+                    return Err(format!(
+                        "aerosol-optical-depth must be finite and in 0.0..=0.6, got \
+                         {aerosol_optical_depth}"
+                    ));
+                }
+            }
+            "rh-aerosol-swelling" | "rh_aerosol_swelling" | "rh-swelling" => {
+                rh_aerosol_swelling = parse_bool(v)?
+            }
+            "atmosphere-correction" | "atmosphere_correction" | "atmo-correction" => {
+                atmosphere_correction = parse_bool(v)?
+            }
+            "terrain-atmosphere" | "terrain_atmosphere" | "terrain-atmo" => {
+                terrain_atmosphere = parse_bool(v)?
+            }
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
+            "beer-powder" | "beer_powder" | "beerpowder" => beer_powder = parse_bool(v)?,
             "clouds" => clouds = parse_bool(v)?,
+            "cloud-optical-depth-scale" | "cloud_optical_depth_scale" | "cloud-od-scale" => {
+                cloud_optical_depth_scale = v
+                    .parse()
+                    .map_err(|_| format!("bad cloud-optical-depth-scale '{v}'"))?;
+                if !cloud_optical_depth_scale.is_finite()
+                    || !(0.0..=4.0).contains(&cloud_optical_depth_scale)
+                {
+                    return Err(format!(
+                        "cloud-optical-depth-scale must be finite and in 0.0..=4.0, got \
+                         {cloud_optical_depth_scale}"
+                    ));
+                }
+            }
+            "granulation" | "granulate" | "cloud-granulation" => granulation = parse_bool(v)?,
             "steps" | "quality" => steps = parse_steps(v)?,
             "sun-elev" | "sun_elev" | "sunelev" => {
                 sun_elev_override = Some(v.parse().map_err(|_| format!("bad sun-elev '{v}'"))?)
@@ -862,11 +951,18 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         timestep,
         resolution,
         margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
         multiscatter,
+        beer_powder,
         steps,
         sun_elev_override,
         sun_az_override,
         clouds,
+        cloud_optical_depth_scale,
+        granulation,
         exposure,
         cache,
         bluemarble,
@@ -981,8 +1077,15 @@ fn print_usage() {
          \x20 timestep=<n>       time index (default 0)\n\
          \x20 resolution=<mode>  native | abi1km | abi2km           (default native)\n\
          \x20 margin=<frac>      zoom-out margin fraction on each side (default 0.0 edge-to-edge)\n\
+         \x20 aerosol-optical-depth=<f>  aerosol AOD, 0.0..=0.6 (default {DEFAULT_AOD})\n\
+         \x20 rh-aerosol-swelling=<b>    on|off 1.5x aerosol swelling (default off)\n\
+         \x20 atmosphere-correction=<b>  on|off daytime aerial-veil correction (default on)\n\
+         \x20 terrain-atmosphere=<b>     on|off terrain-height columns (default on)\n\
          \x20 multiscatter=<b>   on | off  (M5 octaves)             (default on)\n\
+         \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
+         \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default 1.0)\n\
+         \x20 granulation=<b>    on | off  sub-grid cloud detail    (default off)\n\
          \x20 steps=<quality>    offline | interactive              (default offline)\n\
          \x20 sun-elev=<deg>     OPTIONAL sun elevation override (else true solar)\n\
          \x20 sun-az=<deg>       OPTIONAL sun azimuth override, deg from north\n\
@@ -1011,4 +1114,35 @@ fn print_usage() {
          \x20 synthetic-green=<b> on|off ABI synthetic-green display mode (G'=0.45R+0.45B+0.10G)\n\
          \x20 bands-out=<path.bin>  QA: also dump raw pre-tonemap reflectance (f32le RGB)\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_with(extra: &[&str]) -> Opts {
+        let mut args = vec!["input=input".to_string(), "out=out.png".to_string()];
+        args.extend(extra.iter().map(|v| (*v).to_string()));
+        parse_opts(&args).expect("parse options")
+    }
+
+    #[test]
+    fn cloud_appearance_switches_default_off() {
+        let opts = opts_with(&[]);
+        assert!(!opts.beer_powder);
+        assert!(!opts.granulation);
+        let params = render_params(&opts);
+        assert!(!params.beer_powder);
+        assert_eq!(params.granulation, Some(false));
+    }
+
+    #[test]
+    fn cloud_appearance_switches_parse_and_reach_render_params() {
+        let opts = opts_with(&["beer-powder=on", "granulation=yes"]);
+        assert!(opts.beer_powder);
+        assert!(opts.granulation);
+        let params = render_params(&opts);
+        assert!(params.beer_powder);
+        assert_eq!(params.granulation, Some(true));
+    }
 }

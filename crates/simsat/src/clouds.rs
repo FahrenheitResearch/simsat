@@ -147,6 +147,33 @@ pub const OCTAVE_PHASE_SCALE: f64 = 0.5;
 /// monotone-toward-ceiling tests hold).
 pub const OCTAVE_BRIGHTNESS_SCALE: f64 = 0.85;
 
+/// Runtime visible-cloud optical-depth scale bounds. `0` is a deliberate QA/off
+/// endpoint; values above four are capped because exponentials are already visually
+/// saturated there while extreme/invalid inputs can otherwise destabilise a march.
+/// The stored brick extinction and derived cloud-optical-depth products remain raw.
+pub const CLOUD_OPTICAL_DEPTH_SCALE_MIN: f32 = 0.0;
+pub const CLOUD_OPTICAL_DEPTH_SCALE_MAX: f32 = 4.0;
+
+/// Validate a user-facing visible-cloud optical-depth scale. Non-finite values fall
+/// back to the neutral physical default rather than silently erasing/saturating cloud.
+#[inline]
+pub fn validated_cloud_optical_depth_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(CLOUD_OPTICAL_DEPTH_SCALE_MIN, CLOUD_OPTICAL_DEPTH_SCALE_MAX)
+    } else {
+        1.0
+    }
+}
+
+/// Probability that an additional scattering event is available in cloud optical
+/// depth `tau`. Raising this once per higher octave gives the correct thin limit:
+/// order `k` vanishes as `tau^k`, while optically thick cloud tends to the unchanged
+/// Wrenninge/Oz octave sum. Octave zero is never gated.
+#[inline]
+fn multiscatter_thin_gate(tau: f64) -> f64 {
+    1.0 - (-tau.max(0.0)).exp()
+}
+
 /// Solar disk angular DIAMETER (rad) = 0.533 deg — the penumbra-widening factor for
 /// the ground cloud shadow (design section 6: blur radius = occluder distance x
 /// tan 0.533 deg). `tan(0.533 deg) ~= 0.0093`.
@@ -1075,11 +1102,43 @@ pub fn octave_sun_source(
     beer_powder_on: bool,
     octaves: usize,
 ) -> f64 {
+    octave_sun_source_thin_gated(
+        cos_theta,
+        ext_liquid,
+        ext_ice_precip,
+        tau_sun,
+        beer_powder_on,
+        octaves,
+        f64::INFINITY,
+    )
+}
+
+/// [`octave_sun_source`] with the physically required optically-thin limit. The
+/// compatibility wrapper above retains the legacy ungated helper contract; visible
+/// render marches call this function with the larger of local and column cloud OD.
+/// Order zero is byte-identical to single scatter. Every higher order is weighted by
+/// another `1 - exp(-support_tau)`, so it disappears when there is insufficient cloud
+/// for another interaction and approaches the former result for thick cloud.
+#[inline]
+pub fn octave_sun_source_thin_gated(
+    cos_theta: f64,
+    ext_liquid: f64,
+    ext_ice_precip: f64,
+    tau_sun: f64,
+    beer_powder_on: bool,
+    octaves: usize,
+    support_tau: f64,
+) -> f64 {
     let mut acc = 0.0f64;
     let mut ext_scale = 1.0f64; // a^k
     let mut g_scale = 1.0f64; // b^k
     let mut weight = 1.0f64; // c^k
-    for _ in 0..octaves.max(1) {
+    let thin_gate = multiscatter_thin_gate(support_tau);
+    let mut order_gate = 1.0f64;
+    for k in 0..octaves.max(1) {
+        if k > 0 {
+            order_gate *= thin_gate;
+        }
         let tau_k = tau_sun * ext_scale;
         let vis_k = if beer_powder_on {
             beer_powder(tau_k)
@@ -1087,7 +1146,7 @@ pub fn octave_sun_source(
             beer(tau_k)
         };
         let phase_k = aggregate_phase_scaled(cos_theta, ext_liquid, ext_ice_precip, g_scale);
-        acc += weight * phase_k * vis_k;
+        acc += order_gate * weight * phase_k * vis_k;
         ext_scale *= OCTAVE_EXTINCTION_SCALE;
         g_scale *= OCTAVE_PHASE_SCALE;
         weight *= OCTAVE_BRIGHTNESS_SCALE;
@@ -1655,7 +1714,9 @@ impl OccupancyMip {
 /// sun transmittance any more — a 2-D total-column scalar cannot give a per-depth
 /// transmittance, which killed the direct-sun term for thick clouds (M4 review FINDING
 /// 1); that now uses the depth-resolved secondary light march in
-/// [`cloud_sun_optical_depth`].
+/// [`cloud_sun_optical_depth`]. The raw total is also safe as a support-only answer to
+/// “is this column thick enough for higher scattering orders?”; it gates their thin
+/// limit without standing in for sample-to-sun transmittance.
 ///
 /// M5 adds `occ_dist` (per texel: the extinction-weighted mean SLANT distance from the
 /// ground to the occluding cloud along the sun ray) so [`SunOdMap::penumbral_shadow`]
@@ -1996,6 +2057,15 @@ impl SunOdMap {
     /// disk-sampling the volume): a higher cloud (larger `occ_dist`) yields a wider,
     /// softer penumbra; a ground-hugging cloud stays sharp; a clear column stays 1.
     pub fn penumbral_shadow(&self, p: [f64; 3]) -> f64 {
+        self.penumbral_shadow_scaled(p, 1.0)
+    }
+
+    /// [`Self::penumbral_shadow`] with a visible-cloud optical-depth multiplier.
+    /// The stored map remains raw (and reusable by physical COD diagnostics); the
+    /// Beer exponent is scaled only at this visible-render consumer. The occluder
+    /// distance is an extinction-weighted mean and therefore does not change.
+    pub fn penumbral_shadow_scaled(&self, p: [f64; 3], optical_depth_scale: f32) -> f64 {
+        let od_scale = validated_cloud_optical_depth_scale(optical_depth_scale) as f64;
         let (u, v) = self.plane_uv(p);
         let occ_dist = self.sample_uv(&self.occ_dist, u, v);
         let radius = occ_dist * (SUN_ANGULAR_DIAMETER_RAD.tan());
@@ -2003,13 +2073,13 @@ impl SunOdMap {
         let texel = ((self.u_max - self.u_min).abs() / self.width.max(1) as f64)
             .max((self.v_max - self.v_min).abs() / self.height.max(1) as f64);
         if radius <= 0.5 * texel {
-            return beer(self.sample_uv(&self.od, u, v));
+            return beer(od_scale * self.sample_uv(&self.od, u, v));
         }
         // A centre tap + two rings of taps over the blur disk, transmittance-averaged
         // (the penumbra is a partial occlusion of the sun DISK, so it softens in
         // transmittance, not optical-depth, space).
         const RING: usize = 8;
-        let mut sum = beer(self.sample_uv(&self.od, u, v));
+        let mut sum = beer(od_scale * self.sample_uv(&self.od, u, v));
         let mut wsum = 1.0f64;
         for (ri, &rr) in [0.5, 1.0].iter().enumerate() {
             let w = if ri == 0 { 1.0 } else { 0.6 };
@@ -2017,7 +2087,7 @@ impl SunOdMap {
                 let ang = (k as f64 + 0.5) / RING as f64 * 2.0 * PI;
                 let du = radius * rr * ang.cos();
                 let dv = radius * rr * ang.sin();
-                sum += w * beer(self.sample_uv(&self.od, u + du, v + dv));
+                sum += w * beer(od_scale * self.sample_uv(&self.od, u + du, v + dv));
                 wsum += w;
             }
         }
@@ -2078,8 +2148,9 @@ pub struct MarchConfig {
     /// SAMPLE toward the top of the cloud, so a thick-anvil top (little cloud above it
     /// toward the sun) is near-fully sunlit while the base (whole cloud above it) is
     /// shadowed. Replaces the fix2 depth-blind total-column sun-OD-map term (M4 review
-    /// FINDING 1); the orthographic sun-OD map is retained ONLY for the ground-shadow
-    /// consumer, where the whole-column value is correct.
+    /// FINDING 1); the orthographic sun-OD map remains the ground-shadow source and a
+    /// total-column support measure for the thin-limit multiscatter gate. It is never
+    /// substituted for the depth-resolved sun transmittance.
     pub sun_march_steps: usize,
     /// Base (first) sun-march step length (m); each subsequent step grows by
     /// `sun_march_growth`. Defaults to the voxel pitch so the near field is resolved.
@@ -2108,6 +2179,12 @@ pub struct MarchConfig {
     pub ground_albedo: f64,
     /// Early-out view-transmittance floor (stop when the cloud is essentially opaque).
     pub transmittance_floor: f64,
+    /// Runtime QA/calibration multiplier for VISIBLE cloud optical depth. Applied at
+    /// render consumption to view extinction, cloud self-shadow, ground shadow, and
+    /// ambient attenuation. It deliberately does not mutate the decoded volume,
+    /// derived COD products, or thermal-IR opacity. Default `1.0`; validated to
+    /// [`CLOUD_OPTICAL_DEPTH_SCALE_MIN`]..=[`CLOUD_OPTICAL_DEPTH_SCALE_MAX`].
+    pub cloud_optical_depth_scale: f32,
     /// GROUND LIFT (top-down/basemap appearance pass, [`crate::render::GROUND_DAY_LIFT`]):
     /// the sun-gated daytime surface-brightness lift passed to
     /// [`crate::render::surface_toa_radiance`] by the cloud/top-down composite. Default =
@@ -2168,6 +2245,7 @@ impl MarchConfig {
             beer_powder: false,
             ground_albedo: GROUND_ALBEDO,
             transmittance_floor: 0.003,
+            cloud_optical_depth_scale: 1.0,
             // Appearance-pass baked defaults (the studio's `..MarchConfig::new()` inherits
             // these; the render_frame CLI knobs override them). Edge feather off by default
             // (activated only by a zoom-out margin, via `edge_feather_cells_for_margin`).
@@ -2177,6 +2255,12 @@ impl MarchConfig {
             edge_feather_cells: 0.0,
             granulation: None,
         }
+    }
+
+    /// Validated visible optical-depth multiplier as the march's native `f64`.
+    #[inline]
+    pub fn validated_cloud_optical_depth_scale(&self) -> f64 {
+        validated_cloud_optical_depth_scale(self.cloud_optical_depth_scale) as f64
     }
 }
 
@@ -2310,7 +2394,9 @@ fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
             dist += half;
         }
     }
-    tau
+    // The decoded field and cached sun-OD map stay physical/raw. The visible QA
+    // multiplier is applied at consumption so derived COD and thermal IR are untouched.
+    tau * cfg.validated_cloud_optical_depth_scale()
 }
 
 /// The finite-disk EARTH-SHADOW sun factor for an elevated sample (WS1
@@ -2350,6 +2436,7 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
     let fine = scene.cfg.fine_mult * pitch;
     let e_sun = SOLAR_IRRADIANCE_RGB;
     let cos_vs = dot3(view, scene.sun_ecef);
+    let od_scale = scene.cfg.validated_cloud_optical_depth_scale();
 
     let mut t = t_enter;
     let mut trans = 1.0f64;
@@ -2404,9 +2491,10 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         // hard cutoff. `sigma_eff` scales BOTH the in-scatter source and the step opacity
         // consistently, so a faded sample scatters less light AND grows more transparent
         // (the ground shows through). No-op (feather 1.0) when there is no margin, i.e.
-        // `edge_feather_cells == 0` -> `sigma_eff == sigma_t` byte-for-byte.
+        // At the neutral OD scale, `edge_feather_cells == 0` ->
+        // `sigma_eff == sigma_t` byte-for-byte.
         let feather = edge_feather(mi, mj, vol.nx, vol.ny, scene.cfg.edge_feather_cells);
-        let sigma_eff = sigma_t * feather;
+        let sigma_eff = sigma_t * feather * od_scale;
         if sigma_eff <= 0.0 {
             t += ds;
             steps += 1;
@@ -2420,13 +2508,26 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         // makes a thick anvil brilliant. Beer-powder (OFF by default in M5) applies per
         // octave when on.
         let tau_cloud_sun = cloud_sun_optical_depth(scene, pm);
-        let sun_src = octave_sun_source(
+        // The vertical whole-column OD is the best support measure for whether
+        // multiple scattering is possible (including at a thick cloud's sunlit top).
+        // The sun-aligned raw OD map supplies the same column-support fact for slanted
+        // cloud and for synthetic/legacy volumes whose tau_up channel is absent/zero;
+        // it is NOT used as the sample-to-sun transmittance. `tau_sun` and one local
+        // voxel remain conservative fallbacks.
+        let col_total = vol.sample(mi, mj, 0.0).tau_up; // raw OD of whole column at (i,j)
+        let sun_column_tau = scene.sun_od.sample(pm) * od_scale;
+        let multiscatter_support_tau = (col_total * od_scale)
+            .max(sun_column_tau)
+            .max(tau_cloud_sun)
+            .max(sigma_eff * pitch);
+        let sun_src = octave_sun_source_thin_gated(
             cos_vs,
             sample.ext_liquid,
             sample.ext_ice + sample.ext_precip,
             tau_cloud_sun,
             scene.cfg.beer_powder,
             scene.cfg.octaves,
+            multiscatter_support_tau,
         );
 
         // Atmospheric sun transmittance to the sample (reddening at low sun) with the
@@ -2460,14 +2561,18 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         let e_sky = scene
             .sky_sh
             .irradiance(sun_elev_deg, up, scene.sun_ecef, up);
-        let col_total = vol.sample(mi, mj, 0.0).tau_up; // OD of the whole column at (i,j)
         let tau_down = (col_total - sample.tau_up).max(0.0);
-        let amb_factor = ambient_cloud_factor(sample.tau_up, tau_down, scene.cfg.ground_albedo);
+        let amb_factor = ambient_cloud_factor(
+            sample.tau_up * od_scale,
+            tau_down * od_scale,
+            scene.cfg.ground_albedo,
+        );
 
         // Use the edge-feathered extinction `sigma_eff` for the step opacity + the
-        // in-scatter source (the sun-OD / ambient inputs above use the TRUE field — the
-        // feather only fades THIS sample's local scattering). At feather 1.0 (no margin)
-        // `sigma_eff == sigma_t`, so this is byte-identical to the pre-feather march.
+        // in-scatter source (the sun/ambient inputs above use the edge-unfeathered field;
+        // the runtime visible OD scale still applies to every optical-depth consumer).
+        // At feather 1.0, scale 1.0, `sigma_eff == sigma_t`, so this is byte-identical
+        // to the pre-feather march.
         let step_t = (-sigma_eff * ds).exp();
         for c in 0..3 {
             let s_sun = e_sun[c] * sigma_eff * sun_src * t_atmo_sun[c];
@@ -2556,7 +2661,9 @@ pub fn ground_cloud_shadow(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) ->
     match ray_sphere(cam, view, scene.vol.r_bottom()) {
         Some((t0, _)) if t0 > 0.0 => {
             let pg = madd3(cam, view, t0);
-            scene.sun_od.penumbral_shadow(pg)
+            scene
+                .sun_od
+                .penumbral_shadow_scaled(pg, scene.cfg.cloud_optical_depth_scale)
         }
         _ => 1.0,
     }
@@ -2646,10 +2753,20 @@ pub fn composite_cloud_radiance(
     // (NOT the brick-shell fraction the froxel is not indexed by) — FINDING 4.
     let w_froxel = atmosphere_shell_fraction(cam, view, m.mean_t_m);
     let (i_ac, t_ac) = froxel_at_cloud(froxel, scan_rect, scan_x, scan_y, w_froxel);
+    // Apply the same product-facing aerial correction to atmosphere in FRONT of cloud
+    // that surface_toa_radiance applies over the ground. Leaving this unscaled made the
+    // clouds-on geostationary product reintroduce a bright haze veil. Raw-physics mode
+    // deliberately retains the full froxel airlight.
+    let front_veil = if surf.atmosphere_correction {
+        crate::render::aerial_veil_scale(px.sun_elev_deg as f64)
+    } else {
+        1.0
+    };
     let mut l_final = [0.0f64; 3];
     for c in 0..3 {
-        l_final[c] =
-            l_toa[c] * m.transmittance + t_ac * m.inscatter[c] + i_ac[c] * (1.0 - m.transmittance);
+        l_final[c] = l_toa[c] * m.transmittance
+            + t_ac * m.inscatter[c]
+            + front_veil * i_ac[c] * (1.0 - m.transmittance);
     }
     Some(l_final)
 }
@@ -3086,6 +3203,17 @@ mod tests {
     }
 
     #[test]
+    fn visible_cloud_optical_depth_scale_defaults_neutral_and_is_bounded() {
+        let cfg = MarchConfig::new(StepQuality::Offline, 250.0);
+        assert_eq!(cfg.cloud_optical_depth_scale, 1.0);
+        assert_eq!(cfg.validated_cloud_optical_depth_scale(), 1.0);
+        assert_eq!(validated_cloud_optical_depth_scale(-3.0), 0.0);
+        assert_eq!(validated_cloud_optical_depth_scale(99.0), 4.0);
+        assert_eq!(validated_cloud_optical_depth_scale(f32::NAN), 1.0);
+        assert_eq!(validated_cloud_optical_depth_scale(f32::INFINITY), 1.0);
+    }
+
+    #[test]
     fn ambient_factor_is_monotone_in_tau_up() {
         let mut prev = f64::INFINITY;
         for &tau_up in &[0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0] {
@@ -3196,6 +3324,43 @@ mod tests {
                 "slab transmittance {} vs closed-form e^-tau {expected} (tau={od_ref})",
                 m.transmittance
             );
+
+            // The runtime visible OD scale is applied to the complete march, not just
+            // a display alpha: half scale follows e^(-0.5*tau), while the explicit
+            // zero endpoint is optically clear and emits no cloud light.
+            let march_at_scale = |scale: f32| {
+                let scaled_scene = CloudScene {
+                    vol: scene.vol,
+                    mip: scene.mip,
+                    sun_od: scene.sun_od,
+                    georef: scene.georef,
+                    luts: scene.luts,
+                    sky_sh: scene.sky_sh,
+                    sun_ecef: scene.sun_ecef,
+                    cfg: MarchConfig {
+                        cloud_optical_depth_scale: scale,
+                        ..scene.cfg
+                    },
+                };
+                march_cloud(&scaled_scene, cam.camera, view)
+            };
+            let half = march_at_scale(0.5);
+            let expected_half = (-0.5 * od_ref).exp();
+            assert!(
+                (half.transmittance - expected_half).abs() < 0.002,
+                "half-scale transmittance {} vs {expected_half}",
+                half.transmittance
+            );
+            assert!(
+                half.transmittance > m.transmittance,
+                "half scale must reveal more ground: {} <= {}",
+                half.transmittance,
+                m.transmittance
+            );
+            let off = march_at_scale(0.0);
+            assert_eq!(off.transmittance, 1.0);
+            assert_eq!(off.inscatter, [0.0; 3]);
+            assert_eq!(off.sun_inscatter, [0.0; 3]);
             // And the closed-form optical depth is genuinely Beer-Lambert: tau/sigma
             // (the covered path length) is within ~voxel-boundary slop of the full
             // shell crossing (the top voxel of the shell is above the last brick level).
@@ -3635,6 +3800,8 @@ mod tests {
             flat_albedo_srgb: 0.5,
             raymarch_steps: 8,
             exposure: 1.0,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
         };
         let rnx = raster.nx;
         let lat = raster.lat.clone();
@@ -3743,6 +3910,8 @@ mod tests {
                 flat_albedo_srgb: 0.5,
                 raymarch_steps: 8,
                 exposure,
+                atmosphere_correction: true,
+                terrain_atmosphere: true,
             };
             render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, &assemble)
         };
@@ -3864,6 +4033,34 @@ mod tests {
         assert!(
             multi > single * 2.0,
             "octaves should multiply the thick-cloud sun term: {multi} vs single {single}"
+        );
+    }
+
+    #[test]
+    fn multiscatter_higher_orders_vanish_in_thin_limit_but_thick_cloud_is_preserved() {
+        let (cos, el, ip, tau_sun) = (-0.7, 3.0e-3, 1.0e-3, 4.0);
+        let single = octave_sun_source_thin_gated(cos, el, ip, tau_sun, false, 1, 0.0);
+        let zero_support =
+            octave_sun_source_thin_gated(cos, el, ip, tau_sun, false, DEFAULT_OCTAVES, 0.0);
+        assert_eq!(
+            zero_support.to_bits(),
+            single.to_bits(),
+            "zero cloud support must leave exactly octave zero"
+        );
+
+        let thin =
+            octave_sun_source_thin_gated(cos, el, ip, tau_sun, false, DEFAULT_OCTAVES, 1.0e-3);
+        assert!(
+            thin > single && thin - single < 0.02 * single,
+            "thin-cloud higher orders must be present but asymptotically tiny: {thin} vs {single}"
+        );
+
+        let old_thick = octave_sun_source(cos, el, ip, tau_sun, false, DEFAULT_OCTAVES);
+        let gated_thick =
+            octave_sun_source_thin_gated(cos, el, ip, tau_sun, false, DEFAULT_OCTAVES, 20.0);
+        assert!(
+            (gated_thick - old_thick).abs() < 1.0e-7 * old_thick,
+            "thick-cloud gate must converge to the established octave result: {gated_thick} vs {old_thick}"
         );
     }
 
@@ -4324,13 +4521,15 @@ mod tests {
             center[1] - cam.camera[1],
             center[2] - cam.camera[2],
         ]);
-        // The sun-OD map is not consulted by march_cloud; one dummy map suffices.
+        // This horizon-fade test uses octave zero, so the sun-OD map's higher-order
+        // support gate is irrelevant; one dummy map suffices.
         let sun_od = accumulate_sun_od(&vol, &georef, [0.0, 0.0, 1.0], 4);
         let v_at = |e_deg: f64| -> f64 {
             let er = e_deg.to_radians();
             let sun = norm3(add3(scl3(up, er.sin()), scl3(east, er.cos())));
             let cfg = MarchConfig {
                 sun_march_jitter_amp: 0.0,
+                octaves: 1,
                 ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
             };
             let scene = CloudScene {
@@ -4486,7 +4685,21 @@ mod tests {
             "interior column should carry od: {}",
             od.sample(inside)
         );
-        assert!(od.penumbral_shadow(inside) < 0.9);
+        let shadow = od.penumbral_shadow(inside);
+        assert!(shadow < 0.9);
+        assert_eq!(
+            od.penumbral_shadow_scaled(inside, 0.0),
+            1.0,
+            "zero visible OD scale must cast no ground shadow"
+        );
+        assert!(
+            od.penumbral_shadow_scaled(inside, 0.5) > shadow,
+            "half-scale OD must make the ground shadow more transmissive"
+        );
+        assert!(
+            od.penumbral_shadow_scaled(inside, 2.0) < shadow,
+            "double-scale OD must make the ground shadow darker"
+        );
         // A margin ground point far outside the domain (and the map extent).
         let outside = brick_to_ecef(&georef, -100.0, -100.0, 0.0, 0.0, dz).unwrap();
         assert_eq!(od.sample(outside), 0.0, "out-of-extent od must be clear");

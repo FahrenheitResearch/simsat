@@ -378,6 +378,13 @@ pub struct FrameContext<'a> {
     /// together (both composite through [`radiance_to_rgba`]). `1.0` reproduces the
     /// pre-exposure output; [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
+    /// Apply the product-facing atmospheric correction (the daytime aerial-veil
+    /// reduction, including the matching cloud-front correction). `false` retains the
+    /// full modeled path airlight; it does not disable unrelated display transforms.
+    pub atmosphere_correction: bool,
+    /// Shorten the surface sun/view atmosphere columns to each pixel's terrain
+    /// elevation. `false` reproduces the legacy mean-sea-level sphere behavior.
+    pub terrain_atmosphere: bool,
 }
 
 /// One surface pixel's inputs for [`shade_surface`].
@@ -411,6 +418,10 @@ pub struct SurfacePixel {
     /// M3 Cox-Munk glint: the 10 m wind speed (m/s) at this pixel (`sqrt(U10^2+V10^2)`).
     /// Drives the sea-surface slope distribution. `0` = calm. Only used when `is_water`.
     pub wind_speed: f32,
+    /// Terrain height above mean sea level (m), used only when
+    /// [`FrameContext::terrain_atmosphere`] is enabled. Missing/out-of-domain values
+    /// are `0`; the atmosphere geometry safely clips negative/non-finite values.
+    pub surface_elevation_m: f32,
 }
 
 impl Default for SurfacePixel {
@@ -431,6 +442,7 @@ impl Default for SurfacePixel {
             sky_openness: 1.0,
             bent_normal_enu: [0.0, 0.0, 1.0],
             wind_speed: 0.0,
+            surface_elevation_m: 0.0,
         }
     }
 }
@@ -990,9 +1002,14 @@ pub fn surface_toa_radiance(
     // Sun transmittance at the surface, evaluated at max(elev, 0) so the finite-disk
     // crossing stays smooth (the disk fraction handles the terminator, not a hard mu).
     let mu_sun = (px.sun_elev_deg.max(0.0) as f64 * pi / 180.0).sin();
+    let surface_elevation_m = if ctx.terrain_atmosphere {
+        (px.surface_elevation_m as f64).max(0.0)
+    } else {
+        0.0
+    };
     let t_sun = atmosphere::sample_transmittance(
         &ctx.luts.transmittance,
-        atmosphere::R_GROUND_M + 1.0,
+        atmosphere::R_GROUND_M + surface_elevation_m + 1.0,
         mu_sun,
     );
     // Terrain ambient aperture (M3 — completes M5's SH-2 sky ambient). M5 evaluated the
@@ -1022,7 +1039,7 @@ pub fn surface_toa_radiance(
 
     // The atmosphere shell segment (reused for the water surface-up and the aerial
     // march). For an on-earth pixel `t_exit` is the ground intersection.
-    let seg = atmosphere::ray_atmosphere_segment(cam, view);
+    let seg = atmosphere::ray_atmosphere_segment_to_surface(cam, view, surface_elevation_m);
 
     let mut l_surf = [0.0; 3];
     if px.is_water {
@@ -1150,7 +1167,11 @@ pub fn surface_toa_radiance(
         // untouched because the scale is 1.0 at/below VEIL_TERMINATOR_ELEV_DEG). The
         // surface transmittance is left intact. Off-earth limb in-scatter (above) is
         // never scaled.
-        let veil = aerial_veil_scale(px.sun_elev_deg as f64);
+        let veil = if ctx.atmosphere_correction {
+            aerial_veil_scale(px.sun_elev_deg as f64)
+        } else {
+            1.0
+        };
         l_toa = combine_aerial_veil(l_surf, sc.transmittance, sc.inscatter, veil);
     }
     Some(l_toa)
@@ -1436,6 +1457,8 @@ mod tests {
             // the pre-exposure output (a moderated default is a display choice made in
             // the studio / CLI, not baked into the physics tests).
             exposure: 1.0,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
         };
         (ctx, sun_enu)
     }

@@ -101,7 +101,7 @@ struct Uniforms {
     solar: vec4<f32>, // xyz band solar irradiance, w pitch_y
     p0: vec4<f32>,    // mie_sca_ground, mie_ext_ground, mie_g, pw_ratio
     p1: vec4<f32>,    // bm_present, water_scale, flat_albedo, output_transform
-    p2: vec4<f32>,    // ambient_elev_min, ambient_elev_max, ambient_n, unused
+    p2: vec4<f32>,    // ambient_elev_min, ambient_elev_max, ambient_n, atmosphere_correction
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -636,7 +636,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // SUNRISE veil ramp (low-sun visible pass): scale the additive surface
         // in-scatter; the terminator band (<= VEIL_TERMINATOR_ELEV) keeps the full
         // physical veil, daytime keeps the refinement de-haze.
-        let veil = aerial_veil_scale(sun_elev);
+        let veil = select(1.0, aerial_veil_scale(sun_elev), u.p2.w > 0.5);
         l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
     }
     // Low-sun illuminant correction at the display seam (on-earth pixels only; the

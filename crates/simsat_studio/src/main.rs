@@ -469,6 +469,10 @@ struct PreparedRender {
     derived: Option<(DerivedField, Vec<f32>)>,
     /// The product mode this frame was rendered in (for the PNG-export file name).
     render_mode: RenderMode,
+    /// The cloud toggle captured when this worker render started. A CPU top-down
+    /// surface-only frame still occupies `cloud_rgba`, so buffer presence is not
+    /// valid provenance for whether clouds were enabled.
+    clouds_enabled: bool,
     /// The EXPERIMENTAL GPU cloud-pass inputs: `Some` when this frame is to be
     /// rendered by the GPU cloud pass on the UI thread (`cloud_rgba` is then `None`).
     /// Carries an optional CPU reference frame for the parity instrument.
@@ -843,10 +847,19 @@ struct SimSatStudioApp {
     // M2 atmosphere controls (design section 3 / 6).
     aod: f32,
     rh_swelling: bool,
+    /// Daytime aerial-veil correction. On is the product-facing
+    /// default; the toggle exists for an exact corrected/raw-TOA QA A/B.
+    atmosphere_correction: bool,
+    /// Clip the atmospheric column to each surface pixel's terrain elevation.
+    /// On is physical; off reproduces the old full sea-level column for QA.
+    terrain_atmosphere: bool,
     output_transform: OutputTransform,
     // M4 cloud controls (design section 4) + M5 multi-scatter (section 4/6).
     clouds_enabled: bool,
     multiscatter: bool,
+    /// Explicit visible cloud optical-depth QA/what-if multiplier. A neutral 1.0
+    /// uses the model-derived extinction without tuning.
+    cloud_optical_depth_scale: f32,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise; see the clouds.rs
     /// granulation section). OFF by default as of v0.1.1 — the round-1 default look
@@ -983,10 +996,14 @@ impl SimSatStudioApp {
             ir_enhancement: IrEnhancement::default(),
             aod: atmosphere::DEFAULT_AOD as f32,
             rh_swelling: false,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: true,
             // Wrenninge multi-scatter octaves ON by default (M5): the bright-anvil look.
             multiscatter: true,
+            // Neutral unless the user deliberately makes a QA/what-if override.
+            cloud_optical_depth_scale: 1.0,
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
             // scatter buildup, so powder-on would double-darken (design M5 decision).
             beer_powder: false,
@@ -1073,9 +1090,13 @@ impl SimSatStudioApp {
         self.margin_pct = s.margin_pct;
         self.aod = s.aod;
         self.rh_swelling = s.rh_swelling;
+        self.atmosphere_correction = s.atmosphere_correction;
+        self.terrain_atmosphere = s.terrain_atmosphere;
         self.clouds_enabled = s.clouds_enabled;
         self.multiscatter = s.multiscatter;
+        self.cloud_optical_depth_scale = s.cloud_optical_depth_scale;
         self.beer_powder = s.beer_powder;
+        self.granulation = s.granulation;
         self.exposure = s.exposure;
         self.bm_month_override = s.bm_month_override;
         self.bm_allow_download = s.bm_allow_download;
@@ -1098,9 +1119,13 @@ impl SimSatStudioApp {
             margin_pct: self.margin_pct,
             aod: self.aod,
             rh_swelling: self.rh_swelling,
+            atmosphere_correction: self.atmosphere_correction,
+            terrain_atmosphere: self.terrain_atmosphere,
             clouds_enabled: self.clouds_enabled,
             multiscatter: self.multiscatter,
+            cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             beer_powder: self.beer_powder,
+            granulation: self.granulation,
             exposure: self.exposure,
             bm_month_override: self.bm_month_override,
             bm_allow_download: self.bm_allow_download,
@@ -1699,6 +1724,21 @@ impl SimSatStudioApp {
                  (parity compares granulation-off).",
             );
         }
+        if (atmo.gpu_clouds || atmo.parity) && atmo.terrain_atmosphere {
+            self.logline(
+                "GPU clouds: terrain-height atmosphere requires the CPU path; disabling that \
+                 physical correction re-enables the experimental GPU preview.",
+            );
+        }
+        if atmo.clouds_enabled
+            && atmo.render_mode.uses_visible_controls()
+            && (atmo.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON
+        {
+            self.logline(format!(
+                "QA override: visible cloud optical depth scaled by {:.2} (neutral = 1.00).",
+                atmo.cloud_optical_depth_scale
+            ));
+        }
         let Some(job) = self.job_for_timestep(&ts) else {
             return;
         };
@@ -1850,9 +1890,12 @@ impl SimSatStudioApp {
             ir_enhancement: self.ir_enhancement,
             aod: self.aod as f64,
             rh_swelling: self.rh_swelling,
+            atmosphere_correction: self.atmosphere_correction,
+            terrain_atmosphere: self.terrain_atmosphere,
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
             multiscatter: self.multiscatter,
+            cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             step_quality: self.step_quality,
@@ -1883,8 +1926,7 @@ impl SimSatStudioApp {
         let is_ir = ir_bt.is_some();
         let ir_enhancement = prep.ir_enhancement;
         let ir_band = prep.ir_band;
-        let has_cloud_frame = prep.cloud_rgba.is_some() || prep.gpu_cloud.is_some();
-        let clouds_on = has_cloud_frame && !is_ir && derived.is_none();
+        let clouds_on = rendered_clouds_on(prep.clouds_enabled, is_ir, derived.is_some());
         let (rendered, texture, gpu_info) = match self.render_prepared(ctx, &mut prep) {
             Ok(v) => v,
             Err(e) => {
@@ -2143,6 +2185,16 @@ impl SimSatStudioApp {
             self.logline(
                 "Sequence renders always use the CPU path; GPU clouds ignored for the batch.",
             );
+        }
+        if atmo.clouds_enabled
+            && atmo.render_mode.uses_visible_controls()
+            && (atmo.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON
+        {
+            self.logline(format!(
+                "QA override for batch: visible cloud optical depth scaled by {:.2} \
+                 (neutral = 1.00).",
+                atmo.cloud_optical_depth_scale
+            ));
         }
         atmo.gpu_clouds = false;
         atmo.parity = false;
@@ -2952,13 +3004,41 @@ impl SimSatStudioApp {
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Aerosol:");
-                        ui.add(egui::Slider::new(&mut self.aod, 0.0..=0.6).text("AOD"));
+                        ui.add(
+                            egui::Slider::new(&mut self.aod, 0.0..=0.6)
+                                .text("Aerosol optical depth (AOD)"),
+                        )
+                        .on_hover_text(
+                            "Visible aerosol optical depth at 550 nm. This does not disable \
+                             molecular (Rayleigh) scattering.",
+                        );
                         ui.checkbox(&mut self.rh_swelling, "RH aerosol swelling")
                             .on_hover_text(
-                                "Off by default (M2). Scales the Mie coefficient — a documented \
-                                 hook.",
+                                "Scales aerosol extinction by 1.5 to represent humid growth. \
+                                 Off leaves AOD at the numeric value shown.",
                             );
-                        ui.separator();
+                        if self.rh_swelling {
+                            ui.weak(format!("effective aerosol AOD {:.3}", self.aod * 1.5));
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(
+                            &mut self.atmosphere_correction,
+                            "Daytime aerial-veil correction",
+                        )
+                        .on_hover_text(
+                            "Reduce the modeled daytime atmospheric veil for the true-color \
+                             product. On is the product-facing default; off retains full \
+                             modeled path airlight. Other display transforms remain.",
+                        );
+                        ui.checkbox(&mut self.terrain_atmosphere, "Terrain-height atmosphere")
+                            .on_hover_text(
+                                "Shorten the view and sunlight atmospheric columns to each pixel's \
+                             model terrain elevation. On is physical; off reproduces the old \
+                             full sea-level column for QA.",
+                            );
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Output:");
                         egui::ComboBox::from_id_salt("outtx")
                             .selected_text(match self.output_transform {
@@ -2994,6 +3074,31 @@ impl SimSatStudioApp {
                                     "Wrenninge multi-scatter octaves (M5) — the bright-anvil \
                                      look. Off = fix2 single scatter (dimmer).",
                                 );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.cloud_optical_depth_scale,
+                                    0.0..=4.0,
+                                )
+                                .text("Cloud optical-depth scale (QA override)")
+                                .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Explicit what-if multiplier applied consistently to visible \
+                                 cloud extinction, sunlight attenuation, and shadows. 1.00 uses \
+                                 the model-derived physical input unchanged; 0 disables visible \
+                                 cloud optical extinction. This does not change IR products.",
+                            );
+                            if ui
+                                .add_enabled(
+                                    (self.cloud_optical_depth_scale - 1.0).abs()
+                                        > f32::EPSILON,
+                                    egui::Button::new("Reset scale to 1.00"),
+                                )
+                                .on_hover_text("Restore the neutral, model-derived cloud depth.")
+                                .clicked()
+                            {
+                                self.cloud_optical_depth_scale = 1.0;
+                            }
                             ui.checkbox(&mut self.beer_powder, "Beer-powder")
                                 .on_hover_text(
                                     "Schneider sugar-powder darkening of the sun term \
@@ -3035,7 +3140,10 @@ impl SimSatStudioApp {
                     let gpu_applicable = self.gpu.is_some()
                         && matches!(self.render_mode, RenderMode::Visible)
                         && self.view == StudioView::Geostationary
-                        && self.clouds_enabled;
+                        && self.clouds_enabled
+                        // The current WGSL path supports the true-color correction
+                        // toggle, but not per-pixel terrain elevation.
+                        && !self.terrain_atmosphere;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
                     // cluster was unexplained (owner-reported) — name the unmet
                     // conditions inline and on the disabled-hover instead.
@@ -3052,6 +3160,9 @@ impl SimSatStudioApp {
                         if !self.clouds_enabled {
                             unmet.push("Clouds on");
                         }
+                        if self.terrain_atmosphere {
+                            unmet.push("terrain-height atmosphere off");
+                        }
                         if unmet.is_empty() {
                             String::new()
                         } else {
@@ -3060,7 +3171,8 @@ impl SimSatStudioApp {
                     };
                     const GPU_DISABLED_HINT: &str =
                         "Enabled in Visible mode + Geostationary view with Clouds on \
-                         (needs a GPU device, a loaded run, and no render in progress).";
+                         and terrain-height atmosphere off. Also needs a GPU device, \
+                         a loaded run, and no render in progress.";
                     ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(gpu_applicable, |ui| {
                             ui.checkbox(&mut self.gpu_clouds, "GPU clouds (experimental)")
@@ -3961,10 +4073,16 @@ struct AtmoSettings {
     ir_enhancement: IrEnhancement,
     aod: f64,
     rh_swelling: bool,
+    /// Daytime aerial-veil correction (product-facing default on; off = full path airlight).
+    atmosphere_correction: bool,
+    /// Clip view/sun atmospheric columns to terrain elevation (physical default on).
+    terrain_atmosphere: bool,
     output_transform: OutputTransform,
     clouds_enabled: bool,
     /// M5 Wrenninge multi-scatter octaves on/off (the A/B knob: DEFAULT_OCTAVES vs 1).
     multiscatter: bool,
+    /// Explicit visible cloud optical-depth QA/what-if scale. Neutral is 1.0.
+    cloud_optical_depth_scale: f32,
     beer_powder: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise): when on, the visible
     /// cloud march + sun march + sun-OD map all sample the SAME dx-amplitude eroded
@@ -4304,14 +4422,21 @@ fn prepare_render(
     // projection the WGSL forward does not implement (rotated lat-lon = GRIB RRFS)
     // falls back to the CPU composite with a log line.
     let gpu_projection_ok = gpu::projection_supported(&georef);
+    // The GPU shader honors the true-color-correction flag, but it has no per-pixel
+    // terrain elevation. Never silently ignore that physical control.
+    let gpu_atmosphere_ok = !atmo.terrain_atmosphere;
     let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
         && atmo.clouds_enabled
         && !is_topdown
         && !is_persp
         && matches!(atmo.render_mode, RenderMode::Visible)
-        && gpu_projection_ok;
+        && gpu_projection_ok
+        && gpu_atmosphere_ok;
     if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
         status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
+    }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_atmosphere_ok {
+        status("GPU clouds: terrain-height atmosphere is CPU-only; using the CPU composite.");
     }
     let bm_cache_dir = ingest::default_cache_dir();
     let (bluemarble, bm_status, season_line): (Option<BmGround>, BmStatus, String) = match raster
@@ -4560,6 +4685,7 @@ fn prepare_render(
         ambient_elev_min: sky_sh.elev_min_deg as f32,
         ambient_elev_max: sky_sh.elev_max_deg as f32,
         ambient_n: sky_sh.entries.len() as f32,
+        atmosphere_correction: if atmo.atmosphere_correction { 1.0 } else { 0.0 },
     };
     let transmittance_lut = luts.transmittance.data.clone();
     let multiscatter_lut = luts.multiscatter.data.clone();
@@ -4661,6 +4787,7 @@ fn prepare_render(
         // the studio toggle is ignored by this preview (logged at Render).
         let icfg = MarchConfig {
             beer_powder: atmo.beer_powder,
+            cloud_optical_depth_scale: atmo.cloud_optical_depth_scale,
             octaves: if atmo.multiscatter {
                 clouds::DEFAULT_OCTAVES
             } else {
@@ -4680,6 +4807,7 @@ fn prepare_render(
             transmittance_floor: icfg.transmittance_floor as f32,
             edge_feather_cells: icfg.edge_feather_cells as f32,
             ground_day_lift: icfg.ground_day_lift as f32,
+            cloud_optical_depth_scale: icfg.cloud_optical_depth_scale,
         };
         let sun_od_plan = gpu::plan_sun_od(
             &georef,
@@ -4733,6 +4861,8 @@ fn prepare_render(
                 flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
                 raymarch_steps: 16,
                 exposure: atmo.exposure,
+                atmosphere_correction: atmo.atmosphere_correction,
+                terrain_atmosphere: atmo.terrain_atmosphere,
             };
             let bm_ref = bluemarble.as_ref().map(|a| &a.0);
             let rnx = raster.nx;
@@ -4750,13 +4880,17 @@ fn prepare_render(
                     Some(bm) if bm.width > 0 && bm.height > 0 => bm.sample_bilinear(g[0], g[1]),
                     _ => [FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB],
                 };
-                let (normal_enu, is_water) = if g[2] >= 0.0 {
+                let (normal_enu, is_water, surface_elevation_m) = if g[2] >= 0.0 {
                     let fi_f = (g[2] as f64 * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
                     let fj_f = (g[3] as f64 * ny as f64 - 0.5).clamp(0.0, (ny - 1) as f64);
                     let cell = fj_f.round() as usize * nx + fi_f.round() as usize;
-                    (normals[cell], brick.landmask[cell] < 0.5)
+                    (
+                        normals[cell],
+                        brick.landmask[cell] < 0.5,
+                        brick.hgt.get(cell).copied().unwrap_or(0.0),
+                    )
                 } else {
-                    ([0.0, 0.0, 1.0], false)
+                    ([0.0, 0.0, 1.0], false, 0.0)
                 };
                 SurfacePixel {
                     on_earth: true,
@@ -4766,6 +4900,7 @@ fn prepare_render(
                     sun_elev_deg: l[3],
                     is_water,
                     view_dir: [0.0, 0.0, 1.0],
+                    surface_elevation_m,
                     // Flat/open M3 defaults (the GPU surface model).
                     ..Default::default()
                 }
@@ -4822,7 +4957,12 @@ fn prepare_render(
         }));
         status("GPU cloud inputs ready.");
         (None, None)
-    } else if atmo.clouds_enabled || is_topdown || is_persp || is_visible_ir_composite {
+    } else if atmo.clouds_enabled
+        || is_topdown
+        || is_persp
+        || is_visible_ir_composite
+        || !gpu_atmosphere_ok
+    {
         // ── CPU VISIBLE composite. Geostationary clouds-ON composites the M4/M5 cloud
         // march over the M2/M3 surface radiance (the tested CPU render path; the GPU
         // cloud pass is the deferred M5 activation). The TOP-DOWN map and the
@@ -4880,6 +5020,7 @@ fn prepare_render(
         );
         let cfg = MarchConfig {
             beer_powder: atmo.beer_powder,
+            cloud_optical_depth_scale: atmo.cloud_optical_depth_scale,
             // Multi-scatter A/B (M5): DEFAULT_OCTAVES = the bright multiple-scatter look,
             // 1 = the fix2 single scatter.
             octaves: if atmo.multiscatter {
@@ -4926,6 +5067,8 @@ fn prepare_render(
             raymarch_steps: 16,
             // One display exposure for the whole composited frame (surface + cloud).
             exposure: atmo.exposure,
+            atmosphere_correction: atmo.atmosphere_correction,
+            terrain_atmosphere: atmo.terrain_atmosphere,
         };
         let bm_ref = bluemarble.as_ref().map(|a| &a.0);
         let rnx = raster.nx;
@@ -4955,6 +5098,7 @@ fn prepare_render(
                 sky_openness,
                 bent_normal_enu,
                 wind_speed,
+                surface_elevation_m,
             ) = if g[2] >= 0.0 {
                 let fi_f = (g[2] as f64 * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
                 let fj_f = (g[3] as f64 * ny as f64 - 0.5).clamp(0.0, (ny - 1) as f64);
@@ -4978,9 +5122,10 @@ fn prepare_render(
                     openness as f32,
                     [bent[0] as f32, bent[1] as f32, bent[2] as f32],
                     wind,
+                    brick.hgt.get(cell).copied().unwrap_or(0.0),
                 )
             } else {
-                ([0.0, 0.0, 1.0], false, 0.0, 1.0, [0.0, 0.0, 1.0], 0.0)
+                ([0.0, 0.0, 1.0], false, 0.0, 1.0, [0.0, 0.0, 1.0], 0.0, 0.0)
             };
             SurfacePixel {
                 on_earth: true,
@@ -4994,6 +5139,7 @@ fn prepare_render(
                 sky_openness,
                 bent_normal_enu,
                 wind_speed,
+                surface_elevation_m,
             }
         };
         // Geostationary: scan-angle rays + the aerial-perspective froxel. Top-down map:
@@ -5139,6 +5285,7 @@ fn prepare_render(
         ir_band,
         derived: derived_out,
         render_mode: atmo.render_mode,
+        clouds_enabled: atmo.clouds_enabled,
         gpu_cloud: gpu_cloud_out,
     };
     Ok(Box::new(prep))
@@ -5326,6 +5473,13 @@ fn band_display(band: u8) -> String {
     }
 }
 
+/// Whether the visible-frame status line should report volumetric clouds as on.
+/// CPU top-down/perspective surface-only renders still return an RGBA buffer, so
+/// this must use the captured UI toggle rather than infer state from buffer presence.
+fn rendered_clouds_on(clouds_enabled: bool, is_ir: bool, is_derived: bool) -> bool {
+    clouds_enabled && !is_ir && !is_derived
+}
+
 /// Default sat-store root under the SimSat Studio data dir (sibling of the brick
 /// cache). Shown in the UI and changeable; the owner points BowEcho here.
 fn default_store_root() -> PathBuf {
@@ -5475,6 +5629,14 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_cloud_status_uses_the_requested_toggle_not_frame_buffer_presence() {
+        assert!(rendered_clouds_on(true, false, false));
+        assert!(!rendered_clouds_on(false, false, false));
+        assert!(!rendered_clouds_on(true, true, false));
+        assert!(!rendered_clouds_on(true, false, true));
+    }
 
     #[test]
     fn parity_stats_identical_frames_are_zero() {

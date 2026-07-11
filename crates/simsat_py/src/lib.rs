@@ -151,6 +151,16 @@ impl Georef {
 /// surrounding earth (Blue Marble ground + clear sky, no WRF weather outside the domain).
 /// It applies to both views and to every render function here.
 ///
+/// Visible-family atmosphere/cloud controls are shared by RGB, bands, GeoColor,
+/// Sandwich, cloud-layer, and perspective renders: `aerosol_optical_depth` (default
+/// 0.05), `rh_aerosol_swelling` (1.5x when true), `atmosphere_correction`,
+/// `terrain_atmosphere`, and `cloud_optical_depth_scale` (0..=4, default 1). The OD
+/// scale is a visible sensitivity control and does not alter the quantitative
+/// `render_cloud_optical_depth` product. `clouds` remains the explicit feature bypass;
+/// `multiscatter` controls the higher scattering octaves without changing transmittance.
+/// `beer_powder` enables the optional direct-sun shaping, and `granulation` enables
+/// display-only sub-grid cloud-edge erosion; both default off.
+///
 /// `threads` (default None = all cores, or RAYON_NUM_THREADS) caps the render worker
 /// threads for THIS PROCESS. The pool is global and built ONCE — the first render call's
 /// value wins; later calls cannot change it. Available on every render function here.
@@ -159,9 +169,11 @@ impl Georef {
 #[pyfunction]
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
-    exposure=None, multiscatter=true, steps="offline", clouds=true, sun_elev=None,
-    sun_az=None, cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true,
-    threads=None
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    sun_elev=None, sun_az=None, cache=None, bluemarble=None,
+    bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_visible_rgb<'py>(
@@ -172,10 +184,17 @@ fn render_visible_rgb<'py>(
     timestep: usize,
     resolution: &str,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -191,10 +210,17 @@ fn render_visible_rgb<'py>(
         timestep,
         resolution,
         margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
         exposure,
         multiscatter,
+        beer_powder,
         steps,
         clouds,
+        cloud_optical_depth_scale,
+        granulation,
         sun_elev,
         sun_az,
         cache,
@@ -228,9 +254,11 @@ fn render_visible_rgb<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
-    exposure=None, multiscatter=true, steps="offline", clouds=true, sun_elev=None,
-    sun_az=None, cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true,
-    threads=None
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    sun_elev=None, sun_az=None, cache=None, bluemarble=None,
+    bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_geocolor<'py>(
@@ -241,10 +269,17 @@ fn render_geocolor<'py>(
     timestep: usize,
     resolution: &str,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -260,10 +295,17 @@ fn render_geocolor<'py>(
         timestep,
         resolution,
         margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
         exposure,
         multiscatter,
+        beer_powder,
         steps,
         clouds,
+        cloud_optical_depth_scale,
+        granulation,
         sun_elev,
         sun_az,
         cache,
@@ -298,9 +340,11 @@ fn render_geocolor<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
-    exposure=None, multiscatter=true, steps="offline", clouds=true, sun_elev=None,
-    sun_az=None, cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true,
-    threads=None
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    sun_elev=None, sun_az=None, cache=None, bluemarble=None,
+    bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_sandwich<'py>(
@@ -311,10 +355,17 @@ fn render_sandwich<'py>(
     timestep: usize,
     resolution: &str,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -330,10 +381,17 @@ fn render_sandwich<'py>(
         timestep,
         resolution,
         margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
         exposure,
         multiscatter,
+        beer_powder,
         steps,
         clouds,
+        cloud_optical_depth_scale,
+        granulation,
         sun_elev,
         sun_az,
         cache,
@@ -364,8 +422,11 @@ fn render_sandwich<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
-    multiscatter=true, steps="offline", sun_elev=None, sun_az=None, cache=None,
-    bluemarble=None, bluemarble_month=None, bluemarble_download=true, threads=None
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, multiscatter=true, beer_powder=false, steps="offline", clouds=true,
+    cloud_optical_depth_scale=1.0, granulation=false, sun_elev=None, sun_az=None, cache=None,
+    bluemarble=None,
+    bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_visible_bands<'py>(
@@ -376,8 +437,16 @@ fn render_visible_bands<'py>(
     timestep: usize,
     resolution: &str,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
+    clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -393,10 +462,17 @@ fn render_visible_bands<'py>(
         timestep,
         resolution,
         margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
         None,
         multiscatter,
+        beer_powder,
         steps,
-        true,
+        clouds,
+        cloud_optical_depth_scale,
+        granulation,
         sun_elev,
         sun_az,
         cache,
@@ -696,14 +772,19 @@ fn render_cloud_optical_depth<'py>(
 ///       (NW, NE, SE, SW).
 ///
 /// TOP-DOWN by definition (there is no `view=` — the host map is the ground; no Blue
-/// Marble is rendered). The sun / exposure / steps / multiscatter controls drive the
-/// cloud march exactly like `render_visible_rgb`. Datum note: lat/lon are on the WRF
+/// Marble is rendered). The sun / aerosol / exposure / steps / multiscatter /
+/// beer-powder / granulation / cloud-optical-depth controls drive the cloud march
+/// exactly like `render_visible_rgb`;
+/// `clouds=False` returns a transparent cloud image and neutral shadow. Datum note:
+/// lat/lon are on the WRF
 /// sphere fed through standard EPSG:3857 — the usual WRF-on-a-web-map approximation.
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", timestep=0, margin=0.0, exposure=None, multiscatter=true,
-    steps="offline", sun_elev=None, sun_az=None, cache=None, premultiplied=false,
-    threads=None
+    input, *, sat="goes-east", timestep=0, margin=0.0, aerosol_optical_depth=0.05,
+    rh_aerosol_swelling=false, atmosphere_correction=true, terrain_atmosphere=true,
+    exposure=None, multiscatter=true, beer_powder=false, steps="offline", clouds=true,
+    cloud_optical_depth_scale=1.0, granulation=false, sun_elev=None, sun_az=None, cache=None,
+    premultiplied=false, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_cloud_layer<'py>(
@@ -712,9 +793,17 @@ fn render_cloud_layer<'py>(
     sat: &str,
     timestep: usize,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
+    clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -729,11 +818,22 @@ fn render_cloud_layer<'py>(
     params.satellite = parse_sat(sat)?;
     params.timestep = timestep;
     params.margin_frac = parse_margin(margin)?;
+    apply_visible_physics_controls(
+        &mut params,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
+        cloud_optical_depth_scale,
+        beer_powder,
+        granulation,
+    )?;
     if let Some(e) = exposure {
         params.exposure = e;
     }
     params.multiscatter = multiscatter;
     params.steps = parse_steps(steps)?;
+    params.clouds = clouds;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
         Some(SunOverride {
             elev_deg: sun_elev,
@@ -792,10 +892,12 @@ fn render_cloud_layer<'py>(
 /// simply N calls along your own eye/look path (each frame is an independent render).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0, exposure=None,
-    multiscatter=true, steps="offline", clouds=true, cloud_layer_only=false,
-    sun_elev=None, sun_az=None, cache=None, bluemarble=None, bluemarble_month=None,
-    bluemarble_download=true, threads=None
+    input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0,
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, exposure=None, multiscatter=true, beer_powder=false,
+    steps="offline", clouds=true, cloud_optical_depth_scale=1.0, granulation=false,
+    cloud_layer_only=false, sun_elev=None, sun_az=None,
+    cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_perspective<'py>(
@@ -806,10 +908,17 @@ fn render_perspective<'py>(
     fov: f64,
     size: (usize, usize),
     timestep: usize,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     cloud_layer_only: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -821,6 +930,16 @@ fn render_perspective<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
     params.timestep = timestep;
+    apply_visible_physics_controls(
+        &mut params,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
+        cloud_optical_depth_scale,
+        beer_powder,
+        granulation,
+    )?;
     if let Some(e) = exposure {
         params.exposure = e;
     }
@@ -980,10 +1099,17 @@ fn build_visible_params(
     timestep: usize,
     resolution: &str,
     margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
     exposure: Option<f64>,
     multiscatter: bool,
+    beer_powder: bool,
     steps: &str,
     clouds: bool,
+    cloud_optical_depth_scale: f32,
+    granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -997,6 +1123,16 @@ fn build_visible_params(
     params.timestep = timestep;
     params.resolution = parse_resolution(resolution)?;
     params.margin_frac = parse_margin(margin)?;
+    apply_visible_physics_controls(
+        &mut params,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
+        cloud_optical_depth_scale,
+        beer_powder,
+        granulation,
+    )?;
     if let Some(e) = exposure {
         params.exposure = e;
     }
@@ -1022,6 +1158,43 @@ fn build_visible_params(
         },
     };
     Ok(params)
+}
+
+/// Validate and apply the common visible-atmosphere/cloud calibration controls. Keeping
+/// this in one helper makes the Python defaults and bounds identical across RGB, raw bands,
+/// GeoColor, Sandwich, cloud-layer, and perspective entry points.
+fn apply_visible_physics_controls(
+    params: &mut RenderParams,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
+    cloud_optical_depth_scale: f32,
+    beer_powder: bool,
+    granulation: bool,
+) -> PyResult<()> {
+    if !aerosol_optical_depth.is_finite() || !(0.0..=0.6).contains(&aerosol_optical_depth) {
+        return Err(value_err(format!(
+            "aerosol_optical_depth must be finite and in 0.0..=0.6, got \
+             {aerosol_optical_depth}"
+        )));
+    }
+    if !cloud_optical_depth_scale.is_finite()
+        || !(0.0..=4.0).contains(&cloud_optical_depth_scale)
+    {
+        return Err(value_err(format!(
+            "cloud_optical_depth_scale must be finite and in 0.0..=4.0, got \
+             {cloud_optical_depth_scale}"
+        )));
+    }
+    params.aerosol_optical_depth = aerosol_optical_depth;
+    params.rh_aerosol_swelling = rh_aerosol_swelling;
+    params.atmosphere_correction = atmosphere_correction;
+    params.terrain_atmosphere = terrain_atmosphere;
+    params.cloud_optical_depth_scale = cloud_optical_depth_scale;
+    params.beer_powder = beer_powder;
+    params.granulation = Some(granulation);
+    Ok(())
 }
 
 /// Build the Python [`Georef`] from a render result: scalars + the projection dict + the
@@ -1257,6 +1430,51 @@ fn parse_enhancement(v: &str) -> PyResult<IrEnhancement> {
         _ => Err(value_err(format!(
             "unknown enhancement '{v}' (cimss|bd|avn|funktop|rainbow|gray)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_physics_helper_assigns_every_binding_control() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        apply_visible_physics_controls(&mut params, 0.2, true, false, false, 0.5, true, true)
+            .unwrap();
+        assert_eq!(params.aerosol_optical_depth, 0.2);
+        assert!(params.rh_aerosol_swelling);
+        assert!(!params.atmosphere_correction);
+        assert!(!params.terrain_atmosphere);
+        assert_eq!(params.cloud_optical_depth_scale, 0.5);
+        assert!(params.beer_powder);
+        assert_eq!(params.granulation, Some(true));
+    }
+
+    #[test]
+    fn visible_physics_helper_preserves_engine_defaults() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        apply_visible_physics_controls(
+            &mut params,
+            simsat_engine::atmosphere::DEFAULT_AOD as f32,
+            false,
+            true,
+            true,
+            1.0,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            params.aerosol_optical_depth.to_bits(),
+            (simsat_engine::atmosphere::DEFAULT_AOD as f32).to_bits()
+        );
+        assert!(!params.rh_aerosol_swelling);
+        assert!(params.atmosphere_correction);
+        assert!(params.terrain_atmosphere);
+        assert_eq!(params.cloud_optical_depth_scale, 1.0);
+        assert!(!params.beer_powder);
+        assert_eq!(params.granulation, Some(false));
     }
 }
 

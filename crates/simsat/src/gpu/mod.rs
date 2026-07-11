@@ -86,6 +86,9 @@ pub struct SurfaceUniforms {
     pub ambient_elev_min: f32,
     pub ambient_elev_max: f32,
     pub ambient_n: f32,
+    /// Product-facing atmosphere correction flag (0 = raw physical airlight, 1 =
+    /// corrected true-color veil). Packed in the formerly-unused `p2.w` lane.
+    pub atmosphere_correction: f32,
 }
 
 impl SurfaceUniforms {
@@ -110,7 +113,7 @@ impl SurfaceUniforms {
                 self.ambient_elev_min,
                 self.ambient_elev_max,
                 self.ambient_n,
-                0.0,
+                self.atmosphere_correction,
             ],
         ]
     }
@@ -1157,6 +1160,9 @@ pub struct CloudMarchParams {
     pub beer_powder: bool,
     pub ground_albedo: f32,
     pub transmittance_floor: f32,
+    /// Visible-cloud optical-depth QA/calibration multiplier. Packed validated in
+    /// `u.frx2.w`; raw volume/COD and the thermal path remain unscaled.
+    pub cloud_optical_depth_scale: f32,
     /// Zoom-out-margin edge-feather band (cells; 0 = no margin, the no-op).
     pub edge_feather_cells: f32,
     /// The sun-gated whole-surface daytime lift (`render::GROUND_DAY_LIFT` default).
@@ -1260,12 +1266,12 @@ pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 25] {
         [so.v_min as f32, so.v_max as f32, so.dim as f32, 1.0],
         // frx: the froxel scan rect
         inputs.scan_rect,
-        // frx2: froxel_dim, edge_feather_cells, ground_day_lift, unused
+        // frx2: froxel_dim, edge_feather_cells, ground_day_lift, visible cloud OD scale
         [
             inputs.froxel_dim as f32,
             m.edge_feather_cells,
             m.ground_day_lift,
-            0.0,
+            crate::clouds::validated_cloud_optical_depth_scale(m.cloud_optical_depth_scale),
         ],
     ]
 }
@@ -2001,6 +2007,7 @@ mod tests {
             ambient_elev_min: -20.0,
             ambient_elev_max: 90.0,
             ambient_n: 48.0,
+            atmosphere_correction: 1.0,
         }
     }
 
@@ -2052,6 +2059,7 @@ mod tests {
                 beer_powder: false,
                 ground_albedo: 0.3,
                 transmittance_floor: 0.003,
+                cloud_optical_depth_scale: 0.75,
                 edge_feather_cells: 3.2,
                 ground_day_lift: 2.0,
             },
@@ -2085,7 +2093,7 @@ mod tests {
         assert_eq!(quads.len(), 25);
         // The first 9 quads are the surface uniforms verbatim.
         assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
-        assert_eq!(quads[8], [-20.0, 90.0, 48.0, 0.0]);
+        assert_eq!(quads[8], [-20.0, 90.0, 48.0, 1.0]);
         // dims: nx, ny, nz, voxel_pitch.
         assert_eq!(quads[9], [80.0, 60.0, 40.0, 500.0]);
         // vert: z_min, dz, r_top, r_bottom.
@@ -2096,8 +2104,13 @@ mod tests {
         // sod_c.w = transmittance floor; sod_e = extents + dim + clouds-enabled.
         assert_eq!(quads[19][3], 0.003);
         assert_eq!(quads[22], [-40_000.0, 40_000.0, 512.0, 1.0]);
-        // frx2: froxel dim, edge feather, ground lift.
-        assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.0]);
+        // frx2: froxel dim, edge feather, ground lift, visible cloud OD scale.
+        assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
+        let mut invalid = test_cloud_inputs(test_surface_uniforms());
+        invalid.march.cloud_optical_depth_scale = f32::NAN;
+        assert_eq!(cloud_uniform_quads(&invalid)[24][3], 1.0);
+        invalid.march.cloud_optical_depth_scale = 99.0;
+        assert_eq!(cloud_uniform_quads(&invalid)[24][3], 4.0);
         // 25 vec4 = 400 bytes, little-endian f32s in order.
         let bytes = quads_to_bytes(&quads);
         assert_eq!(bytes.len(), 400);
@@ -2349,6 +2362,7 @@ mod tests {
             ambient_elev_min: -20.0,
             ambient_elev_max: 90.0,
             ambient_n: 48.0,
+            atmosphere_correction: 1.0,
         };
         let bytes = u.to_bytes();
         assert_eq!(bytes.len(), 144);
@@ -2362,7 +2376,7 @@ mod tests {
             f32::from_le_bytes(bytes[136..140].try_into().unwrap()),
             48.0
         );
-        // Trailing pad word is zero.
-        assert_eq!(f32::from_le_bytes(bytes[140..144].try_into().unwrap()), 0.0);
+        // Trailing word is the product-facing atmosphere-correction flag.
+        assert_eq!(f32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1.0);
     }
 }

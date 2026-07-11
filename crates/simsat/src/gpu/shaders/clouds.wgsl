@@ -13,7 +13,8 @@
 // the CPU's trilerp of decoded extinction, a ~quantization-granularity difference);
 // nearest froxel depth. The in-cloud sun transmittance is a short DEPTH-RESOLVED
 // secondary light march toward the sun (mirrors clouds.rs after M4 review FINDING 1);
-// the sun-OD map is used only for the ground cloud-shadow. The froxel is indexed by the
+// the sun-OD map drives ground cloud-shadow and the support-only thin-multiscatter gate,
+// never sample-to-sun transmittance. The froxel is indexed by the
 // ATMOSPHERE-shell traversal fraction of the cloud centroid (FINDING 4), and the front
 // airlight is weighted by (1 - T_cloud) so it is not double-counted.
 //
@@ -192,7 +193,7 @@ struct Uniforms {
     sod_v: vec4<f32>,  // av xyz, u_max
     sod_e: vec4<f32>,  // v_min, v_max, sunod_dim, clouds_enabled
     frx: vec4<f32>,    // scan x_min, x_max, y_min, y_max
-    frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, unused
+    frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, visible cloud OD scale
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -461,6 +462,12 @@ fn edge_feather(fi: f32, fj: f32) -> f32 {
     }
     let t = d / band;
     return t * t * (3.0 - 2.0 * t);
+}
+
+// Validated on CPU before packing; clamp again at the consumption seam so the shader
+// remains bounded if an alternate caller builds uniforms directly.
+fn cloud_od_scale() -> f32 {
+    return clamp(u.frx2.w, 0.0, 4.0);
 }
 
 // SUNRISE veil ramp (twin of render::aerial_veil_scale / surface.wgsl).
@@ -953,10 +960,13 @@ fn aggregate_phase_scaled(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, g_sc
 }
 
 // Wrenninge/Oz multi-scatter octave SUN SOURCE (M5): sum_k weight_k * phase(g*b^k) *
-// vis(tau_sun*a^k). octaves=1 == the fix2 single scatter. Twin of clouds.rs::octave_sun_source.
+// vis(tau_sun*a^k). Higher orders additionally carry `(1-exp(-support_tau))^k`, the
+// probability of enough cloud interactions: they vanish in the optically-thin limit,
+// while octave zero and thick-cloud behavior are unchanged. CPU twin:
+// clouds.rs::octave_sun_source_thin_gated.
 // The octave count comes from u.m1.y (the studio Multi-scatter A/B: DEFAULT_OCTAVES vs 1),
 // clamped to [1, OCTAVES]; a zero/garbage uniform falls back to the full OCTAVES.
-fn octave_sun_source(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, tau_sun: f32, powder: bool) -> f32 {
+fn octave_sun_source(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, tau_sun: f32, powder: bool, support_tau: f32) -> f32 {
     var octaves = i32(u.m1.y + 0.5);
     if (octaves < 1 || octaves > OCTAVES) {
         octaves = OCTAVES;
@@ -965,14 +975,19 @@ fn octave_sun_source(cos_t: f32, ext_liquid: f32, ext_ice_precip: f32, tau_sun: 
     var ext_scale = 1.0;
     var g_scale = 1.0;
     var weight = 1.0;
+    let thin_gate = 1.0 - exp(-max(support_tau, 0.0));
+    var order_gate = 1.0;
     for (var k: i32 = 0; k < octaves; k = k + 1) {
+        if (k > 0) {
+            order_gate = order_gate * thin_gate;
+        }
         let tau_k = tau_sun * ext_scale;
         var vis_k = exp(-tau_k);
         if (powder) {
             vis_k = beer_powder(tau_k);
         }
         let phase_k = aggregate_phase_scaled(cos_t, ext_liquid, ext_ice_precip, g_scale);
-        acc = acc + weight * phase_k * vis_k;
+        acc = acc + order_gate * weight * phase_k * vis_k;
         ext_scale = ext_scale * OCTAVE_EXTINCTION_SCALE;
         g_scale = g_scale * OCTAVE_PHASE_SCALE;
         weight = weight * OCTAVE_BRIGHTNESS_SCALE;
@@ -1098,16 +1113,17 @@ fn sun_od_dist_sample(p: vec3<f32>) -> f32 {
 // Blur radius = occluder distance x tan(0.533 deg) in the sun-OD map's (au, av) plane;
 // transmittance-averaged over a small disk (soft, distance-widening edge).
 fn penumbral_shadow(pg: vec3<f32>) -> f32 {
+    let od_scale = cloud_od_scale();
     let occ_dist = sun_od_dist_sample(pg);
     let radius = occ_dist * SUN_ANG_DIAM;
     let dim = max(u.sod_e.z, 1.0);
     let texel = max((u.sod_v.w - u.sod_u.w) / dim, (u.sod_e.y - u.sod_e.x) / dim);
     if (radius <= 0.5 * texel) {
-        return exp(-sun_od_sample(pg));
+        return exp(-od_scale * sun_od_sample(pg));
     }
     let au = u.sod_u.xyz;
     let av = u.sod_v.xyz;
-    var sum = exp(-sun_od_sample(pg));
+    var sum = exp(-od_scale * sun_od_sample(pg));
     var wsum = 1.0;
     for (var ri: i32 = 0; ri < 2; ri = ri + 1) {
         let rr = select(1.0, 0.5, ri == 0);
@@ -1115,7 +1131,7 @@ fn penumbral_shadow(pg: vec3<f32>) -> f32 {
         for (var kk: i32 = 0; kk < 8; kk = kk + 1) {
             let ang = (f32(kk) + 0.5) / 8.0 * 2.0 * PI;
             let off = au * (radius * rr * cos(ang)) + av * (radius * rr * sin(ang));
-            sum = sum + w * exp(-sun_od_sample(pg + off));
+            sum = sum + w * exp(-od_scale * sun_od_sample(pg + off));
             wsum = wsum + w;
         }
     }
@@ -1142,8 +1158,9 @@ fn hash01(p: vec3<f32>) -> f32 {
 // FROM the sample (the cloud between the sample and the sun), exponentially-spaced so
 // the near field that dominates the sunlit face is resolved and the far tail is cheap.
 // Mirrors clouds.rs::cloud_sun_optical_depth (M4 review FINDING 1). The sun-OD map is no
-// longer consulted here (a 2-D total-column scalar cannot give a per-depth partial); it
-// survives only for the ground cloud-shadow.
+// longer consulted here (a 2-D total-column scalar cannot give a per-depth partial);
+// outside this function its total is used only for ground shadow and multiscatter
+// support, never for the sample-to-sun Beer term.
 // WS1: each ray samples its segments at a deterministic stratified hash offset instead
 // of the fixed midpoint, and a two-sample TAIL covers the remaining in-shell slant
 // toward the sun past the schedule's natural reach (a distant occluder along a low sun
@@ -1178,7 +1195,9 @@ fn cloud_sun_optical_depth(p: vec3<f32>, sun: vec3<f32>) -> f32 {
             }
         }
     }
-    return tau;
+    // Keep the compute-generated sun-OD texture and uploaded volume raw. Scale only
+    // this visible-light consumer; derived COD and thermal IR remain physical.
+    return tau * cloud_od_scale();
 }
 
 // The traversal fraction of the ATMOSPHERE shell (entry -> ground / far exit) at an
@@ -1245,6 +1264,7 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
     let floor_t = u.sod_c.w;
     let e_sun = u.solar.xyz;
     let cos_vs = dot(view, sun);
+    let od_scale = cloud_od_scale();
 
     var t = t_enter;
     var trans = 1.0;
@@ -1285,8 +1305,8 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         }
         // Zoom-out-margin EDGE FEATHER (twin of the CPU march): scales BOTH the
         // in-scatter source and the step opacity, so a faded sample scatters less
-        // AND grows more transparent. sigma_eff == sigma_t at band 0 (no margin).
-        let sigma_eff = sigma_t * edge_feather(bm.x, bm.y);
+        // AND grows more transparent. sigma_eff == sigma_t at band 0 and OD scale 1.
+        let sigma_eff = sigma_t * edge_feather(bm.x, bm.y) * od_scale;
         if (sigma_eff <= 0.0) {
             t = t + ds;
             continue;
@@ -1294,7 +1314,23 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         // Sun source: Wrenninge multi-scatter octaves (M5) over the single depth-
         // resolved cloud sun optical depth (octaves=1 == fix2 single scatter).
         let tau_cloud_sun = cloud_sun_optical_depth(pm, sun);
-        let sun_src = octave_sun_source(cos_vs, s.x, s.y + s.z, tau_cloud_sun, u.m1.z > 0.5);
+        // Column OD preserves the higher-order buildup at a thick cloud's sunlit top.
+        // The sun-aligned raw OD map covers slanted and legacy/analytic zero-tau_up
+        // data; it supports the gate only and never replaces sample-to-sun tau.
+        let col_total = sample_volume(vec3<f32>(bm.x, bm.y, 0.0)).w;
+        let sun_column_tau = sun_od_sample(pm) * od_scale;
+        let support_tau = max(
+            max(max(col_total * od_scale, sun_column_tau), tau_cloud_sun),
+            sigma_eff * u.dims.w,
+        );
+        let sun_src = octave_sun_source(
+            cos_vs,
+            s.x,
+            s.y + s.z,
+            tau_cloud_sun,
+            u.m1.z > 0.5,
+            support_tau,
+        );
         let r = length(pm);
         let up = pm / r;
         let mu_sun = dot(up, sun);
@@ -1314,11 +1350,11 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         let sun_elev = degrees(asin(clamp(mu_sun, -1.0, 1.0)));
         // SH-2 directional sky ambient (M5): sky irradiance at the voxel's local up.
         let e_sky = sh_irradiance(sun_elev, sun_frame_normal(up, sun, up));
-        let col_total = sample_volume(vec3<f32>(bm.x, bm.y, 0.0)).w;
         let tau_down = max(col_total - s.w, 0.0);
-        let amb_factor = AMBIENT_W_ABOVE * exp(-s.w) + AMBIENT_W_BELOW * u.m1.w * exp(-tau_down);
+        let amb_factor = AMBIENT_W_ABOVE * exp(-s.w * od_scale)
+            + AMBIENT_W_BELOW * u.m1.w * exp(-tau_down * od_scale);
         // The FEATHERED extinction drives the step opacity + the local in-scatter
-        // source (the sun/ambient inputs above use the TRUE field — CPU twin).
+        // source (sun/ambient use the edge-unfeathered but OD-scaled field — CPU twin).
         let step_t = exp(-sigma_eff * ds);
         let s_sun = e_sun * (sigma_eff * sun_src) * t_atmo;
         let s_amb = e_sky * (sigma_eff * amb_factor / PI);
@@ -1445,7 +1481,7 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
         let sc = raymarch(cam + view * t_enter, view, sun_ecef, t_ground - t_enter);
         // SUNRISE veil ramp (low-sun visible pass): the terminator band keeps the full
         // physical veil, daytime keeps the refinement de-haze.
-        let veil = aerial_veil_scale(sun_elev);
+        let veil = select(1.0, aerial_veil_scale(sun_elev), u.p2.w > 0.5);
         l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
     }
     return l_toa;
@@ -1481,7 +1517,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Low-sun illuminant correction at the display seam (on-earth pixels only; the
     // limb above keeps its physical color) — twin of the CPU shade_cloud_pixel /
     // shade_surface seam. Identity outside the 2-30 deg band.
-    let illum = low_sun_illuminant_gains(textureLoad(lut_light, coord, 0).w);
+    let pixel_sun_elev = textureLoad(lut_light, coord, 0).w;
+    let illum = low_sun_illuminant_gains(pixel_sun_elev);
 
     if (u.sod_e.w < 0.5) {
         // Clouds disabled: the M2 surface unchanged.
@@ -1497,7 +1534,13 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let ap = froxel_at(scan_x, scan_y, w_froxel);
     // Front airlight weighted by (1 - T_cloud) to avoid double-counting the front
     // segment already inside l_toa's full-column airlight (FINDING 4).
-    let l_final = l_toa * m.transmittance + ap.a * m.inscatter + ap.rgb * (1.0 - m.transmittance);
+    // Match the product-facing surface atmospheric correction for froxel airlight in
+    // FRONT of cloud. p2.w is the shared SurfaceUniforms atmosphere-correction flag;
+    // raw-physics mode leaves the full froxel veil intact.
+    let front_veil = select(1.0, aerial_veil_scale(pixel_sun_elev), u.p2.w > 0.5);
+    let l_final = l_toa * m.transmittance
+        + ap.a * m.inscatter
+        + front_veil * ap.rgb * (1.0 - m.transmittance);
     // Display seam (twin of shade_cloud_pixel -> radiance_to_rgba_softclip): the
     // low-sun illuminant gains, then rho = EXPOSURE * pi * L / E_sun into the
     // exposure-aware output transform.

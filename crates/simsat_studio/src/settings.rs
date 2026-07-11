@@ -93,9 +93,20 @@ pub struct StudioSettings {
     pub margin_pct: f32,
     pub aod: f32,
     pub rh_swelling: bool,
+    /// Daytime aerial-veil correction. `true` is the product-facing
+    /// default; persisted so QA can make an exact corrected/raw-TOA A/B.
+    pub atmosphere_correction: bool,
+    /// Shorten the atmospheric column to the model terrain elevation. `true` is
+    /// the physical default; `false` preserves the sea-level-column QA baseline.
+    pub terrain_atmosphere: bool,
     pub clouds_enabled: bool,
     pub multiscatter: bool,
+    /// Explicit QA/what-if multiplier on visible cloud optical depth. `1.0` keeps
+    /// the model-derived physical input unchanged.
+    pub cloud_optical_depth_scale: f32,
     pub beer_powder: bool,
+    /// Display-only sub-grid cloud-edge erosion. Explicitly opt-in/off by default.
+    pub granulation: bool,
     pub exposure: f32,
     pub bm_month_override: u32,
     pub bm_allow_download: bool,
@@ -128,9 +139,13 @@ impl Default for StudioSettings {
             margin_pct: 0.0,
             aod: simsat::atmosphere::DEFAULT_AOD as f32,
             rh_swelling: false,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
             clouds_enabled: true,
             multiscatter: true,
+            cloud_optical_depth_scale: 1.0,
             beer_powder: false,
+            granulation: false,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             bm_month_override: 0,
             bm_allow_download: true,
@@ -166,6 +181,12 @@ impl StudioSettings {
         let d = StudioSettings::default();
         self.margin_pct = clamp_finite(self.margin_pct, 0.0, 100.0, d.margin_pct);
         self.aod = clamp_finite(self.aod, 0.0, 0.6, d.aod);
+        self.cloud_optical_depth_scale = clamp_finite(
+            self.cloud_optical_depth_scale,
+            0.0,
+            4.0,
+            d.cloud_optical_depth_scale,
+        );
         self.exposure = clamp_finite(self.exposure, 0.25, 4.0, d.exposure);
         self.play_fps = clamp_finite(self.play_fps, 1.0, 30.0, d.play_fps);
         self.frame_cap = self.frame_cap.clamp(8, 480);
@@ -453,6 +474,13 @@ mod tests {
         assert_eq!(s.sat, "himawari");
         assert_eq!(s.exposure, 2.0);
         assert_eq!(s.mode, StudioSettings::default().mode);
+        // Backward compatibility: settings written before these controls existed
+        // receive the new shipped defaults field-by-field via `#[serde(default)]`.
+        assert!(s.atmosphere_correction);
+        assert!(s.terrain_atmosphere);
+        assert_eq!(s.cloud_optical_depth_scale, 1.0);
+        assert!(!s.beer_powder);
+        assert!(!s.granulation);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -461,6 +489,7 @@ mod tests {
         let mut s = StudioSettings {
             margin_pct: 250.0,
             aod: -3.0,
+            cloud_optical_depth_scale: 99.0,
             exposure: 99.0,
             play_fps: 0.0,
             frame_cap: 1,
@@ -476,6 +505,7 @@ mod tests {
         s.sanitize();
         assert_eq!(s.margin_pct, 100.0);
         assert_eq!(s.aod, 0.0);
+        assert_eq!(s.cloud_optical_depth_scale, 4.0);
         assert_eq!(s.exposure, 4.0);
         assert_eq!(s.play_fps, 1.0);
         assert_eq!(s.frame_cap, 8);
@@ -487,6 +517,11 @@ mod tests {
         assert_eq!(s.orbit_range_km, StudioSettings::default().orbit_range_km);
         assert_eq!(s.persp_width, 4096);
         assert_eq!(s.persp_height, 2);
+        // Non-finite scale cannot enter JSON normally, but sanitize is defensive
+        // for programmatic callers too and restores the neutral physical value.
+        s.cloud_optical_depth_scale = f32::NAN;
+        s.sanitize();
+        assert_eq!(s.cloud_optical_depth_scale, 1.0);
         // Idempotent.
         let once = s.clone();
         s.sanitize();
@@ -549,6 +584,11 @@ mod tests {
         let mut s = StudioSettings {
             sat: "goes-west".to_string(),
             exposure: 2.5,
+            atmosphere_correction: false,
+            terrain_atmosphere: false,
+            cloud_optical_depth_scale: 0.5,
+            beer_powder: true,
+            granulation: true,
             recent: vec![RecentEntry {
                 kind: "sequence".to_string(),
                 paths: vec!["C:/runs/enderlin".to_string()],

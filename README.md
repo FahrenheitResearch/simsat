@@ -51,6 +51,15 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
 
+New in v0.1.3: **atmosphere and cloud fidelity controls** — terrain-height
+atmospheric columns, consistent daytime aerial-veil correction across the
+surface and cloud-front airlight, optically-thin multi-scatter gating, and a
+bounded visible cloud optical-depth sensitivity scale. AOD, RH swelling,
+atmosphere correction, terrain atmosphere, clouds, multiscatter, Beer-powder,
+granulation, and cloud-OD scale now have matching controls in Studio, the CLI,
+and Python. Raw derived cloud optical depth and thermal products remain
+unscaled.
+
 New in v0.1.2: **operational-model ingest** — NOAA **HRRR** native-level GRIB2
 (`wrfnat`) opens directly in the studio/CLI/Python exactly like a wrfout;
 **RRFS** (rotated lat-lon, `natlev`) ingests via the CLI with a regional crop.
@@ -75,7 +84,9 @@ Two named binaries render without a GPU or GUI (`cargo build --release --bins`):
 
 ```
 simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
-    sat=goes-east view=geo sun-elev=30
+    sat=goes-east view=geo aod=0.05 rh-swelling=off \
+    atmosphere-correction=on terrain-atmosphere=on cloud-od-scale=1.0 \
+    multiscatter=on beer-powder=off granulation=off clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
     enhancement=rainbow
 ```
@@ -84,6 +95,13 @@ simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
 `simsat-render-ir` renders IR, water vapor (`wv=6.2|6.9|7.3`), and the derived
 fields (`derived=pw|ctt|cod`). Both take `key=value` arguments (run with
 `--help` for the full list) and print a machine-readable `SUMMARY` line.
+Visible renders expose the same atmosphere/cloud QA controls as Studio and Python:
+numeric aerosol AOD (`0` disables aerosol), RH swelling, reduced-versus-full
+aerial airlight, terrain-height atmosphere, multiscatter, beer-powder, granulation,
+clouds, and a neutral-at-`1.0` cloud optical-depth scale (`0` disables visible cloud
+extinction, valid range `0.0..=4.0`). The scale is an explicit sensitivity control and
+does not alter the raw derived cloud-optical-depth product; beer-powder and granulation
+remain opt-in/off by default.
 
 Animated GIF loops are exported from a completed store run:
 
@@ -102,7 +120,17 @@ lat/lon mesh) for every product, ready for matplotlib/cartopy:
 
 ```python
 import simsat
-rgb, geo = simsat.render_visible_rgb("wrfout_d03_...", view="topdown")
+rgb, geo = simsat.render_visible_rgb(
+    "wrfout_d03_...",
+    view="topdown",
+    aerosol_optical_depth=0.05,
+    rh_aerosol_swelling=False,
+    atmosphere_correction=True,
+    terrain_atmosphere=True,
+    cloud_optical_depth_scale=1.0,
+    beer_powder=False,
+    granulation=False,
+)
 ax.imshow(rgb, extent=geo.extent, origin="upper")
 ```
 

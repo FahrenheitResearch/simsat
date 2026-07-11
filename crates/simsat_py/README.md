@@ -41,11 +41,35 @@ Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), 
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default), `margin=0.0`
 (zoom-out fraction added on each side — real surrounding earth, clear sky, frames the
 domain), `cache=<dir>`, `threads=<n>`. The visible-family functions additionally take
-`exposure=1.6`, `multiscatter=True`, `steps` (`offline`/`interactive`), `clouds=True`,
+`exposure=1.6`, `multiscatter=True`, `beer_powder=False`, `granulation=False`,
+`steps` (`offline`/`interactive`), `clouds=True`,
 `sun_elev`/`sun_az` (what-if sun override), `bluemarble=<path>` (single-file ground),
 `bluemarble_month`, `bluemarble_download=True`. Thermal functions (`render_ir`,
 `render_water_vapor`) take `enhancement=` (`cimss`/`bd`/`avn`/`funktop`/`rainbow`/`gray`);
 the derived-field functions take `colormap=`.
+
+The visible-family functions (including raw visible bands, cloud layer, and perspective)
+also expose the atmosphere/cloud QA controls directly:
+
+| keyword | default | effect |
+|---|---:|---|
+| `aerosol_optical_depth` | `0.05` | aerosol AOD only; Rayleigh remains present at zero |
+| `rh_aerosol_swelling` | `False` | apply the documented 1.5x aerosol-extinction multiplier |
+| `atmosphere_correction` | `True` | product-facing daytime aerial-veil correction; `False` retains full modeled path airlight (other display transforms remain) |
+| `terrain_atmosphere` | `True` | shorten atmosphere columns to the WRF terrain elevation |
+| `cloud_optical_depth_scale` | `1.0` | multiply visible cloud OD consistently in view/sun/ambient/shadow paths (`0.0..=4.0`) |
+| `beer_powder` | `False` | optional Schneider shaping of the direct cloud-sun term; does not change transmittance |
+| `granulation` | `False` | display-only sub-grid cloud-edge erosion; quantitative bands/thermal/derived products remain unmodified |
+
+`cloud_optical_depth_scale` is a labeled sensitivity control: `1.0` preserves the
+model-derived extinction and `0.0` makes its visible optical effects transparent. It does
+not alter `render_cloud_optical_depth`, which intentionally returns the unscaled physical
+input. `clouds=False` remains the explicit feature bypass, while `multiscatter=False`
+disables the higher cloud-scattering octaves without changing cloud transmittance.
+`beer_powder` and `granulation` are explicit opt-in appearance controls and remain off
+unless requested.
+Layer-only products accept the shared keywords for call-site consistency, but
+`atmosphere_correction` and `terrain_atmosphere` have no surface atmosphere to modify there.
 
 ### `threads=` (per-process render-thread cap)
 

@@ -245,7 +245,17 @@ impl AtmosphereParams {
     /// AOD / H_M`.
     #[inline]
     pub fn mie_extinction_ground(&self) -> f64 {
-        self.aerosol_swelling * self.aod / MIE_SCALE_HEIGHT_M
+        let aod = if self.aod.is_finite() {
+            self.aod.max(0.0)
+        } else {
+            DEFAULT_AOD
+        };
+        let swelling = if self.aerosol_swelling.is_finite() {
+            self.aerosol_swelling.max(0.0)
+        } else {
+            1.0
+        };
+        swelling * aod / MIE_SCALE_HEIGHT_M
     }
     /// Mie SCATTERING at the surface (m^-1).
     #[inline]
@@ -1405,6 +1415,43 @@ pub fn ray_atmosphere_segment(origin: [f64; 3], dir: [f64; 3]) -> Option<(f64, f
     Some((t_enter, t_exit))
 }
 
+/// The in-atmosphere segment from top-of-atmosphere entry to a terrain surface at
+/// `surface_elevation_m` above mean sea level.
+///
+/// The atmosphere LUTs are parameterized by radius above [`R_GROUND_M`], while the
+/// historical surface path always ended its view ray at the mean-sea-level sphere.
+/// That gives elevated terrain a fictitious low-level atmosphere column.  This helper
+/// keeps the existing camera ray and clips its earthward end against the concentric
+/// sphere at the pixel's terrain elevation.  Non-finite, negative, and zero elevations
+/// deliberately reproduce [`ray_atmosphere_segment`]; negative terrain remains clipped
+/// to mean sea level because the atmosphere shell itself starts there.
+pub fn ray_atmosphere_segment_to_surface(
+    origin: [f64; 3],
+    dir: [f64; 3],
+    surface_elevation_m: f64,
+) -> Option<(f64, f64)> {
+    let (t_enter, mut t_exit) = ray_atmosphere_segment(origin, dir)?;
+    let elevation = if surface_elevation_m.is_finite() {
+        surface_elevation_m.max(0.0)
+    } else {
+        0.0
+    };
+    if elevation <= 0.0 {
+        return Some((t_enter, t_exit));
+    }
+
+    // Stay strictly inside the atmosphere shell. Ingested terrain is many orders of
+    // magnitude below this guard, but the clamp makes malformed inputs harmless.
+    let surface_radius = (R_GROUND_M + elevation).min(R_TOP_M - 1.0);
+    if let Some((t0_surface, _)) = ray_sphere(origin, dir, surface_radius)
+        && t0_surface > t_enter
+        && t0_surface < t_exit
+    {
+        t_exit = t0_surface;
+    }
+    (t_exit > t_enter).then_some((t_enter, t_exit))
+}
+
 /// Ray/sphere intersection: the two real roots `(t0 <= t1)` of `|origin + t*dir| =
 /// radius`, or `None`. `dir` is assumed unit.
 fn ray_sphere(origin: [f64; 3], dir: [f64; 3], radius: f64) -> Option<(f64, f64)> {
@@ -1654,6 +1701,25 @@ mod tests {
         assert!(at25.extinction[1] > 0.0);
         // Green extinction at the ozone peak exceeds well above the ozone layer.
         assert!(at25.extinction[1] > above.extinction[1]);
+    }
+
+    #[test]
+    fn aerosol_controls_reject_negative_and_non_finite_extinction() {
+        let negative = AtmosphereParams {
+            aod: -0.5,
+            ..Default::default()
+        };
+        assert_eq!(negative.mie_extinction_ground(), 0.0);
+
+        let invalid = AtmosphereParams {
+            aod: f64::NAN,
+            aerosol_swelling: f64::INFINITY,
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid.mie_extinction_ground(),
+            DEFAULT_AOD / MIE_SCALE_HEIGHT_M
+        );
     }
 
     #[test]
@@ -2003,6 +2069,36 @@ mod tests {
         let (_l0, l1) = ray_atmosphere_segment(cam.camera, limb).expect("limb grazes the shell");
         let exit_r = len3(madd3(cam.camera, limb, l1));
         assert!(exit_r > R_GROUND_M + 1000.0, "limb ray must not hit ground");
+    }
+
+    #[test]
+    fn terrain_surface_shortens_nadir_atmosphere_segment() {
+        let cam = CameraGeometry::from_sub_lon(0.0);
+        let nadir = cam.view_dir(0.0, 0.0);
+        let sea = ray_atmosphere_segment_to_surface(cam.camera, nadir, 0.0)
+            .expect("sea-level nadir segment");
+        let mountain = ray_atmosphere_segment_to_surface(cam.camera, nadir, 4000.0)
+            .expect("mountain nadir segment");
+        assert_eq!(sea.0, mountain.0, "top-of-atmosphere entry must not move");
+        assert!(
+            mountain.1 < sea.1,
+            "elevated terrain must shorten the view column"
+        );
+        assert!(
+            ((sea.1 - mountain.1) - 4000.0).abs() < 1.0,
+            "nadir shortening should equal terrain height: {} m",
+            sea.1 - mountain.1
+        );
+        let mountain_r = len3(madd3(cam.camera, nadir, mountain.1));
+        assert!(
+            (mountain_r - (R_GROUND_M + 4000.0)).abs() < 1.0,
+            "terrain segment must end at the requested radius"
+        );
+        assert_eq!(
+            ray_atmosphere_segment_to_surface(cam.camera, nadir, f64::NAN),
+            Some(sea),
+            "non-finite terrain must reproduce the safe sea-level path"
+        );
     }
 
     #[test]
