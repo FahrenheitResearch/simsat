@@ -44,15 +44,15 @@ use simsat::bluemarble;
 use simsat::bricks::{self, RunManifest};
 use simsat::camera::{
     GeoCamera, MAX_AXIS, PerspectiveBasis, PerspectiveCamera, ResolutionMode, SatellitePreset,
-    SurfaceRaster, build_map_raster, build_perspective_raster, build_surface_raster_mode,
+    SurfaceRaster, build_map_raster_mode, build_perspective_raster, build_surface_raster_mode,
     extended_native_counts,
 };
-use simsat::clouds::{self, MarchConfig, StepQuality};
+use simsat::clouds::{self, CloudMultiscatterMode, MarchConfig, StepQuality};
 use simsat::derived::{self, DerivedField};
 use simsat::frame::{GridGeoref, WrfProjectionParams};
 use simsat::geocolor;
 use simsat::gpu::{
-    self, CloudFrameInputs, CloudMarchParams, CloudPassResources, RenderedFrame,
+    self, CloudFrameInputs, CloudMarchParams, CloudPassResources, CloudViewMode, RenderedFrame,
     SurfaceFrameInputs, SurfaceResources, SurfaceUniforms,
 };
 use simsat::horizon::HorizonMap;
@@ -478,12 +478,18 @@ struct PreparedRender {
     /// rendered by the GPU cloud pass on the UI thread (`cloud_rgba` is then `None`).
     /// Carries an optional CPU reference frame for the parity instrument.
     gpu_cloud: Option<Box<GpuCloudPrep>>,
+    /// True only for the dedicated one-click action (the persistent manual toggle is false).
+    one_click_gpu_render: bool,
+    /// Exact temporary control differences selected by that action.
+    gpu_preview_adjustments: GpuPreviewAdjustments,
 }
 
 /// Worker-prepared inputs of one GPU cloud render (the owned twin of
 /// `gpu::CloudFrameInputs`' cloud half; the surface half comes from the existing
 /// `PreparedRender` fields). Built in `prepare_render`, consumed on the UI thread.
 struct GpuCloudPrep {
+    view_mode: CloudViewMode,
+    ray_lut: Vec<f32>,
     texture_a: Vec<u8>,
     occupancy: Vec<u8>,
     vol_nx: u32,
@@ -523,6 +529,78 @@ struct ParityReport {
 struct GpuRenderInfo {
     gpu_ms: u64,
     parity: Option<ParityReport>,
+}
+
+/// Temporary changes made by the one-click `GPU Render` action. These flags travel
+/// with the prepared/rendered frame so the preview can disclose exactly how it differs
+/// from the persistent Studio controls. The controls themselves are never mutated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GpuPreviewAdjustments(u16);
+
+impl GpuPreviewAdjustments {
+    const MODE_VISIBLE: u16 = 1 << 0;
+    const VIEW_GEOSTATIONARY: u16 = 1 << 1;
+    const CLOUDS_ON: u16 = 1 << 2;
+    const TERRAIN_ATMOSPHERE_OFF: u16 = 1 << 3;
+    const FRACTIONAL_CLOUDS_OFF: u16 = 1 << 4;
+    const GRANULATION_OFF: u16 = 1 << 5;
+    const EXPOSED_EDGE_FEATHER_OFF: u16 = 1 << 6;
+    const SHIPPED_HIGHLIGHTS: u16 = 1 << 7;
+    const INTERACTIVE_STEPS: u16 = 1 << 8;
+    const LEGACY_CLOUD_TRANSPORT: u16 = 1 << 9;
+    const TOPDOWN_STRATIFORM_REGULARIZATION_OFF: u16 = 1 << 10;
+
+    fn insert(&mut self, flag: u16) {
+        self.0 |= flag;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn labels(self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        for (flag, label) in [
+            (Self::MODE_VISIBLE, "Mode -> Visible"),
+            (Self::VIEW_GEOSTATIONARY, "View -> Geostationary"),
+            (Self::CLOUDS_ON, "Clouds -> On"),
+            (
+                Self::TERRAIN_ATMOSPHERE_OFF,
+                "Terrain-height atmosphere -> Off",
+            ),
+            (
+                Self::FRACTIONAL_CLOUDS_OFF,
+                "Model cloud fraction -> Off (legacy full-cell coverage)",
+            ),
+            (Self::GRANULATION_OFF, "Granulation -> Off"),
+            (
+                Self::TOPDOWN_STRATIFORM_REGULARIZATION_OFF,
+                "Top-down stratiform reconstruction -> Off",
+            ),
+            (
+                Self::EXPOSED_EDGE_FEATHER_OFF,
+                "Exposed-edge feather -> Off",
+            ),
+            (
+                Self::SHIPPED_HIGHLIGHTS,
+                "Highlight knee/ceiling -> shipped values",
+            ),
+            (Self::INTERACTIVE_STEPS, "Cloud steps -> Interactive (192)"),
+            (
+                Self::LEGACY_CLOUD_TRANSPORT,
+                "Cloud transport -> Legacy octaves (GPU-compatible)",
+            ),
+        ] {
+            if self.0 & flag != 0 {
+                labels.push(label);
+            }
+        }
+        labels
+    }
+
+    fn summary(self) -> String {
+        self.labels().join("; ")
+    }
 }
 
 /// Per-channel |delta| statistics between two same-size RGBA frames, in 8-bit counts,
@@ -707,6 +785,10 @@ struct RenderedState {
     /// pass — such a frame is a preview and is never written to the store (the
     /// stored-frame path stays CPU for quality/provenance).
     gpu_ms: Option<u64>,
+    /// True when the frame came from the dedicated one-click `GPU Render` action.
+    one_click_gpu_render: bool,
+    /// Temporary preview changes, shown beside a successful GPU frame.
+    gpu_preview_adjustments: GpuPreviewAdjustments,
 }
 
 /// One rendered frame retained in memory for instant loop playback (the
@@ -869,6 +951,11 @@ struct SimSatStudioApp {
     /// off is the legacy full-horizontal-cell cloud coverage A/B.
     fractional_clouds: bool,
     multiscatter: bool,
+    /// Opt-in Stage-2 Monte Carlo depth-source cloud closure. False keeps the exact
+    /// established octave/single-scatter dispatch.
+    delta_flux_clouds: bool,
+    /// Opt-in bounded P1 directional reconstruction over the Stage-2 closure.
+    delta_flux_v2_clouds: bool,
     /// Visible cloud optical-depth calibration. The shipped 0.15 is the owner's
     /// cross-file visual selection; 1.0 uses model extinction without scaling.
     cloud_optical_depth_scale: f32,
@@ -884,9 +971,12 @@ struct SimSatStudioApp {
     /// The amplitude is dx-derived, so a fine (250 m) run is near-neutral and a
     /// coarse (2-3 km) run granulates strongly. Persisted as an explicit opt-in.
     granulation: bool,
+    /// Top-down-only source-space reconstruction for broad low stratiform cloud.
+    /// Opt-in/default off while v0.1.6 multi-case QA is in progress.
+    topdown_stratiform_regularization: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL "GPU clouds" toggle (the M5-GPU cloud-pass activation): when on,
-    /// the DISPLAYED geostationary Visible clouds-on frame renders through the
+    /// the DISPLAYED Geostationary or Top-down Visible clouds-on frame renders through the
     /// `clouds.wgsl` GPU pass at the Interactive schedule instead of the CPU
     /// composite. The CPU path remains the shipping default and ground truth:
     /// Write-store and sequence batch renders ALWAYS use the CPU path regardless.
@@ -1034,6 +1124,8 @@ impl SimSatStudioApp {
             fractional_clouds: true,
             // Wrenninge multi-scatter octaves ON by default (M5): the bright-anvil look.
             multiscatter: true,
+            delta_flux_clouds: false,
+            delta_flux_v2_clouds: false,
             // Owner-selected v0.1.4 cross-file visible calibration.
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             // Owner-selected v0.1.5 finite-domain cloud-edge presentation default.
@@ -1043,6 +1135,7 @@ impl SimSatStudioApp {
             beer_powder: false,
             // Sub-grid granulation OPT-IN (off) as of v0.1.1 — see the field doc.
             granulation: false,
+            topdown_stratiform_regularization: false,
             // Offline (384 steps, full quality) is the default so the displayed AND
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.
@@ -1140,10 +1233,13 @@ impl SimSatStudioApp {
         self.clouds_enabled = s.clouds_enabled;
         self.fractional_clouds = s.fractional_clouds;
         self.multiscatter = s.multiscatter;
+        self.delta_flux_clouds = s.delta_flux_clouds;
+        self.delta_flux_v2_clouds = s.delta_flux_v2_clouds;
         self.cloud_optical_depth_scale = s.cloud_optical_depth_scale;
         self.feather_exposed_domain_edges = s.feather_exposed_domain_edges;
         self.beer_powder = s.beer_powder;
         self.granulation = s.granulation;
+        self.topdown_stratiform_regularization = s.topdown_stratiform_regularization;
         self.exposure = s.exposure;
         self.ground_gain = s.ground_gain;
         self.cloud_softclip = s.cloud_softclip;
@@ -1181,10 +1277,13 @@ impl SimSatStudioApp {
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
             multiscatter: self.multiscatter,
+            delta_flux_clouds: self.delta_flux_clouds,
+            delta_flux_v2_clouds: self.delta_flux_v2_clouds,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
+            topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             exposure: self.exposure,
             ground_gain: self.ground_gain,
             cloud_softclip: self.cloud_softclip,
@@ -1666,14 +1765,8 @@ impl SimSatStudioApp {
         }
     }
 
-    fn can_render(&self) -> bool {
+    fn render_source_ready(&self) -> bool {
         if self.busy || self.gpu.is_none() || self.timesteps.is_empty() {
-            return false;
-        }
-        // Perspective (3-D) is VISIBLE-mode only in v1 (the engine has no
-        // perspective IR march); the Render button carries the "(needs Mode:
-        // Visible)" hint.
-        if self.view == StudioView::Perspective && self.render_mode != RenderMode::Visible {
             return false;
         }
         match &self.source {
@@ -1690,6 +1783,54 @@ impl SimSatStudioApp {
             }) => !needs_confirm || *confirmed,
             None => false,
         }
+    }
+
+    fn can_render(&self) -> bool {
+        if !self.render_source_ready() {
+            return false;
+        }
+        // Perspective (3-D) is VISIBLE-mode only in v1 (the engine has no
+        // perspective IR march); the Render button carries the "(needs Mode:
+        // Visible)" hint.
+        if self.view == StudioView::Perspective && self.render_mode != RenderMode::Visible {
+            return false;
+        }
+        true
+    }
+
+    /// Actual blockers for the dedicated GPU action. Current Mode/View/cloud controls
+    /// are intentionally absent: the action uses a temporary compatible preview copy.
+    fn gpu_render_action_blockers(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.gpu.is_none() {
+            reasons.push(
+                self.gpu_error
+                    .clone()
+                    .unwrap_or_else(|| "no wgpu GPU device is available".to_string()),
+            );
+        }
+        if self.busy {
+            reasons.push("another render is already in progress".to_string());
+        }
+        if self.source.is_none() {
+            reasons.push("open a wrfout/GRIB2 file or cached run first".to_string());
+        } else if self.timesteps.is_empty() {
+            reasons.push("the open source has no renderable timestep".to_string());
+        }
+        match &self.source {
+            Some(Source::Wrfout {
+                needs_confirm: true,
+                confirmed: false,
+                ..
+            })
+            | Some(Source::Sequence {
+                needs_confirm: true,
+                confirmed: false,
+                ..
+            }) => reasons.push("confirm the large import first".to_string()),
+            _ => {}
+        }
+        reasons
     }
 
     /// Whether a batch (loop) render can start: rendering is possible and there is more
@@ -1758,12 +1899,43 @@ impl SimSatStudioApp {
         if !self.can_render() {
             return;
         }
+        let atmo = self.capture_atmo();
+        self.start_render_with_atmo(ctx, atmo);
+    }
+
+    /// One-click GPU cloud preview. It does not edit any persistent checkbox, picker,
+    /// or quality value: only the captured per-render copy is brought into the reviewed
+    /// Visible GPU envelope, and every difference is disclosed. Geostationary and
+    /// Top-down retain their selected camera; Perspective falls back to geo.
+    fn start_gpu_render(&mut self, ctx: &egui::Context) {
+        let blockers = self.gpu_render_action_blockers();
+        if !blockers.is_empty() {
+            self.logerr(format!("GPU Render unavailable: {}.", blockers.join("; ")));
+            return;
+        }
+        let mut atmo = self.capture_atmo();
+        let changes = configure_one_click_gpu_preview(&mut atmo);
+        if changes.is_empty() {
+            self.logline(
+                "GPU Render: current controls already fit the selected-view Visible GPU preview. \
+                 Studio settings are unchanged; this preview is not store output.",
+            );
+        } else {
+            self.logline(format!(
+                "GPU Render temporary preview (Studio settings unchanged): {}. Stored/sequence \
+                 output remains on the CPU quality path.",
+                changes.summary()
+            ));
+        }
+        self.start_render_with_atmo(ctx, atmo);
+    }
+
+    fn start_render_with_atmo(&mut self, ctx: &egui::Context, atmo: AtmoSettings) {
         let Some(ts) = self.timesteps.get(self.selected_ts).cloned() else {
             return;
         };
         let preset = self.preset;
         let resolution = self.resolution;
-        let atmo = self.capture_atmo();
         // The parity request is one-shot: consumed by this render.
         self.parity_pending = false;
         if atmo.parity {
@@ -1787,6 +1959,17 @@ impl SimSatStudioApp {
                  sub-grid detail is not ignored. Turn off Granulation only for a legacy GPU preview.",
             );
         }
+        if (atmo.gpu_clouds || atmo.parity)
+            && !gpu_topdown_stratiform_preview_compatible(
+                atmo.view_mode == StudioView::TopDownMap,
+                atmo.topdown_stratiform_regularization,
+            )
+        {
+            self.logline(
+                "GPU clouds: top-down stratiform reconstruction is CPU-only; using the CPU \
+                 composite so the requested reconstructed cloud field is not ignored.",
+            );
+        }
         if (atmo.gpu_clouds || atmo.parity) && atmo.terrain_atmosphere {
             self.logline(
                 "GPU clouds: terrain-height atmosphere requires the CPU path; disabling that \
@@ -1800,6 +1983,26 @@ impl SimSatStudioApp {
                 "GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU \
                  composite so the requested display calibration is not ignored.",
             );
+        }
+        if (atmo.gpu_clouds || atmo.parity)
+            && matches!(
+                atmo.cloud_multiscatter,
+                CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+            )
+        {
+            self.logline("GPU clouds: delta-flux transport is CPU-only; using the CPU composite.");
+        }
+        if atmo.clouds_enabled
+            && atmo.render_mode.uses_visible_controls()
+            && matches!(
+                atmo.cloud_multiscatter,
+                CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+            )
+        {
+            self.logline(format!(
+                "Cloud transport: {} (experimental CPU path).",
+                atmo.cloud_multiscatter.slug()
+            ));
         }
         if atmo.clouds_enabled
             && atmo.render_mode.uses_visible_controls()
@@ -1884,6 +2087,8 @@ impl SimSatStudioApp {
                 .ok_or_else(|| "GPU unavailable; cannot render.".to_string())?;
             let inputs = CloudFrameInputs {
                 surface: surface_inputs(prep),
+                view_mode: gc.view_mode,
+                ray_lut: &gc.ray_lut,
                 vol_nx: gc.vol_nx,
                 vol_ny: gc.vol_ny,
                 vol_nz: gc.vol_nz,
@@ -1990,14 +2195,21 @@ impl SimSatStudioApp {
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
-            multiscatter: self.multiscatter,
+            cloud_multiscatter: studio_cloud_multiscatter_mode(
+                self.multiscatter,
+                self.delta_flux_clouds,
+                self.delta_flux_v2_clouds,
+            ),
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
             feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
+            topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             step_quality: self.step_quality,
             gpu_clouds: self.gpu_clouds,
             parity: self.parity_pending,
+            one_click_gpu_render: false,
+            gpu_preview_adjustments: GpuPreviewAdjustments::default(),
             exposure: self.exposure as f64,
             ground_gain: self.ground_gain as f64,
             cloud_softclip: self.cloud_softclip as f64,
@@ -2077,6 +2289,8 @@ impl SimSatStudioApp {
             derived: derived_summary,
             render_mode: prep.render_mode,
             gpu_ms,
+            one_click_gpu_render: prep.one_click_gpu_render,
+            gpu_preview_adjustments: prep.gpu_preview_adjustments,
         });
         // A new render resets the display viewport to fit-to-window (no leftover zoom/pan).
         self.view_zoom = 1.0;
@@ -2585,6 +2799,12 @@ impl SimSatStudioApp {
     fn top_strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let can_render = self.can_render();
         let can_seq = self.can_render_sequence();
+        let gpu_action_blockers = self.gpu_render_action_blockers();
+        let can_gpu_render = gpu_action_blockers.is_empty();
+        let gpu_action_disabled = format!(
+            "GPU Render unavailable: {}.",
+            gpu_action_blockers.join("; ")
+        );
         // A GPU-clouds preview frame is never written to the store (the stored path
         // stays CPU for quality/provenance) — the button disables with a tooltip.
         // A Perspective frame has NO store contract (a picture, not a map) — same
@@ -2627,6 +2847,20 @@ impl SimSatStudioApp {
                     .clicked()
                 {
                     self.write_to_store();
+                }
+                if ui
+                    .add_enabled(can_gpu_render, egui::Button::new("GPU Render"))
+                    .on_hover_text(
+                        "One-click fast cloud preview. It retains Geostationary or Top-down, \
+                         temporarily uses Visible + Clouds on, and substitutes only the CPU-only controls \
+                         needed by the current WGSL pass. Studio settings are unchanged; every \
+                         difference is shown, and stored/sequence output stays on the CPU \
+                         quality path.",
+                    )
+                    .on_disabled_hover_text(gpu_action_disabled)
+                    .clicked()
+                {
+                    self.start_gpu_render(ctx);
                 }
                 if ui
                     .add_enabled(can_render, egui::Button::new("Render"))
@@ -2934,6 +3168,18 @@ impl SimSatStudioApp {
                      Stored frames always come from the CPU path."
                 ),
             );
+            if state.one_click_gpu_render {
+                let changes = state.gpu_preview_adjustments;
+                let detail = if changes.is_empty() {
+                    "Current controls already matched the GPU envelope.".to_string()
+                } else {
+                    format!("Temporary preview differences: {}.", changes.summary())
+                };
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 205, 135),
+                    format!("One-click GPU Render: {detail} Studio settings were not changed."),
+                );
+            }
         }
     }
 
@@ -3071,9 +3317,11 @@ impl SimSatStudioApp {
                         })
                         .response
                         .on_hover_text(
-                            "Native = one output pixel per WRF grid cell (full resolution, the \
-                             default). ABI 1 km / 2 km use the fixed GOES scan pitch (coarser on \
-                             a fine WRF grid).",
+                            "Model native = one output pixel per source grid cell (the default), \
+                             not necessarily the highest output resolution. ABI 1 km / 2 km use \
+                             the fixed GOES scan pitch in Geostationary view and physical 1 km / \
+                             2 km map spacing in Top-down view, so they may upsample a coarse \
+                             model or downsample a fine WRF grid.",
                         );
                     ui.separator();
                     ui.label("Zoom out / margin:");
@@ -3344,11 +3592,80 @@ impl SimSatStudioApp {
                                 self.gpu_clouds = false;
                                 self.parity_pending = false;
                             }
-                            ui.checkbox(&mut self.multiscatter, "Multi-scatter")
-                                .on_hover_text(
-                                    "Wrenninge multi-scatter octaves (M5) — the bright-anvil \
-                                     look. Off = fix2 single scatter (dimmer).",
-                                );
+                            let previous_transport = studio_cloud_multiscatter_mode(
+                                self.multiscatter,
+                                self.delta_flux_clouds,
+                                self.delta_flux_v2_clouds,
+                            );
+                            let mut cloud_transport = previous_transport;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Cloud transport:");
+                                egui::ComboBox::from_id_salt("cloud-transport")
+                                    .selected_text(match cloud_transport {
+                                        CloudMultiscatterMode::LegacyOctaves => {
+                                            "Legacy octaves (default)"
+                                        }
+                                        CloudMultiscatterMode::SingleScatter => "Single scatter",
+                                        CloudMultiscatterMode::DeltaFluxV1 => {
+                                            "Delta-flux v1 (experimental)"
+                                        }
+                                        CloudMultiscatterMode::DeltaFluxV2 => {
+                                            "Delta-flux v2b P1 (experimental)"
+                                        }
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut cloud_transport,
+                                            CloudMultiscatterMode::LegacyOctaves,
+                                            "Legacy octaves (default, exact v0.1.5)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut cloud_transport,
+                                            CloudMultiscatterMode::SingleScatter,
+                                            "Single scatter",
+                                        );
+                                        ui.selectable_value(
+                                            &mut cloud_transport,
+                                            CloudMultiscatterMode::DeltaFluxV1,
+                                            "Delta-flux v1 (experimental, CPU)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut cloud_transport,
+                                            CloudMultiscatterMode::DeltaFluxV2,
+                                            "Delta-flux v2b P1 (experimental, CPU)",
+                                        );
+                                    });
+                            });
+                            self.delta_flux_clouds =
+                                cloud_transport == CloudMultiscatterMode::DeltaFluxV1;
+                            self.delta_flux_v2_clouds =
+                                cloud_transport == CloudMultiscatterMode::DeltaFluxV2;
+                            self.multiscatter =
+                                cloud_transport == CloudMultiscatterMode::LegacyOctaves;
+                            if cloud_transport != previous_transport
+                                && matches!(
+                                    cloud_transport,
+                                    CloudMultiscatterMode::DeltaFluxV1
+                                        | CloudMultiscatterMode::DeltaFluxV2
+                                )
+                            {
+                                self.gpu_clouds = false;
+                                self.parity_pending = false;
+                            }
+                            ui.weak(match cloud_transport {
+                                CloudMultiscatterMode::LegacyOctaves => {
+                                    "Established bright-anvil octave transport; shipped default."
+                                }
+                                CloudMultiscatterMode::SingleScatter => {
+                                    "Direct single scattering only; dimmer diagnostic path."
+                                }
+                                CloudMultiscatterMode::DeltaFluxV1 => {
+                                    "Research Stage-2 higher-order closure; CPU-only and opt-in."
+                                }
+                                CloudMultiscatterMode::DeltaFluxV2 => {
+                                    "Brightness-neutral Stage-2 P1 upper-escape directionality; CPU-only and opt-in."
+                                }
+                            });
                             ui.add(
                                 egui::Slider::new(
                                     &mut self.cloud_optical_depth_scale,
@@ -3439,6 +3756,18 @@ impl SimSatStudioApp {
                                 self.gpu_clouds = false;
                                 self.parity_pending = false;
                             }
+                            ui.checkbox(
+                                &mut self.topdown_stratiform_regularization,
+                                "Top-down stratiform reconstruction",
+                            )
+                            .on_hover_text(
+                                "Experimental v0.1.6 top-down observation operator: applies a \
+                                 bounded, area-OD-conserving 5x5 column reconstruction only to \
+                                 broad low/liquid stratiform cloud. It suppresses native-grid \
+                                 HRRR rings while preserving each column's vertical/phase structure \
+                                 and excluding high/convective cores. Geostationary, raw bands, \
+                                 thermal and derived products are unchanged. Default off.",
+                            );
                             ui.label("Steps:");
                             egui::ComboBox::from_id_salt("stepq")
                                 .selected_text(match self.step_quality {
@@ -3466,8 +3795,8 @@ impl SimSatStudioApp {
                             "Legacy cloud coverage: each non-zero cloudy cell is horizontally full."
                         });
                     }
-                    // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): geostationary
-                    // Visible clouds-on only; the CPU composite stays the shipping default
+                    // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): Geostationary
+                    // or Top-down Visible clouds-on; the CPU composite stays the shipping default
                     // and the ONLY stored-frame path.
                     let gpu_tonemap_ok = (self.cloud_softclip
                         - CLOUD_SOFTCLIP_KNEE as f32)
@@ -3479,7 +3808,7 @@ impl SimSatStudioApp {
                         gpu_land_appearance_compatible(self.land_appearance_config());
                     let gpu_applicable = self.gpu.is_some()
                         && matches!(self.render_mode, RenderMode::Visible)
-                        && self.view == StudioView::Geostationary
+                        && self.view != StudioView::Perspective
                         && self.clouds_enabled
                         // The current WGSL path supports the true-color correction
                         // toggle, but not per-pixel terrain elevation, fractional
@@ -3487,58 +3816,99 @@ impl SimSatStudioApp {
                         && !self.terrain_atmosphere
                         && gpu_fractional_preview_compatible(self.fractional_clouds)
                         && gpu_granulation_preview_compatible(self.granulation)
+                        && gpu_topdown_stratiform_preview_compatible(
+                            self.view == StudioView::TopDownMap,
+                            self.topdown_stratiform_regularization,
+                        )
                         && gpu_exposed_edge_feather_compatible(
                             self.feather_exposed_domain_edges,
                         )
+                        && !self.delta_flux_clouds
+                        && !self.delta_flux_v2_clouds
                         && gpu_tonemap_ok
                         && gpu_land_appearance_ok;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
                     // cluster was unexplained (owner-reported) — name the unmet
                     // conditions inline and on the disabled-hover instead.
                     let gpu_hint = if self.gpu.is_none() {
-                        "(no GPU device)".to_string()
+                        format!(
+                            "Manual GPU toggle unavailable: {}",
+                            self.gpu_error
+                                .as_deref()
+                                .unwrap_or("no wgpu GPU device is available")
+                        )
                     } else {
-                        let mut unmet: Vec<&str> = Vec::new();
+                        let mut unmet: Vec<String> = Vec::new();
                         if !matches!(self.render_mode, RenderMode::Visible) {
-                            unmet.push("Mode: Visible");
+                            unmet.push(format!(
+                                "Mode is {}; requires Visible",
+                                self.render_mode.label()
+                            ));
                         }
-                        if self.view != StudioView::Geostationary {
-                            unmet.push("View: Geostationary");
+                        if self.view == StudioView::Perspective {
+                            unmet.push(format!(
+                                "View is {}; requires Geostationary or Top-down",
+                                self.view.label()
+                            ));
                         }
                         if !self.clouds_enabled {
-                            unmet.push("Clouds on");
+                            unmet.push("Clouds is Off; requires On".to_string());
                         }
                         if self.terrain_atmosphere {
-                            unmet.push("terrain-height atmosphere off");
+                            unmet.push("Terrain-height atmosphere is On; requires Off".to_string());
                         }
                         if self.fractional_clouds {
-                            unmet.push("Use model cloud fraction off");
+                            unmet.push("Use model cloud fraction is On; requires Off".to_string());
                         }
                         if self.granulation {
-                            unmet.push("Granulation off");
+                            unmet.push("Granulation is On; requires Off".to_string());
+                        }
+                        if !gpu_topdown_stratiform_preview_compatible(
+                            self.view == StudioView::TopDownMap,
+                            self.topdown_stratiform_regularization,
+                        ) {
+                            unmet.push("Top-down stratiform reconstruction off".to_string());
                         }
                         if self.feather_exposed_domain_edges {
-                            unmet.push("Feather exposed domain edges off");
+                            unmet.push(
+                                "Feather exposed domain edges is On; requires Off".to_string(),
+                            );
+                        }
+                        if self.delta_flux_clouds || self.delta_flux_v2_clouds {
+                            unmet.push(
+                                "Delta-flux v1/v2b transport is CPU-only; requires Legacy octaves \
+                                 or Single scatter"
+                                    .to_string(),
+                            );
                         }
                         if !gpu_tonemap_ok {
-                            unmet.push("shipped highlight calibration");
+                            unmet.push(
+                                "custom highlight knee/ceiling; requires shipped values"
+                                    .to_string(),
+                            );
+                        }
+                        if !gpu_land_appearance_ok {
+                            unmet.push(
+                                "current land appearance is not implemented in WGSL".to_string(),
+                            );
                         }
                         if unmet.is_empty() {
-                            String::new()
+                            "Manual GPU toggle ready for the current controls.".to_string()
                         } else {
-                            format!("(needs {})", unmet.join(" + "))
+                            format!("Manual GPU toggle blocked: {}.", unmet.join("; "))
                         }
                     };
-                    const GPU_DISABLED_HINT: &str =
-                        "Enabled in Visible mode + Geostationary view with Clouds on \
-                         terrain-height atmosphere off, Use model cloud fraction off, \
-                         Granulation off, and Feather exposed domain edges off. Fractional \
-                         subcolumns, granulation, exposed-edge feathering, and custom highlight \
-                         calibration are CPU-only. Also needs a GPU device, a loaded \
-                         run, and no render in progress.";
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 190, 235),
+                        "One click: use GPU Render in the top bar. It makes a temporary compatible \
+                         preview, reports every difference, and leaves these settings unchanged.",
+                    );
                     ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(gpu_applicable, |ui| {
-                            ui.checkbox(&mut self.gpu_clouds, "GPU clouds (experimental)")
+                            ui.checkbox(
+                                &mut self.gpu_clouds,
+                                "GPU clouds on regular Render (manual)",
+                            )
                                 .on_hover_text(
                                     "Render the DISPLAYED frame through the GPU cloud pass \
                                      (clouds.wgsl, Interactive sun schedule) instead of the CPU \
@@ -3547,9 +3917,9 @@ impl SimSatStudioApp {
                                      to CPU. Other known preview divergences: terrain shadows / \
                                      ambient aperture / per-pixel wind / snow use flat-open \
                                      defaults; hardware-trilinear volume sampling; f32 math. \
-                                     Geostationary Visible mode only.",
+                                     Geostationary or Top-down Visible mode only.",
                                 )
-                                .on_disabled_hover_text(GPU_DISABLED_HINT);
+                                .on_disabled_hover_text(gpu_hint.clone());
                             if ui
                                 .add_enabled(
                                     !self.busy && self.can_render(),
@@ -3561,16 +3931,33 @@ impl SimSatStudioApp {
                                      per-channel mean/p95/max |delta| and show a delta \
                                      heatmap. The GPU frame is displayed; nothing is stored.",
                                 )
-                                .on_disabled_hover_text(GPU_DISABLED_HINT)
+                                .on_disabled_hover_text(if gpu_applicable {
+                                    let blockers = self.gpu_render_action_blockers();
+                                    if blockers.is_empty() {
+                                        "GPU parity check is ready.".to_string()
+                                    } else {
+                                        format!(
+                                            "GPU parity check unavailable: {}.",
+                                            blockers.join("; ")
+                                        )
+                                    }
+                                } else {
+                                    gpu_hint.clone()
+                                })
                                 .clicked()
                             {
                                 self.parity_pending = true;
                                 self.start_render(ctx);
                             }
                         });
-                        if !gpu_hint.is_empty() {
-                            ui.label(egui::RichText::new(gpu_hint).weak());
-                        }
+                        ui.colored_label(
+                            if gpu_applicable {
+                                egui::Color32::from_rgb(135, 205, 150)
+                            } else {
+                                egui::Color32::from_rgb(235, 165, 120)
+                            },
+                            gpu_hint,
+                        );
                     });
                     // The last parity report: numbers + the delta heatmap (black =
                     // identical; brighter = larger delta, gain 4x).
@@ -4449,8 +4836,9 @@ struct AtmoSettings {
     /// Use the source's cloud-fraction/subcolumn closure when available. The CPU
     /// renderer consumes this; `false` requests the legacy horizontally-full cells.
     fractional_clouds: bool,
-    /// M5 Wrenninge multi-scatter octaves on/off (the A/B knob: DEFAULT_OCTAVES vs 1).
-    multiscatter: bool,
+    /// Explicit visible-cloud higher-order transport selection. The Studio's two
+    /// persisted compatibility booleans are resolved to this engine enum at capture.
+    cloud_multiscatter: CloudMultiscatterMode,
     /// Visible cloud optical-depth scale. Shipped = 0.15; 1.0 is unscaled.
     cloud_optical_depth_scale: f32,
     /// Fade finished visible clouds at camera-exposed finite-domain boundaries.
@@ -4460,14 +4848,21 @@ struct AtmoSettings {
     /// cloud march + sun march + sun-OD map all sample the SAME dx-amplitude eroded
     /// field (clouds.rs granulation section). Thermal modes never granulate.
     granulation: bool,
+    /// Top-down-only low-stratiform column optical-depth reconstruction.
+    topdown_stratiform_regularization: bool,
     step_quality: StepQuality,
-    /// EXPERIMENTAL: render the geostationary Visible clouds-on frame through the
+    /// EXPERIMENTAL: render a Geostationary or Top-down Visible clouds-on frame through the
     /// GPU cloud pass (Interactive schedule) instead of the CPU composite. Only the
     /// DISPLAYED single-frame render honors it; batch/sequence renders force it off.
     gpu_clouds: bool,
     /// One-shot GPU parity check: march BOTH paths and return the CPU reference so
     /// the UI can diff them (works whether or not `gpu_clouds` is on).
     parity: bool,
+    /// Dedicated one-click GPU action. Unlike the persisted manual toggle, this uses
+    /// a temporary compatible preview configuration and never mutates Studio controls.
+    one_click_gpu_render: bool,
+    /// Exact temporary differences chosen by the one-click action.
+    gpu_preview_adjustments: GpuPreviewAdjustments,
     /// Display-side exposure gain (before the ABI stretch) for the CPU composite.
     exposure: f64,
     /// Sun-gated daytime surface-radiance lift (`1.0` is neutral).
@@ -4487,6 +4882,64 @@ struct AtmoSettings {
     /// Lazily download missing Blue Marble months (GitHub asset URL -> NASA URL, SHA-256
     /// gated) on the render worker; `false` = cached 2 km or the vendored 8 km fallback only.
     bm_allow_download: bool,
+}
+
+/// Convert a captured render configuration into the GPU cloud shader's supported
+/// preview envelope. This mutates only the per-render copy: the user's persistent
+/// Studio controls remain untouched. Geostationary and Top-down retain their camera;
+/// Perspective has no GPU cloud ray path and is changed to a geostationary preview.
+fn configure_one_click_gpu_preview(atmo: &mut AtmoSettings) -> GpuPreviewAdjustments {
+    let mut changes = GpuPreviewAdjustments::default();
+    if atmo.render_mode != RenderMode::Visible {
+        changes.insert(GpuPreviewAdjustments::MODE_VISIBLE);
+        atmo.render_mode = RenderMode::Visible;
+    }
+    if atmo.view_mode == StudioView::Perspective {
+        changes.insert(GpuPreviewAdjustments::VIEW_GEOSTATIONARY);
+        atmo.view_mode = StudioView::Geostationary;
+    }
+    if !atmo.clouds_enabled {
+        changes.insert(GpuPreviewAdjustments::CLOUDS_ON);
+        atmo.clouds_enabled = true;
+    }
+    if atmo.terrain_atmosphere {
+        changes.insert(GpuPreviewAdjustments::TERRAIN_ATMOSPHERE_OFF);
+        atmo.terrain_atmosphere = false;
+    }
+    if atmo.fractional_clouds {
+        changes.insert(GpuPreviewAdjustments::FRACTIONAL_CLOUDS_OFF);
+        atmo.fractional_clouds = false;
+    }
+    if atmo.granulation {
+        changes.insert(GpuPreviewAdjustments::GRANULATION_OFF);
+        atmo.granulation = false;
+    }
+    if atmo.topdown_stratiform_regularization {
+        changes.insert(GpuPreviewAdjustments::TOPDOWN_STRATIFORM_REGULARIZATION_OFF);
+        atmo.topdown_stratiform_regularization = false;
+    }
+    if atmo.feather_exposed_domain_edges {
+        changes.insert(GpuPreviewAdjustments::EXPOSED_EDGE_FEATHER_OFF);
+        atmo.feather_exposed_domain_edges = false;
+    }
+    if atmo.cloud_multiscatter != CloudMultiscatterMode::LegacyOctaves {
+        changes.insert(GpuPreviewAdjustments::LEGACY_CLOUD_TRANSPORT);
+        atmo.cloud_multiscatter = CloudMultiscatterMode::LegacyOctaves;
+    }
+    if !gpu_cloud_tonemap_compatible(atmo.cloud_softclip, atmo.cloud_highlight_max) {
+        changes.insert(GpuPreviewAdjustments::SHIPPED_HIGHLIGHTS);
+        atmo.cloud_softclip = CLOUD_SOFTCLIP_KNEE;
+        atmo.cloud_highlight_max = RHO_HIGHLIGHT_MAX;
+    }
+    if atmo.step_quality != StepQuality::Interactive {
+        changes.insert(GpuPreviewAdjustments::INTERACTIVE_STEPS);
+        atmo.step_quality = StepQuality::Interactive;
+    }
+    atmo.gpu_clouds = true;
+    atmo.parity = false;
+    atmo.one_click_gpu_render = true;
+    atmo.gpu_preview_adjustments = changes;
+    changes
 }
 
 enum JobKind {
@@ -4662,13 +5115,19 @@ fn prepare_render(
     // Output raster over the domain. Geostationary: the from-space scan raster (Native
     // sizes it to the WRF grid — one pixel per cell; the ABI modes use the fixed GOES
     // pitch). Top-down map: the north-up map raster over the domain's own Lambert extent
-    // (native one-pixel-per-cell), adapted to the shared `SurfaceRaster` so the LUT +
+    // (Native is one-pixel-per-cell; ABI modes use physical 1 km / 2 km spacing), adapted
+    // to the shared `SurfaceRaster` so the LUT +
     // Blue Marble + assemble machinery below is IDENTICAL — only the per-pixel ray at
     // render time diverges (nadir vs scan). `build_surface_raster_mode` logs to stderr if
     // a huge domain forces the MAX_AXIS clamp.
     let is_topdown = atmo.view_mode == StudioView::TopDownMap;
     let is_persp = atmo.view_mode == StudioView::Perspective;
     let camera = GeoCamera::new(preset);
+    let (map_dx_m, map_dy_m) = if params.map_proj == 6 {
+        (params.dx_m * 111_195.0, params.dy_m * 111_195.0)
+    } else {
+        (params.dx_m, params.dy_m)
+    };
     // Zoom-out / domain-margin: 0.0 = the domain edge-to-edge; > 0 grows the extent by that
     // fraction of the domain span on each side (real Blue Marble ground + clear sky around
     // the domain — no WRF weather outside it). Ignored in Perspective view (the camera
@@ -4747,7 +5206,7 @@ fn prepare_render(
             || -> Result<SurfaceRaster, String> {
                 if is_topdown {
                     status("Building top-down map raster...");
-                    build_map_raster(&georef, nx, ny, nx, ny, margin)
+                    build_map_raster_mode(&georef, nx, ny, map_dx_m, map_dy_m, resolution, margin)
                         .map(|m| m.as_surface_raster())
                         .ok_or_else(|| {
                             "The domain is too small to build a top-down map.".to_string()
@@ -4771,8 +5230,8 @@ fn prepare_render(
     let raster: &SurfaceRaster = &raster_arc;
     // Native clamped against the per-axis cap (the margin-extended target exceeds MAX_AXIS)?
     // Then the raster is coarser than native — the honest exception, surfaced in the UI.
-    // (Top-down is always native one-pixel-per-cell, capped separately in build_map_raster;
-    // perspective dims are explicit, never clamped here.)
+    // (Top-down is capped separately in build_map_raster_mode; perspective dims are
+    // explicit, never clamped here.)
     let (target_nx, target_ny) = extended_native_counts(nx, ny, margin);
     let res_clamped = !is_topdown
         && !is_persp
@@ -4795,11 +5254,19 @@ fn prepare_render(
     let is_sandwich = atmo.render_mode.is_sandwich();
     let is_visible_ir_composite = atmo.render_mode.is_visible_ir_composite();
     let ir_band = atmo.render_mode.ir_band();
-    // EXPERIMENTAL GPU cloud path: geostationary Visible clouds-on only. A parity
+    // EXPERIMENTAL GPU cloud path: Geostationary or Top-down Visible clouds-on. A parity
     // render takes it too (both paths run) even when the live toggle is off. A
     // projection the WGSL forward does not implement (rotated lat-lon = GRIB RRFS)
     // falls back to the CPU composite with a log line.
     let gpu_projection_ok = gpu::projection_supported(&georef);
+    if atmo.one_click_gpu_render && !gpu_projection_ok {
+        return Err(
+            "GPU Render unavailable for this source: rotated lat-lon (RRFS) has no WGSL \
+             projection forward. No CPU fallback was substituted; use regular Render for the \
+             exact CPU result."
+                .to_string(),
+        );
+    }
     // The GPU shader honors the true-color-correction flag, but it has no per-pixel
     // terrain elevation. Never silently ignore that physical control.
     let gpu_atmosphere_ok = !atmo.terrain_atmosphere;
@@ -4810,6 +5277,14 @@ fn prepare_render(
     // Granulation changes both view extinction and the sunlight OD field. The WGSL
     // preview has neither, so never silently drop this physical control.
     let gpu_granulation_ok = gpu_granulation_preview_compatible(atmo.granulation);
+    // The current GPU upload consumes the raw quantized brick. Until it accepts the
+    // reconstructed decoded volume, a top-down request for that field must stay on CPU.
+    // Keep this predicate explicit even while this branch's GPU path is geo-only so a
+    // future top-down GPU activation cannot silently bypass the requested operator.
+    let gpu_topdown_stratiform_ok = gpu_topdown_stratiform_preview_compatible(
+        is_topdown,
+        atmo.topdown_stratiform_regularization,
+    );
     // The exposed-domain edge control resolves against the camera raster. The WGSL
     // preview has only the legacy margin value, so keep the requested presentation exact
     // by routing it through CPU until the shader receives a reviewed twin.
@@ -4832,18 +5307,26 @@ fn prepare_render(
     // land corrections. Keep this predicate at the UI/worker seam so future land
     // operators cannot silently become GPU-eligible without an explicit review.
     let gpu_land_appearance_ok = gpu_land_appearance_compatible(atmo.land_appearance);
+    // The current WGSL shader implements the established octave/single-scatter
+    // transport only. Delta-flux is deliberately CPU-only until it has a reviewed
+    // shader twin; never silently substitute a different cloud closure.
+    let gpu_cloud_transport_ok = !matches!(
+        atmo.cloud_multiscatter,
+        CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+    );
     let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
         && atmo.clouds_enabled
-        && !is_topdown
         && !is_persp
         && matches!(atmo.render_mode, RenderMode::Visible)
         && gpu_projection_ok
         && gpu_atmosphere_ok
         && gpu_fractional_clouds_ok
         && gpu_granulation_ok
+        && gpu_topdown_stratiform_ok
         && gpu_exposed_edge_feather_ok
         && gpu_cloud_tonemap_ok
-        && gpu_land_appearance_ok;
+        && gpu_land_appearance_ok
+        && gpu_cloud_transport_ok;
     if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
         status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
     }
@@ -4862,6 +5345,12 @@ fn prepare_render(
              sub-grid detail is not ignored.",
         );
     }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_topdown_stratiform_ok {
+        status(
+            "GPU clouds: top-down stratiform reconstruction is CPU-only; using the CPU \
+             composite so the reconstructed cloud field is not silently ignored.",
+        );
+    }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_exposed_edge_feather_ok {
         status(
             "GPU clouds: exposed-domain edge feathering is CPU-only; using the CPU \
@@ -4870,6 +5359,9 @@ fn prepare_render(
     }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_tonemap_ok {
         status("GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU composite.");
+    }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_transport_ok {
+        status("GPU clouds: delta-flux-v1 transport is CPU-only; using the CPU composite.");
     }
     if !atmo.clouds_enabled
         && matches!(atmo.render_mode, RenderMode::Visible)
@@ -5217,15 +5709,36 @@ fn prepare_render(
         // solely for this conservative skip field used multiple GiB on large HRRR
         // bricks. The helper is byte-pinned against the decoded reference in gpu tests.
         let occupancy = gpu::quantized_occupancy_upload(&brick, clouds::OCCUPANCY_MIP_FACTOR);
-        let scan_rect = clouds::scan_rect_of(&raster.scan);
-        let froxel = atmosphere::build_aerial_froxel(
-            luts,
-            &params,
-            &cam_geo,
-            sun_ecef,
-            scan_rect,
-            atmosphere::AERIAL_FROXEL_DIM,
-        );
+        let (view_mode, ray_lut, scan_rect, froxel) = if is_topdown {
+            // Top-down uses a reviewed per-pixel local-up LUT in the cloud shader.
+            // Its CPU contract deliberately omits the extra geo camera->cloud front
+            // froxel, so bind a neutral 1x1x1 value instead of building irrelevant
+            // scan-space atmosphere data.
+            (
+                CloudViewMode::TopDownNadir,
+                gpu::build_topdown_ray_lut(&raster.lat, &raster.lon),
+                (0.0, 1.0, 0.0, 1.0),
+                atmosphere::AerialFroxel {
+                    dim: 1,
+                    data: vec![0.0, 0.0, 0.0, 1.0],
+                },
+            )
+        } else {
+            let scan_rect = clouds::scan_rect_of(&raster.scan);
+            (
+                CloudViewMode::Geostationary,
+                Vec::new(),
+                scan_rect,
+                atmosphere::build_aerial_froxel(
+                    luts,
+                    &params,
+                    &cam_geo,
+                    sun_ecef,
+                    scan_rect,
+                    atmosphere::AERIAL_FROXEL_DIM,
+                ),
+            )
+        };
         // Exact twins of DecodedVolume::{voxel_pitch_m,r_bottom,r_top}; no decoded
         // volume is needed unless the explicit CPU parity render below is requested.
         let pitch = brick.dz_m.min(horiz_pitch_m).max(1.0);
@@ -5241,10 +5754,11 @@ fn prepare_render(
             ground_day_lift: atmo.ground_gain,
             cloud_softclip_knee: atmo.cloud_softclip,
             cloud_highlight_max: atmo.cloud_highlight_max,
-            octaves: if atmo.multiscatter {
-                clouds::DEFAULT_OCTAVES
-            } else {
-                1
+            octaves: match atmo.cloud_multiscatter {
+                CloudMultiscatterMode::LegacyOctaves => clouds::DEFAULT_OCTAVES,
+                CloudMultiscatterMode::SingleScatter
+                | CloudMultiscatterMode::DeltaFluxV1
+                | CloudMultiscatterMode::DeltaFluxV2 => 1,
             },
             edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, nx, ny),
             ..MarchConfig::new(StepQuality::Interactive, pitch)
@@ -5364,18 +5878,26 @@ fn prepare_render(
                     ..Default::default()
                 }
             };
-            Some(clouds::render_cloud_frame_rgba(
-                &scene,
-                &surf,
-                &froxel,
-                &raster.scan,
-                assemble,
-            ))
+            Some(if is_topdown {
+                topdown::render_topdown_frame_rgba(
+                    &surf,
+                    Some(&scene),
+                    &raster.lat,
+                    &raster.lon,
+                    raster.nx,
+                    raster.ny,
+                    assemble,
+                )
+            } else {
+                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+            })
         } else {
             None
         };
         status("Packing the GPU volume upload...");
         gpu_cloud_out = Some(Box::new(GpuCloudPrep {
+            view_mode,
+            ray_lut,
             texture_a: clouds::pack_texture_a(&brick),
             occupancy: occupancy.r8,
             vol_nx: brick.nx as u32,
@@ -5426,8 +5948,9 @@ fn prepare_render(
     {
         // ── CPU VISIBLE composite. Geostationary clouds-ON composites the M4/M5 cloud
         // march over the M2/M3 surface radiance (the tested CPU render path; the GPU
-        // cloud pass is the deferred M5 activation). The TOP-DOWN map and the
-        // PERSPECTIVE (3-D) view ALWAYS render here (no GPU pass for either):
+        // cloud pass is the deferred M5 activation). Regular CPU Top-down renders and
+        // every PERSPECTIVE (3-D) view render here; the dedicated Top-down GPU preview
+        // is handled by the branch above:
         // per-pixel nadir rays / pinhole eye rays into the SAME shading kernels
         // (`topdown::render_topdown_frame_rgba` / `render_perspective_frame_rgba`).
         // All run on the below-normal worker with rayon row-parallelism — the UI never
@@ -5494,6 +6017,13 @@ fn prepare_render(
         } else if atmo.clouds_enabled && atmo.fractional_clouds {
             status("Marching clouds (model fraction unavailable; legacy coverage)...");
         }
+        if is_topdown && atmo.clouds_enabled && atmo.topdown_stratiform_regularization {
+            let stats = vol.regularize_topdown_stratiform_columns(atmo.cloud_optical_depth_scale);
+            status(&format!(
+                "Top-down stratiform reconstruction: {}/{} columns, OD {:.3}->{:.3}",
+                stats.columns_changed, stats.columns_total, stats.tau_before, stats.tau_after,
+            ));
+        }
         let mip = clouds::OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
         let sun_od = clouds::accumulate_sun_od_granulated(
             &vol,
@@ -5511,11 +6041,13 @@ fn prepare_render(
             cloud_highlight_max: atmo.cloud_highlight_max,
             // Multi-scatter A/B (M5): DEFAULT_OCTAVES = the bright multiple-scatter look,
             // 1 = the fix2 single scatter.
-            octaves: if atmo.multiscatter {
-                clouds::DEFAULT_OCTAVES
-            } else {
-                1
+            octaves: match atmo.cloud_multiscatter {
+                CloudMultiscatterMode::LegacyOctaves => clouds::DEFAULT_OCTAVES,
+                CloudMultiscatterMode::SingleScatter
+                | CloudMultiscatterMode::DeltaFluxV1
+                | CloudMultiscatterMode::DeltaFluxV2 => 1,
             },
+            multiscatter_mode: atmo.cloud_multiscatter,
             // The legacy behavior described below remains exact when the new switch is
             // Off. When On, the shared resolver also activates the same band for an
             // actually exposed geo/perspective domain boundary at margin zero.
@@ -5788,6 +6320,8 @@ fn prepare_render(
         render_mode: atmo.render_mode,
         clouds_enabled: atmo.clouds_enabled,
         gpu_cloud: gpu_cloud_out,
+        one_click_gpu_render: atmo.one_click_gpu_render,
+        gpu_preview_adjustments: atmo.gpu_preview_adjustments,
     };
     Ok(Box::new(prep))
 }
@@ -6061,10 +6595,40 @@ fn gpu_fractional_preview_compatible(fractional_clouds: bool) -> bool {
     !fractional_clouds
 }
 
+/// Resolve the Studio's backwards-compatible persisted booleans to the same explicit
+/// engine transport enum used by the Rust API, CLI, and Python binding. Delta-flux wins
+/// when selected; otherwise the historical multi-scatter checkbox retains its exact
+/// octaves/single-scatter meaning.
+fn studio_cloud_multiscatter_mode(
+    multiscatter: bool,
+    delta_flux_clouds: bool,
+    delta_flux_v2_clouds: bool,
+) -> CloudMultiscatterMode {
+    if delta_flux_v2_clouds {
+        CloudMultiscatterMode::DeltaFluxV2
+    } else if delta_flux_clouds {
+        CloudMultiscatterMode::DeltaFluxV1
+    } else if multiscatter {
+        CloudMultiscatterMode::LegacyOctaves
+    } else {
+        CloudMultiscatterMode::SingleScatter
+    }
+}
+
 /// The experimental WGSL preview does not sample the granulated cloud field for
 /// either the camera or sunlight march. A requested granulated render must use CPU.
 fn gpu_granulation_preview_compatible(granulation: bool) -> bool {
     !granulation
+}
+
+/// The GPU cloud upload currently consumes the raw quantized brick, not a decoded
+/// volume after the top-down stratiform observation operator. Geo ignores that
+/// top-down-only switch, but a top-down render with it enabled must remain on CPU.
+fn gpu_topdown_stratiform_preview_compatible(
+    is_topdown: bool,
+    topdown_stratiform_regularization: bool,
+) -> bool {
+    !is_topdown || !topdown_stratiform_regularization
 }
 
 /// The current WGSL preview accepts only the legacy margin-derived feather width;
@@ -6332,6 +6896,121 @@ mod tests {
         }
     }
 
+    fn incompatible_gpu_preview_atmo() -> AtmoSettings {
+        AtmoSettings {
+            view_mode: StudioView::TopDownMap,
+            orbit: pipeline::OrbitParams {
+                az_deg: 180.0,
+                tilt_deg: 45.0,
+                range_km: 1_000.0,
+                fov_deg: 60.0,
+                width: 1280,
+                height: 720,
+            },
+            margin_frac: 0.25,
+            render_mode: RenderMode::Ir,
+            ir_enhancement: IrEnhancement::default(),
+            aod: 0.05,
+            rh_swelling: true,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
+            land_appearance: LandAppearanceConfig::default(),
+            output_transform: OutputTransform::AbiReflectance,
+            clouds_enabled: false,
+            fractional_clouds: true,
+            cloud_multiscatter: CloudMultiscatterMode::DeltaFluxV1,
+            cloud_optical_depth_scale: 0.15,
+            feather_exposed_domain_edges: true,
+            beer_powder: false,
+            granulation: true,
+            topdown_stratiform_regularization: true,
+            step_quality: StepQuality::Offline,
+            gpu_clouds: false,
+            parity: true,
+            one_click_gpu_render: false,
+            gpu_preview_adjustments: GpuPreviewAdjustments::default(),
+            exposure: 1.5,
+            ground_gain: 1.0,
+            cloud_softclip: 0.75,
+            cloud_highlight_max: 1.05,
+            sun_override: None,
+            bm_month_override: None,
+            bm_allow_download: false,
+        }
+    }
+
+    #[test]
+    fn one_click_gpu_render_selects_compatible_preview_without_touching_calibration() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        let original_exposure = atmo.exposure;
+        let original_cloud_scale = atmo.cloud_optical_depth_scale;
+        let original_margin = atmo.margin_frac;
+        let changes = configure_one_click_gpu_preview(&mut atmo);
+
+        assert_eq!(atmo.render_mode, RenderMode::Visible);
+        assert_eq!(atmo.view_mode, StudioView::TopDownMap);
+        assert!(atmo.clouds_enabled);
+        assert!(!atmo.terrain_atmosphere);
+        assert!(!atmo.fractional_clouds);
+        assert!(!atmo.granulation);
+        assert!(!atmo.topdown_stratiform_regularization);
+        assert!(!atmo.feather_exposed_domain_edges);
+        assert_eq!(
+            atmo.cloud_multiscatter,
+            CloudMultiscatterMode::LegacyOctaves
+        );
+        assert_eq!(atmo.cloud_softclip, CLOUD_SOFTCLIP_KNEE);
+        assert_eq!(atmo.cloud_highlight_max, RHO_HIGHLIGHT_MAX);
+        assert_eq!(atmo.step_quality, StepQuality::Interactive);
+        assert!(atmo.gpu_clouds);
+        assert!(!atmo.parity);
+        assert!(atmo.one_click_gpu_render);
+        assert_eq!(atmo.exposure, original_exposure);
+        assert_eq!(atmo.cloud_optical_depth_scale, original_cloud_scale);
+        assert_eq!(atmo.margin_frac, original_margin);
+        assert_eq!(changes.0 & GpuPreviewAdjustments::VIEW_GEOSTATIONARY, 0);
+        assert!(changes.0 & GpuPreviewAdjustments::MODE_VISIBLE != 0);
+        assert!(changes.summary().contains("legacy full-cell coverage"));
+        assert!(changes.summary().contains("Legacy octaves"));
+        assert!(changes.summary().contains("stratiform reconstruction"));
+    }
+
+    #[test]
+    fn one_click_gpu_render_temporarily_replaces_delta_flux_v2b_transport() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        atmo.render_mode = RenderMode::Visible;
+        atmo.cloud_multiscatter = CloudMultiscatterMode::DeltaFluxV2;
+
+        let changes = configure_one_click_gpu_preview(&mut atmo);
+
+        assert_eq!(atmo.view_mode, StudioView::TopDownMap);
+        assert_eq!(
+            atmo.cloud_multiscatter,
+            CloudMultiscatterMode::LegacyOctaves
+        );
+        assert_ne!(changes.0 & GpuPreviewAdjustments::LEGACY_CLOUD_TRANSPORT, 0);
+        assert!(changes.summary().contains("Legacy octaves"));
+    }
+
+    #[test]
+    fn one_click_gpu_render_plan_is_idempotent() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        configure_one_click_gpu_preview(&mut atmo);
+        let second = configure_one_click_gpu_preview(&mut atmo);
+        assert!(second.is_empty());
+        assert!(atmo.gpu_clouds);
+        assert!(atmo.one_click_gpu_render);
+    }
+
+    #[test]
+    fn one_click_gpu_render_only_changes_unsupported_perspective_camera() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        atmo.view_mode = StudioView::Perspective;
+        let changes = configure_one_click_gpu_preview(&mut atmo);
+        assert_eq!(atmo.view_mode, StudioView::Geostationary);
+        assert_ne!(changes.0 & GpuPreviewAdjustments::VIEW_GEOSTATIONARY, 0);
+    }
+
     #[test]
     fn geo_clouds_off_renders_real_surface_pixels_without_entering_cloud_callback() {
         let surf = studio_test_surface_context();
@@ -6405,9 +7084,43 @@ mod tests {
     }
 
     #[test]
+    fn studio_cloud_transport_matches_rust_cli_and_python_dispatch() {
+        assert_eq!(
+            studio_cloud_multiscatter_mode(true, false, false),
+            CloudMultiscatterMode::LegacyOctaves
+        );
+        assert_eq!(
+            studio_cloud_multiscatter_mode(false, false, false),
+            CloudMultiscatterMode::SingleScatter
+        );
+        assert_eq!(
+            studio_cloud_multiscatter_mode(true, true, false),
+            CloudMultiscatterMode::DeltaFluxV1,
+            "the explicit experimental selection overrides the legacy boolean"
+        );
+        assert_eq!(
+            studio_cloud_multiscatter_mode(false, true, false),
+            CloudMultiscatterMode::DeltaFluxV1
+        );
+        assert_eq!(
+            studio_cloud_multiscatter_mode(true, true, true),
+            CloudMultiscatterMode::DeltaFluxV2,
+            "the explicitly selected v2 reconstruction has highest precedence"
+        );
+    }
+
+    #[test]
     fn gpu_preview_never_silently_drops_granulation() {
         assert!(gpu_granulation_preview_compatible(false));
         assert!(!gpu_granulation_preview_compatible(true));
+    }
+
+    #[test]
+    fn gpu_preview_never_silently_drops_topdown_stratiform_reconstruction() {
+        assert!(gpu_topdown_stratiform_preview_compatible(false, false));
+        assert!(gpu_topdown_stratiform_preview_compatible(false, true));
+        assert!(gpu_topdown_stratiform_preview_compatible(true, false));
+        assert!(!gpu_topdown_stratiform_preview_compatible(true, true));
     }
 
     #[test]

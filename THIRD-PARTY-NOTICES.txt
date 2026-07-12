@@ -12,6 +12,14 @@ excluded. SimSat Studio itself is dual-licensed MIT OR Apache-2.0 (see
 LICENSE-MIT and LICENSE-APACHE at the repository root); this file covers only
 the third-party dependencies that are statically linked into the shipped binary.
 
+Windows PE metadata license audit (2026-07-11): the version-resource build
+scripts now use find-msvc-tools 0.1.9 to locate the Windows SDK resource
+compiler. That exact MIT OR Apache-2.0 crate was already locked and is already
+listed under the MIT license below, so this change adds no crate, version, or
+license text. `cargo tree --target x86_64-pc-windows-msvc -e normal -p
+simsat_studio` confirms that it is not linked into the shipped executable;
+`-e build` confirms the direct build-time edge.
+
 NOTES ON SPECIAL CASES
 ----------------------
 - TLS / crypto provider: SUPERSEDED -- see the ADDENDUM (2026-07-09) at the end

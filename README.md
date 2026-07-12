@@ -51,6 +51,21 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
 
+New in v0.1.6: **faster GPU preview and improved top-down rendering**. Studio has
+a one-click GPU Render action, while Rust, the CLI, and Python expose the same
+`gpu-preview` backend with every temporary compatibility adjustment reported.
+Top-down renders now honor Model native, ABI 1 km, and ABI 2 km resolution, and
+preserve the physical aspect ratio when capped. An opt-in, default-off
+stratiform reconstruction control can reduce source-grid cloud rings in affected
+HRRR fields without changing geostationary or raw-band output. Optional bounded
+delta-flux cloud-transport experiments are also available across the interfaces.
+
+New in v0.1.5: **brighter terrain and natural finite-domain cloud edges**.
+The visible preset raises exposure while retaining highlight control, adds
+sun-angle-aware land normalization, and feathers clouds only where the finite
+model boundary is exposed. All presentation controls remain independently
+switchable in Studio, the CLI, Python, and Rust.
+
 New in v0.1.4: **model-aware fractional-cloud coverage and visible calibration**.
 WRF `CLDFRA` is preserved where supplied; condensate cells with missing or
 contradictory zero coverage are repaired with WRF's Xu-Randall diagnostic. HRRR
@@ -131,6 +146,12 @@ band when a finished visible or cloud-layer camera raster exposes the WRF bounda
 with it off, the pre-v0.1.5 positive-margin behavior is unchanged, and raw visible bands,
 IR/WV, and derived products ignore the control.
 
+Single-frame visible previews can explicitly select the shared Studio wgpu cloud pass
+with `backend=gpu-preview` (`cpu` remains the default). The preview preserves `view=geo`
+or `view=topdown`, reports every temporary compatibility substitution on stderr, and
+never writes a sat-store frame. A missing adapter or unsupported rotated-lat/lon source
+is an error rather than a silent CPU fallback.
+
 Animated GIF loops are exported from a completed store run:
 
 ```
@@ -150,6 +171,7 @@ lat/lon mesh) for every product, ready for matplotlib/cartopy:
 import simsat
 rgb, geo = simsat.render_visible_rgb(
     "wrfout_d03_...",
+    backend="cpu",  # or "gpu-preview" for the synchronous Studio wgpu path
     view="topdown",
     aerosol_optical_depth=0.05,
     rh_aerosol_swelling=False,
@@ -162,6 +184,7 @@ rgb, geo = simsat.render_visible_rgb(
     beer_powder=False,
     granulation=False,
     feather_exposed_domain_edges=True,  # owner-selected v0.1.5 finite-domain default
+    topdown_stratiform_regularization=False,  # opt-in top-down low-deck reconstruction
 )
 ax.imshow(rgb, extent=geo.extent, origin="upper")
 ```
@@ -171,6 +194,13 @@ See [crates/simsat_py/README.md](crates/simsat_py/README.md) for the full API
 `render_water_vapor`, `render_geocolor`, `render_sandwich`,
 `render_precipitable_water`, `render_cloud_top_temp`,
 `render_cloud_optical_depth`) and wheel-building instructions.
+
+The experimental `topdown_stratiform_regularization` switch is off by default. It is
+a bounded, optical-depth-conserving observation-operator approximation for coarse-grid
+low stratiform decks, not a literal satellite footprint or new microphysics, and it
+cannot recover unresolved cloud/clear structure. Geostationary and raw-band products
+ignore it; Studio falls back to CPU if a GPU preview cannot consume the reconstructed
+field exactly.
 
 ## Honest limitations
 
@@ -182,7 +212,8 @@ night side is the IR composite only — no city-lights layer yet. The IR and
 water-vapor bands use gray band-averaged absorption coefficients (documented in
 the code) rather than line-by-line radiative transfer. The shipping render path
 is CPU (rayon-parallel; a native-resolution 800x800 composite renders in about a
-second on a desktop CPU); GPU activation is in progress.
+second on a desktop CPU). An explicit, display-only GPU cloud preview is available for
+geostationary and top-down Visible frames; CPU remains the stored/batch quality path.
 
 ## Building from source
 

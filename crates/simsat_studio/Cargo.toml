@@ -31,3 +31,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # "Save PNG..." export of the rendered frame (RGBA -> RGB8 PNG on a spawned thread).
 image = { workspace = true }
+
+[build-dependencies]
+find-msvc-tools = { workspace = true }

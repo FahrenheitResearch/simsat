@@ -126,6 +126,12 @@ pub struct StudioSettings {
     /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
     pub fractional_clouds: bool,
     pub multiscatter: bool,
+    /// Opt-in Stage-2 Monte Carlo depth-source closure. False preserves the exact
+    /// legacy octave/single-scatter dispatch.
+    pub delta_flux_clouds: bool,
+    /// Opt-in bounded P1 directional reconstruction over the same Stage-2 LUT.
+    /// False preserves every legacy/v1 path.
+    pub delta_flux_v2_clouds: bool,
     /// Visible cloud optical-depth calibration. The shipped default is `0.15`;
     /// `1.0` keeps the model-derived physical input unchanged.
     pub cloud_optical_depth_scale: f32,
@@ -135,6 +141,9 @@ pub struct StudioSettings {
     pub beer_powder: bool,
     /// Display-only sub-grid cloud-edge erosion. Explicitly opt-in/off by default.
     pub granulation: bool,
+    /// Top-down-only low-stratiform column-OD reconstruction. Experimental and
+    /// explicitly opt-in; geostationary/raw products ignore it.
+    pub topdown_stratiform_regularization: bool,
     pub exposure: f32,
     /// Sun-gated daytime ground-radiance lift. `1.0` is neutral.
     pub ground_gain: f32,
@@ -186,10 +195,13 @@ impl Default for StudioSettings {
             clouds_enabled: true,
             fractional_clouds: true,
             multiscatter: true,
+            delta_flux_clouds: false,
+            delta_flux_v2_clouds: false,
             cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             feather_exposed_domain_edges: true,
             beer_powder: false,
             granulation: false,
+            topdown_stratiform_regularization: false,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             ground_gain: simsat::render::GROUND_DAY_LIFT as f32,
             cloud_softclip: simsat::render::CLOUD_SOFTCLIP_KNEE as f32,
@@ -242,10 +254,13 @@ impl StudioSettings {
         self.clouds_enabled = d.clouds_enabled;
         self.fractional_clouds = d.fractional_clouds;
         self.multiscatter = d.multiscatter;
+        self.delta_flux_clouds = d.delta_flux_clouds;
+        self.delta_flux_v2_clouds = d.delta_flux_v2_clouds;
         self.cloud_optical_depth_scale = d.cloud_optical_depth_scale;
         self.feather_exposed_domain_edges = d.feather_exposed_domain_edges;
         self.beer_powder = d.beer_powder;
         self.granulation = d.granulation;
+        self.topdown_stratiform_regularization = d.topdown_stratiform_regularization;
         self.exposure = d.exposure;
         self.ground_gain = d.ground_gain;
         self.cloud_softclip = d.cloud_softclip;
@@ -582,6 +597,8 @@ mod tests {
         assert_eq!(s.output_transform, "abi-reflectance");
         assert!(s.clouds_enabled);
         assert!(s.multiscatter);
+        assert!(!s.delta_flux_clouds);
+        assert!(!s.delta_flux_v2_clouds);
         assert!(!s.beer_powder);
         assert_eq!(s.cloud_optical_depth_scale, 0.15);
         assert!(s.feather_exposed_domain_edges);
@@ -591,6 +608,7 @@ mod tests {
         assert_eq!(s.cloud_highlight_max, 1.25);
         assert!(s.fractional_clouds);
         assert!(!s.granulation);
+        assert!(!s.topdown_stratiform_regularization);
     }
 
     #[test]
@@ -621,6 +639,7 @@ mod tests {
             feather_exposed_domain_edges: false,
             beer_powder: true,
             granulation: true,
+            topdown_stratiform_regularization: true,
             exposure: 4.0,
             ground_gain: 4.0,
             cloud_softclip: 1.0,
@@ -644,6 +663,8 @@ mod tests {
         assert_eq!(s.clouds_enabled, d.clouds_enabled);
         assert_eq!(s.fractional_clouds, d.fractional_clouds);
         assert_eq!(s.multiscatter, d.multiscatter);
+        assert_eq!(s.delta_flux_clouds, d.delta_flux_clouds);
+        assert_eq!(s.delta_flux_v2_clouds, d.delta_flux_v2_clouds);
         assert_eq!(s.cloud_optical_depth_scale, d.cloud_optical_depth_scale);
         assert_eq!(
             s.feather_exposed_domain_edges,
@@ -651,6 +672,10 @@ mod tests {
         );
         assert_eq!(s.beer_powder, d.beer_powder);
         assert_eq!(s.granulation, d.granulation);
+        assert_eq!(
+            s.topdown_stratiform_regularization,
+            d.topdown_stratiform_regularization
+        );
         assert_eq!(s.exposure, d.exposure);
         assert_eq!(s.ground_gain, d.ground_gain);
         assert_eq!(s.cloud_softclip, d.cloud_softclip);
@@ -737,6 +762,7 @@ mod tests {
         );
         assert!(!s.beer_powder);
         assert!(!s.granulation);
+        assert!(!s.topdown_stratiform_regularization);
         assert_eq!(s.ground_gain, StudioSettings::default().ground_gain);
         assert_eq!(s.cloud_softclip, StudioSettings::default().cloud_softclip);
         assert_eq!(

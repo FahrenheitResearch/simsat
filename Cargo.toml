@@ -10,7 +10,7 @@ exclude = ["crates/simsat_py"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/simsat"
@@ -49,6 +49,10 @@ serde_json = { version = "1.0", features = ["float_roundtrip"] }
 # self_update.rs streaming-download pattern).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
+# Build-time-only Windows SDK discovery for embedding PE version resources.
+# This crate/version was already present transitively through `cc`; making it
+# explicit adds no package to the locked dependency graph.
+find-msvc-tools = "0.1.9"
 
 # Shared machinery from the rusty-weather monorepo (all one rev). These are the
 # output contract (rw-store), geostationary math (rw-sat), the sat player panel

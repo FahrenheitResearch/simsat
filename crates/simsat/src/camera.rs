@@ -184,11 +184,11 @@ impl ResolutionMode {
         ResolutionMode::Abi2km,
     ];
 
-    /// Short label for the picker + status bar (e.g. the status reads
-    /// `"800x800 Native"`).
+    /// Short label for the picker + status bar. The explicit source-grid wording keeps
+    /// `Native` from being mistaken for the highest available output resolution.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Native => "Native",
+            Self::Native => "Model native (one pixel per source grid cell)",
             Self::Abi1km => "ABI 1 km (28 urad)",
             Self::Abi2km => "ABI 2 km (56 urad)",
         }
@@ -846,6 +846,92 @@ pub fn map_pixel_edge_index_bounds(
 /// api-layer georef-mesh round-trip tolerance (0.02 cells), which pins the mesh to the
 /// exact corner indices.
 pub const MAP_EDGE_INSET_CELLS: f64 = 0.01;
+
+/// Nominal ground sample distances for the two ABI-class resolution choices when
+/// rendering a map-registered top-down frame.  Unlike the geostationary view, a
+/// top-down raster has no scan-angle geometry: its output counts are therefore
+/// derived directly from the WRF domain's physical projected-grid spacing.
+const ABI_1KM_GROUND_PITCH_M: f64 = 1_000.0;
+const ABI_2KM_GROUND_PITCH_M: f64 = 2_000.0;
+
+/// Base (zero-margin) top-down output counts for `mode`.
+///
+/// `Native` deliberately returns `(domain_nx, domain_ny)` without inspecting the
+/// spacings, preserving the historical map raster byte-for-byte.  ABI modes cover
+/// the full centre-to-centre domain span, `(n - 1) * d`, with a sample on each edge;
+/// `ceil(span / pitch) + 1` guarantees that the effective pitch is never coarser
+/// than the selected 1 km / 2 km class.  If either axis would exceed [`MAX_AXIS`],
+/// both axes are rescaled with ONE common physical pitch.  The constrained axis
+/// gets `MAX_AXIS - 1` edge-to-edge intervals and the other axis is rounded from
+/// that same pitch, preserving the domain's physical aspect ratio instead of
+/// independently stretching x and y. [`build_map_raster`] still spans the complete
+/// domain and applies its existing margin growth/cap semantics.
+pub fn topdown_resolution_counts(
+    domain_nx: usize,
+    domain_ny: usize,
+    dx_m: f64,
+    dy_m: f64,
+    mode: ResolutionMode,
+) -> (usize, usize) {
+    if mode == ResolutionMode::Native {
+        return (domain_nx, domain_ny);
+    }
+    let pitch_m = match mode {
+        ResolutionMode::Abi1km => ABI_1KM_GROUND_PITCH_M,
+        ResolutionMode::Abi2km => ABI_2KM_GROUND_PITCH_M,
+        ResolutionMode::Native => unreachable!(),
+    };
+    if domain_nx < 2
+        || domain_ny < 2
+        || !dx_m.is_finite()
+        || !dy_m.is_finite()
+        || dx_m <= 0.0
+        || dy_m <= 0.0
+    {
+        // Invalid source metadata must not create a zero/astronomical raster.
+        // Falling back to source counts keeps the frame usable; build_map_raster
+        // owns the final safety cap exactly as it did before this selector existed.
+        return (domain_nx, domain_ny);
+    }
+
+    let span_x_m = (domain_nx - 1) as f64 * dx_m;
+    let span_y_m = (domain_ny - 1) as f64 * dy_m;
+    let raw_ix = (span_x_m / pitch_m).ceil().max(1.0) as usize;
+    let raw_iy = (span_y_m / pitch_m).ceil().max(1.0) as usize;
+    let max_intervals = MAX_AXIS - 1;
+    if raw_ix <= max_intervals && raw_iy <= max_intervals {
+        return (raw_ix + 1, raw_iy + 1);
+    }
+
+    // One common coarsened pitch keeps square physical output pixels.  Counts are
+    // edge-sample counts, hence MAX_AXIS pixels provide MAX_AXIS-1 intervals.
+    let capped_pitch_m = (span_x_m / max_intervals as f64)
+        .max(span_y_m / max_intervals as f64)
+        .max(pitch_m);
+    let capped_count = |span_m: f64| {
+        ((span_m / capped_pitch_m).round() as usize)
+            .clamp(1, max_intervals)
+            .saturating_add(1)
+    };
+    (capped_count(span_x_m), capped_count(span_y_m))
+}
+
+/// Build a top-down map raster at a selected [`ResolutionMode`].  `dx_m` and
+/// `dy_m` are the physical WRF grid spacings in metres (callers convert geographic
+/// degree grids before entering here).  Margin growth and the per-axis cap remain
+/// owned by [`build_map_raster`], so every mode spans the same physical extent.
+pub fn build_map_raster_mode(
+    georef: &GridGeoref,
+    domain_nx: usize,
+    domain_ny: usize,
+    dx_m: f64,
+    dy_m: f64,
+    mode: ResolutionMode,
+    margin_frac: f64,
+) -> Option<MapRaster> {
+    let (out_nx, out_ny) = topdown_resolution_counts(domain_nx, domain_ny, dx_m, dy_m, mode);
+    build_map_raster(georef, domain_nx, domain_ny, out_nx, out_ny, margin_frac)
+}
 
 pub fn build_map_raster(
     georef: &GridGeoref,
@@ -1600,6 +1686,85 @@ mod tests {
             }
         }
         assert!(worst < 0.02, "map round-trip worst {worst} cells");
+    }
+
+    #[test]
+    fn topdown_native_mode_is_byte_exact_with_legacy_map_builder() {
+        let proj = MapProjection::lambert(30.0, 60.0, -97.5);
+        let (nx, ny) = (37usize, 23usize);
+        let georef = GridGeoref::new(
+            proj,
+            (nx - 1) as f64 / 2.0,
+            (ny - 1) as f64 / 2.0,
+            39.0,
+            -97.5,
+            3000.0,
+            3000.0,
+        );
+        let legacy = build_map_raster(&georef, nx, ny, nx, ny, 0.0).unwrap();
+        let selected =
+            build_map_raster_mode(&georef, nx, ny, 3000.0, 3000.0, ResolutionMode::Native, 0.0)
+                .unwrap();
+        assert_eq!((selected.nx, selected.ny), (legacy.nx, legacy.ny));
+        assert_eq!(selected.lat, legacy.lat);
+        assert_eq!(selected.lon, legacy.lon);
+        assert_eq!(selected.grid_i, legacy.grid_i);
+        assert_eq!(selected.grid_j, legacy.grid_j);
+    }
+
+    #[test]
+    fn topdown_abi_modes_use_physical_three_km_domain_span() {
+        // 11 x 7 points at 3 km span 30 x 18 km centre-to-centre.  A sample at
+        // both edges therefore requires 31 x 19 pixels at 1 km, and 16 x 10 at
+        // 2 km.  This also proves x/y are sized independently.
+        assert_eq!(
+            topdown_resolution_counts(11, 7, 3000.0, 3000.0, ResolutionMode::Abi1km),
+            (31, 19)
+        );
+        assert_eq!(
+            topdown_resolution_counts(11, 7, 3000.0, 3000.0, ResolutionMode::Abi2km),
+            (16, 10)
+        );
+
+        // Fractional pitch ratios round upward so the selected resolution still
+        // spans the complete domain without becoming coarser than requested.
+        assert_eq!(
+            topdown_resolution_counts(10, 6, 3000.0, 3000.0, ResolutionMode::Abi2km),
+            (15, 9)
+        );
+        // A huge fixed-resolution request is capped with ONE scale factor. The
+        // shorter axis shrinks proportionally instead of being independently
+        // clamped to 4096 (which would make rectangular physical pixels).
+        assert_eq!(
+            topdown_resolution_counts(5000, 4000, 3000.0, 3000.0, ResolutionMode::Abi1km),
+            (MAX_AXIS, 3277)
+        );
+
+        // The actual 3-km HRRR native-grid geometry: uncapped ABI1km would be
+        // 5394 x 3175. X hits MAX_AXIS, while Y uses the same ~1.317 km effective
+        // pitch and preserves the physical aspect ratio.
+        let hrrr_dx = 2_999.421_304_743_559;
+        let hrrr = topdown_resolution_counts(1799, 1059, hrrr_dx, hrrr_dx, ResolutionMode::Abi1km);
+        assert_eq!(hrrr, (MAX_AXIS, 2411));
+        let pitch_x = (1799 - 1) as f64 * hrrr_dx / (hrrr.0 - 1) as f64;
+        let pitch_y = (1059 - 1) as f64 * hrrr_dx / (hrrr.1 - 1) as f64;
+        assert!(
+            (pitch_x - pitch_y).abs() / pitch_x < 2.0e-4,
+            "uniform-cap pitches differ: {pitch_x} m vs {pitch_y} m"
+        );
+    }
+
+    #[test]
+    fn topdown_fixed_resolution_keeps_existing_margin_growth() {
+        let proj = MapProjection::lambert(30.0, 60.0, -97.5);
+        let georef = GridGeoref::new(proj, 5.0, 3.0, 39.0, -97.5, 3000.0, 3000.0);
+        let map =
+            build_map_raster_mode(&georef, 11, 7, 3000.0, 3000.0, ResolutionMode::Abi1km, 0.25)
+                .unwrap();
+        // Base 31 x 19, grown by the pre-existing (1 + 2m) rule.
+        assert_eq!((map.nx, map.ny), (47, 29));
+        assert!(map.grid_i.iter().any(|v| v.is_nan()));
+        assert!(map.grid_i.iter().any(|v| v.is_finite()));
     }
 
     #[test]

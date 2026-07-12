@@ -16,6 +16,7 @@
 
 /// Parse the `VmHWM:` (peak resident set) line out of a `/proc/self/status`
 /// dump and return kilobytes. Pure string logic so it is testable on any OS.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_vmhwm_kb(status: &str) -> Option<u64> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmHWM:") {

@@ -16,11 +16,14 @@
 //! [`crate::render`]. The live GPU render is exercised by the owner's exe.
 
 use eframe::egui_wgpu::wgpu;
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 use crate::bluemarble::BlueMarbleCrop;
 use crate::bricks::{LogQuant, VolumeBrick};
-use crate::camera::SurfaceRaster;
+use crate::camera::{SurfaceRaster, TOPDOWN_CAMERA_ALTITUDE_M, topdown_nadir_ray};
 use crate::frame::{GridGeoref, MapProjection};
+use crate::optics::EARTH_RADIUS_M;
 use crate::render::{
     FLAT_ALBEDO_SRGB, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
     LAND_SZA_MAX_GAIN, LandAppearanceConfig,
@@ -30,6 +33,24 @@ use crate::solar::SolarFrame;
 /// The offscreen render-target format. The shader outputs sRGB-encoded display
 /// values directly, so the stored bytes ARE the display values (no sRGB target).
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Camera-ray construction used by the cloud shader. Geostationary retains the
+/// historical scan-angle fan; Top-down reads a per-pixel local-up vector and makes
+/// the same nadir ray as [`topdown_nadir_ray`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudViewMode {
+    Geostationary,
+    TopDownNadir,
+}
+
+impl CloudViewMode {
+    fn shader_tag(self) -> f32 {
+        match self {
+            Self::Geostationary => 0.0,
+            Self::TopDownNadir => 1.0,
+        }
+    }
+}
 
 const SURFACE_WGSL: &str = include_str!("shaders/surface.wgsl");
 
@@ -41,6 +62,66 @@ pub struct RenderedFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// A synchronous, surface-free wgpu context for command-line and language-binding
+/// preview renders. It drives the exact same [`CloudPassResources`] used by Studio;
+/// only adapter/device acquisition lives here.
+pub struct HeadlessCloudRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    resources: CloudPassResources,
+    adapter_name: String,
+}
+
+impl HeadlessCloudRenderer {
+    /// Request a high-performance adapter without a window surface. Failure is explicit:
+    /// callers must never silently route a requested GPU preview back to CPU.
+    pub fn request() -> Result<Self, String> {
+        let instance = wgpu::Instance::default();
+        let adapter = block_on_wgpu(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .map_err(|e| format!("no compatible GPU adapter is available: {e}"))?;
+        let adapter_name = adapter.get_info().name;
+        let (device, queue) = block_on_wgpu(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("simsat-headless-gpu-preview"),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("GPU device request failed for {adapter_name}: {e}"))?;
+        let resources = CloudPassResources::init(&device);
+        Ok(Self {
+            device,
+            queue,
+            resources,
+            adapter_name,
+        })
+    }
+
+    /// Human-readable adapter name for provenance/diagnostics.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// Run the shared sun-OD + cloud march synchronously and read back RGBA8.
+    pub fn render(&self, inputs: &CloudFrameInputs<'_>) -> RenderedFrame {
+        self.resources.render(&self.device, &self.queue, inputs)
+    }
+}
+
+/// Minimal executor for wgpu's adapter/device futures. wgpu owns the platform event
+/// machinery; polling the future is sufficient here and avoids a second async runtime.
+fn block_on_wgpu<F: Future>(future: F) -> F::Output {
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// A conservative quantized occupancy upload for the GPU cloud volume.
@@ -878,6 +959,49 @@ pub fn build_luts(
     (geo, light)
 }
 
+/// Build the per-pixel Top-down GPU ray LUT. Each texel is `(up_ecef.xyz, valid)`;
+/// the shader reconstructs `cam = up * (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M)` and
+/// `view = -up`. Storing local-up rather than latitude/longitude avoids a second,
+/// subtly different trigonometric implementation in WGSL and pins the GPU ray to
+/// the reviewed CPU [`topdown_nadir_ray`] construction.
+pub fn build_topdown_ray_lut(lat: &[f32], lon: &[f32]) -> Vec<f32> {
+    assert_eq!(
+        lat.len(),
+        lon.len(),
+        "top-down ray latitude/longitude length"
+    );
+    let mut out = vec![0.0f32; lat.len() * 4];
+    for (idx, (&la, &lo)) in lat.iter().zip(lon).enumerate() {
+        if !la.is_finite() || !lo.is_finite() {
+            continue;
+        }
+        let (_, view) = topdown_nadir_ray(la as f64, lo as f64);
+        out[idx * 4] = -view[0] as f32;
+        out[idx * 4 + 1] = -view[1] as f32;
+        out[idx * 4 + 2] = -view[2] as f32;
+        out[idx * 4 + 3] = 1.0;
+    }
+    out
+}
+
+/// CPU transcription of the WGSL Top-down ray reconstruction, public so parity
+/// tests and alternate front ends can validate an uploaded LUT before dispatch.
+pub fn topdown_ray_from_lut(texel: [f32; 4]) -> Option<([f32; 3], [f32; 3])> {
+    if texel[3] <= 0.5 {
+        return None;
+    }
+    let len = (texel[0] * texel[0] + texel[1] * texel[1] + texel[2] * texel[2]).sqrt();
+    if !len.is_finite() || len <= 0.0 {
+        return None;
+    }
+    let up = [texel[0] / len, texel[1] / len, texel[2] / len];
+    let radius = (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32;
+    Some((
+        [up[0] * radius, up[1] * radius, up[2] * radius],
+        [-up[0], -up[1], -up[2]],
+    ))
+}
+
 // ── M4 cloud GPU volume path (design section 2/4; vol3d 3-D upload pattern) ────
 
 /// The cloud raymarch fragment shader (a superset of the surface pass). The GPU
@@ -1325,6 +1449,12 @@ pub struct CloudMarchParams {
 /// froxel and SH-ambient uploads.
 pub struct CloudFrameInputs<'a> {
     pub surface: SurfaceFrameInputs<'a>,
+    /// Ray construction for this preview. The geostationary mode preserves the
+    /// historical uniform scan fan; Top-down consumes `ray_lut` per output pixel.
+    pub view_mode: CloudViewMode,
+    /// `(local_up_ecef.xyz, valid)` per output pixel for [`CloudViewMode::TopDownNadir`].
+    /// May be empty in geostationary mode (a 1x1 dummy texture is bound).
+    pub ray_lut: &'a [f32],
     /// Brick dims + Texture A (`clouds::pack_texture_a`) + occupancy mip.
     pub vol_nx: u32,
     pub vol_ny: u32,
@@ -1358,10 +1488,10 @@ pub struct CloudFrameInputs<'a> {
     pub scan_rect: [f32; 4],
 }
 
-/// The 27 packed vec4s of the WGSL cloud `Uniforms` (the historical surface 9, the
-/// cloud 16, then the shared land-appearance 2), in declaration order. Kept as a
+/// The 28 packed vec4s of the WGSL cloud `Uniforms` (the historical surface 9, the
+/// cloud 16, shared land-appearance 2, then the camera-ray selector), in declaration order. Kept as a
 /// pure function so the layout is unit-testable on the headless nodes.
-pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 27] {
+pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 28] {
     let s = inputs.surface.uniforms.to_vec4s();
     let m = &inputs.march;
     let so = &inputs.sun_od;
@@ -1427,6 +1557,13 @@ pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 27] {
         // preserve every historical cloud-uniform offset above.
         s[9],
         s[10],
+        // ray0: view-mode tag, Top-down synthetic camera radius, reserved.
+        [
+            inputs.view_mode.shader_tag(),
+            (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32,
+            0.0,
+            0.0,
+        ],
     ]
 }
 
@@ -1560,6 +1697,7 @@ impl CloudPassResources {
                 tex3d(13, false), // froxel (Rgba32Float)
                 tex2d(14, false), // sh_ambient (Rgba32Float)
                 tex2d(15, false), // sun_od_dist (R32Float)
+                tex2d(16, false), // per-pixel Top-down local-up ray LUT (Rgba32Float)
             ],
         });
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1828,7 +1966,24 @@ impl CloudPassResources {
             "sh-ambient",
         );
 
-        // The 432-byte packed cloud uniform.
+        // Top-down uses one reviewed local-up vector per output pixel. Geo keeps
+        // the historical scan-uniform path and binds a harmless 1x1 dummy so its
+        // uploads and shader arithmetic remain otherwise unchanged.
+        let ray_lut_tex = match inputs.view_mode {
+            CloudViewMode::TopDownNadir => {
+                assert_eq!(
+                    inputs.ray_lut.len(),
+                    w as usize * h as usize * 4,
+                    "top-down GPU ray LUT shape"
+                );
+                upload_rgba32f(device, queue, w, h, inputs.ray_lut, "topdown-rays")
+            }
+            CloudViewMode::Geostationary => {
+                upload_rgba32f(device, queue, 1, 1, &[0.0, 0.0, 1.0, 0.0], "geo-ray-dummy")
+            }
+        };
+
+        // The 448-byte packed cloud uniform.
         let quads = cloud_uniform_quads(inputs);
         let uniform_bytes = quads_to_bytes(&quads);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1907,6 +2062,10 @@ impl CloudPassResources {
                 wgpu::BindGroupEntry {
                     binding: 15,
                     resource: wgpu::BindingResource::TextureView(&sun_od_dist_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(&view(&ray_lut_tex)),
                 },
             ],
         });
@@ -2396,6 +2555,151 @@ mod tests {
     }
 
     #[test]
+    fn topdown_gpu_ray_lut_matches_cpu_nadir_construction() {
+        let lat = [0.0, 39.75, 65.2, -22.4, f32::NAN];
+        let lon = [-97.5, -104.9, -149.8, 133.2, 0.0];
+        let lut = build_topdown_ray_lut(&lat, &lon);
+        assert_eq!(lut.len(), lat.len() * 4);
+        for idx in 0..lat.len() - 1 {
+            let texel: [f32; 4] = lut[idx * 4..idx * 4 + 4].try_into().unwrap();
+            let (gpu_cam, gpu_view) = topdown_ray_from_lut(texel).expect("valid GPU ray");
+            let (cpu_cam, cpu_view) = topdown_nadir_ray(lat[idx] as f64, lon[idx] as f64);
+            for c in 0..3 {
+                // The upload and WGSL ALU are f32; a few metres at Earth radius is
+                // the expected conversion envelope, while direction stays sub-ppm.
+                assert!((gpu_cam[c] as f64 - cpu_cam[c]).abs() < 2.0);
+                assert!((gpu_view[c] as f64 - cpu_view[c]).abs() < 2.0e-7);
+            }
+            let radius =
+                (gpu_cam[0] * gpu_cam[0] + gpu_cam[1] * gpu_cam[1] + gpu_cam[2] * gpu_cam[2])
+                    .sqrt();
+            assert!((radius - (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32).abs() <= 1.0);
+        }
+        let invalid: [f32; 4] = lut[lut.len() - 4..].try_into().unwrap();
+        assert_eq!(invalid, [0.0; 4]);
+        assert!(topdown_ray_from_lut(invalid).is_none());
+    }
+
+    #[test]
+    fn topdown_cloud_view_uniform_selects_nadir_without_moving_geo_offsets() {
+        let mut inputs = test_cloud_inputs(test_surface_uniforms());
+        inputs.view_mode = CloudViewMode::TopDownNadir;
+        let quads = cloud_uniform_quads(&inputs);
+        assert_eq!(quads[27][0], 1.0);
+        assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
+        assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
+    }
+
+    #[test]
+    #[ignore = "requires a local wgpu adapter; run on the Windows release machine"]
+    fn topdown_gpu_cloud_pass_renders_deterministic_small_scene() {
+        let renderer = HeadlessCloudRenderer::request().expect("local headless wgpu backend");
+        assert!(!renderer.adapter_name().is_empty());
+
+        let (width, height) = (2u32, 2u32);
+        let lat = vec![39.0f32; 4];
+        let lon = vec![-97.5f32; 4];
+        let ray_lut = build_topdown_ray_lut(&lat, &lon);
+        let (_, cpu_view) = topdown_nadir_ray(39.0, -97.5);
+        let sun = [
+            -cpu_view[0] as f32,
+            -cpu_view[1] as f32,
+            -cpu_view[2] as f32,
+        ];
+
+        let lut_geo = [0.0f32, 0.0, 0.25, 0.25].repeat(4);
+        let lut_light = [0.0f32, 0.0, 1.0, 90.0].repeat(4);
+        let normals = [128u8, 128, 255, 255].repeat(4);
+        let landmask = vec![255u8; 4];
+        let transmittance = [1.0f32, 1.0, 1.0, 1.0].repeat(256 * 64);
+        let multiscatter = [0.0f32, 0.0, 0.0, 1.0].repeat(32 * 32);
+        let ambient = [0.0f32, 0.0, 0.0, 1.0].repeat(2);
+        let mut uniforms = test_surface_uniforms();
+        uniforms.sun = sun;
+        uniforms.ambient_n = 2.0;
+
+        let georef = GridGeoref::new(
+            MapProjection::lambert(30.0, 60.0, -97.5),
+            0.5,
+            0.5,
+            39.0,
+            -97.5,
+            4000.0,
+            4000.0,
+        );
+        let sun64 = [sun[0] as f64, sun[1] as f64, sun[2] as f64];
+        let sun_od = plan_sun_od(&georef, 2, 2, 2, 0.0, 1000.0, 500.0, sun64, 8);
+        let texture_a = vec![255u8; 2 * 2 * 2 * 4];
+        let occupancy = vec![255u8; 1];
+        let froxel = vec![0.0f32, 0.0, 0.0, 1.0];
+        let sh = vec![0.0f32; 9 * 2 * 4];
+        let surface = SurfaceFrameInputs {
+            width,
+            height,
+            lut_geo: &lut_geo,
+            lut_light: &lut_light,
+            nx: 2,
+            ny: 2,
+            normals_rgba: &normals,
+            landmask_r8: &landmask,
+            bluemarble: None,
+            transmittance_lut: &transmittance,
+            multiscatter_lut: &multiscatter,
+            ambient_lut: &ambient,
+            ambient_n: 2,
+            uniforms,
+        };
+        let inputs = CloudFrameInputs {
+            surface,
+            view_mode: CloudViewMode::TopDownNadir,
+            ray_lut: &ray_lut,
+            vol_nx: 2,
+            vol_ny: 2,
+            vol_nz: 2,
+            texture_a: &texture_a,
+            occ_dims: (1, 1, 1),
+            occupancy: &occupancy,
+            ql: [1.0e-5, 1.0e-3, 1.0e-5, 1.0e-3],
+            qp: [1.0e-5, 1.0e-3, 1.0e-4, 10.0],
+            z_min_m: 0.0,
+            dz_m: 1000.0,
+            r_top_m: EARTH_RADIUS_M as f32 + 2000.0,
+            r_bottom_m: EARTH_RADIUS_M as f32,
+            voxel_pitch_m: 500.0,
+            geo: geo_quads(&georef),
+            march: CloudMarchParams {
+                coarse_step_m: 1000.0,
+                fine_step_m: 500.0,
+                max_steps: 64.0,
+                exposure: 1.5,
+                octaves: 1.0,
+                beer_powder: false,
+                ground_albedo: 0.3,
+                transmittance_floor: 0.003,
+                cloud_optical_depth_scale: 1.0,
+                edge_feather_cells: 0.0,
+                ground_day_lift: 1.0,
+            },
+            sun_od,
+            froxel_dim: 1,
+            froxel_data: &froxel,
+            sh_rows: 2,
+            sh_data: &sh,
+            scan_rect: [0.0, 1.0, 0.0, 1.0],
+        };
+
+        let first = renderer.render(&inputs);
+        let second = renderer.render(&inputs);
+        assert_eq!((first.width, first.height), (width, height));
+        assert_eq!(
+            first.rgba, second.rgba,
+            "same GPU scene must be deterministic"
+        );
+        assert!(first.rgba.chunks_exact(4).all(|px| px[3] == 255));
+        assert!(first.rgba.chunks_exact(4).any(|px| px[0..3] != [0, 0, 0]));
+    }
+
+    #[test]
     fn packers_encode_expected_bytes() {
         let up = normals_to_rgba8(&[[0.0, 0.0, 1.0]]);
         assert_eq!(up, vec![128, 128, 255, 255]);
@@ -2462,6 +2766,8 @@ mod tests {
                 ambient_n: 48,
                 uniforms,
             },
+            view_mode: CloudViewMode::Geostationary,
+            ray_lut: &[],
             vol_nx: 80,
             vol_ny: 60,
             vol_nz: 40,
@@ -2521,7 +2827,7 @@ mod tests {
     fn cloud_uniform_quads_pack_the_wgsl_layout() {
         let inputs = test_cloud_inputs(test_surface_uniforms());
         let quads = cloud_uniform_quads(&inputs);
-        assert_eq!(quads.len(), 27);
+        assert_eq!(quads.len(), 28);
         // The first 9 quads are the surface uniforms verbatim.
         assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
         assert_eq!(quads[8], [-20.0, 90.0, 48.0, 1.0]);
@@ -2540,6 +2846,15 @@ mod tests {
         // Appended land controls preserve every historical cloud offset above.
         assert_eq!(quads[25], [0.0, 1.6, 0.0, 0.08]);
         assert_eq!(quads[26], [0.65, 1.5, 0.0, 0.0]);
+        assert_eq!(
+            quads[27],
+            [
+                0.0,
+                (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32,
+                0.0,
+                0.0
+            ]
+        );
         let mut invalid = test_cloud_inputs(test_surface_uniforms());
         invalid.march.cloud_optical_depth_scale = f32::NAN;
         assert_eq!(
@@ -2548,9 +2863,9 @@ mod tests {
         );
         invalid.march.cloud_optical_depth_scale = 99.0;
         assert_eq!(cloud_uniform_quads(&invalid)[24][3], 4.0);
-        // 27 vec4 = 432 bytes, little-endian f32s in order.
+        // 28 vec4 = 448 bytes, little-endian f32s in order.
         let bytes = quads_to_bytes(&quads);
-        assert_eq!(bytes.len(), 432);
+        assert_eq!(bytes.len(), 448);
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         assert_eq!(
             f32::from_le_bytes(bytes[9 * 16..9 * 16 + 4].try_into().unwrap()),

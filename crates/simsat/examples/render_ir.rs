@@ -16,6 +16,8 @@
 //!   sat=<preset>        goes-east | goes-west | himawari    (default goes-east)
 //!   timestep=<n>        time index (default 0).
 //!   resolution=<mode>   native | abi1km | abi2km            (default native)
+//!                       native = one output pixel per source grid cell. ABI 1/2 km are
+//!                       output sampling choices and may upsample coarse or downsample fine data.
 //!   enhancement=<name>  cimss | bd | avn | funktop | rainbow | gray  (default gray;
 //!                       cimss for a WV band)
 //!   wv=<band>           6.2 | 6.9 | 7.3  — render a WATER-VAPOR band instead of the
@@ -411,6 +413,8 @@ fn print_usage() {
          \x20 sat=<preset>        goes-east | goes-west | himawari   (default goes-east)\n\
          \x20 timestep=<n>        time index (default 0)\n\
          \x20 resolution=<mode>   native | abi1km | abi2km           (default native)\n\
+         \x20                     native = one pixel per source-grid cell; ABI 1/2 km may\n\
+         \x20                     upsample coarse or downsample fine model grids\n\
          \x20 margin=<frac>       zoom-out margin fraction on each side (default 0.0; thermal margin = no-data)\n\
          \x20 enhancement=<name>  cimss|bd|avn|funktop|rainbow|gray  (default gray; cimss for WV)\n\
          \x20 wv=<band>           6.2|6.9|7.3  render a water-vapor band (else band 13)\n\

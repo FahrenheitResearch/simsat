@@ -36,6 +36,10 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 
+[build-dependencies]
+find-msvc-tools = { workspace = true }
+serde_json = { workspace = true }
+
 [dev-dependencies]
 # WGSL shader parse+validate in unit tests (design doc section 9, test strategy 3).
 naga = { workspace = true }

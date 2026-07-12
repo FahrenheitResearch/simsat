@@ -38,6 +38,9 @@
 //!
 //! Default `view='topdown'` (map-registered, north-up — the natural fit for a top-down
 //! Lambert map); `view='geo'` gives the from-space geostationary view.
+//! `resolution='native'` means one output pixel per source-model grid cell, not the
+//! highest possible output resolution. `abi1km` / `abi2km` select 1 km / 2 km output
+//! sampling and may upsample a coarse model or downsample a fine WRF grid.
 //!
 //! Every function also takes `threads=` (cap the render worker threads; the rayon pool
 //! is GLOBAL and built once per process — the first render call's value wins, see
@@ -56,11 +59,11 @@ use pyo3::types::{PyDict, PyTuple};
 use std::path::PathBuf;
 
 use simsat_engine::api::{
-    self, BlueMarble, ExtentKind, FrameData, GroundSource, Product, RenderParams, RenderResult,
-    SunOverride,
+    self, BlueMarble, ExtentKind, FrameData, GroundSource, Product, RenderBackend, RenderParams,
+    RenderResult, SunOverride,
 };
 use simsat_engine::camera::{ResolutionMode, SatellitePreset, ViewMode};
-use simsat_engine::clouds::StepQuality;
+use simsat_engine::clouds::{CloudMultiscatterMode, StepQuality};
 use simsat_engine::derived::DerivedField;
 use simsat_engine::ir_enhance::IrEnhancement;
 use simsat_engine::topdown::{configure_global_rayon, effective_thread_count};
@@ -162,9 +165,15 @@ impl Georef {
 /// fraction when present; false restores legacy horizontally-full cells. The OD scale is
 /// a visible sensitivity control and does not alter the quantitative
 /// `render_cloud_optical_depth` product. `clouds` remains the explicit feature bypass;
-/// `multiscatter` controls the higher scattering octaves without changing transmittance.
+/// `multiscatter` controls the established higher scattering octaves without changing
+/// transmittance. `cloud_multiscatter` is an explicit override accepting
+/// `legacy-octaves`, `single-scatter`, or opt-in experimental `delta-flux-v1` /
+/// `delta-flux-v2b`; leaving it unset preserves the historical boolean behavior exactly.
 /// `beer_powder` enables the optional direct-sun shaping, and `granulation` enables
 /// display-only sub-grid cloud-edge erosion; both default off. Finished visible display
+/// products also expose `topdown_stratiform_regularization`, an opt-in/default-off
+/// low/liquid-deck reconstruction used only by the top-down finished-visible path.
+/// Geostationary and raw visible bands ignore it. Finished visible display
 /// products also accept `ground_gain`, `cloud_softclip`, and `cloud_highlight_max` as
 /// optional calibration overrides. The land-only controls
 /// `land_sza_normalization` / `land_sza_max_gain` and `land_dark_toe` plus its
@@ -180,14 +189,15 @@ impl Georef {
 /// Returns `(rgb, georef)` where `rgb` is a numpy `H x W x 3` uint8 array (row 0 = north).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, backend="cpu", sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
-    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
     feather_exposed_domain_edges=true, granulation=false,
+    topdown_stratiform_regularization=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -195,6 +205,7 @@ impl Georef {
 fn render_visible_rgb<'py>(
     py: Python<'py>,
     input: String,
+    backend: &str,
     sat: &str,
     view: &str,
     timestep: usize,
@@ -215,6 +226,7 @@ fn render_visible_rgb<'py>(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -222,6 +234,7 @@ fn render_visible_rgb<'py>(
     cloud_optical_depth_scale: f32,
     feather_exposed_domain_edges: bool,
     granulation: bool,
+    topdown_stratiform_regularization: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -230,7 +243,7 @@ fn render_visible_rgb<'py>(
     bluemarble_download: bool,
     threads: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Georef)> {
-    let params = build_visible_params(
+    let mut params = build_visible_params(
         input,
         sat,
         view,
@@ -252,6 +265,7 @@ fn render_visible_rgb<'py>(
         cloud_softclip,
         cloud_highlight_max,
         multiscatter,
+        cloud_multiscatter,
         beer_powder,
         steps,
         clouds,
@@ -259,6 +273,7 @@ fn render_visible_rgb<'py>(
         cloud_optical_depth_scale,
         feather_exposed_domain_edges,
         granulation,
+        topdown_stratiform_regularization,
         sun_elev,
         sun_az,
         cache,
@@ -266,6 +281,7 @@ fn render_visible_rgb<'py>(
         bluemarble_month,
         bluemarble_download,
     )?;
+    params.backend = parse_backend(backend)?;
     apply_thread_cap(threads);
     let result = render_or_err(py, params, Product::VisibleRgb)?;
     warn_downgrades(py, &result, true);
@@ -296,9 +312,10 @@ fn render_visible_rgb<'py>(
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
-    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
     feather_exposed_domain_edges=true, granulation=false,
+    topdown_stratiform_regularization=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -326,6 +343,7 @@ fn render_geocolor<'py>(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -333,6 +351,7 @@ fn render_geocolor<'py>(
     cloud_optical_depth_scale: f32,
     feather_exposed_domain_edges: bool,
     granulation: bool,
+    topdown_stratiform_regularization: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -363,6 +382,7 @@ fn render_geocolor<'py>(
         cloud_softclip,
         cloud_highlight_max,
         multiscatter,
+        cloud_multiscatter,
         beer_powder,
         steps,
         clouds,
@@ -370,6 +390,7 @@ fn render_geocolor<'py>(
         cloud_optical_depth_scale,
         feather_exposed_domain_edges,
         granulation,
+        topdown_stratiform_regularization,
         sun_elev,
         sun_az,
         cache,
@@ -408,9 +429,10 @@ fn render_geocolor<'py>(
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
-    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
     feather_exposed_domain_edges=true, granulation=false,
+    topdown_stratiform_regularization=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -438,6 +460,7 @@ fn render_sandwich<'py>(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -445,6 +468,7 @@ fn render_sandwich<'py>(
     cloud_optical_depth_scale: f32,
     feather_exposed_domain_edges: bool,
     granulation: bool,
+    topdown_stratiform_regularization: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -475,6 +499,7 @@ fn render_sandwich<'py>(
         cloud_softclip,
         cloud_highlight_max,
         multiscatter,
+        cloud_multiscatter,
         beer_powder,
         steps,
         clouds,
@@ -482,6 +507,7 @@ fn render_sandwich<'py>(
         cloud_optical_depth_scale,
         feather_exposed_domain_edges,
         granulation,
+        topdown_stratiform_regularization,
         sun_elev,
         sun_az,
         cache,
@@ -513,7 +539,8 @@ fn render_sandwich<'py>(
 #[pyo3(signature = (
     input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, multiscatter=true, beer_powder=false, steps="offline", clouds=true,
+    terrain_atmosphere=true, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
+    steps="offline", clouds=true,
     fractional_clouds=true, cloud_optical_depth_scale=0.15, granulation=false, sun_elev=None,
     sun_az=None, cache=None,
     bluemarble=None,
@@ -533,6 +560,7 @@ fn render_visible_bands<'py>(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -569,6 +597,7 @@ fn render_visible_bands<'py>(
         None,
         None,
         multiscatter,
+        cloud_multiscatter,
         beer_powder,
         steps,
         clouds,
@@ -576,6 +605,7 @@ fn render_visible_bands<'py>(
         cloud_optical_depth_scale,
         false,
         granulation,
+        false,
         sun_elev,
         sun_az,
         cache,
@@ -887,7 +917,8 @@ fn render_cloud_optical_depth<'py>(
     input, *, sat="goes-east", timestep=0, margin=0.0, aerosol_optical_depth=0.05,
     rh_aerosol_swelling=false, atmosphere_correction=true, terrain_atmosphere=true,
     exposure=None, ground_gain=None, cloud_softclip=None, cloud_highlight_max=None,
-    multiscatter=true, beer_powder=false, steps="offline", clouds=true,
+    multiscatter=true, cloud_multiscatter=None, beer_powder=false,
+    steps="offline", clouds=true,
     fractional_clouds=true, cloud_optical_depth_scale=0.15,
     feather_exposed_domain_edges=true, granulation=false, sun_elev=None, sun_az=None, cache=None,
     premultiplied=false, threads=None
@@ -908,6 +939,7 @@ fn render_cloud_layer<'py>(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -945,6 +977,9 @@ fn render_cloud_layer<'py>(
         cloud_highlight_max,
     );
     params.multiscatter = multiscatter;
+    params.cloud_multiscatter = cloud_multiscatter
+        .map(parse_cloud_multiscatter)
+        .transpose()?;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
@@ -1010,7 +1045,7 @@ fn render_cloud_layer<'py>(
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
-    cloud_highlight_max=None, multiscatter=true, beer_powder=false,
+    cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
     feather_exposed_domain_edges=true, granulation=false,
     cloud_layer_only=false, sun_elev=None, sun_az=None,
@@ -1040,6 +1075,7 @@ fn render_perspective<'py>(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -1087,6 +1123,9 @@ fn render_perspective<'py>(
         land_dark_toe_max_gain,
     )?;
     params.multiscatter = multiscatter;
+    params.cloud_multiscatter = cloud_multiscatter
+        .map(parse_cloud_multiscatter)
+        .transpose()?;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
@@ -1257,6 +1296,7 @@ fn build_visible_params(
     cloud_softclip: Option<f64>,
     cloud_highlight_max: Option<f64>,
     multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
     beer_powder: bool,
     steps: &str,
     clouds: bool,
@@ -1264,6 +1304,7 @@ fn build_visible_params(
     cloud_optical_depth_scale: f32,
     feather_exposed_domain_edges: bool,
     granulation: bool,
+    topdown_stratiform_regularization: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -1306,8 +1347,12 @@ fn build_visible_params(
         land_dark_toe_max_gain,
     )?;
     params.multiscatter = multiscatter;
+    params.cloud_multiscatter = cloud_multiscatter
+        .map(parse_cloud_multiscatter)
+        .transpose()?;
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
+    params.topdown_stratiform_regularization = topdown_stratiform_regularization;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
         Some(SunOverride {
             elev_deg: sun_elev,
@@ -1487,6 +1532,12 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
 /// (`time_is_fallback`, `ground_source`, `ground_status`) for programmatic use.
 fn warn_downgrades(py: Python<'_>, result: &RenderResult, sun_dependent: bool) {
     let mut msgs: Vec<String> = Vec::new();
+    for adjustment in &result.diagnostics {
+        msgs.push(format!(
+            "simsat: GPU preview temporary adjustment: {}",
+            adjustment.label()
+        ));
+    }
     if sun_dependent && result.time_is_fallback {
         msgs.push(
             "simsat: the source carried no parseable valid time; the sun position and \
@@ -1592,6 +1643,16 @@ fn parse_sat(v: &str) -> PyResult<SatellitePreset> {
     }
 }
 
+fn parse_backend(v: &str) -> PyResult<RenderBackend> {
+    match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "cpu" => Ok(RenderBackend::Cpu),
+        "gpu" | "gpu-preview" | "preview" => Ok(RenderBackend::GpuPreview),
+        _ => Err(value_err(format!(
+            "unknown backend '{v}' (cpu|gpu-preview)"
+        ))),
+    }
+}
+
 fn parse_view(v: &str) -> PyResult<ViewMode> {
     match v.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
         "geo" | "geostationary" | "fromspace" | "space" => Ok(ViewMode::Geostationary),
@@ -1633,6 +1694,19 @@ fn parse_steps(v: &str) -> PyResult<StepQuality> {
     }
 }
 
+fn parse_cloud_multiscatter(v: &str) -> PyResult<CloudMultiscatterMode> {
+    match v.to_ascii_lowercase().replace('_', "-").as_str() {
+        "legacy" | "legacy-octaves" | "octaves" => Ok(CloudMultiscatterMode::LegacyOctaves),
+        "single" | "single-scatter" | "off" => Ok(CloudMultiscatterMode::SingleScatter),
+        "delta-flux-v1" | "delta-flux" | "stage2" => Ok(CloudMultiscatterMode::DeltaFluxV1),
+        "delta-flux-v2b" | "delta-flux-v2" | "stage2-p1" => Ok(CloudMultiscatterMode::DeltaFluxV2),
+        _ => Err(value_err(format!(
+            "unknown cloud_multiscatter '{v}' \
+             (legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b)"
+        ))),
+    }
+}
+
 fn parse_wv_band(v: &str) -> PyResult<WvBand> {
     WvBand::parse(v).ok_or_else(|| {
         value_err(format!(
@@ -1657,6 +1731,21 @@ fn parse_enhancement(v: &str) -> PyResult<IrEnhancement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_parser_defaults_and_tokens_match_rust_api() {
+        assert_eq!(
+            RenderParams::new(PathBuf::from("input")).backend,
+            RenderBackend::Cpu
+        );
+        assert_eq!(parse_backend("cpu").unwrap(), RenderBackend::Cpu);
+        assert_eq!(
+            parse_backend("gpu-preview").unwrap(),
+            RenderBackend::GpuPreview
+        );
+        assert_eq!(parse_backend("gpu").unwrap(), RenderBackend::GpuPreview);
+        assert!(parse_backend("magic").is_err());
+    }
 
     #[test]
     fn visible_physics_helper_assigns_every_binding_control() {
@@ -1781,6 +1870,38 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cloud_multiscatter_parser_matches_rust_and_cli_tokens() {
+        assert_eq!(
+            parse_cloud_multiscatter("legacy-octaves").unwrap(),
+            CloudMultiscatterMode::LegacyOctaves
+        );
+        assert_eq!(
+            parse_cloud_multiscatter("single_scatter").unwrap(),
+            CloudMultiscatterMode::SingleScatter
+        );
+        assert_eq!(
+            parse_cloud_multiscatter("delta-flux-v1").unwrap(),
+            CloudMultiscatterMode::DeltaFluxV1
+        );
+        assert_eq!(
+            parse_cloud_multiscatter("delta-flux-v2b").unwrap(),
+            CloudMultiscatterMode::DeltaFluxV2
+        );
+        assert!(parse_cloud_multiscatter("unknown").is_err());
+    }
+
+    #[test]
+    fn omitted_cloud_multiscatter_preserves_the_legacy_boolean_contract() {
+        let defaults = RenderParams::new(PathBuf::from("input"));
+        assert!(defaults.multiscatter);
+        assert_eq!(defaults.cloud_multiscatter, None);
+
+        let mut legacy_single = defaults;
+        legacy_single.multiscatter = false;
+        assert_eq!(legacy_single.cloud_multiscatter, None);
     }
 }
 

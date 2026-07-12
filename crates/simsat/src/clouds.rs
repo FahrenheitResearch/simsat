@@ -1409,6 +1409,18 @@ pub struct FractionalCloudStats {
     pub effective_fractional_tau: f64,
 }
 
+/// Diagnostics from the opt-in top-down stratiform column regularizer.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StratiformRegularizationStats {
+    pub columns_total: usize,
+    pub low_cloud_seeds: usize,
+    pub columns_changed: usize,
+    pub tau_before: f64,
+    pub tau_after: f64,
+    pub min_scale: f32,
+    pub max_scale: f32,
+}
+
 /// One trilinearly-sampled cloud voxel (physical extinction, m^-1).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CloudSample {
@@ -1582,6 +1594,232 @@ impl DecodedVolume {
         self.ext_snow = Vec::new();
         self.cloud_fraction = Vec::new();
         self.has_cloud_fraction = false;
+        stats
+    }
+
+    /// Apply a bounded, top-down-only observation-operator reconstruction to broad
+    /// low/moderate stratiform cloud columns.
+    ///
+    /// HRRR can carry grid-scale ring/dash energy in BOTH cloud fraction and native
+    /// condensate. A nadir one-cell-per-pixel view exposes that numerical-scale energy
+    /// directly, whereas a slant geostationary footprint mixes it away. This operator
+    /// regularizes COLUMN optical depth before the cloud march, not the finished image:
+    ///
+    /// - only liquid-dominated columns whose cloud top is below 7 km seed a broad deck;
+    /// - high/frozen or optically very thick convective columns and their two-cell
+    ///   neighbourhood are excluded;
+    /// - a normalized 5x5 binomial footprint estimates the local column OD;
+    /// - one positive, bounded scale multiplies every extinction species/level in a
+    ///   selected column, preserving its phase ratio and vertical structure;
+    /// - the selected-area OD is renormalized back to its input total, and `tau_up` is
+    ///   rebuilt so every light/view consumer remains consistent.
+    ///
+    /// It cannot invent cloud in a truly clear column. This is deliberately opt-in and
+    /// is assembled only for finished top-down visible RGB; geostationary and raw-band
+    /// paths never call it.
+    pub fn regularize_topdown_stratiform_columns(
+        &mut self,
+        optical_depth_scale: f32,
+    ) -> StratiformRegularizationStats {
+        const TOP_MAX_M: f64 = 7000.0;
+        const LIQUID_SHARE_MIN: f64 = 0.60;
+        const EFFECTIVE_TAU_MIN: f64 = 0.04;
+        const EFFECTIVE_TAU_CORE: f64 = 12.0;
+        const MIN_COLUMN_SCALE: f64 = 0.35;
+        const MAX_COLUMN_SCALE: f64 = 2.5;
+        const BROAD_SUPPORT_WEIGHT: u32 = 80; // 31% of the 5x5 binomial footprint.
+        const KERNEL: [u32; 5] = [1, 4, 6, 4, 1];
+
+        let ncol = self.nx.saturating_mul(self.ny);
+        let cells = ncol.saturating_mul(self.nz);
+        let mut stats = StratiformRegularizationStats {
+            columns_total: ncol,
+            min_scale: 1.0,
+            max_scale: 1.0,
+            ..StratiformRegularizationStats::default()
+        };
+        if self.nx < 5
+            || self.ny < 5
+            || self.nz == 0
+            || self.ext_liquid.len() != cells
+            || self.ext_ice.len() != cells
+            || self.ext_precip.len() != cells
+            || self.tau_up.len() != cells
+        {
+            return stats;
+        }
+
+        let dz = self.dz_m.max(0.0);
+        let od_scale = (optical_depth_scale as f64).clamp(0.0, 4.0);
+        let mut tau = vec![0.0f64; ncol];
+        let mut low_seed = vec![false; ncol];
+        let mut protected_core = vec![false; ncol];
+        for j in 0..self.ny {
+            for i in 0..self.nx {
+                let col = j * self.nx + i;
+                let mut liquid_tau = 0.0;
+                let mut frozen_tau = 0.0;
+                let mut top_m = self.z_min_m;
+                for k in 0..self.nz {
+                    let c = self.cell(i, j, k);
+                    let liquid = self.ext_liquid[c].max(0.0) as f64;
+                    let frozen =
+                        self.ext_ice[c].max(0.0) as f64 + self.ext_precip[c].max(0.0) as f64;
+                    let total = liquid + frozen;
+                    liquid_tau += liquid * dz;
+                    frozen_tau += frozen * dz;
+                    if total * dz > 1.0e-5 {
+                        top_m = self.z_min_m + (k as f64 + 0.5) * dz;
+                    }
+                }
+                let total_tau = liquid_tau + frozen_tau;
+                tau[col] = total_tau;
+                if total_tau <= 0.0 {
+                    continue;
+                }
+                let liquid_share = liquid_tau / total_tau;
+                let effective_tau = total_tau * od_scale;
+                let low_like = top_m <= TOP_MAX_M && liquid_share >= LIQUID_SHARE_MIN;
+                low_seed[col] =
+                    low_like && (EFFECTIVE_TAU_MIN..EFFECTIVE_TAU_CORE).contains(&effective_tau);
+                protected_core[col] = !low_like || effective_tau >= EFFECTIVE_TAU_CORE;
+                stats.low_cloud_seeds += usize::from(low_seed[col]);
+            }
+        }
+
+        let mut targets = vec![f64::NAN; ncol];
+        for j in 2..self.ny - 2 {
+            for i in 2..self.nx - 2 {
+                let col = j * self.nx + i;
+                if tau[col] <= 0.0 || protected_core[col] {
+                    continue;
+                }
+                let mut seed_support = 0u32;
+                let mut has_protected_core = false;
+                let mut weighted_tau = 0.0;
+                for (ky, &wy) in KERNEL.iter().enumerate() {
+                    let jj = j + ky - 2;
+                    for (kx, &wx) in KERNEL.iter().enumerate() {
+                        let ii = i + kx - 2;
+                        let n = jj * self.nx + ii;
+                        let w = wy * wx;
+                        seed_support += w * u32::from(low_seed[n]);
+                        has_protected_core |= protected_core[n];
+                        weighted_tau += w as f64 * tau[n];
+                    }
+                }
+                if has_protected_core || seed_support < BROAD_SUPPORT_WEIGHT {
+                    continue;
+                }
+                let smoothed = weighted_tau / 256.0;
+                let scale = (smoothed / tau[col]).clamp(MIN_COLUMN_SCALE, MAX_COLUMN_SCALE);
+                targets[col] = tau[col] * scale;
+            }
+        }
+
+        let selected: Vec<usize> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, target)| target.is_finite().then_some(idx))
+            .collect();
+        if selected.is_empty() {
+            return stats;
+        }
+        let raw_sum: f64 = selected.iter().map(|&idx| tau[idx]).sum();
+        // Solve the bounded global gain as a monotone water-fill. A fixed number of
+        // repeated correction/clamp passes can stop with a visible OD deficit when a
+        // small selected region contains columns at both bounds. Since gain=0 gives
+        // 0.35*raw_sum and gain=8 saturates every target at 2.5*raw_sum, bisection has
+        // a guaranteed bracket and is independent of the field's dynamic range.
+        let bounded_sum = |gain: f64| -> f64 {
+            selected
+                .iter()
+                .map(|&idx| {
+                    (targets[idx] * gain)
+                        .clamp(tau[idx] * MIN_COLUMN_SCALE, tau[idx] * MAX_COLUMN_SCALE)
+                })
+                .sum()
+        };
+        let mut gain_lo = 0.0;
+        let mut gain_hi = 1.0;
+        while bounded_sum(gain_hi) < raw_sum {
+            gain_hi *= 2.0;
+        }
+        // 32 halvings put the residual below 1e-9 of the feasible interval; the
+        // capacity-aware residual pass below then removes the remaining sum error.
+        for _ in 0..32 {
+            let gain_mid = 0.5 * (gain_lo + gain_hi);
+            if bounded_sum(gain_mid) < raw_sum {
+                gain_lo = gain_mid;
+            } else {
+                gain_hi = gain_mid;
+            }
+        }
+        let gain = 0.5 * (gain_lo + gain_hi);
+        for &idx in &selected {
+            targets[idx] = (targets[idx] * gain)
+                .clamp(tau[idx] * MIN_COLUMN_SCALE, tau[idx] * MAX_COLUMN_SCALE);
+        }
+
+        // Remove the last few summation ulps without violating either per-column
+        // bound. The stored f32 field will still conserve only to f32 roundoff, which
+        // is why the diagnostic below is measured from the mutated field itself.
+        let mut residual = raw_sum - selected.iter().map(|&idx| targets[idx]).sum::<f64>();
+        for &idx in &selected {
+            if residual == 0.0 {
+                break;
+            }
+            let old = targets[idx];
+            let new = if residual > 0.0 {
+                old + residual.min(tau[idx] * MAX_COLUMN_SCALE - old)
+            } else {
+                old - (-residual).min(old - tau[idx] * MIN_COLUMN_SCALE)
+            };
+            targets[idx] = new;
+            residual -= new - old;
+        }
+
+        stats.tau_before = raw_sum;
+        let mut actual_tau_after = 0.0;
+        for &col in &selected {
+            let scale = (targets[col] / tau[col]) as f32;
+            if (scale - 1.0).abs() <= 1.0e-5 {
+                actual_tau_after += tau[col];
+                continue;
+            }
+            let i = col % self.nx;
+            let j = col / self.nx;
+            let mut column_tau_after = 0.0;
+            for k in 0..self.nz {
+                let c = self.cell(i, j, k);
+                self.ext_liquid[c] *= scale;
+                self.ext_ice[c] *= scale;
+                self.ext_precip[c] *= scale;
+                column_tau_after += (self.ext_liquid[c].max(0.0) as f64
+                    + self.ext_ice[c].max(0.0) as f64
+                    + self.ext_precip[c].max(0.0) as f64)
+                    * dz;
+            }
+            actual_tau_after += column_tau_after;
+            stats.columns_changed += 1;
+            stats.min_scale = stats.min_scale.min(scale);
+            stats.max_scale = stats.max_scale.max(scale);
+
+            let top = self.cell(i, j, self.nz - 1);
+            self.tau_up[top] = 0.0;
+            for k in (0..self.nz - 1).rev() {
+                let c0 = self.cell(i, j, k);
+                let c1 = self.cell(i, j, k + 1);
+                let beta0 = self.ext_liquid[c0] as f64
+                    + self.ext_ice[c0] as f64
+                    + self.ext_precip[c0] as f64;
+                let beta1 = self.ext_liquid[c1] as f64
+                    + self.ext_ice[c1] as f64
+                    + self.ext_precip[c1] as f64;
+                self.tau_up[c0] = (self.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * dz) as f32;
+            }
+        }
+        stats.tau_after = actual_tau_after;
         stats
     }
 
@@ -2399,6 +2637,32 @@ pub enum StepQuality {
     Offline,
 }
 
+/// Visible-cloud higher-order transport dispatch.
+///
+/// `LegacyOctaves` is the exact shipping v0.1.4/v0.1.5 arithmetic. The Stage-2
+/// delta-flux closure is an explicitly selected research candidate and is never
+/// entered by a default render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloudMultiscatterMode {
+    #[default]
+    LegacyOctaves,
+    SingleScatter,
+    DeltaFluxV1,
+    DeltaFluxV2,
+}
+
+impl CloudMultiscatterMode {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::LegacyOctaves => "legacy-octaves",
+            Self::SingleScatter => "single-scatter",
+            Self::DeltaFluxV1 => "delta-flux-v1",
+            Self::DeltaFluxV2 => "delta-flux-v2b",
+        }
+    }
+}
+
 impl StepQuality {
     pub fn max_steps(self) -> usize {
         match self {
@@ -2449,6 +2713,11 @@ pub struct MarchConfig {
     /// M5). `1` = the fix2 single scatter; `DEFAULT_OCTAVES` = the multi-scatter look.
     /// See [`octave_sun_source`] and the octave-constants block.
     pub octaves: usize,
+    /// Higher-order cloud transport dispatch. [`CloudMultiscatterMode::LegacyOctaves`]
+    /// preserves the established octave arithmetic exactly; `DeltaFluxV1` selects the
+    /// opt-in Stage-2 Monte Carlo depth-source LUT and `DeltaFluxV2` its brightness-
+    /// neutral, upward-hemisphere-normalized P1 directional reconstruction.
+    pub multiscatter_mode: CloudMultiscatterMode,
     /// Apply the Schneider beer-powder stylization to the sun term. **OFF by default
     /// as of M5**: beer-powder was a stylization that FAKED the missing forward-scatter
     /// buildup by darkening thin faces; the octaves now supply that buildup for real,
@@ -2530,6 +2799,7 @@ impl MarchConfig {
             sun_march_growth: sun_growth,
             sun_march_jitter_amp: SUN_MARCH_JITTER_AMP,
             octaves: DEFAULT_OCTAVES,
+            multiscatter_mode: CloudMultiscatterMode::LegacyOctaves,
             beer_powder: false,
             ground_albedo: GROUND_ALBEDO,
             transmittance_floor: 0.003,
@@ -2812,15 +3082,67 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
             scene.sun_od.sample(pm) * od_scale
         };
         let multiscatter_support_tau = column_support_tau.max(tau_cloud_sun).max(sigma_eff * pitch);
-        let sun_src = octave_sun_source_thin_gated(
-            cos_vs,
-            sample.ext_liquid,
-            sample.ext_ice + sample.ext_precip,
-            tau_cloud_sun,
-            scene.cfg.beer_powder,
-            scene.cfg.octaves,
-            multiscatter_support_tau,
-        );
+        let up = scl3(pm, 1.0 / rm);
+        let mu_sun = dot3(up, scene.sun_ecef);
+        let sun_src = match scene.cfg.multiscatter_mode {
+            CloudMultiscatterMode::LegacyOctaves => octave_sun_source_thin_gated(
+                cos_vs,
+                sample.ext_liquid,
+                sample.ext_ice + sample.ext_precip,
+                tau_cloud_sun,
+                scene.cfg.beer_powder,
+                scene.cfg.octaves,
+                multiscatter_support_tau,
+            ),
+            CloudMultiscatterMode::SingleScatter => octave_sun_source_thin_gated(
+                cos_vs,
+                sample.ext_liquid,
+                sample.ext_ice + sample.ext_precip,
+                tau_cloud_sun,
+                scene.cfg.beer_powder,
+                1,
+                multiscatter_support_tau,
+            ),
+            CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2 => {
+                let direct = octave_sun_source_thin_gated(
+                    cos_vs,
+                    sample.ext_liquid,
+                    sample.ext_ice + sample.ext_precip,
+                    tau_cloud_sun,
+                    scene.cfg.beer_powder,
+                    1,
+                    multiscatter_support_tau,
+                );
+                let fractional_depth = if col_total.is_finite() && col_total > 0.0 {
+                    (sample.tau_up / col_total).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                let higher = if scene.cfg.multiscatter_mode == CloudMultiscatterMode::DeltaFluxV2 {
+                    // `view` points camera -> sample; the outgoing direction toward the
+                    // camera is `-view`. `up` is the slab upper-boundary normal.
+                    crate::cloud_delta_flux::stage2_higher_order_source_p1(
+                        multiscatter_support_tau,
+                        fractional_depth,
+                        mu_sun,
+                        scene.cfg.ground_albedo,
+                        sample.ext_liquid,
+                        sample.ext_ice + sample.ext_precip,
+                        -dot3(view, up),
+                    )
+                } else {
+                    crate::cloud_delta_flux::stage2_higher_order_source(
+                        multiscatter_support_tau,
+                        fractional_depth,
+                        mu_sun,
+                        scene.cfg.ground_albedo,
+                        sample.ext_liquid,
+                        sample.ext_ice + sample.ext_precip,
+                    )
+                };
+                direct + higher.higher_isotropic
+            }
+        };
 
         // Atmospheric sun transmittance to the sample (reddening at low sun) with the
         // FINITE-DISK EARTH-SHADOW FADE (WS1 march-physics pass): the fraction of the
@@ -2829,8 +3151,6 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
         // (which drew a hard lit/unlit line across dusk anvils). The transmittance-LUT
         // sample clamps mu to the horizon so the fading disk is attenuated by the
         // (defined) grazing path rather than an undefined below-horizon sample.
-        let up = scl3(pm, 1.0 / rm);
-        let mu_sun = dot3(up, scene.sun_ecef);
         let disk_sun = sun_horizon_disk_fraction(rm, mu_sun);
         let t_atmo_sun = if disk_sun <= 0.0 {
             [0.0; 3]
@@ -3479,6 +3799,142 @@ mod tests {
         }
     }
 
+    fn test_column_tau(vol: &DecodedVolume, i: usize, j: usize) -> f64 {
+        (0..vol.nz)
+            .map(|k| {
+                let c = vol.cell(i, j, k);
+                (vol.ext_liquid[c] as f64 + vol.ext_ice[c] as f64 + vol.ext_precip[c] as f64)
+                    * vol.dz_m
+            })
+            .sum()
+    }
+
+    #[test]
+    fn topdown_stratiform_regularization_conserves_od_and_column_structure() {
+        let (nx, ny, nz) = (13, 13, 6);
+        let mut vol = build_volume(nx, ny, nz, 500.0, 3000.0, |i, j, k| {
+            // A broad low/liquid deck with deterministic grid-scale stipple. Every
+            // column is a seed; the species and vertical ratios are non-trivial.
+            let pattern = match (i + 2 * j) % 4 {
+                0 => 0.35,
+                1 => 0.8,
+                2 => 1.5,
+                _ => 2.5,
+            };
+            let vertical = 1.0 + 0.05 * k as f64;
+            (
+                6.0e-4 * pattern * vertical,
+                1.0e-4 * pattern * vertical,
+                5.0e-5 * pattern * vertical,
+            )
+        });
+        vol.tau_up.fill(99.0); // proves every modified column is rebuilt.
+        let before = vol.clone();
+        let interior = |v: &DecodedVolume| {
+            (2..ny - 2)
+                .flat_map(|j| (2..nx - 2).map(move |i| test_column_tau(v, i, j)))
+                .collect::<Vec<_>>()
+        };
+        let before_tau = interior(&before);
+        let variance = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+        };
+
+        let stats = vol.regularize_topdown_stratiform_columns(0.15);
+        let after_tau = interior(&vol);
+        assert_eq!(stats.columns_total, nx * ny);
+        assert_eq!(stats.low_cloud_seeds, nx * ny);
+        assert!(stats.columns_changed > 70, "stats={stats:?}");
+        assert!(
+            variance(&after_tau) < 0.25 * variance(&before_tau),
+            "stipple variance was not materially reduced"
+        );
+
+        let before_sum = before_tau.iter().sum::<f64>();
+        let after_sum = after_tau.iter().sum::<f64>();
+        assert!((stats.tau_before - before_sum).abs() < 1.0e-9);
+        assert!(
+            (stats.tau_after - stats.tau_before).abs() / stats.tau_before < 2.0e-7,
+            "stats={stats:?}"
+        );
+        assert!(
+            (after_sum - before_sum).abs() / before_sum < 2.0e-7,
+            "actual selected OD changed: {before_sum} -> {after_sum}"
+        );
+
+        let mut verified_changed_column = false;
+        for j in 2..ny - 2 {
+            for i in 2..nx - 2 {
+                let scale = test_column_tau(&vol, i, j) / test_column_tau(&before, i, j);
+                if (scale - 1.0).abs() <= 1.0e-5 {
+                    continue;
+                }
+                verified_changed_column = true;
+                for k in 0..nz {
+                    let c = vol.cell(i, j, k);
+                    for (after, raw) in [
+                        (vol.ext_liquid[c], before.ext_liquid[c]),
+                        (vol.ext_ice[c], before.ext_ice[c]),
+                        (vol.ext_precip[c], before.ext_precip[c]),
+                    ] {
+                        assert!(((after / raw) as f64 - scale).abs() < 3.0e-7);
+                    }
+                }
+                let top = vol.cell(i, j, nz - 1);
+                assert_eq!(vol.tau_up[top], 0.0);
+                for k in (0..nz - 1).rev() {
+                    let c0 = vol.cell(i, j, k);
+                    let c1 = vol.cell(i, j, k + 1);
+                    let beta0 = vol.ext_liquid[c0] as f64
+                        + vol.ext_ice[c0] as f64
+                        + vol.ext_precip[c0] as f64;
+                    let beta1 = vol.ext_liquid[c1] as f64
+                        + vol.ext_ice[c1] as f64
+                        + vol.ext_precip[c1] as f64;
+                    let expected = vol.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * vol.dz_m;
+                    assert!((vol.tau_up[c0] as f64 - expected).abs() < 2.0e-6);
+                }
+            }
+        }
+        assert!(verified_changed_column);
+    }
+
+    #[test]
+    fn topdown_stratiform_regularization_exactly_excludes_convective_columns() {
+        let (nx, ny, nz) = (11, 11, 32);
+        let mut vol = build_volume(nx, ny, nz, 250.0, 3000.0, |i, _, k| {
+            if i < nx / 2 {
+                // High frozen cloud: cloud top is above the 7-km stratiform gate.
+                if k >= 28 {
+                    (0.0, 2.0e-3, 5.0e-4)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
+            } else {
+                // Optically thick low liquid core: effective tau is above the core gate.
+                if k < 4 {
+                    (0.1, 0.0, 0.0)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
+            }
+        });
+        vol.tau_up
+            .iter_mut()
+            .enumerate()
+            .for_each(|(idx, v)| *v = idx as f32 * 1.0e-5);
+        let before = vol.clone();
+        let stats = vol.regularize_topdown_stratiform_columns(0.15);
+        assert_eq!(stats.columns_changed, 0, "stats={stats:?}");
+        assert_eq!(stats.tau_before, 0.0);
+        assert_eq!(stats.tau_after, 0.0);
+        assert_eq!(vol.ext_liquid, before.ext_liquid);
+        assert_eq!(vol.ext_ice, before.ext_ice);
+        assert_eq!(vol.ext_precip, before.ext_precip);
+        assert_eq!(vol.tau_up, before.tau_up);
+    }
+
     #[test]
     fn fractional_clouds_unavailable_and_full_cover_are_exact_noops() {
         let mut unavailable = build_volume(2, 1, 3, 250.0, 500.0, |i, _, k| {
@@ -3563,6 +4019,73 @@ mod tests {
         assert_eq!(stats.columns_modified, 0);
         assert_eq!(vol.ext_liquid, before.ext_liquid);
         assert_eq!(vol.tau_up, before.tau_up);
+    }
+
+    #[test]
+    fn topdown_stratiform_regularization_conserves_od_and_preserves_columns() {
+        // A deliberately stiff 7x7 deck: the centre column is much thicker than its
+        // neighbours, so both scale bounds participate in the selected 3x3 interior.
+        // Twelve correction/clamp passes left this case short by about 2.8e-5.
+        let mut vol = build_volume(7, 7, 2, 1.0, 3000.0, |i, j, _| {
+            let tau = if i == 3 && j == 3 { 10.0 } else { 0.267 };
+            (0.4 * tau, 0.1 * tau, 0.0)
+        });
+        let before = vol.clone();
+        let total_od = |v: &DecodedVolume| -> f64 {
+            v.ext_liquid
+                .iter()
+                .zip(&v.ext_ice)
+                .zip(&v.ext_precip)
+                .map(|((&l, &i), &p)| (l as f64 + i as f64 + p as f64) * v.dz_m)
+                .sum()
+        };
+        let od_before = total_od(&vol);
+        let stats = vol.regularize_topdown_stratiform_columns(0.15);
+        let od_after = total_od(&vol);
+
+        assert!(stats.columns_changed > 0);
+        assert!(stats.min_scale >= 0.35 - 2.0e-7);
+        assert!(stats.max_scale <= 2.5 + 2.0e-7);
+        assert!((od_after - od_before).abs() / od_before < 2.0e-7);
+        assert!((stats.tau_after - stats.tau_before).abs() / stats.tau_before < 2.0e-7);
+
+        for j in 0..vol.ny {
+            for i in 0..vol.nx {
+                let c0 = vol.cell(i, j, 0);
+                let scale = vol.ext_liquid[c0] / before.ext_liquid[c0];
+                assert!(scale.is_finite() && scale > 0.0);
+                assert!((0.35 - 2.0e-7..=2.5 + 2.0e-7).contains(&scale));
+                // One scale applies to every level/species in the column.
+                for k in 0..vol.nz {
+                    let c = vol.cell(i, j, k);
+                    assert!((vol.ext_liquid[c] - before.ext_liquid[c] * scale).abs() < 2.0e-7);
+                    assert!((vol.ext_ice[c] - before.ext_ice[c] * scale).abs() < 2.0e-7);
+                    assert_eq!(vol.ext_precip[c], 0.0);
+                    assert!(vol.tau_up[c].is_finite());
+                }
+                // The kernel has no support outside the two-cell interior; those edge
+                // columns must remain an exact no-op rather than acquiring a seam scale.
+                if i < 2 || j < 2 || i + 2 >= vol.nx || j + 2 >= vol.ny {
+                    assert_eq!(scale.to_bits(), 1.0f32.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn topdown_stratiform_regularization_rejects_malformed_tau_up() {
+        let mut vol = build_volume(7, 7, 2, 1.0, 3000.0, |i, j, _| {
+            let tau = if i == 3 && j == 3 { 5.0 } else { 0.5 };
+            (0.5 * tau, 0.0, 0.0)
+        });
+        vol.tau_up.clear();
+        let before = vol.clone();
+        let stats = vol.regularize_topdown_stratiform_columns(0.15);
+        assert_eq!(stats.columns_changed, 0);
+        assert_eq!(vol.ext_liquid, before.ext_liquid);
+        assert_eq!(vol.ext_ice, before.ext_ice);
+        assert_eq!(vol.ext_precip, before.ext_precip);
+        assert!(vol.tau_up.is_empty());
     }
 
     fn shared_luts() -> &'static (AtmosphereLuts, SkyShTable) {

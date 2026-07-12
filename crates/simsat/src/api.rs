@@ -1,6 +1,7 @@
 //! High-level render API — the reusable, PURE-RUST assembly that turns a wrfout / cached
-//! brick into the frame DATA (owned Rust arrays) plus a georeference, WITHOUT a GPU, a
-//! GUI, or a PNG.
+//! brick into the frame DATA (owned Rust arrays) plus a georeference, without a GUI or
+//! PNG. CPU is the default; [`RenderBackend::GpuPreview`] explicitly selects the same
+//! synchronous wgpu cloud preview used by Studio.
 //!
 //! This is the single code path behind BOTH the headless examples (`render_frame` /
 //! `render_ir`) AND the Python binding (`crates/simsat_py`, exposed as `import simsat`).
@@ -29,18 +30,19 @@ use std::path::PathBuf;
 use crate::asset_pack;
 use crate::atmosphere::{
     self, AERIAL_FROXEL_DIM, AtmosphereLuts, AtmosphereParams, CameraGeometry, OutputTransform,
-    SkyShTable, sun_enu_to_ecef,
+    SOLAR_IRRADIANCE_RGB, SkyShTable, sun_enu_to_ecef,
 };
 use crate::bluemarble;
 use crate::bricks::{self, RunManifest, VolumeBrick};
 use crate::camera::{
     GeoCamera, MAX_AXIS, PerspectiveCamera, ResolutionMode, SatellitePreset, SurfaceRaster,
-    ViewMode, build_map_raster, build_perspective_raster, build_surface_raster_mode,
+    ViewMode, build_map_raster_mode, build_perspective_raster, build_surface_raster_mode,
     extended_native_counts, map_pixel_edge_index_bounds,
 };
 use crate::clouds::{
-    self, CloudFrameStats, CloudScene, DecodedVolume, MarchConfig, OccupancyMip, StepQuality,
-    render_cloud_frame_reflectance, render_cloud_frame_rgba, scan_rect_of,
+    self, CloudFrameStats, CloudMultiscatterMode, CloudScene, DecodedVolume, MarchConfig,
+    OccupancyMip, StepQuality, render_cloud_frame_reflectance, render_cloud_frame_rgba,
+    scan_rect_of,
 };
 use crate::derived::{self, DerivedField};
 use crate::frame::{GridGeoref, WrfProjectionParams};
@@ -52,9 +54,9 @@ use crate::ingest_grib;
 use crate::ir::{self, IrConfig, IrScene, IrVolume};
 use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::render::{
-    DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig, SurfacePixel,
-    WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt, reflectance_from_radiance, shade_surface,
-    snow_fraction, surface_toa_radiance,
+    CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt,
+    reflectance_from_radiance, shade_surface, snow_fraction, surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::SolarFrame;
@@ -139,6 +141,60 @@ pub enum Product {
     Perspective { cloud_layer_only: bool },
 }
 
+/// Execution backend for a single render. CPU is the quality/stored/batch default;
+/// `GpuPreview` is an explicitly requested, synchronous, read-back preview using the
+/// same wgpu cloud pass as Studio.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderBackend {
+    #[default]
+    Cpu,
+    GpuPreview,
+}
+
+impl RenderBackend {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::GpuPreview => "gpu-preview",
+        }
+    }
+}
+
+/// One explicit temporary substitution needed by the bounded GPU preview envelope.
+/// These are returned with the frame and surfaced by both CLI and Python.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPreviewAdjustment {
+    ProductVisible,
+    CloudsOn,
+    TerrainAtmosphereOff,
+    FractionalCloudsOff,
+    GranulationOff,
+    TopdownStratiformRegularizationOff,
+    ExposedEdgeFeatherOff,
+    LegacyCloudTransport,
+    ShippedHighlights,
+    InteractiveSteps,
+    ShippedTopdownCloudNorm,
+}
+
+impl GpuPreviewAdjustment {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ProductVisible => "product -> visible",
+            Self::CloudsOn => "clouds -> on",
+            Self::TerrainAtmosphereOff => "terrain-height atmosphere -> off",
+            Self::FractionalCloudsOff => "model cloud fraction -> off (legacy full cells)",
+            Self::GranulationOff => "granulation -> off",
+            Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
+            Self::ExposedEdgeFeatherOff => "exposed-edge feather -> off",
+            Self::LegacyCloudTransport => "cloud transport -> legacy octaves",
+            Self::ShippedHighlights => "highlight knee/ceiling -> shipped values",
+            Self::InteractiveSteps => "cloud steps -> interactive",
+            Self::ShippedTopdownCloudNorm => "top-down cloud normalization -> shipped value",
+        }
+    }
+}
+
 /// The ground-texture source for a visible render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlueMarble {
@@ -180,13 +236,18 @@ pub struct RenderParams {
     /// A wrfout file (ingested to a brick if not cached under `cache`) OR a cached
     /// `run.json`.
     pub input: PathBuf,
+    /// Single-frame execution backend. CPU is the stable default. GPU preview never
+    /// mutates this struct: [`render`] plans temporary compatibility substitutions on a
+    /// clone and reports all of them in [`RenderResult::diagnostics`].
+    pub backend: RenderBackend,
     /// The satellite preset (geostationary view only; ignored for top-down).
     pub satellite: SatellitePreset,
     /// Time index into the wrfout / manifest.
     pub timestep: usize,
     /// The output view: top-down map (default) or from-space geostationary.
     pub view: ViewMode,
-    /// The output resolution mode (geostationary only; top-down is native one-px-per-cell).
+    /// The output resolution mode. Top-down ABI modes use physical 1 km / 2 km map
+    /// spacing; Native remains one output pixel per WRF grid point.
     pub resolution: ResolutionMode,
     /// Zoom-out / domain MARGIN as a FRACTION of the domain size added on EACH side
     /// (`0.0` = the domain edge-to-edge, the pre-margin behavior; `0.20` = +20% of the
@@ -220,6 +281,11 @@ pub struct RenderParams {
     pub exposure: f64,
     /// M5 Wrenninge multi-scatter octaves (visible only).
     pub multiscatter: bool,
+    /// Explicit higher-order cloud-transport mode. `None` preserves the established
+    /// `multiscatter` boolean exactly (`true` = legacy octaves, `false` = single scatter).
+    /// `Some(DeltaFluxV1)` selects the opt-in isotropic Stage-2 Monte Carlo depth-source
+    /// candidate; `Some(DeltaFluxV2)` selects its brightness-neutral v2b P1 reconstruction.
+    pub cloud_multiscatter: Option<CloudMultiscatterMode>,
     /// Schneider beer-powder shaping of the direct cloud-sun term (visible only).
     /// Off by default; this is an appearance/QA switch and does not change cloud
     /// transmittance or the quantitative derived cloud-optical-depth product.
@@ -260,6 +326,11 @@ pub struct RenderParams {
     /// forces the visible-family behavior either way. Recorded on
     /// [`RenderResult::granulation`] (the what-if-label pattern).
     pub granulation: Option<bool>,
+    /// Opt-in top-down visible observation-operator reconstruction for broad,
+    /// liquid-dominated stratiform columns. It regularizes column optical depth before
+    /// marching while conserving selected-area OD and preserving each column's vertical
+    /// structure/species mix. Geostationary and raw visible bands ignore it.
+    pub topdown_stratiform_regularization: bool,
     /// Optional synthetic sun override (visible only).
     pub sun_override: Option<SunOverride>,
     /// Brick cache root (read/write) + seasonal Blue Marble cache.
@@ -309,6 +380,7 @@ impl RenderParams {
     pub fn new(input: PathBuf) -> Self {
         Self {
             input,
+            backend: RenderBackend::Cpu,
             satellite: SatellitePreset::GoesEast,
             timestep: 0,
             view: ViewMode::TopDownMap,
@@ -321,6 +393,7 @@ impl RenderParams {
             land_appearance: LandAppearanceConfig::default(),
             exposure: DEFAULT_EXPOSURE,
             multiscatter: true,
+            cloud_multiscatter: None,
             beer_powder: false,
             steps: StepQuality::Offline,
             clouds: true,
@@ -328,6 +401,8 @@ impl RenderParams {
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             feather_exposed_domain_edges: true,
             granulation: None,
+            // v0.1.6 candidate remains explicit opt-in until multi-case owner QA.
+            topdown_stratiform_regularization: false,
             sun_override: None,
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
@@ -558,6 +633,12 @@ pub struct RenderResult {
     /// scoping). Recorded like the fake-sun what-if label so a consumer can see the
     /// display texturing was active; always `false` for the thermal / derived products.
     pub granulation: bool,
+    /// Backend actually used for this frame.
+    pub backend: RenderBackend,
+    /// Explicit temporary GPU-preview substitutions. Empty on CPU.
+    pub diagnostics: Vec<GpuPreviewAdjustment>,
+    /// Adapter name when [`RenderBackend::GpuPreview`] ran successfully.
+    pub gpu_adapter: Option<String>,
 }
 
 /// Resolved scene inputs (a wrfout ingest-if-needed, or a cached run.json).
@@ -572,28 +653,118 @@ struct SceneSource {
 /// binding. Resolves the source (ingesting the wrfout timestep to a brick if needed),
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
-    let src = resolve_source(params)?;
-    match product {
+    let requested_backend = params.backend;
+    let (effective, product, diagnostics) = if requested_backend == RenderBackend::GpuPreview {
+        plan_gpu_preview(params, product)?
+    } else {
+        (params.clone(), product, Vec::new())
+    };
+    let src = resolve_source(&effective)?;
+    if requested_backend == RenderBackend::GpuPreview && !gpu::projection_supported(&src.georef) {
+        return Err(
+            "backend=gpu-preview does not support this source projection (rotated latitude/longitude has no WGSL forward transform)"
+                .to_string(),
+        );
+    }
+    let mut result = match product {
         // The IR window (band 13) and the WV bands (8/9/10) share ONE thermal march; they
         // differ only in the `IrConfig` (wavelength + WV mass-absorption / band selector).
-        Product::Ir => render_ir_scene(&src, params, IrConfig::band13()),
-        Product::WaterVapor { band } => render_ir_scene(&src, params, band.ir_config()),
-        Product::VisibleRgb | Product::VisibleBands => render_visible_scene(&src, params, product),
+        Product::Ir => render_ir_scene(&src, &effective, IrConfig::band13()),
+        Product::WaterVapor { band } => render_ir_scene(&src, &effective, band.ir_config()),
+        Product::VisibleRgb | Product::VisibleBands => {
+            render_visible_scene(&src, &effective, product)
+        }
         // GeoColor renders the visible + IR frames through the SAME paths and blends them.
-        Product::GeoColor => render_geocolor_scene(&src, params),
+        Product::GeoColor => render_geocolor_scene(&src, &effective),
         // Sandwich also renders visible + IR through the SAME paths, then overlays the colored
         // IR on the cold tops of the visible base.
-        Product::Sandwich => render_sandwich_scene(&src, params),
+        Product::Sandwich => render_sandwich_scene(&src, &effective),
         // Derived scalar fields are a per-column brick computation resampled onto the raster
         // (no sun / atmosphere / cloud march).
-        Product::Derived { field } => render_derived_scene(&src, params, field),
+        Product::Derived { field } => render_derived_scene(&src, &effective, field),
         // The web-map cloud layer: cloud-only + ground shadow on a Web-Mercator grid.
-        Product::CloudLayer => render_cloud_layer_scene(&src, params),
+        Product::CloudLayer => render_cloud_layer_scene(&src, &effective),
         // The free-perspective frame (full composite, or the cloud-layer-only variant).
         Product::Perspective { cloud_layer_only } => {
-            render_perspective_scene(&src, params, cloud_layer_only)
+            render_perspective_scene(&src, &effective, cloud_layer_only)
         }
+    }?;
+    result.backend = requested_backend;
+    result.diagnostics = diagnostics;
+    Ok(result)
+}
+
+/// Build the bounded GPU-preview configuration without mutating caller parameters.
+/// Geo and TopDown are preserved exactly. Free perspective is a hard unsupported-view
+/// error; all other product/quality substitutions are explicit diagnostics.
+pub fn plan_gpu_preview(
+    params: &RenderParams,
+    product: Product,
+) -> Result<(RenderParams, Product, Vec<GpuPreviewAdjustment>), String> {
+    if matches!(product, Product::Perspective { .. }) || params.perspective.is_some() {
+        return Err(
+            "backend=gpu-preview supports geostationary and top-down views only; free perspective has no GPU cloud ray path"
+                .to_string(),
+        );
     }
+    let mut p = params.clone();
+    let mut changes = Vec::new();
+    if product != Product::VisibleRgb {
+        changes.push(GpuPreviewAdjustment::ProductVisible);
+    }
+    if !p.clouds {
+        p.clouds = true;
+        changes.push(GpuPreviewAdjustment::CloudsOn);
+    }
+    if p.terrain_atmosphere {
+        p.terrain_atmosphere = false;
+        changes.push(GpuPreviewAdjustment::TerrainAtmosphereOff);
+    }
+    if p.fractional_clouds {
+        p.fractional_clouds = false;
+        changes.push(GpuPreviewAdjustment::FractionalCloudsOff);
+    }
+    if p.granulation.unwrap_or(false) {
+        p.granulation = Some(false);
+        changes.push(GpuPreviewAdjustment::GranulationOff);
+    }
+    if p.topdown_stratiform_regularization {
+        p.topdown_stratiform_regularization = false;
+        changes.push(GpuPreviewAdjustment::TopdownStratiformRegularizationOff);
+    }
+    if p.feather_exposed_domain_edges {
+        p.feather_exposed_domain_edges = false;
+        changes.push(GpuPreviewAdjustment::ExposedEdgeFeatherOff);
+    }
+    let resolved_transport = p.cloud_multiscatter.unwrap_or(if p.multiscatter {
+        CloudMultiscatterMode::LegacyOctaves
+    } else {
+        CloudMultiscatterMode::SingleScatter
+    });
+    if resolved_transport != CloudMultiscatterMode::LegacyOctaves {
+        changes.push(GpuPreviewAdjustment::LegacyCloudTransport);
+    }
+    p.multiscatter = true;
+    p.cloud_multiscatter = Some(CloudMultiscatterMode::LegacyOctaves);
+    if p.cloud_softclip.unwrap_or(CLOUD_SOFTCLIP_KNEE) != CLOUD_SOFTCLIP_KNEE
+        || p.cloud_highlight_max.unwrap_or(RHO_HIGHLIGHT_MAX) != RHO_HIGHLIGHT_MAX
+    {
+        p.cloud_softclip = None;
+        p.cloud_highlight_max = None;
+        changes.push(GpuPreviewAdjustment::ShippedHighlights);
+    }
+    if p.steps != StepQuality::Interactive {
+        p.steps = StepQuality::Interactive;
+        changes.push(GpuPreviewAdjustment::InteractiveSteps);
+    }
+    if p.topdown_cloud_norm
+        .is_some_and(|v| (v - crate::topdown::TOPDOWN_CLOUD_NORM).abs() > f64::EPSILON)
+    {
+        p.topdown_cloud_norm = None;
+        changes.push(GpuPreviewAdjustment::ShippedTopdownCloudNorm);
+    }
+    p.backend = RenderBackend::GpuPreview;
+    Ok((p, Product::VisibleRgb, changes))
 }
 
 // ── visible assembly (mirrors the studio clouds-on pipeline / render_frame) ─────
@@ -619,9 +790,12 @@ fn render_visible_scene(
     let margin = params.margin_frac as f64;
     let raster = match &params.raster_override {
         Some(r) => r.clone(),
-        None if is_topdown => build_map_raster(georef, nx, ny, nx, ny, margin)
-            .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
-            .as_surface_raster(),
+        None if is_topdown => {
+            let (dx_m, dy_m) = dx_dy_metres(proj);
+            build_map_raster_mode(georef, nx, ny, dx_m, dy_m, params.resolution, margin)
+                .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
+                .as_surface_raster()
+        }
         None => {
             build_surface_raster_mode(&camera, georef, nx, ny, params.resolution, margin, MAX_AXIS)
                 .ok_or_else(|| {
@@ -710,6 +884,11 @@ fn render_visible_scene(
         } else {
             1
         },
+        multiscatter_mode: params.cloud_multiscatter.unwrap_or(if params.multiscatter {
+            CloudMultiscatterMode::LegacyOctaves
+        } else {
+            CloudMultiscatterMode::SingleScatter
+        }),
         granulation,
         ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch_m).max(1.0))
     };
@@ -783,7 +962,29 @@ fn render_visible_scene(
     // either surface-only output and large operational bricks otherwise paid their full
     // decode/preparation cost before being discarded.
     let (rnx, rny) = (raster.nx, raster.ny);
-    let (data, cloud_stats) = if params.clouds {
+    let mut gpu_adapter = None;
+    let (data, cloud_stats) = if params.backend == RenderBackend::GpuPreview {
+        let (rgba, adapter) = render_gpu_visible_frame(
+            brick,
+            georef,
+            &raster,
+            bluemarble.as_ref(),
+            &lut_geo,
+            &lut_light,
+            &normals,
+            &luts,
+            &sky_sh,
+            &cam_geo,
+            sun_ecef,
+            &atmo_params,
+            params,
+            horiz_pitch_m,
+            margin,
+        )?;
+        gpu_adapter = Some(adapter);
+        let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
+        (FrameData::Visible { rgb, rgba }, None)
+    } else if params.clouds {
         let fractional_requested = params.fractional_clouds;
         let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
         let mut vol = if fractional_clouds {
@@ -797,6 +998,22 @@ fn render_visible_scene(
             fractional_requested,
             "visible",
         );
+        if is_topdown
+            && matches!(product, Product::VisibleRgb)
+            && params.topdown_stratiform_regularization
+        {
+            let stats = vol.regularize_topdown_stratiform_columns(params.cloud_optical_depth_scale);
+            crate::log_line!(
+                "simsat api: top-down stratiform OD regularization ON ({} low-cloud seeds; \
+                 {} columns changed; selected tau {:.6} -> {:.6}; scale {:.3}..{:.3})",
+                stats.low_cloud_seeds,
+                stats.columns_changed,
+                stats.tau_before,
+                stats.tau_after,
+                stats.min_scale,
+                stats.max_scale,
+            );
+        }
         let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
         let sun_od = clouds::accumulate_sun_od_granulated(
             &vol,
@@ -932,7 +1149,204 @@ fn render_visible_scene(
         ground_source: Some(ground_source),
         ground_status,
         granulation: gran_on,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_gpu_visible_frame(
+    brick: &VolumeBrick,
+    georef: &GridGeoref,
+    raster: &SurfaceRaster,
+    bluemarble: Option<&bluemarble::BlueMarbleCrop>,
+    lut_geo: &[f32],
+    lut_light: &[f32],
+    normals: &[[f32; 3]],
+    luts: &AtmosphereLuts,
+    sky_sh: &SkyShTable,
+    cam_geo: &CameraGeometry,
+    sun_ecef: [f64; 3],
+    atmo: &AtmosphereParams,
+    params: &RenderParams,
+    horiz_pitch_m: f64,
+    margin: f64,
+) -> Result<(Vec<u8>, String), String> {
+    debug_assert_eq!(params.backend, RenderBackend::GpuPreview);
+    debug_assert!(params.clouds);
+    debug_assert!(!params.terrain_atmosphere);
+    debug_assert!(!params.fractional_clouds);
+    debug_assert!(!params.granulation.unwrap_or(false));
+
+    // Acquire the requested backend before allocating the upload payloads. A missing
+    // adapter is a hard error, never a CPU fallback.
+    let renderer = gpu::HeadlessCloudRenderer::request()?;
+    let adapter_name = renderer.adapter_name().to_string();
+
+    let normals_rgba = gpu::normals_to_rgba8(normals);
+    let landmask_r8 = gpu::landmask_to_r8(&brick.landmask);
+    let ambient_lut = sky_sh.to_scalar_rgba_f32();
+    let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+    let scan = &raster.scan;
+    let uniforms = gpu::SurfaceUniforms {
+        cam: f3(cam_geo.camera),
+        r_ground: atmosphere::R_GROUND_M as f32,
+        sun: f3(sun_ecef),
+        r_top: atmosphere::R_TOP_M as f32,
+        ex: f3(cam_geo.ex),
+        x_min: scan.x_min as f32,
+        ey: f3(cam_geo.ey),
+        y_max: scan.y_max as f32,
+        ez: f3(cam_geo.ez),
+        pitch_x: scan.pitch_x as f32,
+        solar: f3(SOLAR_IRRADIANCE_RGB),
+        pitch_y: scan.pitch_y as f32,
+        mie_sca: atmo.mie_scattering_ground() as f32,
+        mie_ext: atmo.mie_extinction_ground() as f32,
+        mie_g: atmosphere::MIE_ASYMMETRY_G as f32,
+        pw_ratio: atmo.pw_ratio as f32,
+        bm_present: if bluemarble.is_some() { 1.0 } else { 0.0 },
+        water_scale: WATER_ALBEDO_SCALE,
+        flat_albedo: FLAT_ALBEDO_SRGB,
+        output_transform: OutputTransform::AbiReflectance.code(),
+        ambient_elev_min: sky_sh.elev_min_deg as f32,
+        ambient_elev_max: sky_sh.elev_max_deg as f32,
+        ambient_n: sky_sh.entries.len() as f32,
+        atmosphere_correction: if params.atmosphere_correction {
+            1.0
+        } else {
+            0.0
+        },
+        land_appearance: params.land_appearance,
+    };
+    let surface = gpu::SurfaceFrameInputs {
+        width: raster.nx as u32,
+        height: raster.ny as u32,
+        lut_geo,
+        lut_light,
+        nx: brick.nx as u32,
+        ny: brick.ny as u32,
+        normals_rgba: &normals_rgba,
+        landmask_r8: &landmask_r8,
+        bluemarble,
+        transmittance_lut: &luts.transmittance.data,
+        multiscatter_lut: &luts.multiscatter.data,
+        ambient_lut: &ambient_lut,
+        ambient_n: sky_sh.entries.len() as u32,
+        uniforms,
+    };
+
+    let occupancy = gpu::quantized_occupancy_upload(brick, clouds::OCCUPANCY_MIP_FACTOR);
+    let texture_a = clouds::pack_texture_a(brick);
+    let (view_mode, ray_lut, scan_rect, froxel) = if params.view == ViewMode::TopDownMap {
+        (
+            gpu::CloudViewMode::TopDownNadir,
+            gpu::build_topdown_ray_lut(&raster.lat, &raster.lon),
+            (0.0, 1.0, 0.0, 1.0),
+            atmosphere::AerialFroxel {
+                dim: 1,
+                data: vec![0.0, 0.0, 0.0, 1.0],
+            },
+        )
+    } else {
+        let rect = scan_rect_of(scan);
+        (
+            gpu::CloudViewMode::Geostationary,
+            Vec::new(),
+            rect,
+            atmosphere::build_aerial_froxel(luts, atmo, cam_geo, sun_ecef, rect, AERIAL_FROXEL_DIM),
+        )
+    };
+    let pitch = brick.dz_m.min(horiz_pitch_m).max(1.0);
+    let cfg = MarchConfig {
+        beer_powder: params.beer_powder,
+        cloud_optical_depth_scale: params.cloud_optical_depth_scale,
+        ground_day_lift: params.ground_gain.unwrap_or(crate::render::GROUND_DAY_LIFT),
+        cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
+        cloud_highlight_max: RHO_HIGHLIGHT_MAX,
+        octaves: clouds::DEFAULT_OCTAVES,
+        edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, brick.nx, brick.ny),
+        ..MarchConfig::new(StepQuality::Interactive, pitch)
+    };
+    let march = gpu::CloudMarchParams {
+        coarse_step_m: (cfg.coarse_mult * pitch) as f32,
+        fine_step_m: (cfg.fine_mult * pitch) as f32,
+        max_steps: cfg.max_steps as f32,
+        exposure: params.exposure as f32,
+        octaves: cfg.octaves as f32,
+        beer_powder: cfg.beer_powder,
+        ground_albedo: cfg.ground_albedo as f32,
+        transmittance_floor: cfg.transmittance_floor as f32,
+        cloud_optical_depth_scale: cfg.cloud_optical_depth_scale,
+        edge_feather_cells: cfg.edge_feather_cells as f32,
+        ground_day_lift: cfg.ground_day_lift as f32,
+    };
+    let sun_od = gpu::plan_sun_od(
+        georef,
+        brick.nx,
+        brick.ny,
+        brick.nz,
+        brick.z_min_m,
+        brick.dz_m,
+        pitch,
+        sun_ecef,
+        SUN_OD_RESOLUTION,
+    );
+    let lq = brick.quant.get("ext_liquid");
+    let iq = brick.quant.get("ext_ice");
+    let pq = brick.quant.get("ext_precip");
+    let tq = brick.quant.get("tau_up");
+    let sh_data = sky_sh.to_rgba_f32();
+    let inputs = gpu::CloudFrameInputs {
+        surface,
+        view_mode,
+        ray_lut: &ray_lut,
+        vol_nx: brick.nx as u32,
+        vol_ny: brick.ny as u32,
+        vol_nz: brick.nz as u32,
+        texture_a: &texture_a,
+        occ_dims: occupancy.dims,
+        occupancy: &occupancy.r8,
+        ql: [
+            lq.vmin as f32,
+            lq.vmax as f32,
+            iq.vmin as f32,
+            iq.vmax as f32,
+        ],
+        qp: [
+            pq.vmin as f32,
+            pq.vmax as f32,
+            tq.vmin as f32,
+            tq.vmax as f32,
+        ],
+        z_min_m: brick.z_min_m as f32,
+        dz_m: brick.dz_m as f32,
+        r_top_m: (atmosphere::R_GROUND_M + brick.z_min_m + brick.nz as f64 * brick.dz_m) as f32,
+        r_bottom_m: (atmosphere::R_GROUND_M + brick.z_min_m) as f32,
+        voxel_pitch_m: pitch as f32,
+        geo: gpu::geo_quads(georef),
+        march,
+        sun_od,
+        froxel_dim: froxel.dim as u32,
+        froxel_data: &froxel.data,
+        sh_rows: sky_sh.entries.len() as u32,
+        sh_data: &sh_data,
+        scan_rect: [
+            scan_rect.0 as f32,
+            scan_rect.1 as f32,
+            scan_rect.2 as f32,
+            scan_rect.3 as f32,
+        ],
+    };
+    let frame = renderer.render(&inputs);
+    if frame.width as usize != raster.nx || frame.height as usize != raster.ny {
+        return Err(format!(
+            "GPU preview returned {}x{}, expected {}x{}",
+            frame.width, frame.height, raster.nx, raster.ny
+        ));
+    }
+    Ok((frame.rgba, adapter_name))
 }
 
 // ── IR / WV assembly (mirrors render_ir; the ONE thermal path) ──────────────────
@@ -957,7 +1371,8 @@ fn render_ir_scene(
     let camera = GeoCamera::new(params.satellite);
     let margin = params.margin_frac as f64;
     let raster = if is_topdown {
-        build_map_raster(georef, nx, ny, nx, ny, margin)
+        let (dx_m, dy_m) = dx_dy_metres(proj);
+        build_map_raster_mode(georef, nx, ny, dx_m, dy_m, params.resolution, margin)
             .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
             .as_surface_raster()
     } else {
@@ -1019,6 +1434,9 @@ fn render_ir_scene(
         ground_status: Vec::new(),
         // The raw-Kelvin thermal march reads the un-eroded brick by construction.
         granulation: false,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -1099,6 +1517,9 @@ fn render_geocolor_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         ground_status: vis.ground_status,
         // The day half is the visible product; the IR night half never granulates.
         granulation: vis.granulation,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -1166,6 +1587,9 @@ fn render_sandwich_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         ground_status: vis.ground_status,
         // The visible base carries the granulation; the IR overlay never granulates.
         granulation: vis.granulation,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -1196,7 +1620,8 @@ fn render_derived_scene(
     let camera = GeoCamera::new(params.satellite);
     let margin = params.margin_frac as f64;
     let raster = if is_topdown {
-        build_map_raster(georef, nx, ny, nx, ny, margin)
+        let (dx_m, dy_m) = dx_dy_metres(proj);
+        build_map_raster_mode(georef, nx, ny, dx_m, dy_m, params.resolution, margin)
             .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
             .as_surface_raster()
     } else {
@@ -1247,6 +1672,9 @@ fn render_derived_scene(
         ground_status: Vec::new(),
         // Derived fields are per-column brick integrals — never granulated.
         granulation: false,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -1278,7 +1706,8 @@ fn render_cloud_layer_scene(
     } = src;
     let (nx, ny) = (brick.nx, brick.ny);
     let margin = params.margin_frac as f64;
-    let raster = build_map_raster(georef, nx, ny, nx, ny, margin)
+    let (dx_m, dy_m) = dx_dy_metres(proj);
+    let raster = build_map_raster_mode(georef, nx, ny, dx_m, dy_m, params.resolution, margin)
         .ok_or_else(|| "the domain is too small to build a top-down map".to_string())?
         .as_surface_raster();
 
@@ -1349,6 +1778,11 @@ fn render_cloud_layer_scene(
             } else {
                 1
             },
+            multiscatter_mode: params.cloud_multiscatter.unwrap_or(if params.multiscatter {
+                CloudMultiscatterMode::LegacyOctaves
+            } else {
+                CloudMultiscatterMode::SingleScatter
+            }),
             granulation,
             ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
         };
@@ -1467,6 +1901,9 @@ fn render_cloud_layer_scene(
         ground_source: None,
         ground_status: Vec::new(),
         granulation: gran_on,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -1571,6 +2008,11 @@ fn render_perspective_scene(
         } else {
             1
         },
+        multiscatter_mode: params.cloud_multiscatter.unwrap_or(if params.multiscatter {
+            CloudMultiscatterMode::LegacyOctaves
+        } else {
+            CloudMultiscatterMode::SingleScatter
+        }),
         granulation,
         ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch).max(1.0))
     };
@@ -1728,6 +2170,9 @@ fn render_perspective_scene(
         },
         ground_status,
         granulation: gran_on,
+        backend: RenderBackend::Cpu,
+        diagnostics: Vec::new(),
+        gpu_adapter: None,
     })
 }
 
@@ -2380,6 +2825,7 @@ mod tests {
     #[test]
     fn render_params_default_visible_controls_are_intentional() {
         let p = RenderParams::new(PathBuf::from("input"));
+        assert_eq!(p.backend, RenderBackend::Cpu);
         assert_eq!(
             p.aerosol_optical_depth.to_bits(),
             (atmosphere::DEFAULT_AOD as f32).to_bits()
@@ -2395,14 +2841,104 @@ mod tests {
             clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
         assert!(p.multiscatter);
+        assert_eq!(p.cloud_multiscatter, None);
         assert!(!p.beer_powder);
         assert!(p.clouds);
         assert!(p.fractional_clouds);
         assert!(p.feather_exposed_domain_edges);
         assert!(p.granulation.is_none());
+        assert!(!p.topdown_stratiform_regularization);
         assert!(p.ground_gain.is_none());
         assert!(p.cloud_softclip.is_none());
         assert!(p.cloud_highlight_max.is_none());
+    }
+
+    #[test]
+    fn gpu_preview_plan_is_explicit_and_does_not_mutate_caller() {
+        let mut requested = RenderParams::new(PathBuf::from("input"));
+        requested.view = ViewMode::TopDownMap;
+        requested.clouds = false;
+        requested.multiscatter = false;
+        requested.cloud_multiscatter = Some(CloudMultiscatterMode::DeltaFluxV2);
+        requested.granulation = Some(true);
+        requested.topdown_stratiform_regularization = true;
+        requested.cloud_softclip = Some(0.8);
+        requested.topdown_cloud_norm = Some(0.7);
+        let before = requested.clone();
+
+        let (effective, product, changes) =
+            plan_gpu_preview(&requested, Product::GeoColor).expect("preview plan");
+        assert_eq!(requested.backend, before.backend);
+        assert_eq!(requested.clouds, before.clouds);
+        assert_eq!(requested.cloud_multiscatter, before.cloud_multiscatter);
+        assert_eq!(requested.view, ViewMode::TopDownMap);
+        assert_eq!(effective.view, ViewMode::TopDownMap, "camera is preserved");
+        assert_eq!(effective.backend, RenderBackend::GpuPreview);
+        assert_eq!(product, Product::VisibleRgb);
+        assert!(effective.clouds);
+        assert!(!effective.terrain_atmosphere);
+        assert!(!effective.fractional_clouds);
+        assert_eq!(effective.granulation, Some(false));
+        assert!(!effective.topdown_stratiform_regularization);
+        assert!(!effective.feather_exposed_domain_edges);
+        assert_eq!(
+            effective.cloud_multiscatter,
+            Some(CloudMultiscatterMode::LegacyOctaves)
+        );
+        assert_eq!(effective.steps, StepQuality::Interactive);
+        assert!(effective.cloud_softclip.is_none());
+        assert!(effective.topdown_cloud_norm.is_none());
+        for expected in [
+            GpuPreviewAdjustment::ProductVisible,
+            GpuPreviewAdjustment::CloudsOn,
+            GpuPreviewAdjustment::TerrainAtmosphereOff,
+            GpuPreviewAdjustment::FractionalCloudsOff,
+            GpuPreviewAdjustment::GranulationOff,
+            GpuPreviewAdjustment::TopdownStratiformRegularizationOff,
+            GpuPreviewAdjustment::ExposedEdgeFeatherOff,
+            GpuPreviewAdjustment::LegacyCloudTransport,
+            GpuPreviewAdjustment::ShippedHighlights,
+            GpuPreviewAdjustment::InteractiveSteps,
+            GpuPreviewAdjustment::ShippedTopdownCloudNorm,
+        ] {
+            assert!(changes.contains(&expected), "missing {}", expected.label());
+        }
+    }
+
+    #[test]
+    fn gpu_preview_plan_rejects_only_unsupported_free_camera_before_io() {
+        let mut p = RenderParams::new(PathBuf::from("input"));
+        p.perspective = Some(PerspectiveCamera {
+            eye_lat_deg: 40.0,
+            eye_lon_deg: -100.0,
+            eye_alt_m: 1_000_000.0,
+            look_lat_deg: 39.0,
+            look_lon_deg: -97.0,
+            look_alt_m: 0.0,
+            fov_deg: 40.0,
+            width: 64,
+            height: 64,
+        });
+        let err = plan_gpu_preview(
+            &p,
+            Product::Perspective {
+                cloud_layer_only: false,
+            },
+        )
+        .expect_err("free perspective is unsupported");
+        assert!(err.contains("geostationary and top-down"));
+    }
+
+    #[test]
+    fn gpu_preview_plan_is_idempotent() {
+        let p = RenderParams::new(PathBuf::from("input"));
+        let (once, product, _) = plan_gpu_preview(&p, Product::VisibleRgb).unwrap();
+        let (twice, product2, changes) = plan_gpu_preview(&once, product).unwrap();
+        assert_eq!(product2, Product::VisibleRgb);
+        assert!(changes.is_empty());
+        assert_eq!(twice.view, once.view);
+        assert_eq!(twice.backend, once.backend);
+        assert_eq!(twice.steps, once.steps);
     }
 
     /// A tiny synthetic CONUS-centred Lambert scene: a clear brick (no cloud) with a
@@ -2496,6 +3032,111 @@ mod tests {
             az_deg: Some(180.0),
         });
         p
+    }
+
+    fn low_stratiform_stipple_source(nx: usize, ny: usize, nz: usize) -> SceneSource {
+        let mut src = synthetic_source(nx, ny, nz, 3000.0);
+        let n3 = nx * ny * nz;
+        let mut liquid = vec![0.0f32; n3];
+        let mut ice = vec![0.0f32; n3];
+        let mut precip = vec![0.0f32; n3];
+        let mut tau_up = vec![0.0f32; n3];
+        for j in 0..ny {
+            for i in 0..nx {
+                let pattern = match (i + 2 * j) % 4 {
+                    0 => 0.35,
+                    1 => 0.8,
+                    2 => 1.5,
+                    _ => 2.5,
+                };
+                for k in 0..nz {
+                    let vertical = 1.0 + 0.05 * k as f32;
+                    let c = (k * ny + j) * nx + i;
+                    liquid[c] = 6.0e-4 * pattern * vertical;
+                    ice[c] = 1.0e-4 * pattern * vertical;
+                    precip[c] = 5.0e-5 * pattern * vertical;
+                }
+                let top = ((nz - 1) * ny + j) * nx + i;
+                tau_up[top] = 0.0;
+                for k in (0..nz - 1).rev() {
+                    let c0 = (k * ny + j) * nx + i;
+                    let c1 = ((k + 1) * ny + j) * nx + i;
+                    let beta = |c| liquid[c] + ice[c] + precip[c];
+                    tau_up[c0] = tau_up[c1] + 0.5 * (beta(c0) + beta(c1)) * src.brick.dz_m as f32;
+                }
+            }
+        }
+        for (name, field, target) in [
+            ("ext_liquid", liquid, &mut src.brick.ext_liquid),
+            ("ext_ice", ice, &mut src.brick.ext_ice),
+            ("ext_precip", precip, &mut src.brick.ext_precip),
+            ("tau_up", tau_up, &mut src.brick.tau_up),
+        ] {
+            let (quant, codes) = crate::bricks::encode_log_channel(&field);
+            src.brick.quant.0.insert(name.to_string(), quant);
+            *target = codes;
+        }
+        src
+    }
+
+    fn visible_rgba(result: &RenderResult) -> &[u8] {
+        match &result.data {
+            FrameData::Visible { rgba, .. } => rgba,
+            other => panic!("expected Visible, got {other:?}"),
+        }
+    }
+
+    fn band_bits(result: &RenderResult) -> Vec<u32> {
+        match &result.data {
+            FrameData::Bands { reflectance } => reflectance.iter().map(|v| v.to_bits()).collect(),
+            other => panic!("expected Bands, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topdown_stratiform_regularization_is_exact_off_and_product_scoped() {
+        let src = low_stratiform_stipple_source(14, 14, 8);
+        let default_params = synthetic_params(ViewMode::TopDownMap);
+        assert!(!default_params.topdown_stratiform_regularization);
+        let mut explicit_off = default_params.clone();
+        explicit_off.topdown_stratiform_regularization = false;
+        let default_frame =
+            render_visible_scene(&src, &default_params, Product::VisibleRgb).unwrap();
+        let off_frame = render_visible_scene(&src, &explicit_off, Product::VisibleRgb).unwrap();
+        assert_eq!(
+            visible_rgba(&default_frame),
+            visible_rgba(&off_frame),
+            "explicit off must preserve the default v0.1.5 bytes"
+        );
+
+        let mut on = explicit_off.clone();
+        on.topdown_stratiform_regularization = true;
+        let on_frame = render_visible_scene(&src, &on, Product::VisibleRgb).unwrap();
+        assert_ne!(
+            visible_rgba(&on_frame),
+            visible_rgba(&off_frame),
+            "the synthetic low stratiform stipple must exercise the operator"
+        );
+
+        let raw_off = render_visible_scene(&src, &explicit_off, Product::VisibleBands).unwrap();
+        let raw_on = render_visible_scene(&src, &on, Product::VisibleBands).unwrap();
+        assert_eq!(
+            band_bits(&raw_on),
+            band_bits(&raw_off),
+            "raw visible bands must ignore the display observation operator"
+        );
+
+        let mut geo_off = explicit_off;
+        geo_off.view = ViewMode::Geostationary;
+        let mut geo_on = geo_off.clone();
+        geo_on.topdown_stratiform_regularization = true;
+        let geo_off = render_visible_scene(&src, &geo_off, Product::VisibleRgb).unwrap();
+        let geo_on = render_visible_scene(&src, &geo_on, Product::VisibleRgb).unwrap();
+        assert_eq!(
+            visible_rgba(&geo_on),
+            visible_rgba(&geo_off),
+            "geostationary output must ignore the top-down-only operator"
+        );
     }
 
     fn without_cloud_render_channels(mut src: SceneSource) -> SceneSource {
@@ -2865,6 +3506,25 @@ mod tests {
         );
         // The geostationary frame also computes cloud stats (top-down does not).
         assert!(geo.cloud_stats.is_some() && td.cloud_stats.is_none());
+    }
+
+    #[test]
+    fn topdown_api_resolution_selector_sizes_three_km_grid_physically() {
+        let src = synthetic_source(11, 7, 8, 3000.0);
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        p.clouds = false;
+
+        p.resolution = ResolutionMode::Native;
+        let native = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert_eq!((native.nx, native.ny), (11, 7));
+
+        p.resolution = ResolutionMode::Abi1km;
+        let abi1 = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert_eq!((abi1.nx, abi1.ny), (31, 19));
+
+        p.resolution = ResolutionMode::Abi2km;
+        let abi2 = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert_eq!((abi2.nx, abi2.ny), (16, 10));
     }
 
     #[test]
@@ -3554,6 +4214,35 @@ mod tests {
         src.brick.ext_liquid = codes;
         src.brick.quant.0.insert("ext_liquid".to_string(), lq);
         src
+    }
+
+    #[test]
+    fn explicit_legacy_cloud_transport_is_byte_exact_with_the_historical_boolean() {
+        let src = moderate_liquid_source(10, 10, 10, 3000.0);
+        let mut legacy_bool = synthetic_params(ViewMode::TopDownMap);
+        legacy_bool.steps = StepQuality::Interactive;
+        legacy_bool.fractional_clouds = false;
+        legacy_bool.multiscatter = true;
+        legacy_bool.cloud_multiscatter = None;
+
+        let mut explicit_legacy = legacy_bool.clone();
+        explicit_legacy.cloud_multiscatter = Some(CloudMultiscatterMode::LegacyOctaves);
+
+        let mut single_bool = legacy_bool.clone();
+        single_bool.multiscatter = false;
+        let mut explicit_single = legacy_bool.clone();
+        explicit_single.cloud_multiscatter = Some(CloudMultiscatterMode::SingleScatter);
+
+        let rgba =
+            |params: &RenderParams| match render_visible_scene(&src, params, Product::VisibleRgb)
+                .expect("synthetic visible render")
+                .data
+            {
+                FrameData::Visible { rgba, .. } => rgba,
+                other => panic!("expected visible frame, got {other:?}"),
+            };
+        assert_eq!(rgba(&legacy_bool), rgba(&explicit_legacy));
+        assert_eq!(rgba(&single_bool), rgba(&explicit_single));
     }
 
     /// A model-fraction-aware cloud deck: the condensate is grid-mean and each cloudy

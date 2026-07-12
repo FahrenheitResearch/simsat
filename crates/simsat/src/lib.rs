@@ -126,6 +126,7 @@ pub mod atmosphere;
 pub mod bluemarble;
 pub mod bricks;
 pub mod camera;
+pub mod cloud_delta_flux;
 pub mod clouds;
 pub mod derived;
 pub mod fractional_clouds;

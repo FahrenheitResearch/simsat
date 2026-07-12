@@ -5,6 +5,11 @@
 // cloud volume along the true ECEF slant ray, composites, applies the froxel aerial
 // perspective, and tonemaps — in one fragment pass.
 //
+// Camera rays are selected explicitly: the historical geostationary scan fan is
+// unchanged, while Top-down loads a reviewed per-pixel local-up vector and constructs
+// the CPU-equivalent nadir camera/ray. The geo-only front froxel is neutral in Top-down,
+// matching topdown.rs's deliberate no-extra-front-airlight contract.
+//
 // M4 ships the CPU render path (`clouds::shade_cloud_pixel`, tested on the headless
 // nodes); this shader is the naga-validated GPU render twin activated in M5. Kept in
 // lockstep with `clouds.rs` by discipline (the same twin workflow M2 established).
@@ -197,6 +202,7 @@ struct Uniforms {
     frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, visible cloud OD scale
     land0: vec4<f32>,  // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
     land1: vec4<f32>,  // dark_toe_gamma, dark_toe_max_gain, unused, unused
+    ray0: vec4<f32>,   // view_mode (0 geo, 1 per-pixel nadir), topdown camera radius, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -217,6 +223,7 @@ struct Uniforms {
 // columns of RGB) + the sun-OD occluder-distance channel (for the penumbra).
 @group(0) @binding(14) var sh_ambient: texture_2d<f32>;
 @group(0) @binding(15) var sun_od_dist: texture_2d<f32>;
+@group(0) @binding(16) var topdown_ray_lut: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -605,13 +612,38 @@ fn sample_ambient(elev_deg: f32) -> vec3<f32> {
     return mix(a, b, w);
 }
 
-fn view_dir(px: f32, py: f32) -> vec3<f32> {
+fn geostationary_view_dir(px: f32, py: f32) -> vec3<f32> {
     let scan_x = u.ex.w + px * u.ez.w;
     let scan_y = u.ey.w - py * u.solar.w;
     let v_y = tan(scan_x);
     let v_z = tan(scan_y) * sqrt(1.0 + v_y * v_y);
     let world = u.ex.xyz + u.ey.xyz * v_y + u.ez.xyz * v_z;
     return normalize(world);
+}
+
+struct CameraRay {
+    cam: vec3<f32>,
+    view: vec3<f32>,
+    valid: f32,
+};
+
+// Reviewed twin of camera::topdown_nadir_ray. The CPU uploads the local ECEF up
+// vector derived by that exact function; this shader only normalizes and applies
+// the shared synthetic camera radius. Geo takes the historical scan-ray branch.
+fn camera_ray(coord: vec2<i32>) -> CameraRay {
+    if (u.ray0.x < 0.5) {
+        return CameraRay(
+            u.cam.xyz,
+            geostationary_view_dir(f32(coord.x), f32(coord.y)),
+            1.0,
+        );
+    }
+    let r = textureLoad(topdown_ray_lut, coord, 0);
+    if (r.w <= 0.5 || dot(r.xyz, r.xyz) <= 0.0) {
+        return CameraRay(vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+    }
+    let up = normalize(r.xyz);
+    return CameraRay(up * u.ray0.y, -up, 1.0);
 }
 
 // Highlight desaturation: compress chroma toward Rec.709 luminance for pixels that
@@ -1427,8 +1459,7 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
 
 // M2 surface/limb radiance (linear TOA), with a cloud-shadow factor on the direct
 // term. Returns rgb radiance; caller decides transparency for space.
-fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec3<f32> {
-    let cam = u.cam.xyz;
+fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_shadow: f32) -> vec3<f32> {
     let sun_ecef = u.sun.xyz;
     let e_sun = u.solar.xyz;
     let g = textureLoad(lut_geo, coord, 0);
@@ -1545,10 +1576,14 @@ fn surface_radiance(coord: vec2<i32>, view: vec3<f32>, cloud_shadow: f32) -> vec
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(i32(pos.x), i32(pos.y));
     let g = textureLoad(lut_geo, coord, 0);
-    let cam = u.cam.xyz;
     let sun_ecef = u.sun.xyz;
     let e_sun = u.solar.xyz;
-    let view = view_dir(f32(coord.x), f32(coord.y));
+    let ray = camera_ray(coord);
+    if (ray.valid < 0.5) {
+        return vec4<f32>(0.0);
+    }
+    let cam = ray.cam;
+    let view = ray.view;
 
     if (g.x < 0.0) {
         // Off-earth: limb if the ray grazes the shell, else space (transparent).
@@ -1556,7 +1591,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if (top.y < top.x || top.y <= 0.0) {
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
-        let l_limb = surface_radiance(coord, view, 1.0);
+        let l_limb = surface_radiance(coord, cam, view, 1.0);
         let rho = exposure_gain() * PI * l_limb / max(e_sun, vec3<f32>(1e-6));
         return vec4<f32>(output_transform(rho), 1.0);
     }
@@ -1567,7 +1602,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (gnd.y >= gnd.x && gnd.x > 0.0) {
         shadow = penumbral_shadow(cam + view * gnd.x);
     }
-    let l_toa = surface_radiance(coord, view, shadow);
+    let l_toa = surface_radiance(coord, cam, view, shadow);
     // Low-sun illuminant correction at the display seam (on-earth pixels only; the
     // limb above keeps its physical color) — twin of the CPU shade_cloud_pixel /
     // shade_surface seam. Identity outside the 2-30 deg band.
@@ -1581,11 +1616,17 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let m = march_cloud(cam, view, sun_ecef);
-    let scan_x = u.ex.w + f32(coord.x) * u.ez.w;
-    let scan_y = u.ey.w - f32(coord.y) * u.solar.w;
-    // Froxel depth = the atmosphere-shell fraction of the cloud centroid (FINDING 4).
-    let w_froxel = atmosphere_shell_fraction(cam, view, m.mean_t);
-    let ap = froxel_at(scan_x, scan_y, w_froxel);
+    // Geo uses its scan-space aerial froxel. Top-down deliberately has no extra
+    // camera-to-cloud front airlight (the CPU top-down contract): ap=(0,0,0,1)
+    // leaves cloud inscatter unchanged and contributes no front veil.
+    var ap = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    if (u.ray0.x < 0.5) {
+        let scan_x = u.ex.w + f32(coord.x) * u.ez.w;
+        let scan_y = u.ey.w - f32(coord.y) * u.solar.w;
+        // Froxel depth = the atmosphere-shell fraction of the cloud centroid (FINDING 4).
+        let w_froxel = atmosphere_shell_fraction(cam, view, m.mean_t);
+        ap = froxel_at(scan_x, scan_y, w_froxel);
+    }
     // Front airlight weighted by (1 - T_cloud) to avoid double-counting the front
     // segment already inside l_toa's full-column airlight (FINDING 4).
     // Match the product-facing surface atmospheric correction for froxel airlight in

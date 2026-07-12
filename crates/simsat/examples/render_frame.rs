@@ -1,7 +1,8 @@
 //! `render_frame` — headless "render one full composited visible frame to PNG".
 //!
-//! A CPU-only render harness so a render can be visually QA'd without a GPU or the
-//! studio GUI. It is now a THIN wrapper over [`simsat::api::render`] (the one shared
+//! A headless render harness: CPU by default, with an explicit synchronous GPU-preview
+//! backend for visual QA without the Studio GUI. It is a THIN wrapper over
+//! [`simsat::api::render`] (the one shared
 //! render assembly behind the studio, this example, and the Python binding): parse the
 //! CLI, call `api::render`, then do the output glue (optional canvas letterbox, PNG
 //! write, optional sat-store write, the `SUMMARY` line). Because the RGB comes from the
@@ -16,9 +17,13 @@
 //!   input=<path>       REQUIRED. A wrfout file (ingested to a brick if not cached under
 //!                      `cache=`) OR a cached run's `run.json`.
 //!   out=<file.png>     REQUIRED. Output PNG path (RGB8, row 0 = north).
+//!   backend=<mode>     cpu | gpu-preview (default cpu). GPU preview temporarily selects
+//!                      a compatible Visible/clouds-on configuration and reports every change.
 //!   sat=<preset>       goes-east | goes-west | himawari   (default goes-east)
 //!   timestep=<n>       Time index (default 0).
 //!   resolution=<mode>  native | abi1km | abi2km           (default native)
+//!                      native = one output pixel per source grid cell. ABI 1/2 km are
+//!                      output sampling choices and may upsample coarse or downsample fine data.
 //!   margin=<frac>      zoom-out margin, a FRACTION of the domain added on each side
 //!                      (default 0.0 = edge-to-edge; 0.3 = the domain in a 30% earth margin).
 //!   aerosol-optical-depth=<f>  aerosol AOD, 0.0..=0.6 (default DEFAULT_AOD = 0.05).
@@ -120,10 +125,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use image::{GrayImage, RgbImage, RgbaImage};
-use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams, SunOverride};
+use simsat::api::{self, BlueMarble, FrameData, Product, RenderBackend, RenderParams, SunOverride};
 use simsat::atmosphere::DEFAULT_AOD;
 use simsat::camera::{PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMode};
-use simsat::clouds::{CloudFrameStats, DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality};
+use simsat::clouds::{
+    CloudFrameStats, CloudMultiscatterMode, DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality,
+};
 use simsat::gpu::RenderedFrame;
 use simsat::ingest;
 use simsat::render::{
@@ -147,6 +154,7 @@ fn main() {
 struct Opts {
     input: PathBuf,
     out: PathBuf,
+    backend: RenderBackend,
     sat: SatellitePreset,
     timestep: usize,
     resolution: ResolutionMode,
@@ -163,6 +171,7 @@ struct Opts {
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
     multiscatter: bool,
+    cloud_multiscatter: Option<CloudMultiscatterMode>,
     beer_powder: bool,
     steps: StepQuality,
     sun_elev_override: Option<f64>,
@@ -172,6 +181,7 @@ struct Opts {
     cloud_optical_depth_scale: f32,
     feather_exposed_domain_edges: bool,
     granulation: bool,
+    topdown_stratiform_regularization: bool,
     exposure: f64,
     cache: PathBuf,
     bluemarble: Option<PathBuf>,
@@ -231,10 +241,11 @@ fn run(args: &[String]) -> Result<(), String> {
         "render_frame: input={} product={} view={} sat={} ts={} res={} margin={:.2} \
          aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
          land-sza={}({:.2}) land-dark-toe={}({:.3}/{:.2}/{:.2}) \
-         multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
+         cloud-multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
          cloud-od-scale={:.3} feather-exposed-edges={} granulation={} \
+         topdown-stratiform-regularization={} \
          steps={} sun-elev={} \
-         exposure={:.3} canvas={} threads={}",
+         exposure={:.3} backend={} canvas={} threads={}",
         opts.input.display(),
         product_label(&opts),
         opts.view.slug(),
@@ -252,13 +263,14 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.land_dark_toe_knee,
         opts.land_dark_toe_gamma,
         opts.land_dark_toe_max_gain,
-        opts.multiscatter,
+        resolved_cloud_multiscatter(&opts).slug(),
         opts.beer_powder,
         opts.clouds,
         opts.fractional_clouds,
         opts.cloud_optical_depth_scale,
         opts.feather_exposed_domain_edges,
         opts.granulation,
+        opts.topdown_stratiform_regularization,
         if opts.steps == StepQuality::Offline {
             "offline"
         } else {
@@ -268,6 +280,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .map(|e| format!("{e:.1}"))
             .unwrap_or_else(|| "actual".to_string()),
         opts.exposure,
+        opts.backend.slug(),
         opts.canvas
             .map(|(w, h)| format!("{w}x{h}"))
             .unwrap_or_else(|| "native".to_string()),
@@ -293,7 +306,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let params = render_params(&opts);
     // The web-map cloud layer is a different delivery (RGBA + shadow + sidecar, not one
     // RGB PNG) — its own output path.
-    if opts.cloud_layer {
+    if opts.cloud_layer && opts.backend == RenderBackend::Cpu {
         return run_cloud_layer(&opts, &params);
     }
     // Perspective (eye= + look=) wins; then Sandwich > GeoColor > plain visible. All are
@@ -302,6 +315,11 @@ fn run(args: &[String]) -> Result<(), String> {
         Product::Perspective {
             cloud_layer_only: opts.perspective_layer,
         }
+    } else if opts.cloud_layer {
+        // CPU cloud-layer delivery returned above. GPU-preview deliberately receives
+        // the requested product here so the API reports its temporary -> Visible
+        // substitution rather than the CLI hiding it.
+        Product::CloudLayer
     } else if opts.sandwich {
         Product::Sandwich
     } else if opts.geocolor {
@@ -311,6 +329,15 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     let t0 = Instant::now();
     let result = api::render(&params, product)?;
+    if let Some(adapter) = &result.gpu_adapter {
+        eprintln!("render_frame: GPU preview adapter: {adapter}");
+    }
+    for adjustment in &result.diagnostics {
+        eprintln!(
+            "render_frame: GPU preview temporary adjustment: {}",
+            adjustment.label()
+        );
+    }
     let wall = t0.elapsed();
     let (rgb, rgba) = match &result.data {
         FrameData::Visible { rgb, rgba } => (rgb, rgba),
@@ -362,7 +389,11 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // ── optional sat-store write (geostationary only — the store carries the scan mesh) ──
     if opts.store.is_some() {
-        if opts.view == ViewMode::TopDownMap || params.perspective.is_some() {
+        if opts.backend == RenderBackend::GpuPreview {
+            eprintln!(
+                "render_frame: store write skipped (GPU previews are display-only; store output stays CPU)."
+            );
+        } else if opts.view == ViewMode::TopDownMap || params.perspective.is_some() {
             eprintln!("render_frame: store write skipped (store= is for the geostationary view).");
         } else {
             write_store(&opts, &result, rgba)?;
@@ -371,7 +402,14 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // ── optional raw-bands diagnostic dump (a second render through VisibleBands) ──
     if let Some(bands_path) = &opts.bands_out {
-        let bands_result = api::render(&params, Product::VisibleBands)?;
+        let mut bands_params = params.clone();
+        if bands_params.backend == RenderBackend::GpuPreview {
+            eprintln!(
+                "render_frame: bands-out uses CPU because GPU preview is a finished Visible display backend."
+            );
+            bands_params.backend = RenderBackend::Cpu;
+        }
+        let bands_result = api::render(&bands_params, Product::VisibleBands)?;
         let reflectance = match &bands_result.data {
             FrameData::Bands { reflectance } => reflectance,
             _ => return Err("expected a bands frame".to_string()),
@@ -399,9 +437,9 @@ fn run(args: &[String]) -> Result<(), String> {
 
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
-        "SUMMARY file={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
+        "SUMMARY file={} backend={} view={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
          sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
-         atmosphere_correction={} terrain_atmosphere={} multiscatter={} beer_powder={} \
+         atmosphere_correction={} terrain_atmosphere={} cloud_multiscatter={} beer_powder={} \
          clouds={} fractional_clouds_requested={} cloud_optical_depth_scale={:.3} \
          feather_exposed_domain_edges={} granulation={} \
          steps={} synthetic_green={} \
@@ -409,6 +447,7 @@ fn run(args: &[String]) -> Result<(), String> {
          peak_lum={:.3} median_lum={:.3} cloud_frac={} peak_reflectance={} \
          peak_sun_reflectance={} cloud_lum_p90_p10={:.4} cloud_lum_frac={:.3} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+        result.backend.slug(),
         opts.view.slug(),
         final_nx,
         final_ny,
@@ -426,7 +465,7 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.rh_aerosol_swelling,
         opts.atmosphere_correction,
         opts.terrain_atmosphere,
-        opts.multiscatter,
+        resolved_cloud_multiscatter(&opts).slug(),
         opts.beer_powder,
         opts.clouds,
         opts.fractional_clouds,
@@ -694,6 +733,7 @@ fn render_params(opts: &Opts) -> RenderParams {
     };
     RenderParams {
         input: opts.input.clone(),
+        backend: opts.backend,
         satellite: opts.sat,
         timestep: opts.timestep,
         view: opts.view,
@@ -713,6 +753,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         },
         exposure: opts.exposure,
         multiscatter: opts.multiscatter,
+        cloud_multiscatter: opts.cloud_multiscatter,
         beer_powder: opts.beer_powder,
         steps: opts.steps,
         clouds: opts.clouds,
@@ -720,6 +761,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         cloud_optical_depth_scale: opts.cloud_optical_depth_scale,
         feather_exposed_domain_edges: opts.feather_exposed_domain_edges,
         granulation: Some(opts.granulation),
+        topdown_stratiform_regularization: opts.topdown_stratiform_regularization,
         sun_override,
         cache: opts.cache.clone(),
         bluemarble,
@@ -839,6 +881,7 @@ fn display_luma_stats(rgba: &[u8]) -> (usize, f64, f64) {
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut backend = RenderBackend::Cpu;
     let mut sat = SatellitePreset::GoesEast;
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
@@ -855,12 +898,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut land_dark_toe_gamma = LAND_DARK_TOE_GAMMA;
     let mut land_dark_toe_max_gain = LAND_DARK_TOE_MAX_GAIN;
     let mut multiscatter = true;
+    let mut cloud_multiscatter = None;
     let mut beer_powder = false;
     let mut clouds = true;
     let mut fractional_clouds = true;
     let mut cloud_optical_depth_scale = DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
     let mut feather_exposed_domain_edges = true;
     let mut granulation = false;
+    let mut topdown_stratiform_regularization = false;
     let mut steps = StepQuality::Offline;
     let mut sun_elev_override: Option<f64> = None;
     let mut sun_az_override: Option<f64> = None;
@@ -898,6 +943,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         match k {
             "input" | "wrfout" | "in" => input = Some(PathBuf::from(v)),
             "out" | "output" | "png" => out = Some(PathBuf::from(v)),
+            "backend" | "render-backend" | "render_backend" => backend = parse_backend(v)?,
             "sat" | "satellite" => sat = parse_sat(v)?,
             "timestep" | "ts" => timestep = v.parse().map_err(|_| format!("bad timestep '{v}'"))?,
             "resolution" | "res" => resolution = parse_resolution(v)?,
@@ -982,6 +1028,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 }
             }
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
+            "cloud-multiscatter" | "cloud_multiscatter" | "cloud-ms" => {
+                cloud_multiscatter = Some(parse_cloud_multiscatter(v)?)
+            }
             "beer-powder" | "beer_powder" | "beerpowder" => beer_powder = parse_bool(v)?,
             "clouds" => clouds = parse_bool(v)?,
             "fractional-clouds" | "fractional_clouds" | "model-cloud-fraction" => {
@@ -1004,6 +1053,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 feather_exposed_domain_edges = parse_bool(v)?
             }
             "granulation" | "granulate" | "cloud-granulation" => granulation = parse_bool(v)?,
+            "topdown-stratiform-regularization"
+            | "topdown_stratiform_regularization"
+            | "topdown-cloud-regularization" => topdown_stratiform_regularization = parse_bool(v)?,
             "steps" | "quality" => steps = parse_steps(v)?,
             "sun-elev" | "sun_elev" | "sunelev" => {
                 sun_elev_override = Some(v.parse().map_err(|_| format!("bad sun-elev '{v}'"))?)
@@ -1090,6 +1142,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
         out: out.ok_or("missing required out=<file.png>")?,
+        backend,
         sat,
         timestep,
         resolution,
@@ -1105,6 +1158,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
         multiscatter,
+        cloud_multiscatter,
         beer_powder,
         steps,
         sun_elev_override,
@@ -1114,6 +1168,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         cloud_optical_depth_scale,
         feather_exposed_domain_edges,
         granulation,
+        topdown_stratiform_regularization,
         exposure,
         cache,
         bluemarble,
@@ -1160,6 +1215,14 @@ fn parse_view(v: &str) -> Result<ViewMode, String> {
         "geo" | "geostationary" | "fromspace" | "space" => Ok(ViewMode::Geostationary),
         "topdown" | "top" | "map" | "topdownmap" | "nadir" => Ok(ViewMode::TopDownMap),
         _ => Err(format!("unknown view '{v}' (geo|topdown)")),
+    }
+}
+
+fn parse_backend(v: &str) -> Result<RenderBackend, String> {
+    match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "cpu" => Ok(RenderBackend::Cpu),
+        "gpu" | "gpu-preview" | "preview" => Ok(RenderBackend::GpuPreview),
+        _ => Err(format!("unknown backend '{v}' (expected cpu|gpu-preview)")),
     }
 }
 
@@ -1218,16 +1281,39 @@ fn parse_bool(v: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_cloud_multiscatter(v: &str) -> Result<CloudMultiscatterMode, String> {
+    match v.to_ascii_lowercase().replace('_', "-").as_str() {
+        "legacy" | "legacy-octaves" | "octaves" => Ok(CloudMultiscatterMode::LegacyOctaves),
+        "single" | "single-scatter" | "off" => Ok(CloudMultiscatterMode::SingleScatter),
+        "delta-flux-v1" | "delta-flux" | "stage2" => Ok(CloudMultiscatterMode::DeltaFluxV1),
+        "delta-flux-v2b" | "delta-flux-v2" | "stage2-p1" => Ok(CloudMultiscatterMode::DeltaFluxV2),
+        _ => Err(format!(
+            "expected legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b, got '{v}'"
+        )),
+    }
+}
+
+fn resolved_cloud_multiscatter(opts: &Opts) -> CloudMultiscatterMode {
+    opts.cloud_multiscatter.unwrap_or(if opts.multiscatter {
+        CloudMultiscatterMode::LegacyOctaves
+    } else {
+        CloudMultiscatterMode::SingleScatter
+    })
+}
+
 fn print_usage() {
     eprintln!(
-        "render_frame — headless full-frame composited render to PNG (CPU, no GPU).\n\n\
+        "render_frame — headless full-frame composited render to PNG (CPU or explicit GPU preview).\n\n\
          USAGE:\n  render_frame input=<wrfout|run.json> out=<file.png> [key=value ...]\n\n\
          KEYS:\n\
          \x20 input=<path>       wrfout (ingest-if-needed) or a cached run.json  [required]\n\
          \x20 out=<file.png>     output PNG (RGB8, row 0 = north)                [required]\n\
+         \x20 backend=<mode>     cpu | gpu-preview (default cpu; preview reports substitutions)\n\
          \x20 sat=<preset>       goes-east | goes-west | himawari   (default goes-east)\n\
          \x20 timestep=<n>       time index (default 0)\n\
          \x20 resolution=<mode>  native | abi1km | abi2km           (default native)\n\
+         \x20                    native = one pixel per source-grid cell; ABI 1/2 km may\n\
+         \x20                    upsample coarse or downsample fine model grids\n\
          \x20 margin=<frac>      zoom-out margin fraction on each side (default 0.0 edge-to-edge)\n\
          \x20 aerosol-optical-depth=<f>  aerosol AOD, 0.0..=0.6 (default {DEFAULT_AOD})\n\
          \x20 rh-aerosol-swelling=<b>    on|off 1.5x aerosol swelling (default off)\n\
@@ -1239,13 +1325,15 @@ fn print_usage() {
          \x20 land-dark-toe-knee=<f>     toe identity knee (default {LAND_DARK_TOE_KNEE})\n\
          \x20 land-dark-toe-gamma=<f>    toe exponent (default {LAND_DARK_TOE_GAMMA})\n\
          \x20 land-dark-toe-max-gain=<f> toe gain bound (default {LAND_DARK_TOE_MAX_GAIN})\n\
-         \x20 multiscatter=<b>   on | off  (M5 octaves)             (default on)\n\
+         \x20 multiscatter=<b>   on | off  legacy compatibility toggle (default on)\n\
+         \x20 cloud-multiscatter=<mode> legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b (opt-in)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
          \x20 fractional-clouds=<b> on | off use model cloud fraction (default on; off = legacy)\n\
          \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default {DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE}; 1.0 = unscaled)\n\
          \x20 feather-exposed-domain-edges=<b> on|off fade finished clouds at visible WRF boundaries (default on)\n\
          \x20 granulation=<b>    on | off  sub-grid cloud detail    (default off)\n\
+         \x20 topdown-stratiform-regularization=<b> on|off low-deck source reconstruction (default off)\n\
          \x20 steps=<quality>    offline | interactive              (default offline)\n\
          \x20 sun-elev=<deg>     OPTIONAL sun elevation override (else true solar)\n\
          \x20 sun-az=<deg>       OPTIONAL sun azimuth override, deg from north\n\
@@ -1292,8 +1380,16 @@ mod tests {
     #[test]
     fn cloud_controls_have_intentional_defaults() {
         let opts = opts_with(&[]);
+        assert_eq!(opts.backend, RenderBackend::Cpu);
         assert!(!opts.beer_powder);
         assert!(!opts.granulation);
+        assert!(opts.multiscatter);
+        assert_eq!(opts.cloud_multiscatter, None);
+        assert_eq!(
+            resolved_cloud_multiscatter(&opts),
+            CloudMultiscatterMode::LegacyOctaves
+        );
+        assert!(!opts.topdown_stratiform_regularization);
         assert!(opts.fractional_clouds);
         assert!(opts.feather_exposed_domain_edges);
         assert_eq!(
@@ -1310,8 +1406,10 @@ mod tests {
         assert!(opts.cloud_softclip.is_none());
         assert!(opts.cloud_highlight_max.is_none());
         let params = render_params(&opts);
+        assert_eq!(params.backend, RenderBackend::Cpu);
         assert!(!params.beer_powder);
         assert_eq!(params.granulation, Some(false));
+        assert!(!params.topdown_stratiform_regularization);
         assert!(params.fractional_clouds);
         assert!(params.feather_exposed_domain_edges);
         assert_eq!(
@@ -1325,22 +1423,67 @@ mod tests {
     }
 
     #[test]
+    fn backend_parser_is_explicit_and_reaches_render_params() {
+        let opts = opts_with(&["backend=gpu-preview"]);
+        assert_eq!(opts.backend, RenderBackend::GpuPreview);
+        assert_eq!(render_params(&opts).backend, RenderBackend::GpuPreview);
+        assert_eq!(
+            opts_with(&["backend=gpu"]).backend,
+            RenderBackend::GpuPreview
+        );
+
+        let args = vec![
+            "input=input".to_string(),
+            "out=out.png".to_string(),
+            "backend=magic".to_string(),
+        ];
+        let err = parse_opts(&args).err().expect("invalid backend rejected");
+        assert!(err.contains("cpu|gpu-preview"));
+    }
+
+    #[test]
+    fn explicit_cloud_transport_tokens_reach_the_rust_api() {
+        for (token, expected) in [
+            ("legacy-octaves", CloudMultiscatterMode::LegacyOctaves),
+            ("single-scatter", CloudMultiscatterMode::SingleScatter),
+            ("delta-flux-v1", CloudMultiscatterMode::DeltaFluxV1),
+            ("delta-flux-v2b", CloudMultiscatterMode::DeltaFluxV2),
+        ] {
+            let arg = format!("cloud-multiscatter={token}");
+            let opts = opts_with(&[&arg]);
+            assert_eq!(resolved_cloud_multiscatter(&opts), expected);
+            assert_eq!(render_params(&opts).cloud_multiscatter, Some(expected));
+        }
+
+        let legacy_off = opts_with(&["multiscatter=off"]);
+        assert_eq!(legacy_off.cloud_multiscatter, None);
+        assert_eq!(
+            resolved_cloud_multiscatter(&legacy_off),
+            CloudMultiscatterMode::SingleScatter,
+            "omitting the new override preserves the old boolean contract"
+        );
+    }
+
+    #[test]
     fn cloud_controls_parse_and_explicit_edge_off_reach_render_params() {
         let opts = opts_with(&[
             "beer-powder=on",
             "granulation=yes",
             "fractional-clouds=off",
             "feather-exposed-domain-edges=off",
+            "topdown-stratiform-regularization=on",
         ]);
         assert!(opts.beer_powder);
         assert!(opts.granulation);
         assert!(!opts.fractional_clouds);
         assert!(!opts.feather_exposed_domain_edges);
+        assert!(opts.topdown_stratiform_regularization);
         let params = render_params(&opts);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
         assert!(!params.fractional_clouds);
         assert!(!params.feather_exposed_domain_edges);
+        assert!(params.topdown_stratiform_regularization);
     }
 
     #[test]

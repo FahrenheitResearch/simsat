@@ -37,12 +37,22 @@ re-written over the same path) and returns `(array(s), georef)`:
 | `render_cloud_layer(input, ...)` | `(H x W x 4 uint8, H x W float32, geo)` | the WEB-MAP cloud layer pair: cloud-only RGBA (straight alpha; `premultiplied=True` for the additive form) + the ground cloud-shadow MULTIPLY layer, on a Web-Mercator grid with `geo.mercator_corners` for a Mapbox ImageSource (top-down by definition; no ground is rendered — the host map is the ground) |
 | `render_perspective(input, eye=(lat,lon,alt_m), look=(lat,lon,alt_m), fov=40, size=(1280,720), ...)` | `H x W x 3` uint8 | a FREE-PERSPECTIVE frame: an eye/look/fov pinhole camera through the same marches — the angled-3D flyover product (full composite over the Blue Marble ground; sky rays composite the atmosphere limb). `cloud_layer_only=True` returns `H x W x 4` uint8 (the cloud field alone, premultiplied alpha) for a host 3-D map with a matching camera. `geo.camera_pose` always carries the camera; a FLYOVER is N calls along your own eye/look path |
 
+`render_visible_rgb(..., backend="gpu-preview")` explicitly uses the same synchronous
+wgpu cloud pass as Studio (`backend="cpu"` is the default). It preserves `view="geo"`
+or `view="topdown"`, raises one `UserWarning` for every temporary compatibility
+substitution, and never silently falls back to CPU. Free perspective, a rotated-lat/lon
+source, or a missing GPU adapter is an error.
+
 Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`
-(`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default), `margin=0.0`
+(`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default: one output
+pixel per source-model grid cell, not necessarily the highest output resolution;
+`abi1km` / `abi2km` request 1 km / 2 km sampling and may upsample a coarse model or
+downsample a fine WRF grid), `margin=0.0`
 (zoom-out fraction added on each side — real surrounding earth, clear sky, frames the
 domain), `cache=<dir>`, `threads=<n>`. Finished/display visible functions and cloud
 layers additionally take `exposure=1.5`; raw visible bands deliberately do not.
-Visible-family functions also take `multiscatter=True`, `beer_powder=False`, `granulation=False`,
+Visible-family functions also take `multiscatter=True`, `cloud_multiscatter=None`,
+`beer_powder=False`, `granulation=False`,
 `steps` (`offline`/`interactive`), `clouds=True`, `fractional_clouds=True`,
 `feather_exposed_domain_edges=True`,
 `sun_elev`/`sun_az` (what-if sun override), `bluemarble=<path>` (single-file ground),
@@ -61,9 +71,17 @@ also expose the atmosphere/cloud QA controls directly:
 | `terrain_atmosphere` | `True` | shorten atmosphere columns to the WRF terrain elevation |
 | `fractional_clouds` | `True` | use model cloud fraction/subcolumns when available; `False` restores legacy horizontally-full cloudy cells |
 | `cloud_optical_depth_scale` | `0.15` | owner-selected cross-file visible calibration, applied consistently in view/sun/ambient/shadow paths (`0.0..=4.0`; `1.0` = unscaled model extinction) |
+| `cloud_multiscatter` | `None` | explicit transport override: `"legacy-octaves"`, `"single-scatter"`, or experimental CPU `"delta-flux-v1"` / `"delta-flux-v2b"`; omitted preserves the exact historical `multiscatter` boolean contract |
 | `beer_powder` | `False` | optional Schneider shaping of the direct cloud-sun term; does not change transmittance |
 | `granulation` | `False` | display-only sub-grid cloud-edge erosion; quantitative bands/thermal/derived products remain unmodified |
 | `feather_exposed_domain_edges` | `True` | owner-selected v0.1.5 presentation control: when the camera exposes a finite WRF-domain boundary, fade finished visible/cloud-layer clouds over the fixed 4% boundary band; `False` restores the exact prior margin-gated behavior; raw visible bands, thermal, and derived products remain unmodified |
+| `topdown_stratiform_regularization` | `False` | experimental top-down-only 5x5 low/liquid stratiform column reconstruction; conserves selected-area optical depth, protects high/convective cores, and is ignored by geostationary and raw-band products |
+
+`topdown_stratiform_regularization` is an opt-in observation-operator approximation,
+not a literal satellite point-spread function or a correction to the model's
+microphysics. It cannot invent sub-grid cloud/clear structure, remains off by default,
+and currently routes a matching Studio GPU-cloud preview through the CPU so the requested
+field is never silently ignored.
 
 Finished visible display products (`render_visible_rgb`, `render_geocolor`,
 `render_sandwich`, and full-composite `render_perspective`) also accept these
@@ -98,6 +116,10 @@ not consume them. Both remain independently switchable despite being shipped on.
 and safely falls back to full-cell coverage otherwise; set it false for the legacy A/B.
 `clouds=False` remains the explicit feature bypass, while `multiscatter=False`
 disables the higher cloud-scattering octaves without changing cloud transmittance.
+Set `cloud_multiscatter="delta-flux-v1"` to opt into the experimental Stage-2
+isotropic source, or `"delta-flux-v2b"` for its upward-mean-normalized P1 reconstruction.
+Leaving it omitted is byte-compatible with the established
+`multiscatter=True`/`False` paths.
 `beer_powder` and `granulation` are explicit opt-in appearance controls and remain off
 unless requested.
 `feather_exposed_domain_edges=True` is the owner-selected v0.1.5 default. With it off,
@@ -164,7 +186,9 @@ import pyproj
 wrfout = "/path/to/wrfout_d01_2020-06-21_18:00:00"
 
 # 1) Finished true-color RGB (H x W x 3 uint8), top-down and map-registered by default.
-rgb, geo = simsat.render_visible_rgb(wrfout, sat="goes-east", view="topdown")
+rgb, geo = simsat.render_visible_rgb(
+    wrfout, sat="goes-east", view="topdown", backend="cpu"
+)
 crs = ccrs.Projection(pyproj.CRS.from_proj4(geo.proj4))
 ax = plt.axes(projection=crs)
 ax.imshow(rgb, extent=geo.extent, transform=crs, origin="upper")

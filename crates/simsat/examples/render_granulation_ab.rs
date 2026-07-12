@@ -22,7 +22,7 @@
 //!   sat=<preset>        goes-east | goes-west | himawari   (default goes-east)
 //!   timestep=<n>        Time index (default 0).
 //!   view=<mode>         geo | topdown  (default topdown — the WRF-Runner product).
-//!   resolution=<mode>   native | abi1km | abi2km           (default native, geo only)
+//!   resolution=<mode>   native | abi1km | abi2km           (default native)
 //!   margin=<frac>       Zoom-out margin fraction            (default 0.0).
 //!   steps=<quality>     offline | interactive               (default offline).
 //!   sun-elev=<deg>      OPTIONAL sun-elevation override (else true solar geometry).
