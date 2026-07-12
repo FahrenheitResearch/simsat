@@ -110,7 +110,7 @@
 //! binding) sits on top of all of the above:
 //!
 //! - [`api`] — [`api::render`] takes a [`api::RenderParams`] + a [`api::Product`]
-//!   (`VisibleRgb` / `VisibleBands` / `Ir`) and returns the frame DATA as owned arrays +
+//!   (`VisibleRgb` / `RgbReflectance` / `Ir`) and returns the frame DATA as owned arrays +
 //!   a [`api::Georef`] (projection params + `imshow` extent + the H x W lat/lon mesh),
 //!   NOT a PNG. `examples/render_frame.rs` + `examples/render_ir.rs` and the PyO3 crate
 //!   `simsat_py` (`import simsat`) both call it, so there is ONE render code path. The RGB
@@ -136,15 +136,18 @@ pub mod gpu;
 pub mod horizon;
 pub mod ingest;
 pub mod ingest_grib;
+pub mod instrument_footprint;
 pub mod ir;
 pub mod ir_enhance;
 pub mod log;
 pub mod optics;
 pub mod platform;
+pub mod precision_audit;
 pub mod render;
 pub mod sandwich;
 pub mod solar;
 pub mod store_out;
+pub mod thermal_sensor;
 pub mod topdown;
 pub mod web_layer;
 pub mod wv;
@@ -184,7 +187,12 @@ pub mod wv;
 /// overlap semantics used by the renderer. A v4 brick therefore contains materially
 /// different cloud-coverage content and must be regenerated even though a v5 reader
 /// could parse its bytes.
-pub const SSB_FORMAT_VERSION: u32 = 5;
+///
+/// v6 (GRIB snow identity): HRRR/RRFS SNMR is now preserved in the existing
+/// `ext_snow` auxiliary subset instead of being discarded after its contribution
+/// to total `ext_precip`. The byte layout is unchanged, but v5 GRIB bricks cannot
+/// support species-correct IR/fractional optics and must be regenerated.
+pub const SSB_FORMAT_VERSION: u32 = 6;
 
 /// Four-byte magic at the head of every `.ssb` brick file: `SSB` + format epoch.
 pub const SSB_MAGIC: [u8; 4] = *b"SSB1";
@@ -194,9 +202,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssb_format_version_is_v5() {
-        // v5 invalidates v4 cloud-fraction semantics without changing its channel layout.
-        assert_eq!(SSB_FORMAT_VERSION, 5);
+    fn ssb_format_version_is_v6() {
+        // v6 invalidates v5 GRIB snow semantics without changing its channel layout.
+        assert_eq!(SSB_FORMAT_VERSION, 6);
     }
 
     #[test]

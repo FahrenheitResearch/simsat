@@ -8,12 +8,13 @@
 //! textures (design section 1 explicitly allows this for M1; the per-step ECEF
 //! ray march arrives with volumetrics in M4).
 //!
-//! Owner decision 5 (spherical earth, WRF `R = 6_370_000 m`): the ported CGMS
-//! forward/inverse take semi-major/minor axes, and M1 calls them with
-//! `a = b = R` and perspective height `h = GEO_ORBIT_RADIUS_M - R`, so the
-//! scan-angle <-> lat/lon mapping is consistent with M0's spherical projection
-//! inverse. Pixel-for-pixel registration against real ABI imagery is NOT
-//! promised (owner decision 5); physical plausibility is.
+//! The default remains owner decision 5 (spherical earth, WRF `R = 6_370_000 m`):
+//! scan navigation and model physics share the WRF sphere.  v0.1.7 adds an
+//! explicit [`GeoNavigation::GoesRAbiFixedGrid`] alternative: official GOES-R ABI
+//! sweep-x/ellipsoid navigation places sensor raster pixels, then their geodetic
+//! coordinates are mapped back to the unchanged spherical WRF projection and ray
+//! camera.  This separates real-ABI registration from model-volume geometry and
+//! does not claim exact ABI radiometry.
 //!
 //! ---
 //! ATTRIBUTION. The scan-angle math below is PORTED, with the changes noted, from
@@ -32,10 +33,9 @@
 //!   - sub-lon presets from `sat_window.rs` (GOES-East -75.2, GOES-West -137.0,
 //!     Himawari 140.7).
 //!
-//! M1 uses this single CGMS sweep=y forward/inverse pair for ALL three presets
-//! (they differ only by sub-lon + label): the raster is ours and we write an
-//! explicit per-pixel lat/lon mesh, so the raster axis convention is cosmetic and
-//! never used for registration downstream.
+//! The historical path uses one CGMS sweep-y pair for all three presets.  The
+//! opt-in ABI path is GOES-East/West only and uses sweep-x; the distinction is
+//! material for registration (several ABI pixels over CONUS), not cosmetic.
 
 use crate::atmosphere::ATMOSPHERE_HEIGHT_M;
 use crate::frame::GridGeoref;
@@ -48,6 +48,19 @@ pub const GEO_ORBIT_RADIUS_M: f64 = 42_164_000.0;
 
 /// Perspective-point height above the (spherical) surface used by the M1 camera.
 pub const PERSPECTIVE_HEIGHT_M: f64 = GEO_ORBIT_RADIUS_M - R_EARTH;
+
+/// GOES-R ABI fixed-grid ellipsoid metadata published in the GOES-R Product
+/// Definition and User's Guide and carried by the `goes_imager_projection`
+/// variable in ABI L1b/L2 files.  These constants describe navigation only;
+/// SimSat's WRF projection and volume/ray physics deliberately remain on the
+/// existing 6,370 km model sphere.
+pub const GOES_R_ABI_PERSPECTIVE_HEIGHT_M: f64 = 35_786_023.0;
+pub const GOES_R_ABI_SEMI_MAJOR_AXIS_M: f64 = 6_378_137.0;
+pub const GOES_R_ABI_SEMI_MINOR_AXIS_M: f64 = 6_356_752.314_14;
+/// Nominal longitude in current GOES-East (GOES-19) ABI metadata.
+pub const GOES_R_EAST_SUB_LON_DEG: f64 = -75.0;
+/// Nominal longitude in current GOES-West (GOES-18) ABI metadata.
+pub const GOES_R_WEST_SUB_LON_DEG: f64 = -137.0;
 
 /// GOES-East sub-satellite longitude (deg). `sat_window.rs:224`.
 pub const GOES_EAST_SUB_LON_DEG: f64 = -75.2;
@@ -66,6 +79,16 @@ pub const VISIBLE_PITCH_RAD: f64 = 28.0e-6;
 /// ABI IR (2 km) class output pixel pitch (radians): 56 urad. Retained for the
 /// [`ResolutionMode::Abi2km`] option.
 pub const IR_PITCH_RAD: f64 = 56.0e-6;
+/// Number of samples on one axis of the ABI 2 km full-disk fixed grid.
+///
+/// The even sample count is important: the sub-satellite point is the corner shared
+/// by four pixels, never a pixel centre.  The two centres nearest zero are therefore
+/// at `-28` and `+28` microradians.
+pub const ABI_2KM_FULL_DISK_AXIS: usize = 5424;
+/// Smallest signed half-pitch lattice index in the ABI 2 km full disk.
+pub const ABI_2KM_LATTICE_INDEX_MIN: i32 = -(ABI_2KM_FULL_DISK_AXIS as i32 / 2);
+/// Largest signed half-pitch lattice index in the ABI 2 km full disk.
+pub const ABI_2KM_LATTICE_INDEX_MAX: i32 = ABI_2KM_FULL_DISK_AXIS as i32 / 2 - 1;
 /// Hard per-axis raster cap (design section 1 / player 4096^2 cap).
 pub const MAX_AXIS: usize = 4096;
 
@@ -75,6 +98,55 @@ pub enum SatellitePreset {
     GoesEast,
     GoesWest,
     Himawari,
+}
+
+/// Geostationary sensor-raster navigation contract.
+///
+/// `ModelSphere` is the unchanged, model-consistent default.  `GoesRAbiFixedGrid`
+/// uses the official ABI ellipsoid and sweep-x equations to place raster pixel
+/// centres, then converts each resulting geodetic point back to a ray on SimSat's
+/// existing spherical model geometry.  The latter improves registration against
+/// real ABI imagery without pretending the WRF volume itself uses an ellipsoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeoNavigation {
+    #[default]
+    ModelSphere,
+    GoesRAbiFixedGrid,
+}
+
+impl GeoNavigation {
+    pub const ALL: [Self; 2] = [Self::ModelSphere, Self::GoesRAbiFixedGrid];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ModelSphere => "Model sphere (default)",
+            Self::GoesRAbiFixedGrid => "GOES-R ABI ellipsoid (exact navigation)",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::ModelSphere => "model-sphere",
+            Self::GoesRAbiFixedGrid => "goes-r-abi",
+        }
+    }
+}
+
+/// Numeric geometry recorded with a geostationary render.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeoNavigationGeometry {
+    pub navigation: GeoNavigation,
+    pub perspective_point_height_m: f64,
+    pub semi_major_axis_m: f64,
+    pub semi_minor_axis_m: f64,
+    pub sub_lon_deg: f64,
+    /// Longitude of the existing spherical physics camera.  GOES-19 products
+    /// deliberately distinguish their -75.0 fixed-grid origin from the nominal
+    /// platform subpoint near -75.2.
+    pub model_sub_lon_deg: f64,
+    /// CF/ABI sweep-axis token (`"x"` for ABI, `"y"` for the historical
+    /// model-sphere camera).
+    pub sweep_angle_axis: &'static str,
 }
 
 impl SatellitePreset {
@@ -327,11 +399,138 @@ pub fn scan_angles_to_lat_lon(
     Some((lat_deg, lon_deg))
 }
 
+/// Official GOES-R ABI sweep-x fixed-grid forward navigation.
+///
+/// This is the scalar Rust twin of `scripts/fetch-goes-abi-reference.py`'s
+/// independently pyproj-checked NumPy reference and the equations documented by
+/// NOAA/NESDIS/STAR.  It intentionally lives beside, rather than replaces, the
+/// historical sweep-y model-sphere transform above.
+pub fn goes_r_lat_lon_to_scan_angles(
+    perspective_point_height_m: f64,
+    semi_major_axis_m: f64,
+    semi_minor_axis_m: f64,
+    lon0_deg: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+) -> Option<(f64, f64)> {
+    let h = perspective_point_height_m + semi_major_axis_m;
+    let a = semi_major_axis_m;
+    let b = semi_minor_axis_m;
+    if !(h.is_finite()
+        && a.is_finite()
+        && b.is_finite()
+        && lon0_deg.is_finite()
+        && lat_deg.is_finite()
+        && lon_deg.is_finite())
+        || h <= 0.0
+        || a <= 0.0
+        || b <= 0.0
+    {
+        return None;
+    }
+
+    let lat = lat_deg.to_radians();
+    let lon_delta = (lon_deg - lon0_deg).to_radians();
+    let b2_over_a2 = (b * b) / (a * a);
+    let geocentric_lat = (b2_over_a2 * lat.tan()).atan();
+    let eccentricity_sq = (a * a - b * b) / (a * a);
+    let radius = b / (1.0 - eccentricity_sq * geocentric_lat.cos().powi(2)).sqrt();
+    let earth_x = radius * geocentric_lat.cos() * lon_delta.cos();
+    let earth_y = radius * geocentric_lat.cos() * lon_delta.sin();
+    let earth_z = radius * geocentric_lat.sin();
+
+    // GOES-R PUG visibility condition for an ellipsoidal limb.
+    if h * earth_x < earth_x * earth_x + earth_y * earth_y + (a * a / (b * b)) * earth_z * earth_z {
+        return None;
+    }
+
+    let ray_x = h - earth_x;
+    let ray_y = -earth_y;
+    let ray_z = earth_z;
+    let ray_length = (ray_x * ray_x + ray_y * ray_y + ray_z * ray_z).sqrt();
+    if !ray_length.is_finite() || ray_length <= 0.0 {
+        return None;
+    }
+    // ABI sweep=x: E/W is the angle about the full ray norm; N/S is the
+    // elevation about the satellite-to-earth-centre axis.
+    let x = (-ray_y / ray_length).clamp(-1.0, 1.0).asin();
+    let y = ray_z.atan2(ray_x);
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// Official GOES-R ABI sweep-x fixed-grid inverse navigation.
+///
+/// Returns geodetic latitude/longitude on the supplied ellipsoid.  A negative
+/// intersection discriminant is the exact off-disk/limb test.
+pub fn goes_r_scan_angles_to_lat_lon(
+    perspective_point_height_m: f64,
+    semi_major_axis_m: f64,
+    semi_minor_axis_m: f64,
+    lon0_deg: f64,
+    x_rad: f64,
+    y_rad: f64,
+) -> Option<(f64, f64)> {
+    let h = perspective_point_height_m + semi_major_axis_m;
+    let a = semi_major_axis_m;
+    let b = semi_minor_axis_m;
+    if !(h.is_finite()
+        && a.is_finite()
+        && b.is_finite()
+        && lon0_deg.is_finite()
+        && x_rad.is_finite()
+        && y_rad.is_finite())
+        || h <= 0.0
+        || a <= 0.0
+        || b <= 0.0
+    {
+        return None;
+    }
+
+    let (sin_x, cos_x) = x_rad.sin_cos();
+    let (sin_y, cos_y) = y_rad.sin_cos();
+    let a2_over_b2 = (a * a) / (b * b);
+    let qa = sin_x * sin_x + cos_x * cos_x * (cos_y * cos_y + a2_over_b2 * sin_y * sin_y);
+    let qb = -2.0 * h * cos_x * cos_y;
+    let qc = h * h - a * a;
+    let mut discriminant = qb * qb - 4.0 * qa * qc;
+    if !discriminant.is_finite() {
+        return None;
+    }
+    if discriminant < 0.0 {
+        let roundoff = 64.0 * f64::EPSILON * (qb * qb + (4.0 * qa * qc).abs());
+        if discriminant >= -roundoff {
+            discriminant = 0.0;
+        } else {
+            return None;
+        }
+    }
+    let r_s = (-qb - discriminant.sqrt()) / (2.0 * qa);
+    if !r_s.is_finite() || r_s <= 0.0 {
+        return None;
+    }
+    let s_x = r_s * cos_x * cos_y;
+    let s_y = -r_s * sin_x;
+    let s_z = r_s * cos_x * sin_y;
+    let latitude = (a2_over_b2 * s_z / (h - s_x).hypot(s_y)).atan();
+    let longitude = lon0_deg.to_radians() - s_y.atan2(h - s_x);
+    let lat_deg = latitude.to_degrees();
+    let mut lon_deg = (longitude.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
+    if lon_deg == -180.0 {
+        lon_deg = 180.0;
+    }
+    (lat_deg.is_finite() && lon_deg.is_finite()).then_some((lat_deg, lon_deg))
+}
+
 /// A geostationary camera at a sub-lon, on the spherical earth (owner decision 5).
 /// Thin wrapper binding the ported forward/inverse to the M1 spherical constants.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoCamera {
     pub sub_lon_deg: f64,
+    pub model_sub_lon_deg: f64,
+    pub navigation: GeoNavigation,
+    pub perspective_point_height_m: f64,
+    pub semi_major_axis_m: f64,
+    pub semi_minor_axis_m: f64,
 }
 
 impl GeoCamera {
@@ -339,31 +538,112 @@ impl GeoCamera {
     pub fn new(preset: SatellitePreset) -> Self {
         Self {
             sub_lon_deg: preset.sub_lon_deg(),
+            model_sub_lon_deg: preset.sub_lon_deg(),
+            navigation: GeoNavigation::ModelSphere,
+            perspective_point_height_m: PERSPECTIVE_HEIGHT_M,
+            semi_major_axis_m: R_EARTH,
+            semi_minor_axis_m: R_EARTH,
+        }
+    }
+
+    /// Build a camera for an explicit navigation contract.  The ABI ellipsoid is
+    /// meaningful only for the two GOES presets; Himawari retains its separate
+    /// historical sweep-y geometry.
+    pub fn for_navigation(
+        preset: SatellitePreset,
+        navigation: GeoNavigation,
+    ) -> Result<Self, &'static str> {
+        match navigation {
+            GeoNavigation::ModelSphere => Ok(Self::new(preset)),
+            GeoNavigation::GoesRAbiFixedGrid => {
+                let sub_lon_deg = match preset {
+                    SatellitePreset::GoesEast => GOES_R_EAST_SUB_LON_DEG,
+                    SatellitePreset::GoesWest => GOES_R_WEST_SUB_LON_DEG,
+                    SatellitePreset::Himawari => {
+                        return Err("GOES-R ABI ellipsoid navigation is unavailable for Himawari");
+                    }
+                };
+                Ok(Self {
+                    sub_lon_deg,
+                    model_sub_lon_deg: preset.sub_lon_deg(),
+                    navigation,
+                    perspective_point_height_m: GOES_R_ABI_PERSPECTIVE_HEIGHT_M,
+                    semi_major_axis_m: GOES_R_ABI_SEMI_MAJOR_AXIS_M,
+                    semi_minor_axis_m: GOES_R_ABI_SEMI_MINOR_AXIS_M,
+                })
+            }
+        }
+    }
+
+    pub fn geometry(&self) -> GeoNavigationGeometry {
+        GeoNavigationGeometry {
+            navigation: self.navigation,
+            perspective_point_height_m: self.perspective_point_height_m,
+            semi_major_axis_m: self.semi_major_axis_m,
+            semi_minor_axis_m: self.semi_minor_axis_m,
+            sub_lon_deg: self.sub_lon_deg,
+            model_sub_lon_deg: self.model_sub_lon_deg,
+            sweep_angle_axis: match self.navigation {
+                GeoNavigation::ModelSphere => "y",
+                GeoNavigation::GoesRAbiFixedGrid => "x",
+            },
+        }
+    }
+
+    /// The existing spherical physics camera placed at this sensor's subpoint.
+    pub fn model_sphere(&self) -> Self {
+        Self {
+            sub_lon_deg: self.model_sub_lon_deg,
+            model_sub_lon_deg: self.model_sub_lon_deg,
+            navigation: GeoNavigation::ModelSphere,
+            perspective_point_height_m: PERSPECTIVE_HEIGHT_M,
+            semi_major_axis_m: R_EARTH,
+            semi_minor_axis_m: R_EARTH,
         }
     }
 
     /// Forward: geodetic `(lat, lon)` -> scan angles `(x, y)` (rad), spherical.
     pub fn forward(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
-        lat_lon_to_scan_angles(
-            PERSPECTIVE_HEIGHT_M,
-            R_EARTH,
-            R_EARTH,
-            self.sub_lon_deg,
-            lat_deg,
-            lon_deg,
-        )
+        match self.navigation {
+            GeoNavigation::ModelSphere => lat_lon_to_scan_angles(
+                self.perspective_point_height_m,
+                self.semi_major_axis_m,
+                self.semi_minor_axis_m,
+                self.sub_lon_deg,
+                lat_deg,
+                lon_deg,
+            ),
+            GeoNavigation::GoesRAbiFixedGrid => goes_r_lat_lon_to_scan_angles(
+                self.perspective_point_height_m,
+                self.semi_major_axis_m,
+                self.semi_minor_axis_m,
+                self.sub_lon_deg,
+                lat_deg,
+                lon_deg,
+            ),
+        }
     }
 
     /// Inverse: scan angles `(x, y)` (rad) -> geodetic `(lat, lon)`, spherical.
     pub fn inverse(&self, x_rad: f64, y_rad: f64) -> Option<(f64, f64)> {
-        scan_angles_to_lat_lon(
-            PERSPECTIVE_HEIGHT_M,
-            R_EARTH,
-            R_EARTH,
-            self.sub_lon_deg,
-            x_rad,
-            y_rad,
-        )
+        match self.navigation {
+            GeoNavigation::ModelSphere => scan_angles_to_lat_lon(
+                self.perspective_point_height_m,
+                self.semi_major_axis_m,
+                self.semi_minor_axis_m,
+                self.sub_lon_deg,
+                x_rad,
+                y_rad,
+            ),
+            GeoNavigation::GoesRAbiFixedGrid => goes_r_scan_angles_to_lat_lon(
+                self.perspective_point_height_m,
+                self.semi_major_axis_m,
+                self.semi_minor_axis_m,
+                self.sub_lon_deg,
+                x_rad,
+                y_rad,
+            ),
+        }
     }
 }
 
@@ -480,6 +760,83 @@ impl ScanGrid {
         }
     }
 
+    /// Build an exact crop of the global ABI 2 km fixed-grid lattice.
+    ///
+    /// Pixel centres obey the PUG/ABI coordinate contract
+    /// `angle = (index + 1/2) * 56 urad`.  Thus zero scan angle is the corner of
+    /// four pixels and the nearest centres are at +/-28 urad.  Bounds are snapped
+    /// outward to the first global centres that bracket `rect`; row 0 remains north.
+    /// No endpoint fitting or pitch coarsening is permitted.  `None` means the
+    /// requested crop falls outside the 5424-sample full-disk lattice or exceeds the
+    /// caller's axis cap, because either fallback would cease to be an ABI lattice.
+    pub fn abi_2km_global_lattice(rect: ScanAngleRect, max_axis: usize) -> Option<Self> {
+        if !(rect.x_min.is_finite()
+            && rect.x_max.is_finite()
+            && rect.y_min.is_finite()
+            && rect.y_max.is_finite())
+            || rect.x_min > rect.x_max
+            || rect.y_min > rect.y_max
+        {
+            return None;
+        }
+
+        // Coordinates obtained from a NetCDF f32 axis can land a few ulps either
+        // side of an exact half-pitch value.  A 1e-9-index tolerance (5.6e-14 rad)
+        // makes an analytically identical crop deterministic without moving any
+        // genuinely non-lattice domain bound to another pixel.
+        const INDEX_TOLERANCE: f64 = 1.0e-9;
+        let lower_index =
+            |angle: f64| (angle / IR_PITCH_RAD - 0.5 + INDEX_TOLERANCE).floor() as i32;
+        let upper_index = |angle: f64| (angle / IR_PITCH_RAD - 0.5 - INDEX_TOLERANCE).ceil() as i32;
+
+        let x_index_min = lower_index(rect.x_min);
+        let x_index_max = upper_index(rect.x_max);
+        let y_index_min = lower_index(rect.y_min);
+        let y_index_max = upper_index(rect.y_max);
+        if x_index_min < ABI_2KM_LATTICE_INDEX_MIN
+            || x_index_max > ABI_2KM_LATTICE_INDEX_MAX
+            || y_index_min < ABI_2KM_LATTICE_INDEX_MIN
+            || y_index_max > ABI_2KM_LATTICE_INDEX_MAX
+        {
+            return None;
+        }
+
+        let nx = (x_index_max - x_index_min + 1) as usize;
+        let ny = (y_index_max - y_index_min + 1) as usize;
+        let cap = max_axis.clamp(2, MAX_AXIS);
+        if nx < 2 || ny < 2 || nx > cap || ny > cap {
+            return None;
+        }
+        Some(Self {
+            nx,
+            ny,
+            x_min: (x_index_min as f64 + 0.5) * IR_PITCH_RAD,
+            y_max: (y_index_max as f64 + 0.5) * IR_PITCH_RAD,
+            pitch_x: IR_PITCH_RAD,
+            pitch_y: IR_PITCH_RAD,
+        })
+    }
+
+    /// Signed global half-pitch indices `(x_min, x_max, y_min, y_max)` when this
+    /// grid is an exact ABI 2 km lattice crop; `None` for native/legacy fitted grids.
+    pub fn abi_2km_global_indices(&self) -> Option<(i32, i32, i32, i32)> {
+        let index = |angle: f64| -> Option<i32> {
+            let raw = angle / IR_PITCH_RAD - 0.5;
+            let rounded = raw.round();
+            ((raw - rounded).abs() <= 1.0e-8).then_some(rounded as i32)
+        };
+        if (self.pitch_x - IR_PITCH_RAD).abs() > 1.0e-15
+            || (self.pitch_y - IR_PITCH_RAD).abs() > 1.0e-15
+        {
+            return None;
+        }
+        let x_min = index(self.x_min)?;
+        let y_max = index(self.y_max)?;
+        let x_max = x_min.checked_add(self.nx.checked_sub(1)? as i32)?;
+        let y_min = y_max.checked_sub(self.ny.checked_sub(1)? as i32)?;
+        Some((x_min, x_max, y_min, y_max))
+    }
+
     /// Build a NATIVE-resolution raster: one output pixel per WRF grid cell, so the
     /// output axis counts equal the WRF cell counts `native_nx`/`native_ny` (each
     /// clamped to `2..=max_axis`, and `max_axis` itself clamped to [`MAX_AXIS`]). The
@@ -539,6 +896,14 @@ pub struct SurfaceRaster {
     pub grid_i: Vec<f32>,
     /// Fractional WRF index j (0-based) per pixel; `NaN` off-earth.
     pub grid_j: Vec<f32>,
+    /// Optional per-pixel scan angles on SimSat's existing spherical physics
+    /// camera.  `None` is the byte-for-byte historical path where sensor and
+    /// physics scans are identical.  ABI ellipsoid navigation fills this after
+    /// ellipsoid scan -> geodetic -> model-sphere conversion.
+    pub model_scan: Option<Vec<[f32; 2]>>,
+    /// Sensor-navigation metadata for geostationary rasters; `None` for top-down
+    /// and free-perspective rasters.
+    pub navigation_geometry: Option<GeoNavigationGeometry>,
 }
 
 impl SurfaceRaster {
@@ -552,7 +917,49 @@ impl SurfaceRaster {
             lon: vec![f32::NAN; n],
             grid_i: vec![f32::NAN; n],
             grid_j: vec![f32::NAN; n],
+            model_scan: None,
+            navigation_geometry: None,
         }
+    }
+
+    /// Ray scan angles for the existing spherical model physics at one pixel.
+    pub fn model_scan_angle(&self, px: usize, py: usize) -> (f64, f64) {
+        let idx = py * self.nx + px;
+        self.model_scan
+            .as_ref()
+            .and_then(|v| v.get(idx))
+            .filter(|v| v[0].is_finite() && v[1].is_finite())
+            .map(|v| (v[0] as f64, v[1] as f64))
+            .unwrap_or_else(|| self.scan.scan_angle(px, py))
+    }
+
+    /// Bounding rectangle of the ray angles consumed by the model atmosphere and
+    /// cloud marches.  This differs slightly from the public sensor fixed grid in
+    /// ABI ellipsoid mode.
+    pub fn model_scan_rect(&self) -> (f64, f64, f64, f64) {
+        let Some(values) = &self.model_scan else {
+            let x_max = self.scan.x_min + self.scan.nx.saturating_sub(1) as f64 * self.scan.pitch_x;
+            let y_min = self.scan.y_max - self.scan.ny.saturating_sub(1) as f64 * self.scan.pitch_y;
+            return (self.scan.x_min, x_max, y_min, self.scan.y_max);
+        };
+        let mut rect: Option<(f64, f64, f64, f64)> = None;
+        for value in values {
+            let (x, y) = (value[0] as f64, value[1] as f64);
+            if !(x.is_finite() && y.is_finite()) {
+                continue;
+            }
+            rect = Some(match rect {
+                None => (x, x, y, y),
+                Some((xmin, xmax, ymin, ymax)) => {
+                    (xmin.min(x), xmax.max(x), ymin.min(y), ymax.max(y))
+                }
+            });
+        }
+        rect.unwrap_or_else(|| {
+            let x_max = self.scan.x_min + self.scan.nx.saturating_sub(1) as f64 * self.scan.pitch_x;
+            let y_min = self.scan.y_max - self.scan.ny.saturating_sub(1) as f64 * self.scan.pitch_y;
+            (self.scan.x_min, x_max, y_min, self.scan.y_max)
+        })
     }
 
     /// The domain lat/lon bounding box over on-earth pixels, `(lat_min, lat_max,
@@ -654,7 +1061,16 @@ pub fn build_surface_raster_mode(
 ) -> Option<SurfaceRaster> {
     let rect = grow_scan_rect(domain_scan_rect(camera, georef, nx, ny)?, margin_frac);
     let (target_nx, target_ny) = extended_native_counts(nx, ny, margin_frac);
-    let scan = mode.scan_grid(rect, target_nx, target_ny, max_axis);
+    // Exact GOES-R navigation + ABI 2 km uses the actual global 56-urad sample
+    // lattice.  The historical model-sphere ABI crop and both Native paths retain
+    // their prior endpoint-fit/count behavior byte-for-byte.
+    let scan = if camera.navigation == GeoNavigation::GoesRAbiFixedGrid
+        && mode == ResolutionMode::Abi2km
+    {
+        ScanGrid::abi_2km_global_lattice(rect, max_axis)?
+    } else {
+        mode.scan_grid(rect, target_nx, target_ny, max_axis)
+    };
     if mode == ResolutionMode::Native && (scan.nx < target_nx || scan.ny < target_ny) {
         let cap = max_axis.min(MAX_AXIS);
         eprintln!(
@@ -701,6 +1117,11 @@ fn fill_surface_raster(
     scan: ScanGrid,
 ) -> SurfaceRaster {
     let mut raster = SurfaceRaster::empty(scan);
+    raster.navigation_geometry = Some(camera.geometry());
+    let model_camera = camera.model_sphere();
+    if camera.navigation != GeoNavigation::ModelSphere {
+        raster.model_scan = Some(vec![[f32::NAN; 2]; scan.nx * scan.ny]);
+    }
     for py in 0..scan.ny {
         for px in 0..scan.nx {
             let (x, y) = scan.scan_angle(px, py);
@@ -710,6 +1131,11 @@ fn fill_surface_raster(
             let idx = py * scan.nx + px;
             raster.lat[idx] = lat as f32;
             raster.lon[idx] = lon as f32;
+            if let Some(model_scan) = &mut raster.model_scan
+                && let Some((model_x, model_y)) = model_camera.forward(lat, lon)
+            {
+                model_scan[idx] = [model_x as f32, model_y as f32];
+            }
             let (fi, fj) = georef.forward(lat, lon);
             // Keep (i, j) only when it lands inside the WRF domain; outside-domain
             // but on-earth pixels still get Blue Marble albedo (no WRF terrain).
@@ -1044,6 +1470,8 @@ impl MapRaster {
             lon: self.lon.clone(),
             grid_i: self.grid_i.clone(),
             grid_j: self.grid_j.clone(),
+            model_scan: None,
+            navigation_geometry: None,
         }
     }
 }
@@ -1332,6 +1760,182 @@ fn norm3(a: [f64; 3]) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sampled from the exact HRRR target grid in
+    /// `outputs/v017-goes19-hrrr-reference/abi-reference-aligned.npz`; expected
+    /// scans were produced by the pyproj-cross-checked pure-NumPy PUG reference
+    /// in `scripts/fetch-goes-abi-reference.py` using the source GOES-19 CMI
+    /// metadata (a=6378137, b=6356752.31414, h=35786023, lon0=-75, sweep=x).
+    const GOES19_REFERENCE_SAMPLES: &[(f64, f64, f64, f64)] = &[
+        (
+            47.838623047,
+            -134.095474243,
+            -0.091206125744050,
+            0.117195748662799,
+        ),
+        (
+            52.071998596,
+            -110.278320312,
+            -0.057703857631825,
+            0.127844062729958,
+        ),
+        (
+            47.842193604,
+            -60.917194366,
+            0.027244018901465,
+            0.123178030156049,
+        ),
+        (
+            47.975654602,
+            -97.506889343,
+            -0.042504359652495,
+            0.122770868590927,
+        ),
+        (
+            43.475685120,
+            -63.440551758,
+            0.024521421060113,
+            0.115531056518809,
+        ),
+        (
+            43.239986420,
+            -97.506401062,
+            -0.046704881037136,
+            0.114301587493284,
+        ),
+        (
+            39.009223938,
+            -65.663246155,
+            0.021477975760447,
+            0.106740871278062,
+        ),
+        (
+            38.497245789,
+            -97.505973816,
+            -0.050633448397189,
+            0.104785258914001,
+        ),
+        (
+            34.528316498,
+            -67.612884521,
+            0.018216969529581,
+            0.096991540533419,
+        ),
+        (
+            33.754348755,
+            -97.505607605,
+            -0.054238440265365,
+            0.094293485514624,
+        ),
+        (
+            30.040863037,
+            -69.344619751,
+            0.014795790802460,
+            0.086360146227933,
+        ),
+        (
+            29.016033173,
+            -97.505279541,
+            -0.057473015525938,
+            0.082913531458819,
+        ),
+        (
+            25.552131653,
+            -70.900314331,
+            0.011270172680640,
+            0.074936498021740,
+        ),
+        (
+            24.364576340,
+            -97.504989624,
+            -0.060251889852725,
+            0.070956353199642,
+        ),
+        (
+            22.911014557,
+            -114.541458130,
+            -0.098904774797383,
+            0.065480536419709,
+        ),
+        (
+            21.140546799,
+            -72.289718628,
+            0.007754280861710,
+            0.063029512605121,
+        ),
+    ];
+
+    #[test]
+    fn goes_r_forward_matches_validated_goes19_reference_grid() {
+        let camera =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        let mut sum_sq = 0.0;
+        let mut max_error = 0.0_f64;
+        for &(lat, lon, expected_x, expected_y) in GOES19_REFERENCE_SAMPLES {
+            let (x, y) = camera.forward(lat, lon).expect("reference point visible");
+            let error = (x - expected_x).hypot(y - expected_y);
+            max_error = max_error.max(error);
+            sum_sq += error * error;
+        }
+        let rms = (sum_sq / GOES19_REFERENCE_SAMPLES.len() as f64).sqrt();
+        // The fixture's target lat/lon are the aligned NPZ's stored f32 values and
+        // expected scans are decimal text, so ~1e-12 rad is the serialization floor
+        // (still over seven orders below one 28 urad ABI visible pixel).
+        assert!(max_error < 2.0e-12, "max scan error {max_error:e}");
+        assert!(rms < 1.0e-12, "RMS scan error {rms:e}");
+    }
+
+    #[test]
+    fn goes_r_inverse_roundtrips_reference_grid_and_rejects_space() {
+        let camera =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        let mut max_deg = 0.0_f64;
+        for &(lat, lon, x, y) in GOES19_REFERENCE_SAMPLES {
+            let (got_lat, got_lon) = camera.inverse(x, y).expect("reference scan on disk");
+            max_deg = max_deg.max((got_lat - lat).hypot(got_lon - lon));
+        }
+        assert!(max_deg < 3.0e-9, "max roundtrip error {max_deg:e} deg");
+        assert!(camera.inverse(0.1519, 0.1519).is_none());
+        assert!(camera.forward(0.0, 120.0).is_none());
+    }
+
+    #[test]
+    fn goes_r_navigation_is_opt_in_and_himawari_is_rejected() {
+        let default = GeoCamera::new(SatellitePreset::GoesEast);
+        assert_eq!(default.navigation, GeoNavigation::ModelSphere);
+        assert_eq!(default.sub_lon_deg, GOES_EAST_SUB_LON_DEG);
+        let abi =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        assert_eq!(abi.geometry().sweep_angle_axis, "x");
+        assert_eq!(abi.sub_lon_deg, -75.0);
+        assert!(
+            GeoCamera::for_navigation(SatellitePreset::Himawari, GeoNavigation::GoesRAbiFixedGrid)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn goes_r_pug_example_and_axis_limbs() {
+        let camera =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        let (x, y) = camera.forward(33.846162, -84.690932).unwrap();
+        assert!((x - -0.024_051_999_804).abs() < 1.0e-9);
+        assert!((y - 0.095_339_999_332).abs() < 1.0e-9);
+        let (lat, lon) = camera.inverse(-0.024052, 0.095340).unwrap();
+        assert!((lat - 33.846_162_290_6).abs() < 1.0e-9);
+        assert!((lon - -84.690_932_118_8).abs() < 1.0e-9);
+
+        let x_limb = 0.151_852_080_189_958;
+        let y_limb = 0.151_350_701_197_250;
+        assert!(camera.inverse(x_limb - 1.0e-10, 0.0).is_some());
+        assert!(camera.inverse(x_limb + 1.0e-8, 0.0).is_none());
+        assert!(camera.inverse(0.0, y_limb - 1.0e-10).is_some());
+        assert!(camera.inverse(0.0, y_limb + 1.0e-8).is_none());
+    }
     use crate::frame::MapProjection;
 
     fn spherical_forward(lat: f64, lon: f64) -> Option<(f64, f64)> {
@@ -1400,6 +2004,100 @@ mod tests {
         assert_eq!(capped.nx, 64);
         let (cx, _) = capped.scan_angle(capped.nx - 1, 0);
         assert!((cx - rect.x_max).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abi_2km_global_lattice_has_pug_half_pitch_origin_and_full_disk_endpoints() {
+        let center = |index: i32| (index as f64 + 0.5) * IR_PITCH_RAD;
+        assert_eq!(ABI_2KM_FULL_DISK_AXIS, 5424);
+        assert!((center(ABI_2KM_LATTICE_INDEX_MIN) - -0.151_844).abs() < 1.0e-15);
+        assert!((center(ABI_2KM_LATTICE_INDEX_MAX) - 0.151_844).abs() < 1.0e-15);
+
+        // A crop straddling SSP must contain four pixels.  No pixel centre is at
+        // scan (0, 0): SSP is their shared corner, exactly as on the ABI fixed grid.
+        let around_ssp = ScanGrid::abi_2km_global_lattice(
+            ScanAngleRect {
+                x_min: -1.0e-12,
+                x_max: 1.0e-12,
+                y_min: -1.0e-12,
+                y_max: 1.0e-12,
+            },
+            MAX_AXIS,
+        )
+        .unwrap();
+        assert_eq!((around_ssp.nx, around_ssp.ny), (2, 2));
+        assert_eq!(around_ssp.abi_2km_global_indices(), Some((-1, 0, -1, 0)));
+        assert_eq!(around_ssp.scan_angle(0, 0), (-28.0e-6, 28.0e-6));
+        assert_eq!(around_ssp.scan_angle(1, 1), (28.0e-6, -28.0e-6));
+    }
+
+    #[test]
+    fn abi_2km_global_lattice_matches_official_conus_coordinate_crop() {
+        // ABI CONUS 2-km coordinates carried by the GOES-19 M6 CMI reference:
+        // x = -0.101332..0.038612 (2500 columns),
+        // y =  0.128212..0.044268 (1500 north-first rows).  These are analytic
+        // half-pitch coordinates, not values fitted to this test rectangle.
+        let grid = ScanGrid::abi_2km_global_lattice(
+            ScanAngleRect {
+                x_min: -0.101_332,
+                x_max: 0.038_612,
+                y_min: 0.044_268,
+                y_max: 0.128_212,
+            },
+            MAX_AXIS,
+        )
+        .unwrap();
+        assert_eq!((grid.nx, grid.ny), (2500, 1500));
+        assert_eq!(grid.abi_2km_global_indices(), Some((-1810, 689, 790, 2289)));
+        assert_eq!(grid.pitch_x, 56.0e-6);
+        assert_eq!(grid.pitch_y, 56.0e-6);
+        assert!((grid.x_min - -0.101_332).abs() < 1.0e-15);
+        assert!((grid.y_max - 0.128_212).abs() < 1.0e-15);
+        let (x_last, y_last) = grid.scan_angle(grid.nx - 1, grid.ny - 1);
+        assert!((x_last - 0.038_612).abs() < 1.0e-15);
+        assert!((y_last - 0.044_268).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn exact_goes_abi2km_snaps_but_model_sphere_and_native_stay_legacy() {
+        let proj = MapProjection::lambert(30.0, 60.0, -97.5);
+        let (nx, ny) = (120usize, 90usize);
+        let georef = GridGeoref::new(proj, 59.5, 44.5, 39.0, -97.5, 3000.0, 3000.0);
+
+        let abi =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        let abi_rect = domain_scan_rect(&abi, &georef, nx, ny).unwrap();
+        let snapped =
+            build_surface_raster_mode(&abi, &georef, nx, ny, ResolutionMode::Abi2km, 0.0, MAX_AXIS)
+                .unwrap();
+        assert_eq!(
+            snapped.scan,
+            ScanGrid::abi_2km_global_lattice(abi_rect, MAX_AXIS).unwrap()
+        );
+        assert!(snapped.scan.abi_2km_global_indices().is_some());
+
+        let model = GeoCamera::new(SatellitePreset::GoesEast);
+        let model_rect = domain_scan_rect(&model, &georef, nx, ny).unwrap();
+        let legacy = build_surface_raster_mode(
+            &model,
+            &georef,
+            nx,
+            ny,
+            ResolutionMode::Abi2km,
+            0.0,
+            MAX_AXIS,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.scan,
+            ScanGrid::from_rect(model_rect, IR_PITCH_RAD, MAX_AXIS)
+        );
+
+        let native =
+            build_surface_raster_mode(&abi, &georef, nx, ny, ResolutionMode::Native, 0.0, MAX_AXIS)
+                .unwrap();
+        assert_eq!(native.scan, ScanGrid::native(abi_rect, nx, ny, MAX_AXIS));
     }
 
     #[test]

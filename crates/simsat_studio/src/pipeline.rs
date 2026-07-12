@@ -395,6 +395,8 @@ pub struct RasterCacheKey<G: PartialEq> {
     pub view: u8,
     /// `SatellitePreset` ordinal (0 = GOES-E, 1 = GOES-W, 2 = Himawari).
     pub sat: u8,
+    /// `GeoNavigation` ordinal (0 = model sphere, 1 = GOES-R ABI ellipsoid).
+    pub navigation: u8,
 }
 
 /// Key for the per-pixel GEO lookup texture: the raster it was built over plus the
@@ -943,10 +945,10 @@ mod tests {
         assert!(!slot.matches(&moved), "bbox misses");
     }
 
-    /// The stale-raster guard: margin / resolution / view / satellite each miss.
+    /// The stale-raster guard: margin / resolution / view / satellite / navigation each miss.
     #[test]
     fn raster_key_margin_resolution_view_sat_change_misses() {
-        let key = |res: u8, margin: f64, view: u8, sat: u8| RasterCacheKey {
+        let key = |res: u8, margin: f64, view: u8, sat: u8, navigation: u8| RasterCacheKey {
             georef: 77u32, // stand-in for the engine GridGeoref (generic)
             nx: 800,
             ny: 800,
@@ -954,17 +956,19 @@ mod tests {
             margin_bits: margin.to_bits(),
             view,
             sat,
+            navigation,
         };
         let mut slot: CacheSlot<RasterCacheKey<u32>, u32> = CacheSlot::default();
-        slot.put(key(0, 0.0, 0, 0), 1);
-        assert!(slot.matches(&key(0, 0.0, 0, 0)));
-        assert!(!slot.matches(&key(1, 0.0, 0, 0)), "resolution misses");
-        assert!(!slot.matches(&key(0, 0.3, 0, 0)), "margin misses");
-        assert!(!slot.matches(&key(0, 0.0, 1, 0)), "view misses");
-        assert!(!slot.matches(&key(0, 0.0, 0, 1)), "satellite misses");
+        slot.put(key(0, 0.0, 0, 0, 0), 1);
+        assert!(slot.matches(&key(0, 0.0, 0, 0, 0)));
+        assert!(!slot.matches(&key(1, 0.0, 0, 0, 0)), "resolution misses");
+        assert!(!slot.matches(&key(0, 0.3, 0, 0, 0)), "margin misses");
+        assert!(!slot.matches(&key(0, 0.0, 1, 0, 0)), "view misses");
+        assert!(!slot.matches(&key(0, 0.0, 0, 1, 0)), "satellite misses");
+        assert!(!slot.matches(&key(0, 0.0, 0, 0, 1)), "navigation misses");
         // The geo LUT key additionally misses when the BM crop bounds change.
         let geo = |bm: Option<[u32; 4]>| GeoLutKey {
-            raster: key(0, 0.0, 0, 0),
+            raster: key(0, 0.0, 0, 0, 0),
             bm_bounds_bits: bm,
         };
         let mut gslot: CacheSlot<GeoLutKey<u32>, u32> = CacheSlot::default();

@@ -130,6 +130,7 @@ impl WvBand {
         IrConfig {
             band: self.abi_band(),
             wavelength_m: self.wavelength_m(),
+            sensor: crate::thermal_sensor::ThermalSensor::FastGray,
             wv_mass_abs_m2_kg: self.mass_abs_m2_kg(),
             wv_continuum: true,
             ..IrConfig::band13()

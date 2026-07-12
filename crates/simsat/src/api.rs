@@ -14,7 +14,7 @@
 //! - the product data ([`FrameData`]): `VisibleRgb` = the finished true-color RGB (H x W x
 //!   3 u8) — byte-identical to what the studio/`render_frame` PNG shows, because it calls
 //!   the same shipped [`crate::clouds::render_cloud_frame_rgba`] /
-//!   [`crate::topdown::render_topdown_frame_rgba`]; `VisibleBands` = the RAW per-channel
+//!   [`crate::topdown::render_topdown_frame_rgba`]; `RgbReflectance` = the RAW three-channel
 //!   reflectance (H x W x 3 f32, pre-tonemap, in `[0, 1]`); `Ir` = the RAW brightness
 //!   temperature in KELVIN (H x W f32) plus an optional colored RGB enhancement.
 //! - a [`Georef`]: the projection params + an `extent` (for `imshow`) AND the H x W lat/lon
@@ -33,11 +33,11 @@ use crate::atmosphere::{
     SOLAR_IRRADIANCE_RGB, SkyShTable, sun_enu_to_ecef,
 };
 use crate::bluemarble;
-use crate::bricks::{self, RunManifest, VolumeBrick};
+use crate::bricks::{self, RunManifest, StorageProfile, VolumeBrick};
 use crate::camera::{
-    GeoCamera, MAX_AXIS, PerspectiveCamera, ResolutionMode, SatellitePreset, SurfaceRaster,
-    ViewMode, build_map_raster_mode, build_perspective_raster, build_surface_raster_mode,
-    extended_native_counts, map_pixel_edge_index_bounds,
+    GeoCamera, GeoNavigation, GeoNavigationGeometry, MAX_AXIS, PerspectiveCamera, ResolutionMode,
+    SatellitePreset, SurfaceRaster, ViewMode, build_map_raster_mode, build_perspective_raster,
+    build_surface_raster_mode, extended_native_counts, map_pixel_edge_index_bounds,
 };
 use crate::clouds::{
     self, CloudFrameStats, CloudMultiscatterMode, CloudScene, DecodedVolume, MarchConfig,
@@ -51,16 +51,22 @@ use crate::gpu;
 use crate::horizon::HorizonMap;
 use crate::ingest::{self, IngestConfig};
 use crate::ingest_grib;
+use crate::instrument_footprint::{InstrumentFootprint, apply_band13_radiance_footprint_validated};
 use crate::ir::{self, IrConfig, IrScene, IrVolume};
 use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
+use crate::optics::CloudOpticsMode;
 use crate::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt,
-    reflectance_from_radiance, shade_surface, snow_fraction, surface_toa_radiance,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow,
+    normals_from_hgt, radiance_to_rgba_softclip, reflectance_from_radiance, shade_surface,
+    snow_fraction, surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::SolarFrame;
-use crate::topdown::{render_topdown_frame_reflectance, render_topdown_frame_rgba};
+use crate::thermal_sensor::ThermalSensor;
+use crate::topdown::{
+    render_topdown_frame_reflectance, render_topdown_frame_rgba_with_cloud_footprint,
+};
 use crate::web_layer;
 use crate::wv::WvBand;
 
@@ -74,7 +80,17 @@ const BLUEMARBLE_MAX_AXIS: u32 = 4096;
 pub enum Product {
     /// The finished true-color RGB (H x W x 3 u8): the tonemapped display frame.
     VisibleRgb,
-    /// The RAW per-channel reflectance (H x W x 3 f32, pre-tonemap, `[0, 1]`).
+    /// The RAW broad-RGB reflectance (H x W x 3 f32, pre-tonemap, `[0, 1]`).
+    ///
+    /// These are SimSat's current broad red/green/blue channels, not spectral-response-
+    /// integrated ABI visible bands. [`Product::VisibleBands`] remains as a deprecated
+    /// source-compatible alias.
+    RgbReflectance,
+    /// Deprecated compatibility name for [`Product::RgbReflectance`].
+    ///
+    /// This remains a real enum variant so existing glob imports and match expressions keep
+    /// compiling. [`render`] canonicalizes it before dispatch, making its output identical.
+    #[deprecated(since = "0.1.7", note = "use Product::RgbReflectance")]
     VisibleBands,
     /// The RAW 10.3 um (ABI band 13) brightness temperature in KELVIN (H x W f32) +
     /// optional colored RGB.
@@ -83,9 +99,10 @@ pub enum Product {
     /// in KELVIN (H x W f32) + optional colored RGB, returned as [`FrameData::Ir`] (WV is
     /// thermal IR — the same data shape as band 13, just a different weighting function).
     WaterVapor { band: WvBand },
-    /// The GeoColor day/night blend (GOES's flagship product): true-color visible by day,
-    /// colored band-13 IR by night, crossfaded across the terminator by the PER-PIXEL solar
-    /// elevation. Renders the visible frame ([`Product::VisibleRgb`]) AND the IR frame (band
+    /// SimSat Day/Night Color, a GeoColor-style blend: true-color visible by day, colored
+    /// band-13 IR by night, crossfaded across the terminator by per-pixel solar elevation.
+    /// This is not yet sensor-derived ABI GeoColor: the day side uses SimSat's broad-RGB
+    /// operator. Renders the visible frame ([`Product::VisibleRgb`]) AND the IR frame (band
     /// 13 through [`crate::geocolor::GEOCOLOR_NIGHT_ENHANCEMENT`]) through the SAME render
     /// paths and blends them per pixel (see [`crate::geocolor`] for the thresholds). Returned
     /// as [`FrameData::Visible`] — a baked RGB composite, like the visible product. Cost is
@@ -141,6 +158,16 @@ pub enum Product {
     Perspective { cloud_layer_only: bool },
 }
 
+impl Product {
+    #[allow(deprecated)]
+    const fn canonical(self) -> Self {
+        match self {
+            Self::VisibleBands => Self::RgbReflectance,
+            other => other,
+        }
+    }
+}
+
 /// Execution backend for a single render. CPU is the quality/stored/batch default;
 /// `GpuPreview` is an explicitly requested, synchronous, read-back preview using the
 /// same wgpu cloud pass as Studio.
@@ -149,6 +176,143 @@ pub enum RenderBackend {
     #[default]
     Cpu,
     GpuPreview,
+}
+
+/// Scientific intent of a render.
+///
+/// [`Display`](Self::Display) preserves SimSat's shipped, owner-reviewed appearance.
+/// [`SensorFastGray`](Self::SensorFastGray) selects the explicitly limited
+/// `simsat-fast-gray-v1` observation operator: display-only shaping is neutralized,
+/// cloud extinction is unscaled, and every automatic substitution is returned on the
+/// [`RenderResult`]. It is not yet a spectral-response-integrated ABI/AHI simulator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderIntent {
+    #[default]
+    Display,
+    SensorFastGray,
+}
+
+impl RenderIntent {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Display => "display",
+            Self::SensorFastGray => "sensor-fast-gray",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Display => "Display",
+            Self::SensorFastGray => "Sensor Fast Gray",
+        }
+    }
+
+    /// Stable provenance name for downstream files and comparisons.
+    pub fn observation_operator(self) -> &'static str {
+        match self {
+            Self::Display => "simsat-display-v1",
+            Self::SensorFastGray => "simsat-fast-gray-v1",
+        }
+    }
+
+    /// Limitations that must accompany Sensor Fast Gray output.
+    pub fn limitations(self) -> &'static [&'static str] {
+        match self {
+            Self::Display => &[],
+            Self::SensorFastGray => &[
+                "broad band-averaged RGB/gray optics; not instrument SRF-integrated channels",
+                "fast compact brick; not the planned pressure/interface-level science brick",
+                "fixed-radius cloud optics unless the source path explicitly supplies scheme-aware optics",
+                "no instrument PSF/MTF or temporal footprint integration",
+                "finished RGB remains an inspection transform; use visible reflectance bands for quantitative comparison",
+            ],
+        }
+    }
+}
+
+/// One deterministic parameter substitution made by [`RenderIntent::SensorFastGray`].
+/// Only values that actually differed from the strict operator are reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderIntentAdjustment {
+    CloudOpticalDepthUnscaled,
+    ExposureNeutral,
+    GroundLiftNeutral,
+    LandAppearanceIdentity,
+    ExposedEdgeFeatherOff,
+    GranulationOff,
+    TopdownStratiformRegularizationOff,
+    TopdownCloudFootprintOff,
+    AtmosphereCorrectionOff,
+    HighlightShoulderIdentity,
+    SyntheticGreenOff,
+}
+
+impl RenderIntentAdjustment {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CloudOpticalDepthUnscaled => "cloud optical-depth scale -> 1.0 (unscaled)",
+            Self::ExposureNeutral => "exposure -> 1.0",
+            Self::GroundLiftNeutral => "ground lift -> 1.0",
+            Self::LandAppearanceIdentity => "land appearance -> identity",
+            Self::ExposedEdgeFeatherOff => "exposed-domain edge feather -> off",
+            Self::GranulationOff => "granulation -> off",
+            Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
+            Self::TopdownCloudFootprintOff => "top-down cloud radiance footprint -> off",
+            Self::AtmosphereCorrectionOff => {
+                "product-facing atmosphere correction -> off (retain modeled airlight)"
+            }
+            Self::HighlightShoulderIdentity => "highlight shoulder -> identity/hard clamp",
+            Self::SyntheticGreenOff => "synthetic green -> off",
+        }
+    }
+}
+
+/// Visible cloud-fraction observation operator.
+///
+/// `EffectiveOd` is the established, fast homogeneous equivalent and remains the
+/// shipped default. The deterministic variants are opt-in 4/8/16-member
+/// fixed-stratified shared-`u` maximum-overlap references: each member is marched
+/// with its own internally consistent view/sun/ambient/shadow state, linear radiance
+/// is averaged, and the display transform is applied once. These are deliberately
+/// not described as a full max-random or Sobol McICA implementation. The separate
+/// `fractional_clouds` bool remains the backward-compatible master switch (`false`
+/// always means `Off`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FractionalCloudMode {
+    Off,
+    #[default]
+    EffectiveOd,
+    Deterministic4,
+    Deterministic8,
+    Deterministic16,
+}
+
+impl FractionalCloudMode {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::EffectiveOd => "effective-od",
+            Self::Deterministic4 => "deterministic-4",
+            Self::Deterministic8 => "deterministic-8",
+            Self::Deterministic16 => "deterministic-16",
+        }
+    }
+
+    /// Number of explicit fixed-stratified members, or `None` for non-ensemble
+    /// closures. Keeping the bounded count on the mode prevents UI/CLI/API drift.
+    pub const fn deterministic_subcolumn_count(self) -> Option<usize> {
+        match self {
+            Self::Deterministic4 => Some(4),
+            Self::Deterministic8 => Some(8),
+            Self::Deterministic16 => Some(16),
+            Self::Off | Self::EffectiveOd => None,
+        }
+    }
+
+    pub const fn is_deterministic(self) -> bool {
+        self.deterministic_subcolumn_count().is_some()
+    }
 }
 
 impl RenderBackend {
@@ -168,11 +332,14 @@ pub enum GpuPreviewAdjustment {
     CloudsOn,
     TerrainAtmosphereOff,
     FractionalCloudsOff,
+    FractionalSubcolumnsOff,
     GranulationOff,
     TopdownStratiformRegularizationOff,
+    TopdownCloudFootprintOff,
     ExposedEdgeFeatherOff,
     LegacyCloudTransport,
     ShippedHighlights,
+    SyntheticGreenOff,
     InteractiveSteps,
     ShippedTopdownCloudNorm,
 }
@@ -184,11 +351,16 @@ impl GpuPreviewAdjustment {
             Self::CloudsOn => "clouds -> on",
             Self::TerrainAtmosphereOff => "terrain-height atmosphere -> off",
             Self::FractionalCloudsOff => "model cloud fraction -> off (legacy full cells)",
+            Self::FractionalSubcolumnsOff => {
+                "deterministic fractional subcolumns -> off (GPU unsupported)"
+            }
             Self::GranulationOff => "granulation -> off",
             Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
+            Self::TopdownCloudFootprintOff => "top-down cloud radiance footprint -> off",
             Self::ExposedEdgeFeatherOff => "exposed-edge feather -> off",
             Self::LegacyCloudTransport => "cloud transport -> legacy octaves",
             Self::ShippedHighlights => "highlight knee/ceiling -> shipped values",
+            Self::SyntheticGreenOff => "synthetic green -> off",
             Self::InteractiveSteps => "cloud steps -> interactive",
             Self::ShippedTopdownCloudNorm => "top-down cloud normalization -> shipped value",
         }
@@ -236,12 +408,22 @@ pub struct RenderParams {
     /// A wrfout file (ingested to a brick if not cached under `cache`) OR a cached
     /// `run.json`.
     pub input: PathBuf,
+    /// Brick extinction storage/precision. CompactU8 is the shipping default;
+    /// ScienceCloudF16 is an explicit CPU-only opt-in with a disjoint cache.
+    pub storage_profile: StorageProfile,
     /// Single-frame execution backend. CPU is the stable default. GPU preview never
     /// mutates this struct: [`render`] plans temporary compatibility substitutions on a
     /// clone and reports all of them in [`RenderResult::diagnostics`].
     pub backend: RenderBackend,
+    /// Output intent. [`RenderIntent::Display`] is the unchanged shipped default;
+    /// [`RenderIntent::SensorFastGray`] applies the strict, provenance-bearing
+    /// `simsat-fast-gray-v1` parameter plan on a clone before rendering.
+    pub intent: RenderIntent,
     /// The satellite preset (geostationary view only; ignored for top-down).
     pub satellite: SatellitePreset,
+    /// Sensor-raster navigation. The unchanged default uses the WRF/model sphere;
+    /// `GoesRAbiFixedGrid` is an opt-in official ABI ellipsoid/sweep-x geometry.
+    pub geo_navigation: GeoNavigation,
     /// Time index into the wrfout / manifest.
     pub timestep: usize,
     /// The output view: top-down map (default) or from-space geostationary.
@@ -284,7 +466,8 @@ pub struct RenderParams {
     /// Explicit higher-order cloud-transport mode. `None` preserves the established
     /// `multiscatter` boolean exactly (`true` = legacy octaves, `false` = single scatter).
     /// `Some(DeltaFluxV1)` selects the opt-in isotropic Stage-2 Monte Carlo depth-source
-    /// candidate; `Some(DeltaFluxV2)` selects its brightness-neutral v2b P1 reconstruction.
+    /// candidate; `Some(DeltaFluxV2)` selects its brightness-neutral v2b P1 reconstruction,
+    /// and `Some(DeltaFluxV3)` selects the bounded successive-order memory candidate.
     pub cloud_multiscatter: Option<CloudMultiscatterMode>,
     /// Schneider beer-powder shaping of the direct cloud-sun term (visible only).
     /// Off by default; this is an appearance/QA switch and does not change cloud
@@ -301,6 +484,13 @@ pub struct RenderParams {
     /// `false` for the legacy behavior that treats every non-zero cloudy grid cell as
     /// horizontally full. Thermal and quantitative derived products are unchanged.
     pub fractional_clouds: bool,
+    /// Fractional-cloud closure selected when [`Self::fractional_clouds`] is true.
+    /// `EffectiveOd` is the unchanged shipped/default behavior. The deterministic
+    /// variants perform 4/8/16 fixed shared-u CPU marches and average pre-tonemap
+    /// radiance.
+    /// `Off` is equivalent to the legacy full-cell path and is provided so new API
+    /// callers can use one honest enum while the legacy bool remains source-compatible.
+    pub fractional_cloud_mode: FractionalCloudMode,
     /// Multiplicative cloud optical-depth calibration (visible only). The shipped default
     /// is [`crate::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE`]; `1.0` consumes the
     /// model-derived extinction unchanged, while `0.0` makes cloud extinction transparent.
@@ -308,18 +498,22 @@ pub struct RenderParams {
     /// view, secondary-sun, ambient, and ground-shadow optical depths. The quantitative
     /// derived cloud-optical-depth product remains the unscaled physical input.
     pub cloud_optical_depth_scale: f32,
+    /// Ingest-time hydrometeor particle-size mapping. Fixed is the stable default.
+    /// `NsslNative` is an explicit WRF-MP18 visible-optics experiment and uses a
+    /// separate cache namespace; invalid native moments fall back per cell.
+    pub cloud_optics: CloudOpticsMode,
     /// Display-only presentation experiment: fade visible cloud extinction over the
     /// existing fixed 4% domain-edge band whenever the camera raster exposes samples
     /// beyond the finite WRF domain, even with zero zoom-out margin. On is the shipped
     /// v0.1.5 visible preset; Off is the exact pre-v0.1.5 margin-gated behavior. Finished Visible RGB-family, CloudLayer, and
-    /// Perspective products consume it; raw VisibleBands, thermal, and derived products
+    /// Perspective products consume it; raw RGB reflectance, thermal, and derived products
     /// deliberately ignore it.
     pub feather_exposed_domain_edges: bool,
     /// Sub-grid cloud GRANULATION (edge-erosion detail noise — see the granulation
     /// section of [`crate::clouds`]). `None` (the default) and `Some(false)` keep it
     /// OFF; `Some(true)` enables it for DISPLAY products ([`Product::VisibleRgb`], and
     /// through it the GeoColor day half and the Sandwich visible base). Quantitative
-    /// raw-reflectance [`Product::VisibleBands`] stays OFF. The raw-Kelvin thermal products
+    /// raw-reflectance [`Product::RgbReflectance`] stays OFF. The raw-Kelvin thermal products
     /// ([`Product::Ir`] / [`Product::WaterVapor`]) and [`Product::Derived`] never
     /// granulate — they read the un-eroded brick by construction, so quantitative BT
     /// verification always reflects model skill, not display texturing. `Some(bool)`
@@ -331,6 +525,12 @@ pub struct RenderParams {
     /// marching while conserving selected-area OD and preserving each column's vertical
     /// structure/species mix. Geostationary and raw visible bands ignore it.
     pub topdown_stratiform_regularization: bool,
+    /// Display-only top-down cloud pixel footprint. When enabled for finished Visible
+    /// RGB-family products, a bounded seven-tap separable binomial footprint is applied
+    /// only to the pre-tonemap cloud radiance residual; the surface stays pixel-sharp.
+    /// Geostationary, raw visible bands, thermal, derived, cloud-layer, and perspective
+    /// products ignore it. Explicitly opt-in and off by default.
+    pub topdown_cloud_footprint: bool,
     /// Optional synthetic sun override (visible only).
     pub sun_override: Option<SunOverride>,
     /// Brick cache root (read/write) + seasonal Blue Marble cache.
@@ -340,6 +540,17 @@ pub struct RenderParams {
     /// For the IR product: also produce a colored RGB via this enhancement (the raw Kelvin
     /// BT plane is always returned). `None` = BT only.
     pub ir_enhancement: Option<IrEnhancement>,
+    /// Thermal source/response model for ABI Band 13 products. The default
+    /// [`ThermalSensor::FastGray`] preserves the historical 10.3 um center-wavelength
+    /// path; [`ThermalSensor::GoesRAbiBand13Fm4`] is the opt-in official FM4 SRF.
+    /// Water-vapor bands retain their own center-wavelength gray response.
+    pub thermal_sensor: ThermalSensor,
+    /// Optional instrument spatial-response stage. The ABI Band 13 prototype acts
+    /// on complete linear channel radiance on the exact global 56-urad ABI lattice,
+    /// before BT inversion. It requires GOES-R sweep-x navigation, ABI 2-km output,
+    /// and the official FM4 response. This is distinct from the display-only
+    /// top-down cloud-residual footprint and remains off by default.
+    pub instrument_footprint: InstrumentFootprint,
     /// For the [`Product::Derived`] products: also produce the basic studio colormap RGB (the
     /// raw physical `f32` field is always returned). `false` (the default) = raw field only —
     /// the binding's primary deliverable; the studio / CLI set it `true` for the coloured map.
@@ -361,6 +572,10 @@ pub struct RenderParams {
     /// the baked calibration. Display-only; raw visible bands, IR, and derived fields
     /// are unaffected.
     pub cloud_highlight_max: Option<f64>,
+    /// ABI synthetic-green display transform. Kept explicit on the request so Sensor
+    /// Fast Gray can deterministically disable and report it without process-global
+    /// state. Off is the unchanged shipped default.
+    pub synthetic_green: bool,
     /// Optional `render_frame` override for the TOP-DOWN CLOUD NORMALIZATION
     /// ([`crate::topdown::TOPDOWN_CLOUD_NORM`]; `1.0` = no normalization). `None` (default)
     /// = the baked constant. The `render_frame` `topdown-cloudnorm=` knob sets it.
@@ -380,8 +595,11 @@ impl RenderParams {
     pub fn new(input: PathBuf) -> Self {
         Self {
             input,
+            storage_profile: StorageProfile::CompactU8,
             backend: RenderBackend::Cpu,
+            intent: RenderIntent::Display,
             satellite: SatellitePreset::GoesEast,
+            geo_navigation: GeoNavigation::ModelSphere,
             timestep: 0,
             view: ViewMode::TopDownMap,
             resolution: ResolutionMode::Native,
@@ -398,20 +616,26 @@ impl RenderParams {
             steps: StepQuality::Offline,
             clouds: true,
             fractional_clouds: true,
+            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            cloud_optics: CloudOpticsMode::Fixed,
             feather_exposed_domain_edges: true,
             granulation: None,
             // v0.1.6 candidate remains explicit opt-in until multi-case owner QA.
             topdown_stratiform_regularization: false,
+            topdown_cloud_footprint: false,
             sun_override: None,
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
             ir_enhancement: None,
+            thermal_sensor: ThermalSensor::FastGray,
+            instrument_footprint: InstrumentFootprint::Off,
             derived_colormap: false,
             raster_override: None,
             ground_gain: None,
             cloud_softclip: None,
             cloud_highlight_max: None,
+            synthetic_green: false,
             topdown_cloud_norm: None,
             perspective: None,
         }
@@ -464,6 +688,9 @@ pub struct Georef {
     /// [`Product::Perspective`] (the what-if labeling discipline: a perspective frame
     /// always carries its camera). `None` for every other product.
     pub camera_pose: Option<PerspectiveCamera>,
+    /// Exact geostationary sensor-raster navigation metadata. `None` for
+    /// top-down, cloud-layer delivery, and free-perspective products.
+    pub geo_navigation: Option<GeoNavigationGeometry>,
 }
 
 impl Georef {
@@ -500,6 +727,12 @@ impl Georef {
                 .to_string();
         }
         if self.extent_kind == ExtentKind::LonLatDegrees {
+            if let Some(nav) = self.geo_navigation {
+                return format!(
+                    "+proj=longlat +a={} +b={} +no_defs",
+                    nav.semi_major_axis_m, nav.semi_minor_axis_m
+                );
+            }
             return format!("+proj=longlat +R={r} +no_defs");
         }
         let p = &self.projection;
@@ -633,12 +866,32 @@ pub struct RenderResult {
     /// scoping). Recorded like the fake-sun what-if label so a consumer can see the
     /// display texturing was active; always `false` for the thermal / derived products.
     pub granulation: bool,
+    /// Whether the display-only top-down cloud-radiance footprint was actually active.
+    /// Always false for non-top-down/non-finished-visible products and strict sensor intent.
+    pub topdown_cloud_footprint: bool,
+    /// Intent actually used for this frame.
+    pub intent: RenderIntent,
+    /// Stable observation-operator provenance slug. This is
+    /// `simsat-fast-gray-v1` for Sensor Fast Gray, never the name of a real ABI/AHI
+    /// channel simulation.
+    pub observation_operator: &'static str,
+    /// Exact strict-intent substitutions made on a cloned request. Empty for Display.
+    pub intent_adjustments: Vec<RenderIntentAdjustment>,
     /// Backend actually used for this frame.
     pub backend: RenderBackend,
     /// Explicit temporary GPU-preview substitutions. Empty on CPU.
     pub diagnostics: Vec<GpuPreviewAdjustment>,
     /// Adapter name when [`RenderBackend::GpuPreview`] ran successfully.
     pub gpu_adapter: Option<String>,
+    /// Thermal spectral response carried by IR or an IR-containing composite.
+    /// `None` for products with no thermal component.
+    pub thermal_sensor: Option<ThermalSensor>,
+    /// Instrument spatial response actually applied to this result.
+    pub instrument_footprint: InstrumentFootprint,
+    /// Explicit science limitations attached to the selected observation operator.
+    pub science_warnings: Vec<String>,
+    /// Storage profile actually decoded for this frame.
+    pub storage_profile: StorageProfile,
 }
 
 /// Resolved scene inputs (a wrfout ingest-if-needed, or a cached run.json).
@@ -653,12 +906,102 @@ struct SceneSource {
 /// binding. Resolves the source (ingesting the wrfout timestep to a brick if needed),
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
+    let product = product.canonical();
+    if params.instrument_footprint != InstrumentFootprint::Off {
+        if !matches!(product, Product::Ir | Product::GeoColor | Product::Sandwich) {
+            return Err(format!(
+                "instrument_footprint={} currently supports ABI Band 13, GeoColor, and Sandwich only",
+                params.instrument_footprint.slug()
+            ));
+        }
+        if params.thermal_sensor != ThermalSensor::GoesRAbiBand13Fm4 {
+            return Err(format!(
+                "instrument_footprint={} requires thermal_sensor=goes-r-abi-band13-fm4 so the spatial-response experiment cannot be attributed to ABI while using the center-wavelength gray source model",
+                params.instrument_footprint.slug()
+            ));
+        }
+        if params.view != ViewMode::Geostationary
+            || params.geo_navigation != GeoNavigation::GoesRAbiFixedGrid
+            || params.resolution != ResolutionMode::Abi2km
+        {
+            return Err(format!(
+                "instrument_footprint={} requires view=geostationary, geo-navigation=goes-r-abi, and resolution=abi2km; that combination selects the exact globally anchored 56-urad ABI lattice",
+                params.instrument_footprint.slug()
+            ));
+        }
+        if params.backend != RenderBackend::Cpu {
+            return Err("instrument footprints currently require backend=cpu".to_string());
+        }
+    }
+    if params.storage_profile == StorageProfile::ScienceCloudF16
+        && params.backend == RenderBackend::GpuPreview
+    {
+        return Err(
+            "storage-profile=science-cloud-f16 currently requires backend=cpu: the GPU cloud path uploads CompactU8 codes directly and cannot consume the authoritative decoded f16 extinction volumes without discarding their precision"
+                .to_string(),
+        );
+    }
+    if params.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+        && params.view == ViewMode::Geostationary
+        && params.backend == RenderBackend::GpuPreview
+    {
+        return Err(
+            "geo-navigation=goes-r-abi currently requires backend=cpu: the GPU preview assumes one linear model-sphere scan grid and cannot yet consume the per-pixel ellipsoid-to-model ray map"
+                .to_string(),
+        );
+    }
+    if params.cloud_optics != CloudOpticsMode::Fixed
+        && matches!(
+            product,
+            Product::Ir | Product::WaterVapor { .. } | Product::GeoColor | Product::Sandwich
+        )
+    {
+        return Err(format!(
+            "cloud_optics={} is currently a visible-optics experiment; thermal, GeoColor, and Sandwich products require cloud_optics=fixed so their fixed-radius IR mass recovery remains self-consistent",
+            params.cloud_optics.token()
+        ));
+    }
     let requested_backend = params.backend;
+    if params.intent == RenderIntent::SensorFastGray
+        && requested_backend == RenderBackend::GpuPreview
+    {
+        return Err(
+            "intent=sensor-fast-gray currently requires backend=cpu: the bounded GPU preview disables model cloud fraction and restores display highlights, which would violate the strict operator"
+                .to_string(),
+        );
+    }
+    let (intent_effective, intent_adjustments) = plan_render_intent(params);
     let (effective, product, diagnostics) = if requested_backend == RenderBackend::GpuPreview {
-        plan_gpu_preview(params, product)?
+        plan_gpu_preview(&intent_effective, product)?
     } else {
-        (params.clone(), product, Vec::new())
+        (intent_effective, product, Vec::new())
     };
+    let deterministic_fractional =
+        effective.fractional_clouds && effective.fractional_cloud_mode.is_deterministic();
+    if deterministic_fractional
+        && matches!(product, Product::CloudLayer | Product::Perspective { .. })
+    {
+        return Err(format!(
+            "fractional-clouds={} is a CPU visible-frame reference and does not yet support product {}; use effective-od or off",
+            effective.fractional_cloud_mode.slug(),
+            match product {
+                Product::CloudLayer => "cloud-layer",
+                Product::Perspective { .. } => "perspective",
+                _ => unreachable!(),
+            }
+        ));
+    }
+    if deterministic_fractional
+        && matches!(
+            product,
+            Product::Ir | Product::WaterVapor { .. } | Product::Derived { .. }
+        )
+    {
+        crate::log_line!(
+            "simsat api: fractional-clouds={} ignored for non-visible product",
+            effective.fractional_cloud_mode.slug()
+        );
+    }
     let src = resolve_source(&effective)?;
     if requested_backend == RenderBackend::GpuPreview && !gpu::projection_supported(&src.georef) {
         return Err(
@@ -669,9 +1012,13 @@ pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, S
     let mut result = match product {
         // The IR window (band 13) and the WV bands (8/9/10) share ONE thermal march; they
         // differ only in the `IrConfig` (wavelength + WV mass-absorption / band selector).
-        Product::Ir => render_ir_scene(&src, &effective, IrConfig::band13()),
+        Product::Ir => render_ir_scene(
+            &src,
+            &effective,
+            IrConfig::band13_with_sensor(effective.thermal_sensor),
+        ),
         Product::WaterVapor { band } => render_ir_scene(&src, &effective, band.ir_config()),
-        Product::VisibleRgb | Product::VisibleBands => {
+        Product::VisibleRgb | Product::RgbReflectance => {
             render_visible_scene(&src, &effective, product)
         }
         // GeoColor renders the visible + IR frames through the SAME paths and blends them.
@@ -688,10 +1035,77 @@ pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, S
         Product::Perspective { cloud_layer_only } => {
             render_perspective_scene(&src, &effective, cloud_layer_only)
         }
+        other => unreachable!("non-canonical product reached dispatch: {other:?}"),
     }?;
     result.backend = requested_backend;
     result.diagnostics = diagnostics;
+    result.intent = params.intent;
+    result.observation_operator = params.intent.observation_operator();
+    result.intent_adjustments = intent_adjustments;
     Ok(result)
+}
+
+/// Resolve an output intent on a clone, preserving the caller request exactly.
+///
+/// Display is an exact no-op. Sensor Fast Gray keeps the physical/model controls
+/// (including model fractional-cloud handling, atmospheric aerosol/Rayleigh physics,
+/// cloud transport, terrain-height atmosphere, and real/fake sun selection) but
+/// neutralizes the appearance calibrations listed in [`RenderIntentAdjustment`].
+pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderIntentAdjustment>) {
+    if params.intent == RenderIntent::Display {
+        return (params.clone(), Vec::new());
+    }
+
+    let mut p = params.clone();
+    let mut changes = Vec::new();
+    if (p.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON {
+        p.cloud_optical_depth_scale = 1.0;
+        changes.push(RenderIntentAdjustment::CloudOpticalDepthUnscaled);
+    }
+    if (p.exposure - 1.0).abs() > f64::EPSILON {
+        p.exposure = 1.0;
+        changes.push(RenderIntentAdjustment::ExposureNeutral);
+    }
+    if p.ground_gain.unwrap_or(crate::render::GROUND_DAY_LIFT) != 1.0 {
+        p.ground_gain = Some(1.0);
+        changes.push(RenderIntentAdjustment::GroundLiftNeutral);
+    }
+    if p.land_appearance != LandAppearanceConfig::identity() {
+        p.land_appearance = LandAppearanceConfig::identity();
+        changes.push(RenderIntentAdjustment::LandAppearanceIdentity);
+    }
+    if p.feather_exposed_domain_edges {
+        p.feather_exposed_domain_edges = false;
+        changes.push(RenderIntentAdjustment::ExposedEdgeFeatherOff);
+    }
+    if p.granulation.unwrap_or(false) {
+        p.granulation = Some(false);
+        changes.push(RenderIntentAdjustment::GranulationOff);
+    }
+    if p.topdown_stratiform_regularization {
+        p.topdown_stratiform_regularization = false;
+        changes.push(RenderIntentAdjustment::TopdownStratiformRegularizationOff);
+    }
+    if p.topdown_cloud_footprint {
+        p.topdown_cloud_footprint = false;
+        changes.push(RenderIntentAdjustment::TopdownCloudFootprintOff);
+    }
+    if p.atmosphere_correction {
+        p.atmosphere_correction = false;
+        changes.push(RenderIntentAdjustment::AtmosphereCorrectionOff);
+    }
+    if p.cloud_softclip.unwrap_or(CLOUD_SOFTCLIP_KNEE) != 1.0
+        || p.cloud_highlight_max.unwrap_or(RHO_HIGHLIGHT_MAX) != 1.0
+    {
+        p.cloud_softclip = Some(1.0);
+        p.cloud_highlight_max = Some(1.0);
+        changes.push(RenderIntentAdjustment::HighlightShoulderIdentity);
+    }
+    if p.synthetic_green {
+        p.synthetic_green = false;
+        changes.push(RenderIntentAdjustment::SyntheticGreenOff);
+    }
+    (p, changes)
 }
 
 /// Build the bounded GPU-preview configuration without mutating caller parameters.
@@ -720,9 +1134,16 @@ pub fn plan_gpu_preview(
         p.terrain_atmosphere = false;
         changes.push(GpuPreviewAdjustment::TerrainAtmosphereOff);
     }
-    if p.fractional_clouds {
+    if p.fractional_clouds && p.fractional_cloud_mode != FractionalCloudMode::Off {
+        if p.fractional_cloud_mode.is_deterministic() {
+            changes.push(GpuPreviewAdjustment::FractionalSubcolumnsOff);
+        } else {
+            changes.push(GpuPreviewAdjustment::FractionalCloudsOff);
+        }
+    }
+    if p.fractional_clouds || p.fractional_cloud_mode != FractionalCloudMode::Off {
         p.fractional_clouds = false;
-        changes.push(GpuPreviewAdjustment::FractionalCloudsOff);
+        p.fractional_cloud_mode = FractionalCloudMode::Off;
     }
     if p.granulation.unwrap_or(false) {
         p.granulation = Some(false);
@@ -731,6 +1152,10 @@ pub fn plan_gpu_preview(
     if p.topdown_stratiform_regularization {
         p.topdown_stratiform_regularization = false;
         changes.push(GpuPreviewAdjustment::TopdownStratiformRegularizationOff);
+    }
+    if p.topdown_cloud_footprint {
+        p.topdown_cloud_footprint = false;
+        changes.push(GpuPreviewAdjustment::TopdownCloudFootprintOff);
     }
     if p.feather_exposed_domain_edges {
         p.feather_exposed_domain_edges = false;
@@ -752,6 +1177,10 @@ pub fn plan_gpu_preview(
         p.cloud_softclip = None;
         p.cloud_highlight_max = None;
         changes.push(GpuPreviewAdjustment::ShippedHighlights);
+    }
+    if p.synthetic_green {
+        p.synthetic_green = false;
+        changes.push(GpuPreviewAdjustment::SyntheticGreenOff);
     }
     if p.steps != StepQuality::Interactive {
         p.steps = StepQuality::Interactive;
@@ -786,7 +1215,8 @@ fn render_visible_scene(
     // Output raster: the from-space scan raster, the top-down map raster, or an explicit
     // override (the supersample QA raster). The top-down map is adapted to a SurfaceRaster
     // so the shared LUT + Blue Marble + assemble machinery is identical for both views.
-    let camera = GeoCamera::new(params.satellite);
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
     let margin = params.margin_frac as f64;
     let raster = match &params.raster_override {
         Some(r) => r.clone(),
@@ -848,7 +1278,7 @@ fn render_visible_scene(
     };
     let luts = AtmosphereLuts::build(&atmo_params);
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
-    let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
+    let cam_geo = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
 
     // Sub-grid cloud GRANULATION (edge-erosion detail noise): OPT-IN (default OFF)
     // as of v0.1.1 — the round-1 default-ON look was owner-rejected on coarse-grid
@@ -863,6 +1293,10 @@ fn render_visible_scene(
     let gran_on = params.clouds
         && params.granulation.unwrap_or(false)
         && matches!(product, Product::VisibleRgb);
+    let topdown_cloud_footprint_on = params.clouds
+        && is_topdown
+        && matches!(product, Product::VisibleRgb)
+        && params.topdown_cloud_footprint;
     let granulation = if gran_on {
         Some(clouds::Granulation::for_grid(horiz_pitch_m))
     } else {
@@ -889,11 +1323,12 @@ fn render_visible_scene(
         } else {
             CloudMultiscatterMode::SingleScatter
         }),
+        synthetic_green: params.synthetic_green,
         granulation,
         ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch_m).max(1.0))
     };
     // Appearance-pass wiring: Off preserves the exact pre-v0.1.5 margin-gated edge feather.
-    // The exposed-edge control is finished-display only; raw VisibleBands keep
+    // The exposed-edge control is finished-display only; raw RGB reflectance keeps
     // the existing margin behavior even if the same RenderParams is reused for an RGB A/B.
     cfg.edge_feather_cells = clouds::edge_feather_cells_for_raster(
         margin,
@@ -903,7 +1338,7 @@ fn render_visible_scene(
         &raster.grid_i,
         &raster.grid_j,
     );
-    // Display-only appearance overrides are deliberately ignored by VisibleBands.
+    // Display-only appearance overrides are deliberately ignored by RgbReflectance.
     // That product remains the stable pre-tonemap diagnostic even when the same
     // RenderParams is reused for an RGB A/B render.
     if matches!(product, Product::VisibleRgb) {
@@ -935,6 +1370,7 @@ fn render_visible_scene(
         ground_day_lift: cfg.ground_day_lift,
         cloud_softclip_knee: cfg.cloud_softclip_knee,
         cloud_highlight_max: cfg.cloud_highlight_max,
+        synthetic_green: params.synthetic_green,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
         land_appearance: if matches!(product, Product::VisibleRgb) {
@@ -984,9 +1420,200 @@ fn render_visible_scene(
         gpu_adapter = Some(adapter);
         let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
         (FrameData::Visible { rgb, rgba }, None)
+    } else if params.clouds
+        && params.fractional_clouds
+        && params.fractional_cloud_mode.is_deterministic()
+        && brick.has_cloud_fraction
+    {
+        let member_count = params
+            .fractional_cloud_mode
+            .deterministic_subcolumn_count()
+            .expect("deterministic branch requires an explicit member count");
+        if is_topdown
+            && matches!(product, Product::VisibleRgb)
+            && params.topdown_stratiform_regularization
+        {
+            return Err(format!(
+                "fractional-clouds={} cannot be combined with top-down stratiform reconstruction; disable one operator so the reference remains attributable",
+                params.fractional_cloud_mode.slug()
+            ));
+        }
+
+        // Selectable fixed-stratified shared-u maximum-overlap members. Each member
+        // gets one authoritative decoded extinction, occupancy, sun OD, secondary-
+        // sun march, ambient transfer and ground shadow. Only the atmosphere-only
+        // froxel is shared. Accumulate UNCLAMPED LINEAR RADIANCE and tonemap once.
+        let scan_rect = raster.model_scan_rect();
+        let froxel = atmosphere::build_aerial_froxel(
+            &luts,
+            &atmo_params,
+            &cam_geo,
+            sun_ecef,
+            scan_rect,
+            AERIAL_FROXEL_DIM,
+        );
+        let mut radiance_sum = vec![0.0f64; rnx * rny * 3];
+        let mut alpha = vec![0u8; rnx * rny];
+        let mut grid_mean_tau = 0.0f64;
+        let mut represented_tau_sum = 0.0f64;
+        let mut partial_layers = 0usize;
+        let mut selected_partial_layers = 0usize;
+        let mut repaired_zero = 0usize;
+
+        for member in 0..member_count {
+            let mut vol = DecodedVolume::from_brick(brick, horiz_pitch_m);
+            let sub = vol.apply_deterministic_fractional_subcolumn_count(member, member_count)?;
+            if member == 0 {
+                grid_mean_tau = sub.grid_mean_cloud_tau;
+                partial_layers = sub.fractional_layer_count;
+                repaired_zero = sub.repaired_zero_count;
+            }
+            represented_tau_sum += sub.subcolumn_cloud_tau;
+            selected_partial_layers += sub.cloudy_fractional_layer_count;
+            crate::log_line!(
+                "simsat api: visible {} member {}/{} u={:.4} ({} / {} partial layers cloudy; cloud tau {:.6})",
+                params.fractional_cloud_mode.slug(),
+                member + 1,
+                member_count,
+                sub.subcolumn_u,
+                sub.cloudy_fractional_layer_count,
+                sub.fractional_layer_count,
+                sub.subcolumn_cloud_tau,
+            );
+
+            let mip = OccupancyMip::build(&vol, clouds::OCCUPANCY_MIP_FACTOR);
+            let sun_od = clouds::accumulate_sun_od_granulated(
+                &vol,
+                georef,
+                sun_ecef,
+                SUN_OD_RESOLUTION,
+                clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+                granulation,
+            );
+            let scene = CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od: &sun_od,
+                georef,
+                luts: &luts,
+                sky_sh: &sky_sh,
+                sun_ecef,
+                cfg,
+            };
+            let (member_radiance, member_alpha) = if is_topdown {
+                crate::topdown::render_topdown_frame_linear_radiance(
+                    &surf,
+                    Some(&scene),
+                    &raster.lat,
+                    &raster.lon,
+                    rnx,
+                    rny,
+                    &assemble,
+                    if matches!(product, Product::VisibleRgb) {
+                        cfg.topdown_cloud_norm
+                    } else {
+                        1.0
+                    },
+                )
+            } else {
+                clouds::render_cloud_frame_linear_radiance(
+                    &scene, &surf, &froxel, &raster, &assemble,
+                )
+            };
+            for (sum, value) in radiance_sum.iter_mut().zip(member_radiance) {
+                *sum += value;
+            }
+            if member == 0 {
+                alpha = member_alpha;
+            } else {
+                debug_assert_eq!(alpha, member_alpha);
+            }
+        }
+
+        let members = member_count as f64;
+        let represented_mean_tau = represented_tau_sum / members;
+        crate::log_line!(
+            "simsat api: fractional-clouds={} complete ({} fixed-stratified shared-u maximum-overlap members; {} source partial layers; {} member-layer selections; {} zero-fraction repairs; ensemble cloud tau {:.6} vs grid-mean {:.6}, ratio {:.4}; average linear radiance then one tonemap)",
+            params.fractional_cloud_mode.slug(),
+            member_count,
+            partial_layers,
+            selected_partial_layers,
+            repaired_zero,
+            represented_mean_tau,
+            grid_mean_tau,
+            if grid_mean_tau > 0.0 {
+                represented_mean_tau / grid_mean_tau
+            } else {
+                1.0
+            },
+        );
+
+        let data = match product {
+            Product::VisibleRgb => {
+                let mut rgba = vec![0u8; rnx * rny * 4];
+                for idx in 0..rnx * rny {
+                    if alpha[idx] == 0 {
+                        continue;
+                    }
+                    let mut l = [
+                        radiance_sum[idx * 3] / members,
+                        radiance_sum[idx * 3 + 1] / members,
+                        radiance_sum[idx * 3 + 2] / members,
+                    ];
+                    let pixel = assemble(idx % rnx, idx / rnx);
+                    l = apply_low_sun_illuminant(
+                        l,
+                        pixel.on_earth,
+                        pixel.sun_elev_deg as f64,
+                        surf.luts,
+                    );
+                    let display = radiance_to_rgba_softclip(
+                        l,
+                        surf.output_transform,
+                        surf.exposure,
+                        cfg.cloud_softclip_knee,
+                        cfg.cloud_highlight_max,
+                    );
+                    for c in 0..4 {
+                        rgba[idx * 4 + c] = (display[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    }
+                }
+                let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
+                FrameData::Visible { rgb, rgba }
+            }
+            Product::RgbReflectance => {
+                let mut reflectance = vec![0.0f32; rnx * rny * 3];
+                for idx in 0..rnx * rny {
+                    if alpha[idx] == 0 {
+                        continue;
+                    }
+                    let rho = reflectance_from_radiance([
+                        radiance_sum[idx * 3] / members,
+                        radiance_sum[idx * 3 + 1] / members,
+                        radiance_sum[idx * 3 + 2] / members,
+                    ]);
+                    reflectance[idx * 3..idx * 3 + 3].copy_from_slice(&rho);
+                }
+                FrameData::Bands { reflectance }
+            }
+            _ => unreachable!("render_visible_scene received a non-visible product"),
+        };
+        (data, None)
     } else if params.clouds {
-        let fractional_requested = params.fractional_clouds;
-        let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
+        let fractional_requested =
+            params.fractional_clouds && params.fractional_cloud_mode != FractionalCloudMode::Off;
+        if params.fractional_clouds
+            && params.fractional_cloud_mode.is_deterministic()
+            && !brick.has_cloud_fraction
+        {
+            crate::log_line!(
+                "simsat api: fractional-clouds={} requested but source has no trusted cloud-fraction field; falling back explicitly to legacy full-cell clouds",
+                params.fractional_cloud_mode.slug()
+            );
+        }
+        let fractional_clouds = fractional_requested
+            && params.fractional_cloud_mode == FractionalCloudMode::EffectiveOd
+            && brick.has_cloud_fraction;
         let mut vol = if fractional_clouds {
             DecodedVolume::from_brick(brick, horiz_pitch_m)
         } else {
@@ -1023,7 +1650,7 @@ fn render_visible_scene(
             clouds::SUN_OD_EDGE_FEATHER_TEXELS,
             granulation,
         );
-        let scan_rect = scan_rect_of(&raster.scan);
+        let scan_rect = raster.model_scan_rect();
         let froxel = atmosphere::build_aerial_froxel(
             &luts,
             &atmo_params,
@@ -1045,7 +1672,7 @@ fn render_visible_scene(
         let data = match product {
             Product::VisibleRgb => {
                 let rgba = if is_topdown {
-                    render_topdown_frame_rgba(
+                    render_topdown_frame_rgba_with_cloud_footprint(
                         &surf,
                         Some(&scene),
                         &raster.lat,
@@ -1053,14 +1680,15 @@ fn render_visible_scene(
                         rnx,
                         rny,
                         assemble,
+                        params.topdown_cloud_footprint,
                     )
                 } else {
-                    render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+                    render_cloud_frame_rgba(&scene, &surf, &froxel, &raster, assemble)
                 };
                 let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
                 FrameData::Visible { rgb, rgba }
             }
-            Product::VisibleBands => {
+            Product::RgbReflectance => {
                 let reflectance = if is_topdown {
                     render_topdown_frame_reflectance(
                         &surf,
@@ -1072,7 +1700,7 @@ fn render_visible_scene(
                         assemble,
                     )
                 } else {
-                    render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster.scan, assemble)
+                    render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster, assemble)
                 };
                 FrameData::Bands { reflectance }
             }
@@ -1083,14 +1711,7 @@ fn render_visible_scene(
         } else {
             let stride = (rnx.max(rny) / 128).max(1);
             Some(clouds::cloud_frame_stats(
-                &scene,
-                &cam_geo,
-                &raster.lat,
-                &raster.lon,
-                &raster.grid_i,
-                &raster.scan,
-                stride,
-                0.98,
+                &scene, &cam_geo, &raster, stride, 0.98,
             ))
         };
         (data, cloud_stats)
@@ -1098,7 +1719,7 @@ fn render_visible_scene(
         let data = match product {
             Product::VisibleRgb => {
                 let rgba = if is_topdown {
-                    render_topdown_frame_rgba(
+                    render_topdown_frame_rgba_with_cloud_footprint(
                         &surf,
                         None,
                         &raster.lat,
@@ -1106,6 +1727,7 @@ fn render_visible_scene(
                         rnx,
                         rny,
                         assemble,
+                        params.topdown_cloud_footprint,
                     )
                 } else {
                     render_geo_surface_rgba(&surf, &raster, assemble)
@@ -1113,7 +1735,7 @@ fn render_visible_scene(
                 let rgb = rgba_to_rgb_black_space(&rgba, rnx, rny);
                 FrameData::Visible { rgb, rgba }
             }
-            Product::VisibleBands => {
+            Product::RgbReflectance => {
                 let reflectance = if is_topdown {
                     render_topdown_frame_reflectance(
                         &surf,
@@ -1149,9 +1771,17 @@ fn render_visible_scene(
         ground_source: Some(ground_source),
         ground_status,
         granulation: gran_on,
+        topdown_cloud_footprint: topdown_cloud_footprint_on,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter,
+        thermal_sensor: None,
+        instrument_footprint: InstrumentFootprint::Off,
+        science_warnings: Vec::new(),
+        storage_profile: src.brick.storage_profile,
     })
 }
 
@@ -1368,7 +1998,8 @@ fn render_ir_scene(
     let (nx, ny) = (brick.nx, brick.ny);
     let is_topdown = params.view == ViewMode::TopDownMap;
 
-    let camera = GeoCamera::new(params.satellite);
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
     let margin = params.margin_frac as f64;
     let raster = if is_topdown {
         let (dx_m, dy_m) = dx_dy_metres(proj);
@@ -1392,7 +2023,7 @@ fn render_ir_scene(
     let horiz_pitch_m = horiz_pitch_m(proj);
     let mip = OccupancyMip::from_quantized_brick(brick, clouds::OCCUPANCY_MIP_FACTOR);
     let vol = IrVolume::from_brick(brick, horiz_pitch_m);
-    let cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
+    let cam_geo = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
     let band = cfg.band;
     let scene = IrScene {
         vol: &vol,
@@ -1401,7 +2032,37 @@ fn render_ir_scene(
         cfg,
     };
 
-    let bt = if is_topdown {
+    let footprint_on = params.instrument_footprint == InstrumentFootprint::GoesRAbiBand13Mtf;
+    let bt = if footprint_on {
+        debug_assert!(!is_topdown);
+        debug_assert_eq!(band, 13);
+        let radiance = ir::render_ir_radiance_frame(&scene, &cam_geo, &raster);
+        let filtered = apply_band13_radiance_footprint_validated(&radiance, raster.nx, raster.ny);
+        let (x0, x1, y0, y1) = raster
+            .scan
+            .abi_2km_global_indices()
+            .expect("footprint guard selects an exact ABI 2-km lattice");
+        let validation_samples = filtered.validation_mask.iter().filter(|&&v| v != 0).count();
+        crate::log_line!(
+            "simsat api: instrument-footprint={} ON (complete Band 13 radiance, separable [0.15 0.70 0.15], exact global ABI lattice pitch {:.6}/{:.6} urad, signed crop indices x={x0}..{x1} y={y0}..{y1}); sweep-x navigation supplies off-nadir ground-footprint growth; validation support {validation_samples}/{} px after emitting {} finite crop/mask-perimeter samples as no-data",
+            params.instrument_footprint.slug(),
+            raster.scan.pitch_x * 1.0e6,
+            raster.scan.pitch_y * 1.0e6,
+            raster.nx * raster.ny,
+            filtered.excluded_finite_samples,
+        );
+        filtered
+            .radiance
+            .into_iter()
+            .map(|value| {
+                if value.is_finite() {
+                    cfg.brightness_temperature(value) as f32
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect()
+    } else if is_topdown {
         crate::topdown::render_topdown_ir_bt_frame(
             &scene,
             &raster.lat,
@@ -1411,7 +2072,7 @@ fn render_ir_scene(
             raster.ny,
         )
     } else {
-        ir::render_ir_bt_frame(&scene, &cam_geo, &raster.scan, &raster.grid_i)
+        ir::render_ir_bt_frame(&scene, &cam_geo, &raster)
     };
     let rgb = params
         .ir_enhancement
@@ -1434,15 +2095,40 @@ fn render_ir_scene(
         ground_status: Vec::new(),
         // The raw-Kelvin thermal march reads the un-eroded brick by construction.
         granulation: false,
+        topdown_cloud_footprint: false,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: Some(cfg.sensor),
+        instrument_footprint: if footprint_on {
+            params.instrument_footprint
+        } else {
+            InstrumentFootprint::Off
+        },
+        science_warnings: cfg
+            .sensor
+            .limitation_warning()
+            .into_iter()
+            .chain(
+                params
+                    .instrument_footprint
+                    .metadata()
+                    .limitation
+                    .filter(|_| footprint_on),
+            )
+            .map(str::to_string)
+            .collect(),
+        storage_profile: src.brick.storage_profile,
     })
 }
 
 // ── GeoColor day/night blend (true-color by day, colored IR by night) ───────────
 
-/// Render the GeoColor day/night blend. Renders the finished true-color visible frame
+/// Render SimSat Day/Night Color, a GeoColor-style blend. It is not yet sensor-derived ABI
+/// GeoColor: the day side uses SimSat's broad-RGB operator. Renders the visible frame
 /// ([`render_visible_scene`] / [`Product::VisibleRgb`]) AND the band-13 colored-IR frame
 /// ([`render_ir_scene`] through [`geocolor::GEOCOLOR_NIGHT_ENHANCEMENT`]) through the SAME
 /// render paths, then blends them per pixel by the PER-PIXEL solar elevation (see
@@ -1468,7 +2154,11 @@ fn render_geocolor_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
     //    enhancement. Reuses the SAME IR march the Ir product uses.
     let mut ir_params = base.clone();
     ir_params.ir_enhancement = Some(geocolor::GEOCOLOR_NIGHT_ENHANCEMENT);
-    let ir = render_ir_scene(src, &ir_params, IrConfig::band13())?;
+    let ir = render_ir_scene(
+        src,
+        &ir_params,
+        IrConfig::band13_with_sensor(base.thermal_sensor),
+    )?;
     let ir_rgb = match &ir.data {
         FrameData::Ir { rgb: Some(rgb), .. } => rgb,
         _ => return Err("geocolor: the IR frame is missing its enhancement RGB".to_string()),
@@ -1517,9 +2207,17 @@ fn render_geocolor_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         ground_status: vis.ground_status,
         // The day half is the visible product; the IR night half never granulates.
         granulation: vis.granulation,
+        topdown_cloud_footprint: vis.topdown_cloud_footprint,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: ir.thermal_sensor,
+        instrument_footprint: ir.instrument_footprint,
+        science_warnings: ir.science_warnings.clone(),
+        storage_profile: vis.storage_profile,
     })
 }
 
@@ -1553,7 +2251,11 @@ fn render_sandwich_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
     //    Ir product uses.
     let mut ir_params = base.clone();
     ir_params.ir_enhancement = Some(sandwich::SANDWICH_ENHANCEMENT);
-    let ir = render_ir_scene(src, &ir_params, IrConfig::band13())?;
+    let ir = render_ir_scene(
+        src,
+        &ir_params,
+        IrConfig::band13_with_sensor(base.thermal_sensor),
+    )?;
     let (bt, ir_rgb) = match &ir.data {
         FrameData::Ir {
             bt_kelvin,
@@ -1587,9 +2289,17 @@ fn render_sandwich_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         ground_status: vis.ground_status,
         // The visible base carries the granulation; the IR overlay never granulates.
         granulation: vis.granulation,
+        topdown_cloud_footprint: vis.topdown_cloud_footprint,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: ir.thermal_sensor,
+        instrument_footprint: ir.instrument_footprint,
+        science_warnings: ir.science_warnings.clone(),
+        storage_profile: vis.storage_profile,
     })
 }
 
@@ -1617,7 +2327,8 @@ fn render_derived_scene(
     let (nx, ny) = (brick.nx, brick.ny);
     let is_topdown = params.view == ViewMode::TopDownMap;
 
-    let camera = GeoCamera::new(params.satellite);
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
     let margin = params.margin_frac as f64;
     let raster = if is_topdown {
         let (dx_m, dy_m) = dx_dy_metres(proj);
@@ -1672,9 +2383,17 @@ fn render_derived_scene(
         ground_status: Vec::new(),
         // Derived fields are per-column brick integrals — never granulated.
         granulation: false,
+        topdown_cloud_footprint: false,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: None,
+        instrument_footprint: InstrumentFootprint::Off,
+        science_warnings: Vec::new(),
+        storage_profile: src.brick.storage_profile,
     })
 }
 
@@ -1735,7 +2454,8 @@ fn render_cloud_layer_scene(
 
         // M4/M5 cloud volume + scene (granulation scoping: the layer is a DISPLAY product —
         // the same opt-in rule as VisibleRgb).
-        let fractional_requested = params.fractional_clouds;
+        let fractional_requested =
+            params.fractional_clouds && params.fractional_cloud_mode != FractionalCloudMode::Off;
         let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
         let mut vol = if fractional_clouds {
             DecodedVolume::from_brick(brick, horiz_pitch)
@@ -1783,6 +2503,7 @@ fn render_cloud_layer_scene(
             } else {
                 CloudMultiscatterMode::SingleScatter
             }),
+            synthetic_green: params.synthetic_green,
             granulation,
             ..MarchConfig::new(params.steps, vol.voxel_pitch_m())
         };
@@ -1882,6 +2603,7 @@ fn render_cloud_layer_scene(
         extent_kind: ExtentKind::WebMercatorMeters,
         mercator_corners_lonlat: Some(grid.corners_lonlat()),
         camera_pose: None,
+        geo_navigation: None,
     };
     Ok(RenderResult {
         nx: grid.nx,
@@ -1901,9 +2623,17 @@ fn render_cloud_layer_scene(
         ground_source: None,
         ground_status: Vec::new(),
         granulation: gran_on,
+        topdown_cloud_footprint: false,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: None,
+        instrument_footprint: InstrumentFootprint::Off,
+        science_warnings: Vec::new(),
+        storage_profile: src.brick.storage_profile,
     })
 }
 
@@ -2013,6 +2743,7 @@ fn render_perspective_scene(
         } else {
             CloudMultiscatterMode::SingleScatter
         }),
+        synthetic_green: params.synthetic_green,
         granulation,
         ..MarchConfig::new(params.steps, brick.dz_m.min(horiz_pitch).max(1.0))
     };
@@ -2037,7 +2768,9 @@ fn render_perspective_scene(
         cfg.ground_day_lift = g;
     }
     // The frame context: ONE camera — the EYE (the perspective render contract).
-    let mut cam_geo = CameraGeometry::from_sub_lon(params.satellite.sub_lon_deg());
+    let geo_camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
+    let mut cam_geo = CameraGeometry::from_sub_lon(geo_camera.model_sub_lon_deg);
     cam_geo.camera = basis.eye;
     let surf = FrameContext {
         luts: &luts,
@@ -2054,6 +2787,7 @@ fn render_perspective_scene(
         ground_day_lift: cfg.ground_day_lift,
         cloud_softclip_knee: cfg.cloud_softclip_knee,
         cloud_highlight_max: cfg.cloud_highlight_max,
+        synthetic_green: params.synthetic_green,
         atmosphere_correction: params.atmosphere_correction,
         terrain_atmosphere: params.terrain_atmosphere,
         land_appearance: if cloud_layer_only {
@@ -2075,7 +2809,8 @@ fn render_perspective_scene(
     );
 
     let rgba = if params.clouds {
-        let fractional_requested = params.fractional_clouds;
+        let fractional_requested =
+            params.fractional_clouds && params.fractional_cloud_mode != FractionalCloudMode::Off;
         let fractional_clouds = fractional_requested && brick.has_cloud_fraction;
         let mut vol = if fractional_clouds {
             DecodedVolume::from_brick(brick, horiz_pitch)
@@ -2151,6 +2886,7 @@ fn render_perspective_scene(
         extent_kind,
         mercator_corners_lonlat: None,
         camera_pose: Some(camera),
+        geo_navigation: None,
     };
     Ok(RenderResult {
         nx: raster.nx,
@@ -2170,9 +2906,17 @@ fn render_perspective_scene(
         },
         ground_status,
         granulation: gran_on,
+        topdown_cloud_footprint: false,
+        intent: RenderIntent::Display,
+        observation_operator: RenderIntent::Display.observation_operator(),
+        intent_adjustments: Vec::new(),
         backend: RenderBackend::Cpu,
         diagnostics: Vec::new(),
         gpu_adapter: None,
+        thermal_sensor: None,
+        instrument_footprint: InstrumentFootprint::Off,
+        science_warnings: Vec::new(),
+        storage_profile: src.brick.storage_profile,
     })
 }
 
@@ -2346,6 +3090,11 @@ fn build_georef(
         extent_kind,
         mercator_corners_lonlat: None,
         camera_pose: None,
+        geo_navigation: if view == ViewMode::Geostationary {
+            raster.navigation_geometry
+        } else {
+            None
+        },
     }
 }
 
@@ -2533,7 +3282,7 @@ fn render_geo_surface_rgba(
         .map(|py| {
             let mut row = Vec::with_capacity(nx * 4);
             for px in 0..nx {
-                let (sx, sy) = scan.scan_angle(px, py);
+                let (sx, sy) = raster.model_scan_angle(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = surf.cam.view_dir(sx, sy);
                 let rgba = shade_surface(surf, &pixel);
@@ -2563,7 +3312,7 @@ fn render_geo_surface_reflectance(
         .map(|py| {
             let mut row = Vec::with_capacity(nx * 3);
             for px in 0..nx {
-                let (sx, sy) = scan.scan_angle(px, py);
+                let (sx, sy) = raster.model_scan_angle(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = surf.cam.view_dir(sx, sy);
                 let reflectance =
@@ -2652,8 +3401,17 @@ fn resolve_wrfout(params: &RenderParams) -> Result<SceneSource, String> {
         .map_err(|e| format!("read geometry: {e}"))?;
     let georef = geom.georef().map_err(|e| format!("georef: {e}"))?;
     let run_id = ingest::default_run_id(path);
+    let cloud_optics = if params.cloud_optics == CloudOpticsMode::HrrrThompsonNative {
+        crate::log_line!(
+            "simsat api: cloud_optics=hrrr-thompson-native requires HRRR native GRIB input; using fixed optics for WRF input"
+        );
+        CloudOpticsMode::Fixed
+    } else {
+        params.cloud_optics
+    };
+    let brick_cache = ingest::brick_cache_dir(&params.cache, cloud_optics, params.storage_profile);
     let brick_file = bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm);
-    let brick_path = bricks::run_dir(&params.cache, &run_id).join(&brick_file);
+    let brick_path = bricks::run_dir(&brick_cache, &run_id).join(&brick_file);
     // Cache-hit STALENESS gate (WS3): a brick on disk is only reused when the run
     // manifest recorded the SAME source-file identity (byte length + mtime) it was
     // ingested from. Re-running WRF over the same wrfout path previously rendered
@@ -2664,10 +3422,13 @@ fn resolve_wrfout(params: &RenderParams) -> Result<SceneSource, String> {
     } else {
         let (src_bytes, src_mtime) = ingest::source_identity(path);
         let fresh = match (src_bytes, src_mtime) {
-            (Some(b), Some(m)) => RunManifest::load(&RunManifest::path(&params.cache, &run_id))
-                .ok()
-                .and_then(|man| man.timesteps.iter().find(|t| t.file == brick_file).cloned())
-                .is_some_and(|t| bricks::cache_entry_is_fresh(&t, b, m)),
+            (Some(b), Some(m)) => RunManifest::load_for_profile(
+                &RunManifest::path(&brick_cache, &run_id),
+                params.storage_profile,
+            )
+            .ok()
+            .and_then(|man| man.timesteps.iter().find(|t| t.file == brick_file).cloned())
+            .is_some_and(|t| bricks::cache_entry_is_fresh(&t, b, m)),
             _ => false,
         };
         if !fresh {
@@ -2684,9 +3445,20 @@ fn resolve_wrfout(params: &RenderParams) -> Result<SceneSource, String> {
         let mut config = IngestConfig::new(params.cache.clone());
         config.run_id = Some(run_id.clone());
         config.timestep = params.timestep;
+        config.cloud_optics = cloud_optics;
+        config.storage_profile = params.storage_profile;
         ingest::ingest_timestep(path, &config).map_err(|e| format!("ingest: {e}"))?;
     }
-    let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    let profiled =
+        bricks::read_ssb_profiled(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    if profiled.profile != params.storage_profile {
+        return Err(format!(
+            "cached brick storage profile is {}, but {} was requested; caches are never substituted across profiles",
+            profiled.profile.slug(),
+            params.storage_profile.slug()
+        ));
+    }
+    let brick = profiled.brick;
     Ok(SceneSource {
         brick,
         georef,
@@ -2713,21 +3485,42 @@ fn resolve_grib(params: &RenderParams) -> Result<SceneSource, String> {
             params.timestep
         ));
     }
+    let cloud_optics = if params.cloud_optics == CloudOpticsMode::HrrrThompsonNative {
+        params.cloud_optics
+    } else {
+        if params.cloud_optics != CloudOpticsMode::Fixed {
+            crate::log_line!(
+                "simsat api: cloud_optics={} is unavailable for GRIB input; using fixed optics",
+                params.cloud_optics.token()
+            );
+        }
+        CloudOpticsMode::Fixed
+    };
+    if params.cloud_optics != cloud_optics {
+        crate::log_line!(
+            "simsat api: effective GRIB cloud optics={}",
+            cloud_optics.token()
+        );
+    }
     let probe = ingest_grib::probe_grib(path).map_err(|e| format!("probe grib: {e}"))?;
     let geom = ingest_grib::read_grib_geometry(path).map_err(|e| format!("read geometry: {e}"))?;
     let georef = geom.georef().map_err(|e| format!("georef: {e}"))?;
     let run_id = probe.default_run_id.clone();
     let brick_file = bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm);
-    let brick_path = bricks::run_dir(&params.cache, &run_id).join(&brick_file);
+    let brick_cache = ingest::brick_cache_dir(&params.cache, cloud_optics, params.storage_profile);
+    let brick_path = bricks::run_dir(&brick_cache, &run_id).join(&brick_file);
     let needs_ingest = if !brick_path.is_file() {
         true
     } else {
         let (src_bytes, src_mtime) = ingest::source_identity(path);
         let fresh = match (src_bytes, src_mtime) {
-            (Some(b), Some(m)) => RunManifest::load(&RunManifest::path(&params.cache, &run_id))
-                .ok()
-                .and_then(|man| man.timesteps.iter().find(|t| t.file == brick_file).cloned())
-                .is_some_and(|t| bricks::cache_entry_is_fresh(&t, b, m)),
+            (Some(b), Some(m)) => RunManifest::load_for_profile(
+                &RunManifest::path(&brick_cache, &run_id),
+                params.storage_profile,
+            )
+            .ok()
+            .and_then(|man| man.timesteps.iter().find(|t| t.file == brick_file).cloned())
+            .is_some_and(|t| bricks::cache_entry_is_fresh(&t, b, m)),
             _ => false,
         };
         if !fresh {
@@ -2742,10 +3535,21 @@ fn resolve_grib(params: &RenderParams) -> Result<SceneSource, String> {
     if needs_ingest {
         let mut config = IngestConfig::new(params.cache.clone());
         config.run_id = Some(run_id.clone());
+        config.cloud_optics = cloud_optics;
+        config.storage_profile = params.storage_profile;
         ingest_grib::ingest_grib_timestep(path, &config)
             .map_err(|e| format!("grib ingest: {e}"))?;
     }
-    let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    let profiled =
+        bricks::read_ssb_profiled(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    if profiled.profile != params.storage_profile {
+        return Err(format!(
+            "cached brick storage profile is {}, but {} was requested; caches are never substituted across profiles",
+            profiled.profile.slug(),
+            params.storage_profile.slug()
+        ));
+    }
+    let brick = profiled.brick;
     Ok(SceneSource {
         brick,
         georef,
@@ -2755,7 +3559,14 @@ fn resolve_grib(params: &RenderParams) -> Result<SceneSource, String> {
 }
 
 fn resolve_cached(params: &RenderParams) -> Result<SceneSource, String> {
-    let manifest = RunManifest::load(&params.input).map_err(|e| format!("read run.json: {e}"))?;
+    if params.cloud_optics != CloudOpticsMode::Fixed {
+        return Err(format!(
+            "cloud_optics={} needs the original source mass/number fields; a cached run.json already contains one baked optical state",
+            params.cloud_optics.token()
+        ));
+    }
+    let manifest = RunManifest::load_for_profile(&params.input, params.storage_profile)
+        .map_err(|e| format!("read run.json: {e}"))?;
     let cache_dir = params
         .input
         .parent()
@@ -2777,7 +3588,16 @@ fn resolve_cached(params: &RenderParams) -> Result<SceneSource, String> {
     if !brick_path.is_file() {
         return Err(format!("cached brick not found: {}", brick_path.display()));
     }
-    let brick = bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    let profiled =
+        bricks::read_ssb_profiled(&brick_path).map_err(|e| format!("read brick: {e}"))?;
+    if profiled.profile != params.storage_profile {
+        return Err(format!(
+            "cached run requested {}, but timestep brick is {}; refusing silent profile substitution",
+            params.storage_profile.slug(),
+            profiled.profile.slug()
+        ));
+    }
+    let brick = profiled.brick;
     let p = &manifest.projection;
     let projp = WrfProjectionParams {
         map_proj: p.map_proj,
@@ -2823,9 +3643,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    #[allow(deprecated)]
+    fn visible_bands_remains_a_source_compatible_alias() {
+        assert_eq!(Product::VisibleBands.canonical(), Product::RgbReflectance);
+    }
+
+    #[test]
     fn render_params_default_visible_controls_are_intentional() {
         let p = RenderParams::new(PathBuf::from("input"));
         assert_eq!(p.backend, RenderBackend::Cpu);
+        assert_eq!(p.storage_profile, StorageProfile::CompactU8);
+        assert_eq!(p.intent, RenderIntent::Display);
+        assert!(!p.synthetic_green);
         assert_eq!(
             p.aerosol_optical_depth.to_bits(),
             (atmosphere::DEFAULT_AOD as f32).to_bits()
@@ -2840,17 +3669,111 @@ mod tests {
             p.cloud_optical_depth_scale,
             clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
+        assert_eq!(p.cloud_optics, CloudOpticsMode::Fixed);
         assert!(p.multiscatter);
         assert_eq!(p.cloud_multiscatter, None);
         assert!(!p.beer_powder);
         assert!(p.clouds);
         assert!(p.fractional_clouds);
+        assert_eq!(p.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
         assert!(p.feather_exposed_domain_edges);
         assert!(p.granulation.is_none());
         assert!(!p.topdown_stratiform_regularization);
+        assert!(!p.topdown_cloud_footprint);
         assert!(p.ground_gain.is_none());
         assert!(p.cloud_softclip.is_none());
         assert!(p.cloud_highlight_max.is_none());
+    }
+
+    #[test]
+    fn sensor_fast_gray_plan_is_strict_explicit_and_keeps_fractional_clouds() {
+        let mut requested = RenderParams::new(PathBuf::from("input"));
+        requested.intent = RenderIntent::SensorFastGray;
+        requested.ground_gain = Some(1.4);
+        requested.granulation = Some(true);
+        requested.topdown_stratiform_regularization = true;
+        requested.topdown_cloud_footprint = true;
+        requested.synthetic_green = true;
+        let before = requested.clone();
+
+        let (effective, changes) = plan_render_intent(&requested);
+        assert_eq!(
+            requested.cloud_optical_depth_scale,
+            before.cloud_optical_depth_scale
+        );
+        assert_eq!(requested.exposure, before.exposure);
+        assert_eq!(requested.ground_gain, before.ground_gain);
+        assert_eq!(requested.land_appearance, before.land_appearance);
+        assert_eq!(requested.granulation, before.granulation);
+        assert!(requested.fractional_clouds);
+
+        assert_eq!(effective.intent, RenderIntent::SensorFastGray);
+        assert_eq!(effective.cloud_optical_depth_scale, 1.0);
+        assert_eq!(effective.exposure, 1.0);
+        assert_eq!(effective.ground_gain, Some(1.0));
+        assert_eq!(effective.land_appearance, LandAppearanceConfig::identity());
+        assert!(!effective.feather_exposed_domain_edges);
+        assert_eq!(effective.granulation, Some(false));
+        assert!(!effective.topdown_stratiform_regularization);
+        assert!(!effective.topdown_cloud_footprint);
+        assert!(!effective.atmosphere_correction);
+        assert_eq!(effective.cloud_softclip, Some(1.0));
+        assert_eq!(effective.cloud_highlight_max, Some(1.0));
+        assert!(!effective.synthetic_green);
+        assert!(
+            effective.fractional_clouds,
+            "strict intent must retain model fractional-cloud handling"
+        );
+        assert_eq!(
+            changes,
+            vec![
+                RenderIntentAdjustment::CloudOpticalDepthUnscaled,
+                RenderIntentAdjustment::ExposureNeutral,
+                RenderIntentAdjustment::GroundLiftNeutral,
+                RenderIntentAdjustment::LandAppearanceIdentity,
+                RenderIntentAdjustment::ExposedEdgeFeatherOff,
+                RenderIntentAdjustment::GranulationOff,
+                RenderIntentAdjustment::TopdownStratiformRegularizationOff,
+                RenderIntentAdjustment::TopdownCloudFootprintOff,
+                RenderIntentAdjustment::AtmosphereCorrectionOff,
+                RenderIntentAdjustment::HighlightShoulderIdentity,
+                RenderIntentAdjustment::SyntheticGreenOff,
+            ]
+        );
+        assert_eq!(
+            effective.intent.observation_operator(),
+            "simsat-fast-gray-v1"
+        );
+        assert!(!effective.intent.limitations().is_empty());
+    }
+
+    #[test]
+    fn display_intent_plan_is_an_exact_noop_and_sensor_gpu_fails_before_io() {
+        let display = RenderParams::new(PathBuf::from("missing-input"));
+        let (effective, changes) = plan_render_intent(&display);
+        assert!(changes.is_empty());
+        assert_eq!(effective.intent, display.intent);
+        assert_eq!(effective.exposure.to_bits(), display.exposure.to_bits());
+        assert_eq!(
+            effective.cloud_optical_depth_scale.to_bits(),
+            display.cloud_optical_depth_scale.to_bits()
+        );
+        assert_eq!(effective.land_appearance, display.land_appearance);
+
+        let mut sensor_gpu = display;
+        sensor_gpu.intent = RenderIntent::SensorFastGray;
+        sensor_gpu.backend = RenderBackend::GpuPreview;
+        let err = render(&sensor_gpu, Product::VisibleRgb)
+            .expect_err("strict sensor intent cannot use the lossy GPU preview envelope");
+        assert!(err.contains("requires backend=cpu"));
+        assert!(err.contains("fraction"));
+
+        let mut science_gpu = RenderParams::new(PathBuf::from("missing-input"));
+        science_gpu.storage_profile = StorageProfile::ScienceCloudF16;
+        science_gpu.backend = RenderBackend::GpuPreview;
+        let err = render(&science_gpu, Product::VisibleRgb)
+            .expect_err("science storage must fail before IO on the CompactU8 GPU path");
+        assert!(err.contains("uploads CompactU8 codes directly"), "{err}");
     }
 
     #[test]
@@ -2862,7 +3785,9 @@ mod tests {
         requested.cloud_multiscatter = Some(CloudMultiscatterMode::DeltaFluxV2);
         requested.granulation = Some(true);
         requested.topdown_stratiform_regularization = true;
+        requested.topdown_cloud_footprint = true;
         requested.cloud_softclip = Some(0.8);
+        requested.synthetic_green = true;
         requested.topdown_cloud_norm = Some(0.7);
         let before = requested.clone();
 
@@ -2880,6 +3805,7 @@ mod tests {
         assert!(!effective.fractional_clouds);
         assert_eq!(effective.granulation, Some(false));
         assert!(!effective.topdown_stratiform_regularization);
+        assert!(!effective.topdown_cloud_footprint);
         assert!(!effective.feather_exposed_domain_edges);
         assert_eq!(
             effective.cloud_multiscatter,
@@ -2887,6 +3813,7 @@ mod tests {
         );
         assert_eq!(effective.steps, StepQuality::Interactive);
         assert!(effective.cloud_softclip.is_none());
+        assert!(!effective.synthetic_green);
         assert!(effective.topdown_cloud_norm.is_none());
         for expected in [
             GpuPreviewAdjustment::ProductVisible,
@@ -2895,14 +3822,38 @@ mod tests {
             GpuPreviewAdjustment::FractionalCloudsOff,
             GpuPreviewAdjustment::GranulationOff,
             GpuPreviewAdjustment::TopdownStratiformRegularizationOff,
+            GpuPreviewAdjustment::TopdownCloudFootprintOff,
             GpuPreviewAdjustment::ExposedEdgeFeatherOff,
             GpuPreviewAdjustment::LegacyCloudTransport,
             GpuPreviewAdjustment::ShippedHighlights,
+            GpuPreviewAdjustment::SyntheticGreenOff,
             GpuPreviewAdjustment::InteractiveSteps,
             GpuPreviewAdjustment::ShippedTopdownCloudNorm,
         ] {
             assert!(changes.contains(&expected), "missing {}", expected.label());
         }
+    }
+
+    #[test]
+    fn gpu_preview_reports_deterministic_subcolumn_fallback_explicitly() {
+        let mut requested = RenderParams::new(PathBuf::from("input"));
+        requested.backend = RenderBackend::GpuPreview;
+        requested.fractional_cloud_mode = FractionalCloudMode::Deterministic4;
+        let (effective, _, changes) = plan_gpu_preview(&requested, Product::VisibleRgb).unwrap();
+        assert!(!effective.fractional_clouds);
+        assert_eq!(effective.fractional_cloud_mode, FractionalCloudMode::Off);
+        assert!(changes.contains(&GpuPreviewAdjustment::FractionalSubcolumnsOff));
+        assert!(!changes.contains(&GpuPreviewAdjustment::FractionalCloudsOff));
+    }
+
+    #[test]
+    fn deterministic_subcolumns_reject_unsupported_products_before_io() {
+        let mut params = RenderParams::new(PathBuf::from("definitely-missing-input"));
+        params.fractional_cloud_mode = FractionalCloudMode::Deterministic4;
+        let err = render(&params, Product::CloudLayer).unwrap_err();
+        assert!(err.contains("deterministic-4"));
+        assert!(err.contains("cloud-layer"));
+        assert!(err.contains("effective-od or off"));
     }
 
     #[test]
@@ -2970,6 +3921,8 @@ mod tests {
             q.insert(name.to_string(), zero);
         }
         let brick = VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,
@@ -3118,8 +4071,8 @@ mod tests {
             "the synthetic low stratiform stipple must exercise the operator"
         );
 
-        let raw_off = render_visible_scene(&src, &explicit_off, Product::VisibleBands).unwrap();
-        let raw_on = render_visible_scene(&src, &on, Product::VisibleBands).unwrap();
+        let raw_off = render_visible_scene(&src, &explicit_off, Product::RgbReflectance).unwrap();
+        let raw_on = render_visible_scene(&src, &on, Product::RgbReflectance).unwrap();
         assert_eq!(
             band_bits(&raw_on),
             band_bits(&raw_off),
@@ -3137,6 +4090,84 @@ mod tests {
             visible_rgba(&geo_off),
             "geostationary output must ignore the top-down-only operator"
         );
+    }
+
+    #[test]
+    fn topdown_cloud_footprint_is_exact_off_and_product_scoped() {
+        let src = low_stratiform_stipple_source(14, 14, 8);
+        let default_params = synthetic_params(ViewMode::TopDownMap);
+        assert!(!default_params.topdown_cloud_footprint);
+        let mut explicit_off = default_params.clone();
+        explicit_off.topdown_cloud_footprint = false;
+        let default_frame =
+            render_visible_scene(&src, &default_params, Product::VisibleRgb).unwrap();
+        let off_frame = render_visible_scene(&src, &explicit_off, Product::VisibleRgb).unwrap();
+        assert_eq!(
+            visible_rgba(&default_frame),
+            visible_rgba(&off_frame),
+            "explicit off must preserve the default display bytes"
+        );
+        assert!(!off_frame.topdown_cloud_footprint);
+
+        let mut on = explicit_off.clone();
+        on.topdown_cloud_footprint = true;
+        let on_frame = render_visible_scene(&src, &on, Product::VisibleRgb).unwrap();
+        assert_ne!(
+            visible_rgba(&on_frame),
+            visible_rgba(&off_frame),
+            "the synthetic stipple must exercise the radiance footprint"
+        );
+        assert!(on_frame.topdown_cloud_footprint);
+
+        let raw_off = render_visible_scene(&src, &explicit_off, Product::RgbReflectance).unwrap();
+        let raw_on = render_visible_scene(&src, &on, Product::RgbReflectance).unwrap();
+        assert_eq!(
+            band_bits(&raw_on),
+            band_bits(&raw_off),
+            "raw visible bands must ignore the display-only footprint"
+        );
+        assert!(!raw_on.topdown_cloud_footprint);
+
+        let mut geo_off = explicit_off;
+        geo_off.view = ViewMode::Geostationary;
+        let mut geo_on = geo_off.clone();
+        geo_on.topdown_cloud_footprint = true;
+        let geo_off = render_visible_scene(&src, &geo_off, Product::VisibleRgb).unwrap();
+        let geo_on = render_visible_scene(&src, &geo_on, Product::VisibleRgb).unwrap();
+        assert_eq!(
+            visible_rgba(&geo_on),
+            visible_rgba(&geo_off),
+            "geostationary output must ignore the top-down-only footprint"
+        );
+        assert!(!geo_on.topdown_cloud_footprint);
+    }
+
+    #[test]
+    fn abi_band13_instrument_footprint_is_off_and_exact_lattice_scoped() {
+        let default_params = RenderParams::new(PathBuf::from("<missing-footprint-fixture>"));
+        assert_eq!(
+            default_params.instrument_footprint,
+            InstrumentFootprint::Off
+        );
+
+        let mut wrong_product = default_params.clone();
+        wrong_product.instrument_footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+        let err = render(&wrong_product, Product::VisibleRgb).unwrap_err();
+        assert!(err.contains("supports ABI Band 13"));
+
+        let mut wrong_sensor = default_params.clone();
+        wrong_sensor.view = ViewMode::Geostationary;
+        wrong_sensor.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+        wrong_sensor.resolution = ResolutionMode::Abi2km;
+        wrong_sensor.instrument_footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+        let err = render(&wrong_sensor, Product::Ir).unwrap_err();
+        assert!(err.contains("requires thermal_sensor=goes-r-abi-band13-fm4"));
+
+        let mut wrong_geometry = default_params;
+        wrong_geometry.instrument_footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+        wrong_geometry.thermal_sensor = ThermalSensor::GoesRAbiBand13Fm4;
+        let err = render(&wrong_geometry, Product::Ir).unwrap_err();
+        assert!(err.contains("requires view=geostationary"));
     }
 
     fn without_cloud_render_channels(mut src: SceneSource) -> SceneSource {
@@ -3185,7 +4216,7 @@ mod tests {
     fn visible_bands_reflectance_is_finite_in_zero_one() {
         let src = synthetic_source(24, 24, 24, 3000.0);
         let p = synthetic_params(ViewMode::TopDownMap);
-        let res = render_visible_scene(&src, &p, Product::VisibleBands).unwrap();
+        let res = render_visible_scene(&src, &p, Product::RgbReflectance).unwrap();
         match &res.data {
             FrameData::Bands { reflectance } => {
                 assert_eq!(reflectance.len(), 24 * 24 * 3);
@@ -3208,7 +4239,7 @@ mod tests {
         let src = synthetic_source(16, 16, 16, 3000.0);
         let mut baseline_params = synthetic_params(ViewMode::TopDownMap);
         baseline_params.land_appearance = LandAppearanceConfig::identity();
-        let baseline = render_visible_scene(&src, &baseline_params, Product::VisibleBands)
+        let baseline = render_visible_scene(&src, &baseline_params, Product::RgbReflectance)
             .expect("baseline bands");
 
         let mut adjusted_params = baseline_params;
@@ -3222,7 +4253,7 @@ mod tests {
             dark_toe: true,
             ..LandAppearanceConfig::identity()
         };
-        let adjusted = render_visible_scene(&src, &adjusted_params, Product::VisibleBands)
+        let adjusted = render_visible_scene(&src, &adjusted_params, Product::RgbReflectance)
             .expect("bands with display overrides");
 
         let bits = |result: &RenderResult| match &result.data {
@@ -3244,7 +4275,7 @@ mod tests {
         let stripped = without_cloud_render_channels(cold_top_source(18, 16, 14, 3000.0));
 
         for view in [ViewMode::TopDownMap, ViewMode::Geostationary] {
-            for product in [Product::VisibleRgb, Product::VisibleBands] {
+            for product in [Product::VisibleRgb, Product::RgbReflectance] {
                 let mut params = synthetic_params(view);
                 params.clouds = false;
                 let expected = render_visible_scene(&complete, &params, product).unwrap();
@@ -4268,8 +5299,8 @@ mod tests {
         let mut off_params = on_params.clone();
         off_params.fractional_clouds = false;
 
-        let on = render_visible_scene(&src, &on_params, Product::VisibleBands).unwrap();
-        let off = render_visible_scene(&src, &off_params, Product::VisibleBands).unwrap();
+        let on = render_visible_scene(&src, &on_params, Product::RgbReflectance).unwrap();
+        let off = render_visible_scene(&src, &off_params, Product::RgbReflectance).unwrap();
         let band_bits = |r: &RenderResult| match &r.data {
             FrameData::Bands { reflectance } => {
                 reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
@@ -4307,10 +5338,44 @@ mod tests {
         // though the physical switch defaults on.
         let fallback = moderate_liquid_source(10, 10, 10, 3000.0);
         let fallback_on =
-            render_visible_scene(&fallback, &on_params, Product::VisibleBands).unwrap();
+            render_visible_scene(&fallback, &on_params, Product::RgbReflectance).unwrap();
         let fallback_off =
-            render_visible_scene(&fallback, &off_params, Product::VisibleBands).unwrap();
+            render_visible_scene(&fallback, &off_params, Product::RgbReflectance).unwrap();
         assert_eq!(band_bits(&fallback_on), band_bits(&fallback_off));
+    }
+
+    #[test]
+    fn selectable_deterministic_counts_reach_the_visible_linear_radiance_integration() {
+        let src = fractional_liquid_source(8, 8, 8, 3000.0);
+        let mut effective = synthetic_params(ViewMode::TopDownMap);
+        effective.steps = StepQuality::Interactive;
+        effective.fractional_clouds = true;
+        effective.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+
+        let a = render_visible_scene(&src, &effective, Product::RgbReflectance).unwrap();
+        let bands = |result: RenderResult| match result.data {
+            FrameData::Bands { reflectance } => reflectance,
+            other => panic!("expected bands, got {other:?}"),
+        };
+        let a = bands(a);
+        for mode in [
+            FractionalCloudMode::Deterministic4,
+            FractionalCloudMode::Deterministic8,
+            FractionalCloudMode::Deterministic16,
+        ] {
+            let mut deterministic = effective.clone();
+            deterministic.fractional_cloud_mode = mode;
+            let b =
+                bands(render_visible_scene(&src, &deterministic, Product::RgbReflectance).unwrap());
+            assert_eq!(a.len(), b.len());
+            assert!(b.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            assert_ne!(
+                a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{} must not collapse to effective OD",
+                mode.slug()
+            );
+        }
     }
 
     #[test]
@@ -4320,8 +5385,8 @@ mod tests {
         off_params.steps = StepQuality::Interactive;
         let mut on_params = off_params.clone();
         on_params.beer_powder = true;
-        let off = render_visible_scene(&src, &off_params, Product::VisibleBands).unwrap();
-        let on = render_visible_scene(&src, &on_params, Product::VisibleBands).unwrap();
+        let off = render_visible_scene(&src, &off_params, Product::RgbReflectance).unwrap();
+        let on = render_visible_scene(&src, &on_params, Product::RgbReflectance).unwrap();
         let center_sum = |r: &RenderResult| match &r.data {
             FrameData::Bands { reflectance } => {
                 let o = ((r.ny / 2) * r.nx + r.nx / 2) * 3;
@@ -4369,7 +5434,7 @@ mod tests {
             "granulation should visibly change a coarse-grid liquid cu field"
         );
 
-        let bands = render_visible_scene(&src, &p, Product::VisibleBands).unwrap();
+        let bands = render_visible_scene(&src, &p, Product::RgbReflectance).unwrap();
         assert!(
             !bands.granulation,
             "the quantitative raw-reflectance bands must stay OFF even when requested"
@@ -4468,8 +5533,8 @@ mod tests {
 
         // Raw reflectance is a stable diagnostic contract: it keeps the existing
         // margin behavior even when the finished-display experiment is requested.
-        let bands_off = render_visible_scene(&src, &geo_off, Product::VisibleBands).unwrap();
-        let bands_on = render_visible_scene(&src, &geo_on, Product::VisibleBands).unwrap();
+        let bands_off = render_visible_scene(&src, &geo_off, Product::RgbReflectance).unwrap();
+        let bands_on = render_visible_scene(&src, &geo_on, Product::RgbReflectance).unwrap();
         let band_bits = |r: &RenderResult| match &r.data {
             FrameData::Bands { reflectance } => {
                 reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()

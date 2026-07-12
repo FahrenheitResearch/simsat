@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+use simsat::bricks::StorageProfile;
 use simsat::ingest::{IngestConfig, default_cache_dir};
 use simsat::ingest_grib::{self, GribIngestOptions, ingest_grib_timestep_with, parse_crop};
 
@@ -26,6 +27,7 @@ fn main() {
     let mut input: Option<PathBuf> = None;
     let mut cache: Option<PathBuf> = None;
     let mut run_id: Option<String> = None;
+    let mut storage_profile = StorageProfile::CompactU8;
     let mut options = GribIngestOptions::default();
     for arg in std::env::args().skip(1) {
         let Some((key, value)) = arg.split_once('=') else {
@@ -36,6 +38,12 @@ fn main() {
             "input" => input = Some(PathBuf::from(value)),
             "cache" => cache = Some(PathBuf::from(value)),
             "run-id" => run_id = Some(value.to_string()),
+            "storage-profile" => {
+                storage_profile = StorageProfile::parse(value).unwrap_or_else(|| {
+                    eprintln!("bad storage-profile '{value}' (compact-u8|science-cloud-f16)");
+                    std::process::exit(2);
+                });
+            }
             "crop" => match parse_crop(value) {
                 Ok(crop) => options.crop = Some(crop),
                 Err(e) => {
@@ -52,7 +60,8 @@ fn main() {
     let Some(input) = input else {
         eprintln!(
             "usage: ingest_grib_file input=<file.grib2> [cache=<dir>] [run-id=<id>] \
-             [crop=conus|lat_min,lat_max,lon_min,lon_max]"
+             [crop=conus|lat_min,lat_max,lon_min,lon_max] \
+             [storage-profile=compact-u8|science-cloud-f16]"
         );
         std::process::exit(2);
     };
@@ -66,6 +75,7 @@ fn main() {
 
     let mut config = IngestConfig::new(cache.unwrap_or_else(default_cache_dir));
     config.run_id = run_id;
+    config.storage_profile = storage_profile;
 
     match ingest_grib_timestep_with(&input, &config, &options) {
         Ok(report) => {

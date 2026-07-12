@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "simsat"
-version = "0.1.6"
+version = "0.1.9"
 description = "Physically-based simulated visible/IR satellite imagery from WRF output — numpy-returning Python binding."
 readme = "README.md"
 requires-python = ">=3.8"

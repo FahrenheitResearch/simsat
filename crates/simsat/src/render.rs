@@ -19,19 +19,18 @@
 //!     full ABI reflectance factor / tonemap lands in M2).
 
 /// Water albedo multiplier (flat dark water; glint is M3). Documented, not tuned.
-/// Since WS2 this is the TWILIGHT anchor: at/below the day ramp's LO elevation the
-/// water body uses exactly this scale (the locked M2 twilight look); at full day it
-/// ramps to [`WATER_ALBEDO_DAY_SCALE`] (see `surface_toa_radiance`'s water branch).
+/// This is the horizon/night anchor: the water body uses exactly this scale at and
+/// below the horizon, then reaches [`WATER_ALBEDO_DAY_SCALE`] by 12 degrees solar
+/// elevation (see `surface_toa_radiance`'s water branch).
 pub const WATER_ALBEDO_SCALE: f32 = 0.55;
 
 /// DAYTIME water-body albedo scale (WS2 water direct-sun pass). The water branch now
 /// receives the same disk-gated, shadow-weighted DIRECT solar term the land branch has
 /// (so cloud shadows exist over the ocean and ocean brightness responds to the sun);
 /// that added flux would brighten the owner-approved dark-ocean look, so the water-body
-/// albedo scale is simultaneously retuned DOWN at day on the SAME sun gate: effective
-/// scale = `water_scale` (0.55, the twilight anchor) at/below the ramp LO, ramping to
-/// this value at/above the ramp HI. Twilight is byte-identical by construction (gate =
-/// 0 there); the dark-ocean/distinct-glint contrast is held by the lower day albedo.
+/// albedo scale is simultaneously retuned DOWN across the surface-help ramp: effective
+/// scale = `water_scale` (0.55) at/below the horizon, ramping to this value by 12
+/// degrees. The dark-ocean/distinct-glint contrast is held by the lower daylight albedo.
 pub const WATER_ALBEDO_DAY_SCALE: f64 = 0.35;
 
 /// CLOUD-SHADOW FLOOR (WS2, QA item: daytime cloud ground-shadows read as very dark
@@ -40,11 +39,11 @@ pub const WATER_ALBEDO_DAY_SCALE: f64 = 0.35;
 /// alone (blue-dominant -> navy). Physically the shadowed ground under a bright sunlit
 /// cloud also receives strong DOWNSCATTERED flux from the cloud itself, which the
 /// ground-shadow consumer does not model. This floor stands in for that fill: the
-/// effective shadow is `f + (1 - f) * shadow` with `f = CLOUD_SHADOW_FLOOR *
-/// smoothstep(LO, HI, sun_elev)` ([`effective_cloud_shadow`]) — sun-gated on the shared
-/// day ramp so twilight is byte-identical, and an unshadowed pixel (`shadow = 1`) maps
-/// to exactly `1` at every elevation (byte-identical). `0.0` = the old hard floor.
-pub const CLOUD_SHADOW_FLOOR: f64 = 0.25;
+/// effective shadow is `f + (1 - f) * shadow` with `f = CLOUD_SHADOW_FLOOR`
+/// ([`effective_cloud_shadow`]). The fill is not gated by solar
+/// elevation because it only affects a direct-sun term that already vanishes at night.
+/// An unshadowed pixel (`shadow = 1`) maps exactly to `1`. `0.0` = the old hard floor.
+pub const CLOUD_SHADOW_FLOOR: f64 = 0.45;
 
 /// Default display-side exposure gain (see [`radiance_to_rgba`]). The v0.1.5
 /// cross-case review selected `1.5`: it restores the uniformly dark HRRR 21Z frame,
@@ -57,9 +56,8 @@ pub const DEFAULT_EXPOSURE: f64 = 1.5;
 /// normalization. At and above this elevation the correction is exactly neutral.
 pub const LAND_SZA_REFERENCE_ELEV_DEG: f64 = 60.0;
 
-/// Default upper bound for the land-only solar-zenith normalization.
-/// The correction is also gated off through the established twilight band, so this
-/// limit is reached only in moderate daylight.
+/// Default upper bound for the land-only solar-zenith normalization. The correction
+/// starts at the horizon and is fully enabled by 12 degrees solar elevation.
 pub const LAND_SZA_MAX_GAIN: f64 = 1.6;
 
 /// Linear-reflectance luminance knee for the dark-land toe. Land at or above
@@ -81,8 +79,8 @@ pub const LAND_DARK_TOE_MAX_GAIN: f64 = 1.5;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LandAppearanceConfig {
     /// Recover the operational true-colour visibility lost when a Lambertian surface is
-    /// viewed at moderate solar zenith. Exactly neutral through twilight and at/above
-    /// [`LAND_SZA_REFERENCE_ELEV_DEG`].
+    /// viewed at moderate solar zenith. Exactly neutral at/below the horizon and at/
+    /// above [`LAND_SZA_REFERENCE_ELEV_DEG`].
     pub sza_normalization: bool,
     /// Upper bound for [`LandAppearanceConfig::sza_normalization`].
     pub sza_max_gain: f64,
@@ -153,7 +151,8 @@ pub const FLAT_ALBEDO_SRGB: f32 = 0.30;
 // de-haze (lower veil), more vivid land (higher vibrancy), a modest LAND-only daytime
 // BRIGHTNESS lift (LAND_DAY_GAIN, distinct from the global exposure), and a brighter
 // + tighter sun glint (higher GLINT_STRENGTH + a narrowed Cox-Munk core GLINT_MSS_SCALE).
-// All are sun-gated or surface-scoped so the M2 twilight look stays byte-identical.
+// All are sun-gated or surface-scoped. Surface help begins above the horizon so terrain
+// remains visible in the same low-sun interval as the corrected atmosphere and clouds.
 
 /// Daytime aerial-perspective (Rayleigh) VEIL reduction. A geostationary view marches
 /// the whole ~100 km atmospheric column to the ground, so a real (physically-correct)
@@ -171,10 +170,10 @@ pub const FLAT_ALBEDO_SRGB: f32 = 0.30;
 /// ground still slightly hazy vs the vivid GOES true-color references).
 pub const AERIAL_VEIL_DAY_SCALE: f64 = 0.40;
 
-/// Sun-elevation gate (deg) shared by the DAYTIME calibration ramp family
-/// ([`day_lerp_ramp`]: land day gain, ground lift, water day term, cloud-shadow floor,
-/// top-down cloud norm): identity at/below LO (twilight and the terminator keep the M2
-/// tuning by construction) ramping to the full daytime value at/above HI.
+/// Sun-elevation gate (deg) for the legacy DAYTIME calibration ramp
+/// ([`day_lerp_ramp`]), now retained by the top-down cloud normalization. Surface
+/// visibility controls use the earlier [`SURFACE_HELP_ELEV_LO_DEG`]--
+/// [`SURFACE_HELP_ELEV_HI_DEG`] ramp instead.
 ///
 /// NOTE (low-sun visible pass): the aerial-perspective VEIL is NO LONGER a member of
 /// this family — it has its own SUNRISE ramp ([`aerial_veil_scale`], constants below).
@@ -183,12 +182,22 @@ pub const AERIAL_VEIL_DAY_SCALE: f64 = 0.40;
 /// so the sunrise band (2-20 deg) was rendering the FULL blue airlight over a nearly
 /// unlit surface — the reported flat navy ground.
 pub const AERIAL_VEIL_ELEV_LO_DEG: f64 = 20.0;
-/// Upper end of the daytime calibration ramp (deg). See [`AERIAL_VEIL_ELEV_LO_DEG`].
+/// Upper end of the legacy daytime calibration ramp (deg). See
+/// [`AERIAL_VEIL_ELEV_LO_DEG`].
 /// WS2 QA: `40 -> 30` — at a sun elevation of 30 deg (mid-morning) the ramp used to sit
 /// at half, leaving the ground half-veiled/half-lifted ("murky"); full daytime treatment
 /// now arrives by 30 deg. Frames at/above 40 deg are byte-identical (both ramps
 /// saturated); the twilight band (<= 20 deg) is byte-identical as before.
 pub const AERIAL_VEIL_ELEV_HI_DEG: f64 = 30.0;
+
+/// Low-sun ramp for surface-visibility corrections. The former shared 20--30 degree
+/// gate made every surface control a no-op for roughly the last one to two hours of
+/// daylight while the independently corrected atmosphere and elevated cloud remained
+/// bright. Surface-only help now begins at the geometric horizon and is fully engaged
+/// by 12 degrees. The old daytime output is unchanged because both ramps equal one by
+/// 30 degrees.
+pub const SURFACE_HELP_ELEV_LO_DEG: f64 = 0.0;
+pub const SURFACE_HELP_ELEV_HI_DEG: f64 = 12.0;
 
 // ── sunrise-band veil ramp (low-sun visible pass; the navy-ground fix) ─────────
 //
@@ -227,8 +236,8 @@ pub const VEIL_SUNRISE_ELEV_HI_DEG: f64 = 16.0;
 /// median luminance (the twilight no-regression metric); it only re-weights chroma.
 pub const LAND_VIBRANCY: f64 = 1.45;
 
-/// LAND daytime BRIGHTNESS lift (refinement pass, round 2). A modest ground-only gain
-/// on the LAND surface reflectance (`l_surf`) at high sun — the orchestrator found the
+/// LAND daylight BRIGHTNESS lift (refinement pass, round 2). A modest ground-only gain
+/// on the LAND surface reflectance (`l_surf`) — the orchestrator found the
 /// round-1 de-hazed ground read a touch dark/muted vs the bright daylight land of the
 /// GOES true-color references, so the surface signal is lifted toward that brightness.
 /// This is a CALIBRATED TRUE-COLOR DISPLAY GAIN on the ground reflectance, NOT the
@@ -236,9 +245,8 @@ pub const LAND_VIBRANCY: f64 = 1.45;
 /// albedo/physics change: it multiplies the assembled surface radiance before the
 /// aerial-perspective veil is added, so only the ground signal brightens (the additive
 /// haze is untouched). WATER is excluded (dark ocean stays dark; the glint has its own
-/// gain). Sun-elevation-gated on the SAME ramp as the veil ([`land_day_gain`]), so at/
-/// below [`AERIAL_VEIL_ELEV_LO_DEG`] it is exactly `1.0` — the whole twilight/terminator
-/// band is byte-unchanged and the M2 twilight tuning is preserved by construction.
+/// gain). It uses the 0–12 degree surface-help ramp ([`land_day_gain`]), remaining
+/// neutral at/below the horizon and reaching its calibrated value by 12 degrees.
 /// `1.0` = no lift. Chosen modest (below any land clip) and verified not to over-bright.
 pub const LAND_DAY_GAIN: f64 = 1.20;
 
@@ -248,10 +256,9 @@ pub const LAND_DAY_GAIN: f64 = 1.20;
 // peaked only ~0.53 display, ocean near-black — darker than real GOES true-color, so
 // the owner had to crank exposure to 4, which then blew the storm cloud to a flat
 // white square). Both are named display calibrations of the shipped radiance path (the
-// LAND_DAY_GAIN / AERIAL_VEIL pattern) and are no-ops at their neutral values, so the
-// owner-approved daytime + twilight looks are preserved by construction.
+// LAND_DAY_GAIN / AERIAL_VEIL pattern) and are no-ops at their neutral values.
 
-/// GROUND LIFT — a sun-gated daytime surface-brightness lift on BOTH land and ocean,
+/// GROUND LIFT — a sun-gated daylight surface-brightness lift on BOTH land and ocean,
 /// toward real-GOES true-color ground levels (the reported ground was too dark). Unlike
 /// [`LAND_DAY_GAIN`] (land only, a modest vibrancy-companion lift) this lifts the WHOLE
 /// surface radiance `l_surf` — land AND water — so the basemap reads bright/vivid and the
@@ -260,9 +267,8 @@ pub const LAND_DAY_GAIN: f64 = 1.20;
 /// perspective veil (only the ground signal brightens, not the additive haze) and BEFORE
 /// the cloud composite (the cloud's own radiance is not lifted — the "white square" is
 /// handled separately by [`CLOUD_SOFTCLIP_KNEE`] + the top-down cloud normalization). It
-/// is sun-elevation-gated on the SAME ramp as the veil / land gain ([`ground_day_lift`]),
-/// so at/below [`AERIAL_VEIL_ELEV_LO_DEG`] it is exactly `1.0` — the whole twilight/
-/// terminator band is byte-unchanged and the M2 twilight tuning is preserved. `1.0` = the
+/// uses the 0–12 degree surface-help ramp ([`ground_day_lift`]), so it is neutral at/
+/// below the horizon and reaches the requested value by 12 degrees. `1.0` = the
 /// neutral no-op (reproduces the pre-lift ground). The former `1.6` lift compounded
 /// with the land-only gain and display exposure, making terrain brighter than the
 /// visible-satellite references in the v0.1.4 cross-case review. It remains available
@@ -470,6 +476,10 @@ pub struct FrameContext<'a> {
     /// Physical reflectance-factor ceiling mapped to display white by the bounded
     /// shoulder. [`RHO_HIGHLIGHT_MAX`] is the shipped default.
     pub cloud_highlight_max: f64,
+    /// Use the ABI synthetic-green display arithmetic for this frame. Explicitly
+    /// carried with the scene so concurrent renders do not depend on process-global
+    /// QA state.
+    pub synthetic_green: bool,
     /// Apply the product-facing atmospheric correction (the daytime aerial-veil
     /// reduction, including the matching cloud-front correction). `false` retains the
     /// full modeled path airlight; it does not disable unrelated display transforms.
@@ -541,16 +551,12 @@ impl Default for SurfacePixel {
     }
 }
 
-/// The shared sun-gated daytime calibration RAMP for the true-color levers: linearly
-/// interpolate from `1.0` at/below [`AERIAL_VEIL_ELEV_LO_DEG`] (the whole twilight/
-/// terminator band, kept byte-identical by construction) to `day_value` at/above
-/// [`AERIAL_VEIL_ELEV_HI_DEG`] (full daytime), via the same monotone smoothstep.
-/// [`land_day_gain`], [`ground_day_lift`], and the water/cloud-shadow day gates are
-/// this one family — only `day_value` differs. (The aerial VEIL left the family in the
-/// low-sun visible pass: [`aerial_veil_scale`] now rides its own sunrise ramp.) At the
-/// NEUTRAL `day_value = 1.0` it is exactly `1.0` at every elevation (`1.0 - t * 0.0`):
-/// the identity no-op that proves each sun-gated lever is a clean parameterization of
-/// the shipped radiance path (used by the refinement sanity tests).
+/// Legacy 20--30 degree daytime calibration ramp, now retained by the top-down cloud
+/// normalization. It interpolates from `1.0` at/below
+/// [`AERIAL_VEIL_ELEV_LO_DEG`] to `day_value` at/above
+/// [`AERIAL_VEIL_ELEV_HI_DEG`] via monotone smoothstep. Surface visibility controls use
+/// [`surface_help_ramp`], while the aerial veil uses [`aerial_veil_scale`]. At the
+/// neutral `day_value = 1.0` this remains exactly `1.0` at every elevation.
 #[inline]
 pub(crate) fn day_lerp_ramp(sun_elev_deg: f64, day_value: f64) -> f64 {
     let t = atmosphere::smoothstep(
@@ -559,6 +565,19 @@ pub(crate) fn day_lerp_ramp(sun_elev_deg: f64, day_value: f64) -> f64 {
         sun_elev_deg,
     );
     1.0 - t * (1.0 - day_value)
+}
+
+/// Surface-only counterpart to [`day_lerp_ramp`]. This earlier ramp keeps terrain,
+/// water, and their display controls synchronized with visible daylight instead of
+/// withholding all correction until the sun is already 20 degrees above the horizon.
+#[inline]
+pub fn surface_help_ramp(sun_elev_deg: f64, day_value: f64) -> f64 {
+    let t = atmosphere::smoothstep(
+        SURFACE_HELP_ELEV_LO_DEG,
+        SURFACE_HELP_ELEV_HI_DEG,
+        sun_elev_deg,
+    );
+    1.0 + t * (day_value - 1.0)
 }
 
 /// Aerial-perspective veil scale at a sun elevation (deg) — the SUNRISE ramp (low-sun
@@ -578,33 +597,30 @@ pub fn aerial_veil_scale(sun_elev_deg: f64) -> f64 {
     1.0 - t * (1.0 - AERIAL_VEIL_DAY_SCALE)
 }
 
-/// LAND daytime brightness gain at a sun elevation (deg): `1.0` at/below
-/// [`AERIAL_VEIL_ELEV_LO_DEG`] (twilight untouched — the same gate as the veil, so the
-/// M2 twilight band is byte-unchanged) ramping to [`LAND_DAY_GAIN`] at/above
-/// [`AERIAL_VEIL_ELEV_HI_DEG`] (full daytime lift). Monotone via smoothstep. See
-/// [`LAND_DAY_GAIN`]. Land-only (the caller gates on `!is_water`).
+/// LAND daylight brightness gain at a sun elevation (deg): `1.0` at/below the horizon,
+/// ramping to [`LAND_DAY_GAIN`] by [`SURFACE_HELP_ELEV_HI_DEG`]. Monotone via
+/// smoothstep. Land-only (the caller gates on `!is_water`).
 #[inline]
 pub fn land_day_gain(sun_elev_deg: f64) -> f64 {
-    day_lerp_ramp(sun_elev_deg, LAND_DAY_GAIN)
+    surface_help_ramp(sun_elev_deg, LAND_DAY_GAIN)
 }
 
-/// GROUND LIFT gain at a sun elevation (deg): `1.0` at/below [`AERIAL_VEIL_ELEV_LO_DEG`]
-/// (twilight untouched — the SAME gate as the veil / land gain, so the M2 twilight band
-/// is byte-unchanged) ramping to `ground_lift` at/above [`AERIAL_VEIL_ELEV_HI_DEG`] (full
-/// daytime lift). Monotone via smoothstep. See [`GROUND_DAY_LIFT`]. `ground_lift` is the
+/// GROUND LIFT gain at a sun elevation (deg): `1.0` at/below the horizon, ramping to
+/// `ground_lift` by [`SURFACE_HELP_ELEV_HI_DEG`]. Monotone via smoothstep. See
+/// [`GROUND_DAY_LIFT`]. `ground_lift` is the
 /// baked constant unless the `render_frame` `ground-gain=` knob overrides it; the neutral
 /// `ground_lift = 1.0` is `1.0` at every elevation (an exact no-op). Applies to land AND
 /// water (the whole surface radiance).
 #[inline]
 pub fn ground_day_lift(sun_elev_deg: f64, ground_lift: f64) -> f64 {
-    day_lerp_ramp(sun_elev_deg, ground_lift)
+    surface_help_ramp(sun_elev_deg, ground_lift)
 }
 
 /// Bounded, land-only solar-zenith display gain. The correction estimates the ratio
 /// between a 60-degree reference illumination and the current horizontal direct-sun
-/// cosine, but it is smoothly gated off through twilight and becomes exactly neutral
-/// again at/above the reference elevation. A disabled correction is never evaluated by
-/// the caller, and `max_gain = 1` is an identity path.
+/// cosine. It begins above the horizon, is fully enabled by 12 degrees, and becomes
+/// exactly neutral again at/above the reference elevation. A disabled correction is
+/// never evaluated by the caller, and `max_gain = 1` is an identity path.
 #[inline]
 pub fn land_sza_normalization_gain(sun_elev_deg: f64, max_gain: f64) -> f64 {
     let max_gain = if max_gain.is_finite() {
@@ -616,16 +632,16 @@ pub fn land_sza_normalization_gain(sun_elev_deg: f64, max_gain: f64) -> f64 {
         return 1.0;
     }
     let mu_ref = LAND_SZA_REFERENCE_ELEV_DEG.to_radians().sin();
-    let mu_floor = AERIAL_VEIL_ELEV_LO_DEG.to_radians().sin();
+    let mu_floor = SURFACE_HELP_ELEV_HI_DEG.to_radians().sin();
     let mu = sun_elev_deg.clamp(0.0, 90.0).to_radians().sin();
     let target = (mu_ref / mu.max(mu_floor)).clamp(1.0, max_gain);
-    day_lerp_ramp(sun_elev_deg, target)
+    surface_help_ramp(sun_elev_deg, target)
 }
 
 /// Bounded scalar lift for a dark positive land reflectance. `albedo` is the linear
 /// RGB surface reflectance after snow/vibrancy handling. The scalar preserves colour
 /// ratios, zero remains zero, values at/above the knee are exactly unchanged, and the
-/// established daylight ramp keeps twilight byte-identical.
+/// surface-help ramp keeps the correction neutral at/below the horizon.
 #[inline]
 pub fn land_dark_toe_gain(
     albedo: [f64; 3],
@@ -660,7 +676,7 @@ pub fn land_dark_toe_gain(
     let w = atmosphere::smoothstep(0.0, knee, y);
     let target = power_target * (1.0 - w) + y * w;
     let gain = (target / y).clamp(1.0, max_gain);
-    day_lerp_ramp(sun_elev_deg, gain)
+    surface_help_ramp(sun_elev_deg, gain)
 }
 
 /// Combined land-only display gain. Each correction is independently switchable and
@@ -695,23 +711,41 @@ pub fn land_appearance_gain(
 }
 
 /// The EFFECTIVE cloud shadow seen by the DIFFUSE direct-sun terms (land + water body):
-/// `f + (1 - f) * shadow` with `f = CLOUD_SHADOW_FLOOR * smoothstep(LO, HI, sun_elev)`
-/// — see [`CLOUD_SHADOW_FLOOR`]. Sun-gated on the shared day ramp, so at/below
-/// [`AERIAL_VEIL_ELEV_LO_DEG`] it is exactly the input `shadow` (twilight
-/// byte-identical), and `shadow = 1` maps to exactly `1` at every elevation (unshadowed
-/// pixels byte-identical). Monotone in `shadow`. The SPECULAR glint keeps the RAW
+/// `f + (1 - f) * shadow` with `f = CLOUD_SHADOW_FLOOR` — see
+/// [`CLOUD_SHADOW_FLOOR`]. It is elevation-independent because the direct-sun term
+/// already vanishes physically at night. `shadow = 1` maps exactly to `1` and the
+/// function is monotone in `shadow`. The SPECULAR glint keeps the RAW
 /// shadow (a mirror image of an occluded solar disk is gone; the floor models diffuse
 /// cloud-scattered fill, which has no specular component).
 #[inline]
-pub fn effective_cloud_shadow(shadow: f64, sun_elev_deg: f64) -> f64 {
+pub fn effective_cloud_shadow(shadow: f64, _sun_elev_deg: f64) -> f64 {
     let s = shadow.clamp(0.0, 1.0);
-    let f = CLOUD_SHADOW_FLOOR.clamp(0.0, 1.0)
-        * atmosphere::smoothstep(
-            AERIAL_VEIL_ELEV_LO_DEG,
-            AERIAL_VEIL_ELEV_HI_DEG,
-            sun_elev_deg,
-        );
+    // The floor multiplies only the direct-sun term, whose finite disk, atmospheric
+    // transmittance, and N.L already vanish at night. Gating the fill itself removed it
+    // exactly when low-sun cloud shadows became longest and most visible.
+    let f = CLOUD_SHADOW_FLOOR.clamp(0.0, 1.0);
     f + (1.0 - f) * s
+}
+
+/// Shadow multiplier exported with the standalone cloud overlay. Unlike the full
+/// renderer, a host map applies this value to its entire already-lit basemap rather
+/// than to the direct-sun term alone. Fade that approximation from neutral at/night to
+/// the full effective direct shadow by [`SURFACE_HELP_ELEV_HI_DEG`].
+#[inline]
+pub fn effective_cloud_shadow_layer(shadow: f64, sun_elev_deg: f64) -> f64 {
+    let direct_shadow = effective_cloud_shadow(shadow, sun_elev_deg);
+    let daylight = atmosphere::smoothstep(
+        SURFACE_HELP_ELEV_LO_DEG,
+        SURFACE_HELP_ELEV_HI_DEG,
+        sun_elev_deg,
+    );
+    if daylight <= 0.0 {
+        return 1.0;
+    }
+    if daylight >= 1.0 {
+        return direct_shadow;
+    }
+    1.0 - daylight * (1.0 - direct_shadow)
 }
 
 // ── low-sun ILLUMINANT CORRECTION (sunrise/dawn visible pass; the cast fix) ─────
@@ -1033,6 +1067,7 @@ pub fn synthesize_abi_green(rho: [f64; 3]) -> [f64; 3] {
 /// `atmosphere::abi_reflectance_stretch`). The debug path stays a plain sRGB gamma.
 /// Reads the process-global synthetic-green switch and delegates to the pure
 /// [`output_transform_with`] (tested directly, so no test ever toggles the global).
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_output_transform(
     rho: [f64; 3],
     transform: OutputTransform,
@@ -1263,36 +1298,29 @@ pub fn surface_toa_radiance(
         // WATER DIRECT SUN (WS2): the diffuse water body now sees the same disk-gated,
         // shadow-weighted direct solar irradiance the land branch has — this is what
         // makes cloud shadows exist over the ocean and the ocean brightness respond to
-        // the sun elevation. DAY-GATED on the shared ramp (`day_t`), so the whole
-        // twilight band (<= LO) is BYTE-IDENTICAL to the locked M2 look; and the
-        // water-body albedo is simultaneously retuned DOWN toward
-        // [`WATER_ALBEDO_DAY_SCALE`] on the SAME gate so the owner-approved dark-ocean/
-        // distinct-glint contrast holds (see the constant's doc).
-        let day_t = atmosphere::smoothstep(
-            AERIAL_VEIL_ELEV_LO_DEG,
-            AERIAL_VEIL_ELEV_HI_DEG,
+        // the sun elevation. The physical direct term follows disk/Tsun/N.L without an
+        // artificial appearance gate. The water-body albedo alone is retuned DOWN
+        // toward [`WATER_ALBEDO_DAY_SCALE`] across the 0--12 degree surface-help ramp so
+        // the owner-approved dark-ocean/distinct-glint contrast holds.
+        let surface_t = atmosphere::smoothstep(
+            SURFACE_HELP_ELEV_LO_DEG,
+            SURFACE_HELP_ELEV_HI_DEG,
             px.sun_elev_deg as f64,
         );
-        // Effective day albedo rescale relative to the already-applied ctx.water_scale
-        // (the twilight anchor): 1.0 at/below LO -> DAY_SCALE/water_scale at/above HI.
+        // Effective daylight albedo rescale relative to the already-applied
+        // ctx.water_scale: 1.0 at/below the horizon -> DAY_SCALE/water_scale by 12 deg.
         let scale_ratio = if ctx.water_scale > 0.0 {
-            1.0 + day_t * (WATER_ALBEDO_DAY_SCALE / ctx.water_scale - 1.0)
+            1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / ctx.water_scale - 1.0)
         } else {
             1.0
         };
         let ndotl = dot(px.normal_enu, px.sun_enu).max(0.0);
         for c in 0..3 {
             let l_glint = glint_rho * e_sun[c] / pi * t_sun[c] * glint_scale;
-            let e_direct = e_sun[c]
-                * t_sun[c]
-                * disk
-                * ndotl
-                * atmosphere::LIMB_DARKENING_DISK_AVG
-                * shadow
-                * day_t;
-            // Skylight- AND (at day) sunlight-lit water body (the Blue Marble water
-            // texel x the day-gated water scale) + the sun glint + the Fresnel sky
-            // reflection. At day_t = 0 this is bit-for-bit the pre-WS2 expression.
+            let e_direct =
+                e_sun[c] * t_sun[c] * disk * ndotl * atmosphere::LIMB_DARKENING_DISK_AVG * shadow;
+            // Skylight- and sunlight-lit water body (the Blue Marble water texel x the
+            // surface-ramped water scale) + the sun glint + the Fresnel sky reflection.
             l_surf[c] = albedo[c] * scale_ratio / pi * (e_direct + e_ambient[c])
                 + l_glint
                 + f_sky * l_sky[c];
@@ -1310,8 +1338,7 @@ pub fn surface_toa_radiance(
         // Operational-display corrections for LAND only. Both are scalar
         // gains on the surface signal, so they preserve colour ratios and cannot alter
         // water/glint or cloud radiance. The explicit identity config takes the exact
-        // legacy path; the daylight gate keeps the established twilight look
-        // byte-identical even in the shipped preset.
+        // legacy path; the surface-help gate keeps it neutral at/below the horizon.
         let appearance_gain =
             land_appearance_gain(ctx.land_appearance, px.sun_elev_deg as f64, albedo);
         if appearance_gain != 1.0 {
@@ -1321,9 +1348,9 @@ pub fn surface_toa_radiance(
         }
     }
 
-    // LAND daytime brightness lift (refinement pass, round 2): a modest ground-only
-    // gain on the surface reflectance at high sun (sun-gated on the veil ramp, so
-    // twilight is byte-unchanged; water excluded). Applied to `l_surf` BEFORE the
+    // LAND daylight brightness lift (refinement pass, round 2): a modest ground-only
+    // gain on the surface reflectance, neutral at/below the horizon and fully engaged
+    // by 12 degrees (water excluded). Applied to `l_surf` BEFORE the
     // aerial-perspective veil, so only the ground signal brightens (not the additive
     // haze). A true-color display gain, distinct from the global exposure. See
     // [`LAND_DAY_GAIN`] / [`land_day_gain`].
@@ -1334,12 +1361,12 @@ pub fn surface_toa_radiance(
         }
     }
 
-    // GROUND LIFT (top-down/basemap appearance pass): a sun-gated daytime brightness lift
+    // GROUND LIFT (top-down/basemap appearance pass): a sun-gated daylight brightness lift
     // on the WHOLE surface radiance — land AND water — toward real-GOES ground levels (the
     // reported ground was too dark). Applied BEFORE the aerial-perspective veil (only the
     // ground signal brightens, not the additive haze) and BEFORE the cloud composite (the
-    // cloud radiance is not lifted). Sun-gated on the veil ramp, so at/below the twilight
-    // band it is exactly `1.0` — twilight is byte-unchanged. `ground_lift = 1.0` = no-op.
+    // cloud radiance is not lifted). The 0--12 degree surface-help ramp leaves it exactly
+    // `1.0` at/below the horizon. `ground_lift = 1.0` is an exact no-op.
     if ground_lift != 1.0 {
         let g = ground_day_lift(px.sun_elev_deg as f64, ground_lift);
         for v in &mut l_surf {
@@ -1423,6 +1450,28 @@ pub fn radiance_to_rgba_softclip(
     softclip_knee: f64,
     highlight_max: f64,
 ) -> [f32; 4] {
+    radiance_to_rgba_softclip_with_synthetic_green(
+        l_toa,
+        transform,
+        exposure,
+        softclip_knee,
+        highlight_max,
+        synthetic_green_enabled(),
+    )
+}
+
+/// Per-render variant of [`radiance_to_rgba_softclip`]. The explicit flag is used by
+/// the high-level API and Studio so Sensor Fast Gray can guarantee native broad-RGB
+/// channels without changing global state; the original function remains the
+/// backwards-compatible low-level QA wrapper.
+pub fn radiance_to_rgba_softclip_with_synthetic_green(
+    l_toa: [f64; 3],
+    transform: OutputTransform,
+    exposure: f64,
+    softclip_knee: f64,
+    highlight_max: f64,
+    synthetic_green: bool,
+) -> [f32; 4] {
     let e_sun = SOLAR_IRRADIANCE_RGB;
     let gain = if exposure.is_finite() && exposure > 0.0 {
         exposure
@@ -1438,13 +1487,19 @@ pub fn radiance_to_rgba_softclip(
     for c in 0..3 {
         rho[c] = gain * std::f64::consts::PI * l_toa[c] / e_sun[c];
     }
-    let out = apply_output_transform(rho, transform, softclip_knee, gain * highlight_max);
+    let out = output_transform_with(
+        rho,
+        transform,
+        softclip_knee,
+        gain * highlight_max,
+        synthetic_green,
+    );
     [out[0], out[1], out[2], 1.0]
 }
 
 /// Convert a top-of-atmosphere linear radiance to the RAW per-channel REFLECTANCE
 /// FACTOR `rho = pi * L / E_sun`, clamped to `[0, 1]` — the pre-tonemap quantity the
-/// Python binding's `render_visible_bands` returns for building custom RGB / operating
+/// Python binding's `render_rgb_reflectance` returns for building custom RGB / operating
 /// on bands. This is the SAME `rho` [`radiance_to_rgba`] computes internally, but WITHOUT
 /// the display exposure gain and WITHOUT the ABI sqrt stretch / highlight desaturation:
 /// a linear reflectance in `[0, 1]` (real ABI visible bands are reflectance factors in
@@ -1470,12 +1525,13 @@ pub fn shade_surface(ctx: &FrameContext, px: &SurfacePixel) -> [f32; 4] {
             // Low-sun illuminant correction at the display seam (on-earth only; the
             // limb keeps its physical color). Identity outside the 2-30 deg band.
             let l = apply_low_sun_illuminant(l_toa, px.on_earth, px.sun_elev_deg as f64, ctx.luts);
-            radiance_to_rgba_softclip(
+            radiance_to_rgba_softclip_with_synthetic_green(
                 l,
                 ctx.output_transform,
                 ctx.exposure,
                 ctx.cloud_softclip_knee,
                 ctx.cloud_highlight_max,
+                ctx.synthetic_green,
             )
         }
     }
@@ -1683,6 +1739,7 @@ mod tests {
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: RHO_HIGHLIGHT_MAX,
+            synthetic_green: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::identity(),
@@ -1927,7 +1984,7 @@ mod tests {
 
     #[test]
     fn reflectance_from_radiance_is_the_clamped_pre_tonemap_rho() {
-        // The raw-bands conversion (Python render_visible_bands) is rho = pi*L/E_sun with
+        // The raw RGB-reflectance conversion is rho = pi*L/E_sun with
         // NO exposure and NO stretch, clamped to [0, 1]. It must equal the same rho that
         // radiance_to_rgba computes internally (before the ABI stretch) at exposure 1.0.
         let e_sun = SOLAR_IRRADIANCE_RGB;
@@ -2223,8 +2280,8 @@ mod tests {
             );
             assert_eq!(
                 land_day_gain(elev),
-                day_lerp_ramp(elev, LAND_DAY_GAIN),
-                "the land day gain is the shared day ramp at LAND_DAY_GAIN"
+                surface_help_ramp(elev, LAND_DAY_GAIN),
+                "the land day gain is the surface-help ramp at LAND_DAY_GAIN"
             );
             if elev >= AERIAL_VEIL_ELEV_HI_DEG {
                 assert_eq!(
@@ -2233,8 +2290,8 @@ mod tests {
                     "full daytime veil must still equal the day-ramp value (byte-identity)"
                 );
             }
-            if elev <= AERIAL_VEIL_ELEV_LO_DEG {
-                assert_eq!(land_day_gain(elev), 1.0, "twilight land gain untouched");
+            if elev <= SURFACE_HELP_ELEV_LO_DEG {
+                assert_eq!(land_day_gain(elev), 1.0, "night land gain untouched");
             }
             if elev <= VEIL_TERMINATOR_ELEV_DEG {
                 assert_eq!(aerial_veil_scale(elev), 1.0, "terminator veil untouched");
@@ -2311,12 +2368,12 @@ mod tests {
             y(bright_land)
         );
 
-        // Day gain brightens at high sun (> 1), is a no-op at twilight, and never overshoots.
+        // Day gain brightens at high sun (> 1), is a no-op at the horizon, and never overshoots.
         assert!(
             land_day_gain(50.0) > 1.0,
             "high-sun land day gain must brighten"
         );
-        assert_eq!(land_day_gain(0.0), 1.0, "twilight land is byte-unchanged");
+        assert_eq!(land_day_gain(0.0), 1.0, "horizon land is unchanged");
         assert!(
             land_day_gain(50.0) <= LAND_DAY_GAIN + 1e-12,
             "the gain never exceeds its daytime target (no over-bright)"
@@ -2636,24 +2693,24 @@ mod tests {
     }
 
     #[test]
-    fn ground_day_lift_is_sun_gated_and_neutral_at_one() {
+    fn ground_day_lift_uses_surface_help_ramp_and_is_neutral_at_one() {
         // The neutral ground_lift = 1.0 is exactly 1.0 at every elevation (identity no-op).
         for &elev in &[-10.0f64, 0.0, 10.0, 20.0, 30.0, 40.0, 60.0, 90.0] {
             assert_eq!(ground_day_lift(elev, 1.0), 1.0, "neutral no-op at {elev}");
-            // It is the shared daytime ramp family (only day_value differs).
+            // It is the surface-help ramp family (only day_value differs).
             assert_eq!(
                 ground_day_lift(elev, GROUND_DAY_LIFT),
-                day_lerp_ramp(elev, GROUND_DAY_LIFT)
+                surface_help_ramp(elev, GROUND_DAY_LIFT)
             );
         }
-        // Sun-gated: exactly 1.0 through the whole twilight band (<= LO); the target at HI.
+        // Sun-gated: exactly 1.0 at/below the horizon; target reached by 12 degrees.
         assert_eq!(
-            ground_day_lift(AERIAL_VEIL_ELEV_LO_DEG, GROUND_DAY_LIFT),
+            ground_day_lift(SURFACE_HELP_ELEV_LO_DEG, GROUND_DAY_LIFT),
             1.0
         );
         assert_eq!(ground_day_lift(0.0, GROUND_DAY_LIFT), 1.0);
         assert!(
-            (ground_day_lift(AERIAL_VEIL_ELEV_HI_DEG, GROUND_DAY_LIFT) - GROUND_DAY_LIFT).abs()
+            (ground_day_lift(SURFACE_HELP_ELEV_HI_DEG, GROUND_DAY_LIFT) - GROUND_DAY_LIFT).abs()
                 < 1e-12
         );
         assert_eq!(
@@ -2694,12 +2751,12 @@ mod tests {
     }
 
     #[test]
-    fn land_sza_normalization_is_twilight_safe_reference_neutral_and_bounded() {
-        for &elev in &[-10.0, 0.0, 10.0, AERIAL_VEIL_ELEV_LO_DEG] {
+    fn land_sza_normalization_is_night_safe_reference_neutral_and_bounded() {
+        for &elev in &[-10.0, 0.0] {
             assert_eq!(
                 land_sza_normalization_gain(elev, LAND_SZA_MAX_GAIN),
                 1.0,
-                "twilight must be exact identity at {elev}"
+                "night/horizon must be exact identity at {elev}"
             );
         }
         for &elev in &[LAND_SZA_REFERENCE_ELEV_DEG, 75.0, 90.0] {
@@ -2711,13 +2768,20 @@ mod tests {
         }
         let moderate = land_sza_normalization_gain(33.0, LAND_SZA_MAX_GAIN);
         assert!(moderate > 1.0 && moderate <= LAND_SZA_MAX_GAIN);
+        for &elev in &[5.0, 8.0, 10.0, 12.0] {
+            let gain = land_sza_normalization_gain(elev, LAND_SZA_MAX_GAIN);
+            assert!(
+                gain > 1.0 && gain <= LAND_SZA_MAX_GAIN,
+                "low-sun gain at {elev}"
+            );
+        }
         assert_eq!(land_sza_normalization_gain(33.0, 1.0), 1.0);
         assert!(land_sza_normalization_gain(30.0, 1.2) <= 1.2);
         assert!(land_sza_normalization_gain(30.0, f64::NAN).is_finite());
     }
 
     #[test]
-    fn land_dark_toe_preserves_black_knee_high_values_and_twilight() {
+    fn land_dark_toe_preserves_black_knee_high_values_and_night() {
         let gain = |rgb, elev| {
             land_dark_toe_gain(
                 rgb,
@@ -2734,7 +2798,11 @@ mod tests {
             "the knee is the identity"
         );
         assert_eq!(gain([0.4; 3], 40.0), 1.0, "bright land is unchanged");
-        assert_eq!(gain([0.02, 0.04, 0.01], 10.0), 1.0, "twilight is unchanged");
+        assert_eq!(gain([0.02, 0.04, 0.01], 0.0), 1.0, "night is unchanged");
+        assert!(
+            gain([0.02, 0.04, 0.01], 10.0) > 1.0,
+            "low-sun toe is active"
+        );
         let day = gain([0.02, 0.04, 0.01], 40.0);
         assert!(day > 1.0 && day <= LAND_DARK_TOE_MAX_GAIN);
         let mid = land_dark_toe_gain([0.04; 3], 40.0, 0.08, 0.65, 4.0);
@@ -2779,7 +2847,7 @@ mod tests {
     }
 
     #[test]
-    fn ground_lift_brightens_day_surface_but_not_twilight() {
+    fn ground_lift_brightens_day_and_low_sun_surface_but_not_night() {
         const TEST_GROUND_LIFT: f64 = 1.6;
         let view = nadir_view();
         let sum = |l: [f64; 3]| l[0] + l[1] + l[2];
@@ -2808,8 +2876,8 @@ mod tests {
                 sum(base)
             );
         }
-        // Twilight (5 deg, at/below the veil LO): the lift ramp is 1.0, so ANY ground_lift
-        // is byte-identical to the neutral surface — the M2 twilight look is preserved.
+        // Low sun (5 deg): the surface-help ramp is active, so the user control must
+        // materially brighten terrain instead of silently doing nothing.
         let (twi_ctx, twi_sun) = nadir_surface_pixel(5.0);
         let px = SurfacePixel {
             on_earth: true,
@@ -2823,9 +2891,22 @@ mod tests {
         };
         let base = surface_toa_radiance(&twi_ctx, &px, 1.0, 1.0).expect("earth");
         let lifted = surface_toa_radiance(&twi_ctx, &px, 1.0, TEST_GROUND_LIFT).expect("earth");
+        assert!(sum(lifted) > sum(base), "ground lift must work at low sun");
+
+        let (night_ctx, night_sun) = nadir_surface_pixel(-5.0);
+        let night_px = SurfacePixel {
+            sun_enu: [
+                night_sun[0] as f32,
+                night_sun[1] as f32,
+                night_sun[2] as f32,
+            ],
+            sun_elev_deg: -5.0,
+            ..px
+        };
         assert_eq!(
-            base, lifted,
-            "ground lift must be byte-identical at twilight"
+            surface_toa_radiance(&night_ctx, &night_px, 1.0, 1.0),
+            surface_toa_radiance(&night_ctx, &night_px, 1.0, TEST_GROUND_LIFT),
+            "ground lift must remain a no-op at night"
         );
     }
 
@@ -2889,24 +2970,24 @@ mod tests {
     }
 
     #[test]
-    fn water_twilight_is_shadow_invariant_and_byte_stable() {
-        // At/below the ramp LO the day gate is 0: NO direct term, NO day albedo rescale
-        // — the water radiance is the locked M2 twilight expression, and (in this
-        // glint-free geometry) it is INVARIANT to the cloud shadow. This is the unit
-        // proxy of the twilight-sweep byte-identity gate.
+    fn water_low_sun_receives_direct_light_and_night_is_shadow_invariant() {
+        // Physical water direct sunlight now follows the disk/Tsun/N.L terms instead of
+        // an artificial 20-degree display gate, so cloud shadows work at low sun.
         for &elev in &[5.0f32, 12.0, 20.0] {
             let (ctx, px) = day_water_pixel(elev);
             let lit = surface_toa_radiance(&ctx, &px, 1.0, 1.0).expect("earth");
             let occluded = surface_toa_radiance(&ctx, &px, 0.0, 1.0).expect("earth");
-            for c in 0..3 {
-                assert!(
-                    (lit[c] - occluded[c]).abs() < 1e-15,
-                    "twilight water must not see the shadow at {elev} deg: {} vs {}",
-                    lit[c],
-                    occluded[c]
-                );
-            }
+            assert!(
+                lit.iter().sum::<f64>() > occluded.iter().sum::<f64>(),
+                "shadow at {elev}"
+            );
         }
+        let (ctx, px) = day_water_pixel(-5.0);
+        assert_eq!(
+            surface_toa_radiance(&ctx, &px, 1.0, 1.0),
+            surface_toa_radiance(&ctx, &px, 0.0, 1.0),
+            "night water has no direct term to shadow"
+        );
     }
 
     #[test]
@@ -2936,31 +3017,34 @@ mod tests {
     }
 
     #[test]
-    fn effective_cloud_shadow_is_sun_gated_floored_and_monotone() {
-        // Twilight (<= LO): exactly the input shadow (byte-identity gate).
-        for &s in &[0.0f64, 0.3, 0.7, 1.0] {
+    fn effective_cloud_shadow_is_elevation_independent_floored_and_monotone() {
+        for &elev in &[-10.0f64, 0.0, 5.0, 20.0, 50.0, 90.0] {
+            assert_eq!(effective_cloud_shadow(0.0, elev), CLOUD_SHADOW_FLOOR);
+            assert_eq!(effective_cloud_shadow(1.0, elev), 1.0);
+            let mut prev = -1.0;
+            for &s in &[0.0f64, 0.25, 0.5, 0.75, 1.0] {
+                let e = effective_cloud_shadow(s, elev);
+                assert!(e > prev, "monotone in shadow at {s}, elev {elev}");
+                assert!((CLOUD_SHADOW_FLOOR..=1.0).contains(&e));
+                prev = e;
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_cloud_layer_shadow_is_neutral_at_night_and_full_by_twelve_degrees() {
+        for &elev in &[-90.0f64, -10.0, 0.0] {
+            assert_eq!(effective_cloud_shadow_layer(0.0, elev), 1.0);
+            assert_eq!(effective_cloud_shadow_layer(0.5, elev), 1.0);
+        }
+        for &raw in &[0.0f64, 0.25, 0.5, 1.0] {
             assert_eq!(
-                effective_cloud_shadow(s, 5.0),
-                s,
-                "twilight identity at {s}"
-            );
-            assert_eq!(
-                effective_cloud_shadow(s, AERIAL_VEIL_ELEV_LO_DEG),
-                s,
-                "identity at the ramp LO"
+                effective_cloud_shadow_layer(raw, SURFACE_HELP_ELEV_HI_DEG),
+                effective_cloud_shadow(raw, SURFACE_HELP_ELEV_HI_DEG)
             );
         }
-        // Full day: a fully-occluded pixel keeps the floor (cloud-scattered fill), an
-        // unshadowed pixel is EXACTLY 1 (byte-identical), and the map is monotone.
-        assert_eq!(effective_cloud_shadow(0.0, 50.0), CLOUD_SHADOW_FLOOR);
-        assert_eq!(effective_cloud_shadow(1.0, 50.0), 1.0);
-        let mut prev = -1.0;
-        for &s in &[0.0f64, 0.25, 0.5, 0.75, 1.0] {
-            let e = effective_cloud_shadow(s, 50.0);
-            assert!(e > prev, "monotone in shadow at {s}");
-            assert!((CLOUD_SHADOW_FLOOR..=1.0).contains(&e));
-            prev = e;
-        }
+        let at_five = effective_cloud_shadow_layer(0.0, 5.0);
+        assert!(at_five > CLOUD_SHADOW_FLOOR && at_five < 1.0);
     }
 
     #[test]

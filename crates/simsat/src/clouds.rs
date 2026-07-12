@@ -37,13 +37,15 @@ use rayon::prelude::*;
 use crate::atmosphere::{
     self, AerialFroxel, AtmosphereLuts, GROUND_ALBEDO, R_GROUND_M, SOLAR_IRRADIANCE_RGB, SkyShTable,
 };
-use crate::bricks::{LogQuant, VolumeBrick};
-use crate::camera::ScanGrid;
-use crate::fractional_clouds::maximum_overlap_closure;
+use crate::bricks::{LogQuant, StorageProfile, VolumeBrick, decode_log2_f16};
+use crate::camera::{ScanGrid, SurfaceRaster};
+use crate::fractional_clouds::{
+    DETERMINISTIC_SUBCOLUMN_COUNT, deterministic_subcolumn_u_for_count, maximum_overlap_closure,
+};
 use crate::frame::GridGeoref;
 use crate::render::{
-    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel, radiance_to_rgba_softclip,
-    surface_toa_radiance,
+    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel,
+    radiance_to_rgba_softclip_with_synthetic_green, surface_toa_radiance,
 };
 
 // ── optics constants (design section 4) ──────────────────────────────────────
@@ -179,11 +181,6 @@ pub fn validated_cloud_optical_depth_scale(scale: f32) -> f32 {
 fn multiscatter_thin_gate(tau: f64) -> f64 {
     1.0 - (-tau.max(0.0)).exp()
 }
-
-/// Solar disk angular DIAMETER (rad) = 0.533 deg — the penumbra-widening factor for
-/// the ground cloud shadow (design section 6: blur radius = occluder distance x
-/// tan 0.533 deg). `tan(0.533 deg) ~= 0.0093`.
-pub const SUN_ANGULAR_DIAMETER_RAD: f64 = 0.533 * std::f64::consts::PI / 180.0;
 
 // LIMB-DARKENING NOTE (WS1 march-physics decision, recorded next to the octave
 // calibration it belongs to): the SURFACE direct-sun term dims by the disk-averaged
@@ -1236,6 +1233,13 @@ pub fn beer(tau: f64) -> f64 {
     (-tau).exp()
 }
 
+/// Project the apparent solar disk radius to an occluder's distance. A convolution
+/// radius uses the disk half-angle, not its full angular diameter.
+#[inline]
+fn solar_penumbra_radius_m(occluder_distance_m: f64) -> f64 {
+    occluder_distance_m.max(0.0) * atmosphere::SUN_ANGULAR_RADIUS_RAD.tan()
+}
+
 /// Schneider's beer-powder sugar term `e^-tau * (1 - e^-2tau)`, applied ONLY to the
 /// sun term (a named STYLIZATION with a physical rationale: it approximates the
 /// missing forward-scatter buildup that darkens optically-thin cloud edges). It is
@@ -1386,6 +1390,9 @@ pub struct DecodedVolume {
     pub ext_snow: Vec<u8>,
     /// Quantization scale for the encoded `ext_snow` auxiliary.
     pub ext_snow_quant: LogQuant,
+    /// Authoritative decoded snow auxiliary for ScienceCloudF16. Empty for the
+    /// compact profile, which keeps the lower-residency encoded u8 path above.
+    pub science_ext_snow: Vec<f32>,
     pub ext_precip: Vec<f32>,
     pub tau_up: Vec<f32>,
     /// Linear-u8 model cloud coverage, one code per voxel.
@@ -1407,6 +1414,23 @@ pub struct FractionalCloudStats {
     pub repaired_zero_count: usize,
     pub raw_fractional_tau: f64,
     pub effective_fractional_tau: f64,
+}
+
+/// Diagnostics from materializing one member of the opt-in deterministic
+/// four-subcolumn maximum-overlap reference ensemble.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FractionalSubcolumnStats {
+    pub available: bool,
+    pub subcolumn_index: usize,
+    pub subcolumn_u: f64,
+    pub fractional_layer_count: usize,
+    pub cloudy_fractional_layer_count: usize,
+    pub repaired_zero_count: usize,
+    /// Grid-mean cloud optical depth represented by the source condensate.
+    pub grid_mean_cloud_tau: f64,
+    /// Cloud optical depth carried by this explicit subcolumn before the render
+    /// calibration multiplier. Ensemble-mean closure is diagnosed by the caller.
+    pub subcolumn_cloud_tau: f64,
 }
 
 /// Diagnostics from the opt-in top-down stratiform column regularizer.
@@ -1461,22 +1485,40 @@ impl DecodedVolume {
         let qs = brick.quant.get("ext_snow");
         let qp = brick.quant.get("ext_precip");
         let qt = brick.quant.get("tau_up");
-        Self {
+        let science = (brick.storage_profile == StorageProfile::ScienceCloudF16)
+            .then_some(brick.science_cloud_f16.as_ref())
+            .flatten();
+        let decode_science = |values: &[u16]| values.iter().map(|&v| decode_log2_f16(v)).collect();
+        let mut volume = Self {
             nx: brick.nx,
             ny: brick.ny,
             nz: brick.nz,
             z_min_m: brick.z_min_m,
             dz_m: brick.dz_m,
             horiz_pitch_m,
-            ext_liquid: brick.ext_liquid.iter().map(|&c| ql.decode(c)).collect(),
-            ext_ice: brick.ext_ice.iter().map(|&c| qi.decode(c)).collect(),
-            ext_snow: if fractional_aux && brick.has_cloud_fraction {
+            ext_liquid: science.map_or_else(
+                || brick.ext_liquid.iter().map(|&c| ql.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_liquid),
+            ),
+            ext_ice: science.map_or_else(
+                || brick.ext_ice.iter().map(|&c| qi.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_ice),
+            ),
+            ext_snow: if science.is_none() && fractional_aux && brick.has_cloud_fraction {
                 brick.ext_snow.clone()
             } else {
                 Vec::new()
             },
             ext_snow_quant: qs,
-            ext_precip: brick.ext_precip.iter().map(|&c| qp.decode(c)).collect(),
+            science_ext_snow: if fractional_aux && brick.has_cloud_fraction {
+                science.map_or_else(Vec::new, |payload| decode_science(&payload.ext_snow))
+            } else {
+                Vec::new()
+            },
+            ext_precip: science.map_or_else(
+                || brick.ext_precip.iter().map(|&c| qp.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_precip),
+            ),
             tau_up: brick.tau_up.iter().map(|&c| qt.decode(c)).collect(),
             cloud_fraction: if fractional_aux && brick.has_cloud_fraction {
                 brick.cloud_fraction.clone()
@@ -1484,6 +1526,43 @@ impl DecodedVolume {
                 Vec::new()
             },
             has_cloud_fraction: fractional_aux && brick.has_cloud_fraction,
+        };
+        if science.is_some() {
+            volume.rebuild_tau_up_from_extinction();
+        }
+        volume
+    }
+
+    #[inline]
+    fn snow_extinction(&self, cell: usize) -> f32 {
+        if self.science_ext_snow.is_empty() {
+            self.ext_snow_quant.decode(self.ext_snow[cell])
+        } else {
+            self.science_ext_snow[cell]
+        }
+    }
+
+    fn rebuild_tau_up_from_extinction(&mut self) {
+        if self.nz == 0 {
+            return;
+        }
+        let dz = self.dz_m.max(0.0);
+        for j in 0..self.ny {
+            for i in 0..self.nx {
+                let top = self.cell(i, j, self.nz - 1);
+                self.tau_up[top] = 0.0;
+                for k in (0..self.nz - 1).rev() {
+                    let c0 = self.cell(i, j, k);
+                    let c1 = self.cell(i, j, k + 1);
+                    let beta0 = self.ext_liquid[c0] as f64
+                        + self.ext_ice[c0] as f64
+                        + self.ext_precip[c0] as f64;
+                    let beta1 = self.ext_liquid[c1] as f64
+                        + self.ext_ice[c1] as f64
+                        + self.ext_precip[c1] as f64;
+                    self.tau_up[c0] = (self.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * dz) as f32;
+                }
+            }
         }
     }
 
@@ -1507,7 +1586,7 @@ impl DecodedVolume {
         let available = self.has_cloud_fraction
             && self.ext_liquid.len() == cells
             && self.ext_ice.len() == cells
-            && self.ext_snow.len() == cells
+            && (self.ext_snow.len() == cells || self.science_ext_snow.len() == cells)
             && self.ext_precip.len() == cells
             && self.tau_up.len() == cells
             && self.cloud_fraction.len() == cells;
@@ -1528,7 +1607,7 @@ impl DecodedVolume {
                     // Independent log quantization can put the snow auxiliary a few
                     // ulps above the total precip channel. Cap it to its parent so the
                     // auxiliary can never invent extinction.
-                    let snow = (self.ext_snow_quant.decode(self.ext_snow[c]) as f64)
+                    let snow = (self.snow_extinction(c) as f64)
                         .max(0.0)
                         .min((self.ext_precip[c] as f64).max(0.0));
                     let cloud_ext = (self.ext_liquid[c] as f64).max(0.0)
@@ -1555,11 +1634,7 @@ impl DecodedVolume {
                     let liquid = self.ext_liquid[c].max(0.0);
                     let ice = self.ext_ice[c].max(0.0);
                     let precip = self.ext_precip[c].max(0.0);
-                    let snow = self
-                        .ext_snow_quant
-                        .decode(self.ext_snow[c])
-                        .max(0.0)
-                        .min(precip);
+                    let snow = self.snow_extinction(c).max(0.0).min(precip);
                     if liquid + ice + snow <= 0.0 {
                         continue;
                     }
@@ -1592,9 +1667,141 @@ impl DecodedVolume {
         // Release them after the one-shot closure to keep large-domain peak residency
         // bounded during the expensive ray march.
         self.ext_snow = Vec::new();
+        self.science_ext_snow = Vec::new();
         self.cloud_fraction = Vec::new();
         self.has_cloud_fraction = false;
         stats
+    }
+
+    /// Materialize one fixed, stratified, maximum-overlap cloud subcolumn.
+    ///
+    /// Model liquid, cloud ice, and snow are grid-mean condensates. In a layer
+    /// with model fraction `f`, the selected subcolumn therefore carries
+    /// `beta/f` when its shared coordinate `u < f`, and zero cloud condensate
+    /// otherwise. Code 255 remains a full layer; code 0 with positive cloud
+    /// condensate is repaired to full coverage, matching the established
+    /// effective-OD closure. Rain/graupel (the non-snow share of `ext_precip`)
+    /// remain full-cell precipitation in every subcolumn.
+    ///
+    /// The resulting volume is self-consistent: `tau_up` is rebuilt from the
+    /// exact extinction that the view, secondary-sun, ambient and shadow paths
+    /// consume. The method is deterministic and performs no stochastic draws.
+    pub fn apply_deterministic_fractional_subcolumn(
+        &mut self,
+        subcolumn_index: usize,
+    ) -> Result<FractionalSubcolumnStats, String> {
+        self.apply_deterministic_fractional_subcolumn_count(
+            subcolumn_index,
+            DETERMINISTIC_SUBCOLUMN_COUNT,
+        )
+    }
+
+    /// Materialize one member of a selectable 4/8/16 fixed-stratified ensemble.
+    ///
+    /// This is the counted form of [`Self::apply_deterministic_fractional_subcolumn`].
+    /// The sampled `u` remains shared through every vertical layer. The caller must
+    /// feed this one resulting volume to its view, sun, ambient, and shadow paths as
+    /// one indivisible member before averaging linear radiance.
+    pub fn apply_deterministic_fractional_subcolumn_count(
+        &mut self,
+        subcolumn_index: usize,
+        subcolumn_count: usize,
+    ) -> Result<FractionalSubcolumnStats, String> {
+        let u = deterministic_subcolumn_u_for_count(subcolumn_index, subcolumn_count).ok_or_else(
+            || {
+                format!(
+                    "deterministic fractional subcolumn index {subcolumn_index} is outside 0..{subcolumn_count}, or count is not one of 4/8/16"
+                )
+            },
+        )?;
+        let cells = self.nx.saturating_mul(self.ny).saturating_mul(self.nz);
+        let available = self.has_cloud_fraction
+            && self.ext_liquid.len() == cells
+            && self.ext_ice.len() == cells
+            && (self.ext_snow.len() == cells || self.science_ext_snow.len() == cells)
+            && self.ext_precip.len() == cells
+            && self.tau_up.len() == cells
+            && self.cloud_fraction.len() == cells;
+        let mut stats = FractionalSubcolumnStats {
+            available,
+            subcolumn_index,
+            subcolumn_u: u,
+            ..FractionalSubcolumnStats::default()
+        };
+        if !available || self.nz == 0 {
+            return Ok(stats);
+        }
+
+        let dz = self.dz_m.max(0.0);
+        for c in 0..cells {
+            let liquid = self.ext_liquid[c].max(0.0);
+            let ice = self.ext_ice[c].max(0.0);
+            let precip = self.ext_precip[c].max(0.0);
+            let snow = self.snow_extinction(c).max(0.0).min(precip);
+            let other_precip = precip - snow;
+            let cloud_ext = liquid + ice + snow;
+            stats.grid_mean_cloud_tau += cloud_ext as f64 * dz;
+
+            match self.cloud_fraction[c] {
+                255 => {
+                    stats.subcolumn_cloud_tau += cloud_ext as f64 * dz;
+                }
+                0 => {
+                    if cloud_ext > 0.0 {
+                        stats.repaired_zero_count += 1;
+                        stats.subcolumn_cloud_tau += cloud_ext as f64 * dz;
+                    }
+                }
+                code => {
+                    if cloud_ext <= 0.0 {
+                        continue;
+                    }
+                    stats.fractional_layer_count += 1;
+                    let f = code as f32 / crate::fractional_clouds::FRACTION_BINS as f32;
+                    if u < f as f64 {
+                        let inv_f = 1.0 / f;
+                        self.ext_liquid[c] = liquid * inv_f;
+                        self.ext_ice[c] = ice * inv_f;
+                        self.ext_precip[c] = other_precip + snow * inv_f;
+                        stats.cloudy_fractional_layer_count += 1;
+                        stats.subcolumn_cloud_tau += cloud_ext as f64 / f as f64 * dz;
+                    } else {
+                        self.ext_liquid[c] = 0.0;
+                        self.ext_ice[c] = 0.0;
+                        self.ext_precip[c] = other_precip;
+                    }
+                }
+            }
+        }
+
+        // Rebuild every column, including those containing only full/repaired
+        // cloud, so the explicit subcolumn has one authoritative extinction state.
+        let n2 = self.nx.saturating_mul(self.ny);
+        if self.nz > 0 && n2 > 0 {
+            for j in 0..self.ny {
+                for i in 0..self.nx {
+                    let top = self.cell(i, j, self.nz - 1);
+                    self.tau_up[top] = 0.0;
+                    for k in (0..self.nz - 1).rev() {
+                        let c0 = self.cell(i, j, k);
+                        let c1 = self.cell(i, j, k + 1);
+                        let beta0 = self.ext_liquid[c0] as f64
+                            + self.ext_ice[c0] as f64
+                            + self.ext_precip[c0] as f64;
+                        let beta1 = self.ext_liquid[c1] as f64
+                            + self.ext_ice[c1] as f64
+                            + self.ext_precip[c1] as f64;
+                        self.tau_up[c0] =
+                            (self.tau_up[c1] as f64 + 0.5 * (beta0 + beta1) * dz) as f32;
+                    }
+                }
+            }
+        }
+
+        self.ext_snow.clear();
+        self.cloud_fraction.clear();
+        self.has_cloud_fraction = false;
+        Ok(stats)
     }
 
     /// Apply a bounded, top-down-only observation-operator reconstruction to broad
@@ -2240,7 +2447,7 @@ impl OccupancyMip {
 /// M5 adds `occ_dist` (per texel: the extinction-weighted mean SLANT distance from the
 /// ground to the occluding cloud along the sun ray) so [`SunOdMap::penumbral_shadow`]
 /// can widen the ground shadow's penumbra with occluder height (design section 6:
-/// blur radius = occluder distance x tan 0.533 deg). The map's `(au, av)` plane IS
+/// blur radius = occluder distance x tan 0.2665 deg). The map's `(au, av)` plane IS
 /// perpendicular to the sun, so a blur of that radius in map metres is the physically
 /// correct disk-of-sun soft edge (a named approximation: pre-blur vs disk-sampling the
 /// volume).
@@ -2570,7 +2777,7 @@ impl SunOdMap {
     /// The PENUMBRAL ground cloud-shadow transmittance at an ECEF ground point (design
     /// section 6, M5): the sun-visibility fraction with a physically soft, distance-
     /// widening edge. The penumbra blur radius = the occluder's slant distance x
-    /// `tan(0.533 deg)` (the sun disk's angular diameter projected onto the sun plane,
+    /// `tan(0.2665 deg)` (the sun disk's angular radius projected onto the sun plane,
     /// which is exactly this map's `(u, v)` plane). We average the Beer transmittance
     /// over a small disk of that radius — a named approximation (pre-blur instead of
     /// disk-sampling the volume): a higher cloud (larger `occ_dist`) yields a wider,
@@ -2587,7 +2794,7 @@ impl SunOdMap {
         let od_scale = validated_cloud_optical_depth_scale(optical_depth_scale) as f64;
         let (u, v) = self.plane_uv(p);
         let occ_dist = self.sample_uv(&self.occ_dist, u, v);
-        let radius = occ_dist * (SUN_ANGULAR_DIAMETER_RAD.tan());
+        let radius = solar_penumbra_radius_m(occ_dist);
         // Below ~one texel of blur there is no penumbra to resolve: sharp Beer shadow.
         let texel = ((self.u_max - self.u_min).abs() / self.width.max(1) as f64)
             .max((self.v_max - self.v_min).abs() / self.height.max(1) as f64);
@@ -2650,6 +2857,7 @@ pub enum CloudMultiscatterMode {
     SingleScatter,
     DeltaFluxV1,
     DeltaFluxV2,
+    DeltaFluxV3,
 }
 
 impl CloudMultiscatterMode {
@@ -2659,6 +2867,7 @@ impl CloudMultiscatterMode {
             Self::SingleScatter => "single-scatter",
             Self::DeltaFluxV1 => "delta-flux-v1",
             Self::DeltaFluxV2 => "delta-flux-v2b",
+            Self::DeltaFluxV3 => "delta-flux-v3-memory",
         }
     }
 }
@@ -2716,7 +2925,8 @@ pub struct MarchConfig {
     /// Higher-order cloud transport dispatch. [`CloudMultiscatterMode::LegacyOctaves`]
     /// preserves the established octave arithmetic exactly; `DeltaFluxV1` selects the
     /// opt-in Stage-2 Monte Carlo depth-source LUT and `DeltaFluxV2` its brightness-
-    /// neutral, upward-hemisphere-normalized P1 directional reconstruction.
+    /// neutral, upward-hemisphere-normalized P1 directional reconstruction;
+    /// `DeltaFluxV3` retains the bounded second-order phase memory in thin cloud.
     pub multiscatter_mode: CloudMultiscatterMode,
     /// Apply the Schneider beer-powder stylization to the sun term. **OFF by default
     /// as of M5**: beer-powder was a stylization that FAKED the missing forward-scatter
@@ -2754,6 +2964,9 @@ pub struct MarchConfig {
     /// `render_frame` `cloud-highlight-max=` knob can override it for display-only
     /// headroom A/B tests; it does not change extinction, transmittance, IR, or derived COD.
     pub cloud_highlight_max: f64,
+    /// Per-frame ABI synthetic-green display arithmetic. False is the native broad-RGB
+    /// path and the strict Sensor Fast Gray requirement.
+    pub synthetic_green: bool,
     /// TOP-DOWN CLOUD NORMALIZATION ([`crate::topdown::TOPDOWN_CLOUD_NORM`]): the
     /// sun-gated multiplier on the top-down cloud radiance (fixes the near-nadir "white
     /// square"; the geostationary path ignores it). Default = the baked
@@ -2810,6 +3023,7 @@ impl MarchConfig {
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
+            synthetic_green: false,
             topdown_cloud_norm: crate::topdown::TOPDOWN_CLOUD_NORM,
             edge_feather_cells: 0.0,
             granulation: None,
@@ -3103,7 +3317,9 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
                 1,
                 multiscatter_support_tau,
             ),
-            CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2 => {
+            CloudMultiscatterMode::DeltaFluxV1
+            | CloudMultiscatterMode::DeltaFluxV2
+            | CloudMultiscatterMode::DeltaFluxV3 => {
                 let direct = octave_sun_source_thin_gated(
                     cos_vs,
                     sample.ext_liquid,
@@ -3118,27 +3334,42 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
                 } else {
                     0.5
                 };
-                let higher = if scene.cfg.multiscatter_mode == CloudMultiscatterMode::DeltaFluxV2 {
-                    // `view` points camera -> sample; the outgoing direction toward the
-                    // camera is `-view`. `up` is the slab upper-boundary normal.
-                    crate::cloud_delta_flux::stage2_higher_order_source_p1(
-                        multiscatter_support_tau,
-                        fractional_depth,
-                        mu_sun,
-                        scene.cfg.ground_albedo,
-                        sample.ext_liquid,
-                        sample.ext_ice + sample.ext_precip,
-                        -dot3(view, up),
-                    )
-                } else {
-                    crate::cloud_delta_flux::stage2_higher_order_source(
-                        multiscatter_support_tau,
-                        fractional_depth,
-                        mu_sun,
-                        scene.cfg.ground_albedo,
-                        sample.ext_liquid,
-                        sample.ext_ice + sample.ext_precip,
-                    )
+                let higher = match scene.cfg.multiscatter_mode {
+                    CloudMultiscatterMode::DeltaFluxV2 => {
+                        // `view` points camera -> sample; the outgoing direction toward
+                        // the camera is `-view`. `up` is the slab upper-boundary normal.
+                        crate::cloud_delta_flux::stage2_higher_order_source_p1(
+                            multiscatter_support_tau,
+                            fractional_depth,
+                            mu_sun,
+                            scene.cfg.ground_albedo,
+                            sample.ext_liquid,
+                            sample.ext_ice + sample.ext_precip,
+                            -dot3(view, up),
+                        )
+                    }
+                    CloudMultiscatterMode::DeltaFluxV3 => {
+                        crate::cloud_delta_flux::stage2_higher_order_source_order_memory(
+                            multiscatter_support_tau,
+                            fractional_depth,
+                            mu_sun,
+                            scene.cfg.ground_albedo,
+                            sample.ext_liquid,
+                            sample.ext_ice + sample.ext_precip,
+                            cos_vs,
+                        )
+                    }
+                    CloudMultiscatterMode::DeltaFluxV1 => {
+                        crate::cloud_delta_flux::stage2_higher_order_source(
+                            multiscatter_support_tau,
+                            fractional_depth,
+                            mu_sun,
+                            scene.cfg.ground_albedo,
+                            sample.ext_liquid,
+                            sample.ext_ice + sample.ext_precip,
+                        )
+                    }
+                    _ => unreachable!("delta-flux match arm entered for non-delta mode"),
                 };
                 direct + higher.higher_isotropic
             }
@@ -3268,7 +3499,7 @@ pub fn froxel_at_cloud(
 /// sun-visibility at the ground point the view ray hits. `1.0` when the ray does not
 /// reach the ground. M5 uses the PENUMBRAL shadow ([`SunOdMap::penumbral_shadow`]) —
 /// a physically soft, distance-widening edge (blur radius = occluder distance x
-/// tan 0.533 deg) instead of the fix2 sharp `e^-od`.
+/// tan 0.2665 deg) instead of the fix2 sharp `e^-od`.
 pub fn ground_cloud_shadow(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> f64 {
     match ray_sphere(cam, view, scene.vol.r_bottom()) {
         Some((t0, _)) if t0 > 0.0 => {
@@ -3316,7 +3547,7 @@ pub fn shade_cloud_pixel(
         // illuminant correction sits at the same display seam as the surface/top-down
         // paths (on-earth only; identity outside the 2-30 deg band) so the geo
         // clouds-on product matches them — the lowsun-fix integration hand-off.
-        Some(l_final) => radiance_to_rgba_softclip(
+        Some(l_final) => radiance_to_rgba_softclip_with_synthetic_green(
             crate::render::apply_low_sun_illuminant(
                 l_final,
                 px.on_earth,
@@ -3327,6 +3558,7 @@ pub fn shade_cloud_pixel(
             surf.exposure,
             scene.cfg.cloud_softclip_knee,
             scene.cfg.cloud_highlight_max,
+            scene.cfg.synthetic_green,
         ),
     }
 }
@@ -3445,13 +3677,11 @@ impl CloudFrameStats {
 pub fn cloud_frame_stats(
     scene: &CloudScene,
     cam: &atmosphere::CameraGeometry,
-    lat: &[f32],
-    lon: &[f32],
-    grid_i: &[f32],
-    scan: &ScanGrid,
+    raster: &SurfaceRaster,
     stride: usize,
     cloudy_threshold: f64,
 ) -> CloudFrameStats {
+    let scan = &raster.scan;
     let stride = stride.max(1);
     let mut sampled = 0usize;
     let mut cloudy = 0usize;
@@ -3462,10 +3692,13 @@ pub fn cloud_frame_stats(
     for py in (0..scan.ny).step_by(stride) {
         for px in (0..scan.nx).step_by(stride) {
             let idx = py * scan.nx + px;
-            if !grid_i[idx].is_finite() || !lat[idx].is_finite() || !lon[idx].is_finite() {
+            if !raster.grid_i[idx].is_finite()
+                || !raster.lat[idx].is_finite()
+                || !raster.lon[idx].is_finite()
+            {
                 continue; // off-earth or outside the WRF domain
             }
-            let (sx, sy) = scan.scan_angle(px, py);
+            let (sx, sy) = raster.model_scan_angle(px, py);
             let view = cam.view_dir(sx, sy);
             let m = march_cloud(scene, cam.camera, view);
             sampled += 1;
@@ -3524,17 +3757,17 @@ pub fn render_cloud_frame_rgba(
     scene: &CloudScene,
     surf: &FrameContext,
     froxel: &AerialFroxel,
-    scan: &ScanGrid,
+    raster: &SurfaceRaster,
     assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
 ) -> Vec<u8> {
-    let (nx, ny) = (scan.nx, scan.ny);
-    let scan_rect = scan_rect_of(scan);
+    let (nx, ny) = (raster.nx, raster.ny);
+    let scan_rect = raster.model_scan_rect();
     let rows: Vec<Vec<u8>> = (0..ny)
         .into_par_iter()
         .map(|py| {
             let mut row = Vec::with_capacity(nx * 4);
             for px in 0..nx {
-                let (sx, sy) = scan.scan_angle(px, py);
+                let (sx, sy) = raster.model_scan_angle(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = surf.cam.view_dir(sx, sy);
                 let rgba = shade_cloud_pixel(scene, surf, &pixel, froxel, scan_rect, sx, sy);
@@ -3550,7 +3783,8 @@ pub fn render_cloud_frame_rgba(
 
 /// Render a full cloud-composited frame to row-major RAW REFLECTANCE (`nx*ny*3` f32 in
 /// `[0, 1]`, row 0 = north; space pixels are `0`) — the PRE-TONEMAP per-band product the
-/// Python binding's `render_visible_bands` returns. Identical assembly to
+/// Python binding's `render_rgb_reflectance` returns (`render_visible_bands` is the
+/// deprecated compatibility alias). Identical assembly to
 /// [`render_cloud_frame_rgba`] (same [`composite_cloud_radiance`], same `assemble`, same
 /// scan rays), but each pixel's composited radiance is converted to the reflectance factor
 /// `pi*L/E_sun` ([`crate::render::reflectance_from_radiance`]) instead of the exposure +
@@ -3559,17 +3793,17 @@ pub fn render_cloud_frame_reflectance(
     scene: &CloudScene,
     surf: &FrameContext,
     froxel: &AerialFroxel,
-    scan: &ScanGrid,
+    raster: &SurfaceRaster,
     assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
 ) -> Vec<f32> {
-    let (nx, ny) = (scan.nx, scan.ny);
-    let scan_rect = scan_rect_of(scan);
+    let (nx, ny) = (raster.nx, raster.ny);
+    let scan_rect = raster.model_scan_rect();
     let rows: Vec<Vec<f32>> = (0..ny)
         .into_par_iter()
         .map(|py| {
             let mut row = vec![0.0f32; nx * 3];
             for px in 0..nx {
-                let (sx, sy) = scan.scan_angle(px, py);
+                let (sx, sy) = raster.model_scan_angle(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = surf.cam.view_dir(sx, sy);
                 if let Some(l) =
@@ -3583,6 +3817,49 @@ pub fn render_cloud_frame_reflectance(
         })
         .collect();
     rows.into_iter().flatten().collect()
+}
+
+/// Render the untonemapped, unclamped linear-radiance numerator of a cloud frame.
+///
+/// This reference seam exists for deterministic ICA/McICA-style subcolumn
+/// integration: callers render each explicit cloud state through the same view,
+/// sun, ambient and shadow paths, average these radiances, then apply the display
+/// transform exactly once. `alpha` is 255 for earth/limb and 0 for space.
+pub fn render_cloud_frame_linear_radiance(
+    scene: &CloudScene,
+    surf: &FrameContext,
+    froxel: &AerialFroxel,
+    raster: &SurfaceRaster,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+) -> (Vec<f64>, Vec<u8>) {
+    let (nx, ny) = (raster.nx, raster.ny);
+    let scan_rect = raster.model_scan_rect();
+    let rows: Vec<(Vec<f64>, Vec<u8>)> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut radiance = vec![0.0f64; nx * 3];
+            let mut alpha = vec![0u8; nx];
+            for px in 0..nx {
+                let (sx, sy) = raster.model_scan_angle(px, py);
+                let mut pixel = assemble(px, py);
+                pixel.view_dir = surf.cam.view_dir(sx, sy);
+                if let Some(l) =
+                    composite_cloud_radiance(scene, surf, &pixel, froxel, scan_rect, sx, sy)
+                {
+                    radiance[px * 3..px * 3 + 3].copy_from_slice(&l);
+                    alpha[px] = 255;
+                }
+            }
+            (radiance, alpha)
+        })
+        .collect();
+    let mut radiance = Vec::with_capacity(nx * ny * 3);
+    let mut alpha = Vec::with_capacity(nx * ny);
+    for (r, a) in rows {
+        radiance.extend(r);
+        alpha.extend(a);
+    }
+    (radiance, alpha)
 }
 
 /// Joint-bilateral upsample of a half-resolution RGB image (`lw*lh*3` f32) to a
@@ -3687,6 +3964,8 @@ mod tests {
             quant.insert(name.to_string(), value);
         }
         VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,
@@ -3765,6 +4044,7 @@ mod tests {
                 vmin: 0.0,
                 vmax: 0.0,
             },
+            science_ext_snow: Vec::new(),
             ext_precip,
             tau_up,
             cloud_fraction: vec![255; n],
@@ -4019,6 +4299,117 @@ mod tests {
         assert_eq!(stats.columns_modified, 0);
         assert_eq!(vol.ext_liquid, before.ext_liquid);
         assert_eq!(vol.tau_up, before.tau_up);
+    }
+
+    #[test]
+    fn deterministic_four_materializes_shared_u_and_preserves_precip_semantics() {
+        let mut source = build_volume(1, 1, 1, 100.0, 500.0, |_, _, _| (0.02, 0.01, 0.04));
+        let (snow_quant, snow_codes) = crate::bricks::encode_log_channel(&[0.01]);
+        source.ext_snow_quant = snow_quant;
+        source.ext_snow = snow_codes;
+        source.has_cloud_fraction = true;
+        source.cloud_fraction.fill(128); // f=128/255, sampled by u=.125 and .375
+        source.tau_up.fill(99.0);
+
+        let f = 128.0f64 / 255.0;
+        let mut cloudy = 0usize;
+        let mut mean_liquid = 0.0f64;
+        let mut mean_ice = 0.0f64;
+        let mut mean_snow = 0.0f64;
+        for n in 0..crate::fractional_clouds::DETERMINISTIC_SUBCOLUMN_COUNT {
+            let mut member = source.clone();
+            let stats = member.apply_deterministic_fractional_subcolumn(n).unwrap();
+            assert!(stats.available);
+            assert_eq!(stats.fractional_layer_count, 1);
+            assert_eq!(member.tau_up[0], 0.0);
+            let other_precip = 0.03f64;
+            let snow = (member.ext_precip[0] as f64 - other_precip).max(0.0);
+            if stats.cloudy_fractional_layer_count == 1 {
+                cloudy += 1;
+                assert!((member.ext_liquid[0] as f64 - 0.02 / f).abs() < 2.0e-8);
+                assert!((member.ext_ice[0] as f64 - 0.01 / f).abs() < 2.0e-8);
+                assert!((snow - 0.01 / f).abs() < 2.0e-8);
+            } else {
+                assert_eq!(member.ext_liquid[0], 0.0);
+                assert_eq!(member.ext_ice[0], 0.0);
+                assert!(snow < 2.0e-8);
+            }
+            // Rain/graupel is the non-snow share and is full-cell in every ICA member.
+            assert!((member.ext_precip[0] as f64 - snow - other_precip).abs() < 2.0e-8);
+            mean_liquid += member.ext_liquid[0] as f64 / 4.0;
+            mean_ice += member.ext_ice[0] as f64 / 4.0;
+            mean_snow += snow / 4.0;
+        }
+        assert_eq!(cloudy, 2);
+        let represented_coverage = cloudy as f64 / 4.0;
+        assert_eq!(represented_coverage, 0.5);
+        // Four-point midpoint quadrature follows the prescribed beta/f in cloudy
+        // members. Its finite-sample mass is therefore beta*(N/4)/f (close, but not
+        // silently renormalized to exact mass when encoded f is not a quarter).
+        assert!((mean_liquid - 0.02 * represented_coverage / f).abs() < 2.0e-8);
+        assert!((mean_ice - 0.01 * represented_coverage / f).abs() < 2.0e-8);
+        assert!((mean_snow - 0.01 * represented_coverage / f).abs() < 2.0e-8);
+    }
+
+    #[test]
+    fn deterministic_four_keeps_full_and_repairs_zero_fraction_layers() {
+        let mut source = build_volume(1, 1, 2, 100.0, 500.0, |_, _, k| {
+            (0.01 * (k + 1) as f64, 0.0, 0.0)
+        });
+        source.has_cloud_fraction = true;
+        source.cloud_fraction = vec![0, 255];
+        let before = source.ext_liquid.clone();
+        for n in 0..4 {
+            let mut member = source.clone();
+            let stats = member.apply_deterministic_fractional_subcolumn(n).unwrap();
+            assert_eq!(stats.repaired_zero_count, 1);
+            assert_eq!(stats.fractional_layer_count, 0);
+            assert_eq!(member.ext_liquid, before);
+            assert_eq!(member.tau_up[1], 0.0);
+            let expected = 0.5 * (before[0] + before[1]) * 100.0;
+            assert!((member.tau_up[0] - expected).abs() < 1.0e-7);
+        }
+    }
+
+    #[test]
+    fn selectable_fixed_stratified_counts_are_deterministic_and_converge_in_coverage() {
+        let mut source = build_volume(1, 1, 1, 100.0, 500.0, |_, _, _| (0.02, 0.0, 0.0));
+        source.has_cloud_fraction = true;
+        source.cloud_fraction.fill(77); // f ~= 0.302; deliberately not aligned to 4/8/16.
+        let encoded_fraction = 77.0 / 255.0;
+
+        let mut previous_error = f64::INFINITY;
+        for count in crate::fractional_clouds::DETERMINISTIC_SUBCOLUMN_COUNTS {
+            let mut cloudy = 0usize;
+            let mut u_bits = Vec::with_capacity(count);
+            for member_index in 0..count {
+                let mut member = source.clone();
+                let stats = member
+                    .apply_deterministic_fractional_subcolumn_count(member_index, count)
+                    .unwrap();
+                u_bits.push(stats.subcolumn_u.to_bits());
+                cloudy += stats.cloudy_fractional_layer_count;
+
+                let mut repeat = source.clone();
+                let repeat_stats = repeat
+                    .apply_deterministic_fractional_subcolumn_count(member_index, count)
+                    .unwrap();
+                assert_eq!(
+                    stats.subcolumn_u.to_bits(),
+                    repeat_stats.subcolumn_u.to_bits()
+                );
+                assert_eq!(member.ext_liquid, repeat.ext_liquid);
+                assert_eq!(member.ext_ice, repeat.ext_ice);
+                assert_eq!(member.ext_precip, repeat.ext_precip);
+                assert_eq!(member.tau_up, repeat.tau_up);
+            }
+            assert_eq!(u_bits.len(), count);
+            let represented = cloudy as f64 / count as f64;
+            let error = (represented - encoded_fraction).abs();
+            assert!(error <= 0.5 / count as f64 + f64::EPSILON);
+            assert!(error <= previous_error + f64::EPSILON);
+            previous_error = error;
+        }
     }
 
     #[test]
@@ -5038,6 +5429,7 @@ mod tests {
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
+            synthetic_green: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
@@ -5054,7 +5446,7 @@ mod tests {
             view_dir: [0.0, 0.0, 1.0],
             ..Default::default()
         };
-        let bytes = render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, &assemble);
+        let bytes = render_cloud_frame_rgba(&scene, &surf, &froxel, &raster, &assemble);
         assert_eq!(bytes.len(), raster.nx * raster.ny * 4);
         let mut earth = 0;
         for px in bytes.chunks_exact(4) {
@@ -5068,7 +5460,7 @@ mod tests {
         // The RAW-BANDS (pre-tonemap reflectance) geostationary product over the SAME
         // scene: nx*ny*3 f32, every value finite and in [0, 1], and the lit/clouded scene
         // has a positive reflectance somewhere.
-        let refl = render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster.scan, &assemble);
+        let refl = render_cloud_frame_reflectance(&scene, &surf, &froxel, &raster, &assemble);
         assert_eq!(refl.len(), raster.nx * raster.ny * 3);
         assert!(
             refl.iter()
@@ -5152,11 +5544,12 @@ mod tests {
                 ground_day_lift: GROUND_DAY_LIFT,
                 cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
                 cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
+                synthetic_green: false,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
                 land_appearance: crate::render::LandAppearanceConfig::identity(),
             };
-            render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, &assemble)
+            render_cloud_frame_rgba(&scene, &surf, &froxel, &raster, &assemble)
         };
         let base = render_at(1.0);
         let bright = render_at(2.0);
@@ -5605,10 +5998,10 @@ mod tests {
     fn penumbra_widens_with_occluder_height() {
         // Two clouds with the same horizontal footprint, one low (near ground) and one
         // high. Sun at the local zenith. The high cloud's occluder distance is larger,
-        // so its ground-shadow penumbra (blur radius = occ_dist x tan 0.533 deg) is
+        // so its ground-shadow penumbra (blur radius = occ_dist x tan 0.2665 deg) is
         // wider — the EXTRA softening over the sharp e^-od shadow scales with height.
-        let (nx, ny, nz) = (32, 32, 56);
-        let (dx, dz) = (500.0, 250.0);
+        let (nx, ny, nz) = (32, 32, 100);
+        let (dx, dz) = (500.0, 500.0);
         let georef = test_georef(nx, ny, dx);
         let build = |k_lo: usize, k_hi: usize| {
             build_volume(nx, ny, nz, dz, dx, move |i, j, k| {
@@ -5621,11 +6014,15 @@ mod tests {
                 }
             })
         };
-        let low = build(2, 6); // ~0.5-1.5 km
-        let high = build(44, 48); // ~11-12 km
-        let center = brick_to_ecef(&georef, 16.0, 16.0, 28.0, 0.0, dz).unwrap();
+        let low = build(2, 6); // ~1-3 km
+        // A deliberately high synthetic layer makes the corrected half-angle blur
+        // resolvable above the map's own bilinear edge width.
+        let high = build(80, 84); // ~40-42 km
+        let center = brick_to_ecef(&georef, 16.0, 16.0, 50.0, 0.0, dz).unwrap();
         let sun = norm3(center); // local zenith over the box
-        let res = 256;
+        // Resolve the physical half-angle penumbra (about 55 m at 12 km). The former
+        // diameter bug made a coarser 256 map appear sufficient by doubling the blur.
+        let res = 512;
         let od_low = accumulate_sun_od(&low, &georef, sun, res);
         let od_high = accumulate_sun_od(&high, &georef, sun, res);
 
@@ -5674,6 +6071,20 @@ mod tests {
         assert!(
             extra_high > extra_low,
             "penumbra widening should scale with occluder height: high +{extra_high} m vs low +{extra_low} m"
+        );
+    }
+
+    #[test]
+    fn penumbra_uses_the_solar_angular_radius_not_diameter() {
+        let distance = 10_000.0;
+        let got = solar_penumbra_radius_m(distance);
+        let want = distance * atmosphere::SUN_ANGULAR_RADIUS_RAD.tan();
+        let old_diameter_radius = distance * (2.0 * atmosphere::SUN_ANGULAR_RADIUS_RAD).tan();
+        assert!((got - want).abs() < 1.0e-12);
+        assert!((got - 46.5).abs() < 0.2, "10 km penumbra radius {got} m");
+        assert!(
+            got < old_diameter_radius * 0.51,
+            "must not use the full diameter"
         );
     }
 

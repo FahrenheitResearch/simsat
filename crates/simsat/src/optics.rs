@@ -37,6 +37,359 @@ pub const RHO_W: f64 = 1000.0;
 /// Spherical earth radius WRF map projections use (m). Mirrored in `frame.rs`.
 pub const EARTH_RADIUS_M: f64 = 6_370_000.0;
 
+/// Source-particle optics used while converting model hydrometeor moments into the
+/// cached visible-extinction brick.
+///
+/// `Fixed` is the established, scheme-independent table below. The native modes are
+/// explicit, source-specific experiments. Missing or invalid moments fall back per
+/// species and cell to `Fixed`. The mode is kept out of the `.ssb` payload and therefore
+/// uses a separate, versioned cache namespace at ingest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CloudOpticsMode {
+    /// Fixed, water-density-normalised radii (the v0.1.6 baseline).
+    #[default]
+    Fixed,
+    /// WRF NSSL MP18 native two-moment/variable-density radii, bounded per species.
+    NsslNative,
+    /// HRRR Thompson/Eidhammer native mass/number/temperature diagnostics.
+    HrrrThompsonNative,
+}
+
+impl CloudOpticsMode {
+    /// Stable CLI/Python token.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::NsslNative => "nssl-native",
+            Self::HrrrThompsonNative => "hrrr-thompson-native",
+        }
+    }
+
+    /// Parse the stable CLI/Python spelling (with underscore accepted for Python users).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fixed" | "legacy" | "legacy-fixed" => Some(Self::Fixed),
+            "nssl-native" | "nssl_native" | "native-nssl" => Some(Self::NsslNative),
+            "hrrr-thompson-native"
+            | "hrrr_thompson_native"
+            | "thompson-native"
+            | "native-thompson" => Some(Self::HrrrThompsonNative),
+            _ => None,
+        }
+    }
+}
+
+/// HRRR hydrometeor class handled by the Thompson/Eidhammer adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThompsonHydrometeorClass {
+    CloudLiquid,
+    Ice,
+    Rain,
+    Snow,
+    Graupel,
+}
+
+/// One valid HRRR Thompson-native visible optical state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThompsonNativeOptics {
+    /// Visible geometric-optics extinction coefficient (m^-1).
+    pub extinction_m_inv: f64,
+    /// Scheme-consistent radiation/area effective radius (m).
+    pub effective_radius_m: f64,
+    /// True when the source moment implied a size outside the Thompson bound.
+    pub radius_was_clamped: bool,
+}
+
+/// Reproduce the particle-size diagnostics used by WRF-v4.7.1 Thompson microphysics.
+///
+/// HRRR `NCONCD`, `NCCICE`, and `SPNCR` are number mixing ratios (kg^-1), not
+/// concentrations per cubic metre. Liquid and ice follow Thompson's
+/// `calc_effectRad`; rain follows the scheme's bounded mass/number slope. Snow uses
+/// the Field-et-al. temperature-dependent moment conversion in `calc_effectRad`, while
+/// its visible extinction uses Thompson's own `m(D)=0.069 D^2` mass/area law (for this
+/// law geometric-optics area per mass is independent of the diagnostic radius).
+/// Operational HRRR does not save graupel number, so graupel follows Thompson's MP8/28
+/// q-dependent intercept diagnostic at the scheme's fixed 400 kg m^-3 density.
+///
+/// `None` means the required moment is absent, non-finite, or physically unusable; the
+/// GRIB ingest then applies the exact fixed-table value for only that species/cell.
+pub fn thompson_native_optics(
+    class: ThompsonHydrometeorClass,
+    rho_air: f64,
+    temperature_k: f64,
+    q: f64,
+    number_per_kg: Option<f64>,
+) -> Option<ThompsonNativeOptics> {
+    if !rho_air.is_finite()
+        || rho_air <= 0.0
+        || !temperature_k.is_finite()
+        || temperature_k <= 0.0
+        || !q.is_finite()
+        || q <= 0.0
+    {
+        return None;
+    }
+
+    const R1: f64 = 1.0e-12;
+    const R2: f64 = 1.0e-6;
+    let mass_concentration = rho_air * q;
+    if !mass_concentration.is_finite() || mass_concentration <= R1 {
+        return None;
+    }
+
+    let bounded = |raw: f64, lo: f64, hi: f64| -> Option<(f64, bool)> {
+        if !raw.is_finite() || raw <= 0.0 {
+            return None;
+        }
+        let value = raw.clamp(lo, hi);
+        Some((value, value != raw))
+    };
+
+    let (effective_radius_m, radius_was_clamped, extinction_m_inv) = match class {
+        ThompsonHydrometeorClass::CloudLiquid => {
+            // WRF calc_effectRad lines 5625-5647. The generalized-gamma integer shape
+            // is diagnosed from number per volume and Γ(nu+4)/Γ(nu+1) is tabulated.
+            const G_RATIO: [f64; 15] = [
+                24.0, 60.0, 120.0, 210.0, 336.0, 504.0, 720.0, 990.0, 1320.0, 1716.0, 2184.0,
+                2730.0, 3360.0, 4080.0, 4896.0,
+            ];
+            let source_number = number_per_kg.filter(|n| n.is_finite() && *n > 0.0)?;
+            let number_m3 = (source_number * rho_air).clamp(2.0, 1_999.0e6);
+            if number_m3 <= R2 {
+                return None;
+            }
+            let inu = if number_m3 < 100.0 {
+                15usize
+            } else if number_m3 > 1.0e10 {
+                2usize
+            } else {
+                ((1.0e9 / number_m3).round() as usize + 2).min(15)
+            };
+            let am_r = std::f64::consts::PI * 1000.0 / 6.0;
+            let lambda = (number_m3 * am_r * G_RATIO[inu - 1] / mass_concentration).cbrt();
+            let raw_radius = 0.5 * (3 + inu) as f64 / lambda;
+            let (radius, clamped) = bounded(raw_radius, 2.51e-6, 50.0e-6)?;
+            (
+                radius,
+                clamped,
+                1.5 * mass_concentration / (1000.0 * radius),
+            )
+        }
+        ThompsonHydrometeorClass::Ice => {
+            // mu_i=0, bm_i=3, rho_i=890: Γ(4)/Γ(1)=6, so the mass/number
+            // slope reduces to (pi*rho_i*N/q)^(1/3).
+            let source_number = number_per_kg.filter(|n| n.is_finite() && *n > 0.0)?;
+            let number_m3 = source_number * rho_air;
+            if !number_m3.is_finite() || number_m3 <= R2 {
+                return None;
+            }
+            let lambda = (std::f64::consts::PI * 890.0 * source_number / q).cbrt();
+            let raw_radius = 1.5 / lambda;
+            // calc_effectRad clamps to 2.51 um, then its caller applies RE_QI_BG=4.99 um.
+            let (radius, clamped) = bounded(raw_radius, 4.99e-6, 125.0e-6)?;
+            (radius, clamped, 1.5 * mass_concentration / (890.0 * radius))
+        }
+        ThompsonHydrometeorClass::Rain => {
+            let source_number = number_per_kg.filter(|n| n.is_finite() && *n > 0.0)?;
+            let number_m3 = source_number * rho_air;
+            if !number_m3.is_finite() || number_m3 <= R2 {
+                return None;
+            }
+            let lambda = (std::f64::consts::PI * 1000.0 * source_number / q).cbrt();
+            let raw_mvd = 3.672 / lambda;
+            let (mvd, clamped) = bounded(raw_mvd, 37.5e-6, 2.5e-3)?;
+            let radius = 1.5 * mvd / 3.672;
+            (
+                radius,
+                clamped,
+                1.5 * mass_concentration / (1000.0 * radius),
+            )
+        }
+        ThompsonHydrometeorClass::Snow => {
+            // Field et al. (2005) moment conversion coefficients copied from the
+            // official WRF Thompson source. bm_s=2 exactly, hence M2=rho*q/am_s.
+            const SA: [f64; 10] = [
+                5.065_339, -0.062_659, -3.032_362, 0.029_469, -0.000_285, 0.312_55, 0.000_204,
+                0.003_199, 0.0, -0.015_952,
+            ];
+            const SB: [f64; 10] = [
+                0.476_221, -0.015_896, 0.165_977, 0.007_468, -0.000_141, 0.060_366, 0.000_079,
+                0.000_594, 0.0, -0.003_577,
+            ];
+            let tc = (temperature_k - 273.15).min(-0.1);
+            let n = 3.0; // cse(1)=bm_s+1
+            let polynomial = |c: &[f64; 10]| {
+                c[0] + c[1] * tc
+                    + c[2] * n
+                    + c[3] * tc * n
+                    + c[4] * tc * tc
+                    + c[5] * n * n
+                    + c[6] * tc * tc * n
+                    + c[7] * tc * n * n
+                    + c[8] * tc * tc * tc
+                    + c[9] * n * n * n
+            };
+            let m2 = mass_concentration / 0.069;
+            let m3 = 10.0f64.powf(polynomial(&SA)) * m2.powf(polynomial(&SB));
+            let raw_radius = 0.5 * m3 / m2;
+            // calc_effectRad's 5.01 um floor is followed by RE_QS_BG=9.99 um.
+            let (radius, clamped) = bounded(raw_radius, 9.99e-6, 999.0e-6)?;
+            // Thompson snow uses m(D)=am_s*D^2. With Qext=2, beta is
+            // 2*(pi/4)*M2 = pi/2*M2; a constant-density sphere inversion is wrong.
+            let extinction = std::f64::consts::FRAC_PI_2 * m2;
+            (radius, clamped, extinction)
+        }
+        ThompsonHydrometeorClass::Graupel => {
+            // MP8/28 carries no graupel number. WRF reconstructs an exponential
+            // intercept from qg*rho before each Thompson call (source lines 1267-1277).
+            const RHO_G: f64 = 400.0; // rho_g(idx_bg1), idx_bg1=5 in Fortran
+            let zans =
+                (3.0 + 2.0 / 7.0 * (mass_concentration.max(1.0e-9).log10() + 8.0)).clamp(2.0, 6.0);
+            let n0 = 10.0f64.powf(zans);
+            let am_g = std::f64::consts::PI * RHO_G / 6.0;
+            let lambda = (n0 * am_g * 6.0 / mass_concentration).powf(0.25);
+            let raw_mvd = 3.672 / lambda;
+            let (mvd, clamped) = bounded(raw_mvd, 50.0e-6, 25.4e-3)?;
+            let radius = 1.5 * mvd / 3.672;
+            (radius, clamped, 1.5 * mass_concentration / (RHO_G * radius))
+        }
+    };
+
+    (extinction_m_inv.is_finite() && extinction_m_inv >= 0.0).then_some(ThompsonNativeOptics {
+        extinction_m_inv,
+        effective_radius_m,
+        radius_was_clamped,
+    })
+}
+
+/// NSSL MP18 hydrometeor whose predicted moments can drive visible extinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsslHydrometeorClass {
+    CloudLiquid,
+    Ice,
+    Snow,
+    Rain,
+    Graupel,
+    Hail,
+}
+
+/// One valid NSSL native-moment optical state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NsslNativeOptics {
+    /// Visible geometric-optics extinction coefficient (m^-1).
+    pub extinction_m_inv: f64,
+    /// Scheme effective radius after the same species bounds used by NSSL radiation (m).
+    pub effective_radius_m: f64,
+    /// Particle bulk density used by the mass-to-area conversion (kg m^-3).
+    pub particle_density_kg_m3: f64,
+    /// True when a finite variable-density moment was clipped to the NSSL physical range.
+    pub density_was_clamped: bool,
+}
+
+/// Reproduce the WRF-v4.7.1 NSSL MP18 `calc_eff_radius` moment equations for one cell.
+///
+/// `q` and `number_per_kg` are WRF mixing ratios. NSSL's Fortran first converts number
+/// to `m^-3`; its air-density factor cancels the identical factor in hydrometeor mass,
+/// yielding the expressions below. Graupel/hail use predicted volume (`m^3 kg^-1`) when
+/// valid and their documented default density otherwise. The variable density is clipped
+/// to the scheme's own graupel/hail envelope before it enters extinction, so corrupt tiny
+/// volumes cannot create unbounded optical depth.
+///
+/// Returns `None` for absent/corrupt moments. Ingest then applies the established fixed
+/// optical state for that cell (hail deliberately has no legacy contribution).
+pub fn nssl_native_optics(
+    class: NsslHydrometeorClass,
+    rho_air: f64,
+    q: f64,
+    number_per_kg: f64,
+    volume_m3_per_kg: Option<f64>,
+) -> Option<NsslNativeOptics> {
+    if !rho_air.is_finite()
+        || rho_air <= 0.0
+        || !q.is_finite()
+        || q <= 0.0
+        || !number_per_kg.is_finite()
+        || number_per_kg <= 0.0
+    {
+        return None;
+    }
+
+    // Constants are the WRF v4.7.1 NSSL defaults. The pre-evaluated Gamma ratios avoid
+    // adding a special-functions dependency for the three fixed generalized-gamma shapes.
+    let (radius_m, particle_density, density_was_clamped) = match class {
+        NsslHydrometeorClass::CloudLiquid
+        | NsslHydrometeorClass::Ice
+        | NsslHydrometeorClass::Snow => {
+            let (density, gamma_2_over_gamma_1, radius_factor, lo_m, hi_m) = match class {
+                NsslHydrometeorClass::CloudLiquid => {
+                    (1000.0, 1.0, 1.107_732_167_432_472_5, 2.51e-6, 50.0e-6)
+                }
+                NsslHydrometeorClass::Ice => {
+                    (900.0, 1.0, 1.107_732_167_432_472_5, 10.01e-6, 125.0e-6)
+                }
+                NsslHydrometeorClass::Snow => {
+                    (100.0, 0.2, 0.836_939_980_381_589_9, 25.0e-6, 999.0e-6)
+                }
+                _ => unreachable!(),
+            };
+            let lambda =
+                (number_per_kg * (std::f64::consts::PI / 6.0) * density * gamma_2_over_gamma_1 / q)
+                    .cbrt();
+            if !lambda.is_finite() || lambda <= 0.0 {
+                return None;
+            }
+            (
+                (0.5 * radius_factor / lambda).clamp(lo_m, hi_m),
+                density,
+                false,
+            )
+        }
+        NsslHydrometeorClass::Rain | NsslHydrometeorClass::Graupel | NsslHydrometeorClass::Hail => {
+            let (alpha, default_density, density_bounds, radius_bounds) = match class {
+                NsslHydrometeorClass::Rain => (0.0, 1000.0, None, (50.0e-6, 2_999.0e-6)),
+                NsslHydrometeorClass::Graupel => {
+                    (0.0, 500.0, Some((170.0, 900.0)), (50.0e-6, 10_000.0e-6))
+                }
+                NsslHydrometeorClass::Hail => {
+                    (1.0, 800.0, Some((500.0, 900.0)), (50.0e-6, 40_000.0e-6))
+                }
+                _ => unreachable!(),
+            };
+            let raw_density = volume_m3_per_kg
+                .filter(|v| v.is_finite() && *v > 1.0e-30)
+                .map(|v| q / v)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(default_density);
+            let (density, density_was_clamped) = match density_bounds {
+                Some((lo, hi)) => {
+                    let bounded = raw_density.clamp(lo, hi);
+                    (bounded, bounded != raw_density)
+                }
+                None => (raw_density, false),
+            };
+            let lambda_factor =
+                (std::f64::consts::PI * (alpha + 3.0) * (alpha + 1.0).powi(2) / 6.0).cbrt();
+            let lambda = lambda_factor * (density * number_per_kg / q).cbrt();
+            if !lambda.is_finite() || lambda <= 0.0 {
+                return None;
+            }
+            (
+                (0.5 * (alpha + 3.0) / lambda).clamp(radius_bounds.0, radius_bounds.1),
+                density,
+                density_was_clamped,
+            )
+        }
+    };
+
+    let extinction_m_inv = 1.5 * rho_air * q / (particle_density * radius_m);
+    (extinction_m_inv.is_finite() && extinction_m_inv >= 0.0).then_some(NsslNativeOptics {
+        extinction_m_inv,
+        effective_radius_m: radius_m,
+        particle_density_kg_m3: particle_density,
+        density_was_clamped,
+    })
+}
+
 /// A single hydrometeor class with its band-averaged effective radius.
 ///
 /// Effective radii (design section 4 + the SSB v3 snow-optics fix): cloud liquid
@@ -193,12 +546,11 @@ pub fn class_extinction(class: HydrometeorClass, rho_air: f64, q: f64) -> f64 {
 // ~ 0.47 for every large species, because Q_abs/Q_ext is SIZE-INDEPENDENT in the
 // geometric regime — which is why ONE per-channel recovery can carry the mixed
 // rain + graupel + snow channel. The shipped channel recovery uses the SNOW
-// coefficient (the channel's cold-relevant species) INCLUDING the documented
-// small-ice-spectrum factor [`IR_SNOW_SMALL_ICE_FACTOR`], i.e. ratio ~ 0.93;
-// for the rain/graupel share this over-absorbs 2x, which is BT-invisible where
-// rain lives (low, warm, T ~ T_sfc: what it absorbs it re-emits at nearly the
-// same temperature). A snow-dominated anvil plate is IR-opaque by sheer mass
-// (tau_vis ~ 20 -> tau_ir ~ 19 with the factor, BT = cloud-top T).
+// coefficient INCLUDING the documented small-ice-spectrum factor
+// [`IR_SNOW_SMALL_ICE_FACTOR`], i.e. ratio ~ 0.93. SSB v6's snow-only auxiliary
+// subset lets `ir.rs` apply that correction only to snow; the rain/graupel remainder
+// uses its own geometric coefficient. A snow-dominated anvil plate is IR-opaque by
+// sheer mass (tau_vis ~ 20 -> tau_ir ~ 19 with the factor, BT = cloud-top T).
 
 /// IR (10.3 um) mass-absorption coefficient for cloud LIQUID (m^2 g^-1).
 pub const IR_MASS_ABS_LIQUID_M2_G: f64 = 0.15;
@@ -236,9 +588,8 @@ pub const IR_MASS_ABS_SNOW_GEOMETRIC_M2_G: f64 = 4.667e-3;
 pub const IR_SNOW_SMALL_ICE_FACTOR: f64 = 2.0;
 
 /// IR (10.3 um) mass-absorption coefficient for SNOW (m^2 g^-1): the geometric
-/// aggregate value times the documented small-ice-spectrum factor. This is the
-/// coefficient `ir.rs` applies to the ENTIRE `ext_precip` channel (see
-/// `cloud_ir_absorption` for why the channel follows its cold-relevant species).
+/// aggregate value times the documented small-ice-spectrum factor. `ir.rs` applies
+/// it only to SSB's snow-only auxiliary subset of total `ext_precip`.
 pub const IR_MASS_ABS_SNOW_M2_G: f64 = IR_SNOW_SMALL_ICE_FACTOR * IR_MASS_ABS_SNOW_GEOMETRIC_M2_G;
 /// IR (10.3 um) mass-absorption coefficient for PRECIP (rain/graupel) (m^2 g^-1).
 /// Large particles (r_e = 1 mm) absorb little per unit mass at 10.3 um; this is
@@ -564,6 +915,128 @@ mod tests {
         assert_eq!(HydrometeorClass::Snow.effective_radius_m(), 150.0e-6);
         assert_eq!(HydrometeorClass::Rain.effective_radius_m(), 1.0e-3);
         assert_eq!(HydrometeorClass::Graupel.effective_radius_m(), 1.0e-3);
+    }
+
+    #[test]
+    fn nssl_native_moments_are_finite_bounded_and_mass_extinction_consistent() {
+        let rho_air = 0.8;
+        let q = 2.0e-4;
+        let number = 2.0e6;
+        for class in [
+            NsslHydrometeorClass::CloudLiquid,
+            NsslHydrometeorClass::Ice,
+            NsslHydrometeorClass::Snow,
+            NsslHydrometeorClass::Rain,
+            NsslHydrometeorClass::Graupel,
+            NsslHydrometeorClass::Hail,
+        ] {
+            let volume = matches!(
+                class,
+                NsslHydrometeorClass::Graupel | NsslHydrometeorClass::Hail
+            )
+            .then_some(q / 600.0);
+            let native = nssl_native_optics(class, rho_air, q, number, volume).unwrap();
+            assert!(native.extinction_m_inv.is_finite() && native.extinction_m_inv > 0.0);
+            assert!(native.effective_radius_m.is_finite() && native.effective_radius_m > 0.0);
+            assert!((100.0..=1000.0).contains(&native.particle_density_kg_m3));
+            let reconstructed =
+                1.5 * rho_air * q / (native.particle_density_kg_m3 * native.effective_radius_m);
+            assert!((native.extinction_m_inv - reconstructed).abs() < 1.0e-15);
+        }
+    }
+
+    #[test]
+    fn nssl_native_invalid_number_falls_back_and_variable_density_is_clipped() {
+        assert!(nssl_native_optics(NsslHydrometeorClass::Snow, 1.0, 1.0e-4, 0.0, None).is_none());
+        let clipped = nssl_native_optics(
+            NsslHydrometeorClass::Graupel,
+            1.0,
+            1.0e-4,
+            1.0e5,
+            Some(1.0e-12),
+        )
+        .unwrap();
+        assert_eq!(clipped.particle_density_kg_m3, 900.0);
+        assert!(clipped.density_was_clamped);
+    }
+
+    #[test]
+    fn thompson_native_modes_parse_with_stable_token() {
+        assert_eq!(
+            CloudOpticsMode::parse("hrrr-thompson-native"),
+            Some(CloudOpticsMode::HrrrThompsonNative)
+        );
+        assert_eq!(
+            CloudOpticsMode::HrrrThompsonNative.token(),
+            "hrrr-thompson-native"
+        );
+    }
+
+    #[test]
+    fn thompson_number_moments_are_bounded_and_require_number() {
+        let rho = 0.9;
+        let temperature = 258.0;
+        let q = 2.0e-4;
+        for class in [
+            ThompsonHydrometeorClass::CloudLiquid,
+            ThompsonHydrometeorClass::Ice,
+            ThompsonHydrometeorClass::Rain,
+        ] {
+            assert!(thompson_native_optics(class, rho, temperature, q, None).is_none());
+            let native = thompson_native_optics(class, rho, temperature, q, Some(2.0e6)).unwrap();
+            assert!(native.extinction_m_inv.is_finite() && native.extinction_m_inv > 0.0);
+            assert!(native.effective_radius_m.is_finite() && native.effective_radius_m > 0.0);
+        }
+
+        let liquid = thompson_native_optics(
+            ThompsonHydrometeorClass::CloudLiquid,
+            rho,
+            temperature,
+            q,
+            Some(2.0e6),
+        )
+        .unwrap();
+        assert!((2.51e-6..=50.0e-6).contains(&liquid.effective_radius_m));
+        let ice = thompson_native_optics(
+            ThompsonHydrometeorClass::Ice,
+            rho,
+            temperature,
+            q,
+            Some(2.0e6),
+        )
+        .unwrap();
+        assert!((4.99e-6..=125.0e-6).contains(&ice.effective_radius_m));
+        let rain = thompson_native_optics(
+            ThompsonHydrometeorClass::Rain,
+            rho,
+            temperature,
+            q,
+            Some(2.0e6),
+        )
+        .unwrap();
+        assert!((15.31e-6..=1.022e-3).contains(&rain.effective_radius_m));
+    }
+
+    #[test]
+    fn thompson_field_snow_uses_mass_area_extinction_and_temperature_size() {
+        let warm = thompson_native_optics(ThompsonHydrometeorClass::Snow, 0.7, 268.0, 1.0e-3, None)
+            .unwrap();
+        let cold = thompson_native_optics(ThompsonHydrometeorClass::Snow, 0.7, 238.0, 1.0e-3, None)
+            .unwrap();
+        assert_ne!(warm.effective_radius_m, cold.effective_radius_m);
+        // m(D)=0.069 D^2 and Qext=2 imply k_ext=pi/(2*0.069) exactly.
+        let expected = std::f64::consts::PI / (2.0 * 0.069) * 0.7e-3;
+        assert!((warm.extinction_m_inv - expected).abs() < 1.0e-12);
+        assert!((cold.extinction_m_inv - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn thompson_graupel_diagnostic_is_finite_without_number() {
+        let native =
+            thompson_native_optics(ThompsonHydrometeorClass::Graupel, 0.8, 260.0, 5.0e-4, None)
+                .unwrap();
+        assert!(native.extinction_m_inv > 0.0);
+        assert!((20.4e-6..=10.38e-3).contains(&native.effective_radius_m));
     }
 
     /// SSB v3: the per-species VISIBLE mass-extinction coefficients are locked —

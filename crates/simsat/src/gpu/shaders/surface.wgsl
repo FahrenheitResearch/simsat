@@ -55,11 +55,13 @@ const WATER_N: f32 = 1.34; // sea-water refractive index (M3 Cox-Munk glint / Fr
 // True-color calibration (refinement pass; twins of render.rs constants). Daytime
 // aerial-perspective veil reduction (Rayleigh correction), land-albedo vibrancy, a
 // LAND-only daytime brightness lift, and the sun-glint brightness gain + core
-// narrowing. Round 2 values. Each is a no-op at its identity value; all are sun-gated
-// or water-only so the M2 twilight look is byte-unchanged.
+// narrowing. Round 2 values. Each is a no-op at its identity value; the surface-help
+// controls begin above the horizon so terrain follows visible daylight.
 const AERIAL_VEIL_DAY_SCALE: f32 = 0.40;
 const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
 const AERIAL_VEIL_ELEV_HI: f32 = 30.0; // WS2: 40 -> 30 (full daytime treatment by 30 deg; twin of render.rs)
+const SURFACE_HELP_ELEV_LO: f32 = 0.0;
+const SURFACE_HELP_ELEV_HI: f32 = 12.0;
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
 const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
@@ -70,7 +72,7 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 // itself (the CPU paths derive x_max = exposure * RHO_HIGHLIGHT_MAX at their seam).
 const CLOUD_SOFTCLIP_KNEE: f32 = 0.65;   // identity below; bounded Mobius shoulder above
 const RHO_HIGHLIGHT_MAX: f32 = 1.25;     // physical reflectance ceiling -> display 1.0
-const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daytime water-body albedo scale (twilight anchor = u.p1.y)
+const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daylight water scale (horizon/night anchor = u.p1.y)
 // Low-sun visible pass (twins of render.rs): the SUNRISE veil ramp (satpy-idiom — the
 // Rayleigh de-haze is reduced toward the terminator, never hard-disabled at 20 deg)
 // and the LUT-derived low-sun ILLUMINANT correction (GREEN RESTORATION: the green of
@@ -330,17 +332,17 @@ fn cox_munk_mss(wind: f32) -> f32 {
     return max(0.003 + 0.00512 * max(wind, 0.0), 1e-4);
 }
 
-// LAND daytime brightness gain (refinement pass, round 2; twin of render::land_day_gain):
-// 1.0 at/below AERIAL_VEIL_ELEV_LO (twilight untouched) ramping to LAND_DAY_GAIN at/above
-// AERIAL_VEIL_ELEV_HI. Land-only surface-reflectance lift, not the global exposure.
+// LAND daylight brightness gain (refinement pass, round 2; twin of
+// render::land_day_gain): 1.0 at/below the horizon, reaching LAND_DAY_GAIN by 12 deg.
+// Land-only surface-reflectance lift, not the global exposure.
 fn land_day_gain(sun_elev: f32) -> f32 {
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
 // Owner-selected v0.1.5 finished-visible LAND corrections. Exact f32 twin of
 // render::{land_sza_normalization_gain, land_dark_toe_gain, land_appearance_gain}:
-// independently switchable, bounded, scalar/colour-preserving, and exactly neutral
-// through the established twilight band. The caller is the LAND branch only.
+// independently switchable, bounded, scalar/colour-preserving, and exactly neutral at/
+// below the horizon. The caller is the LAND branch only.
 // LAND_APPEARANCE_TWIN_BEGIN
 fn land_sza_normalization_gain_gpu(sun_elev: f32) -> f32 {
     let max_gain = clamp(u.land0.y, 1.0, 4.0);
@@ -348,10 +350,10 @@ fn land_sza_normalization_gain_gpu(sun_elev: f32) -> f32 {
         return 1.0;
     }
     let mu_ref = sin(LAND_SZA_REFERENCE_ELEV * DEG2RAD);
-    let mu_floor = sin(AERIAL_VEIL_ELEV_LO * DEG2RAD);
+    let mu_floor = sin(SURFACE_HELP_ELEV_HI * DEG2RAD);
     let mu = sin(clamp(sun_elev, 0.0, 90.0) * DEG2RAD);
     let target_gain = clamp(mu_ref / max(mu, mu_floor), 1.0, max_gain);
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (target_gain - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (target_gain - 1.0);
 }
 
 fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
@@ -369,7 +371,7 @@ fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
     let w = smoothstep(0.0, knee, y);
     let target_y = power_target * (1.0 - w) + y * w;
     let gain = clamp(target_y / y, 1.0, max_gain);
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (gain - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (gain - 1.0);
 }
 
 fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
@@ -649,15 +651,15 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let f_sky = fresnel_unpolarized(cos_view, WATER_N);
         let l_glint = e_sun * (glint / PI) * t_sun * (disk * LIMB_DISK_AVG);
         // WS2 water direct sun (twin of render.rs): the water BODY sees the same
-        // disk-gated direct term as land, DAY-GATED so twilight is byte-unchanged, with
-        // the water albedo simultaneously retuned toward WATER_ALBEDO_DAY_SCALE on the
-        // same gate. No cloud shadow on this clouds-off pass (shadow = 1 implicitly).
-        let day_t = smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev);
+        // physical disk/Tsun/N.L direct term as land. Only the water albedo is retuned
+        // toward WATER_ALBEDO_DAY_SCALE across the 0--12 deg surface-help ramp. No cloud
+        // shadow on this clouds-off pass (shadow = 1 implicitly).
+        let surface_t = smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev);
         var scale_ratio = 1.0;
         if (u.p1.y > 0.0) {
-            scale_ratio = 1.0 + day_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
+            scale_ratio = 1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
         }
-        let e_direct_w = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG * day_t);
+        let e_direct_w = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG);
         l_surf = albedo * scale_ratio / PI * (e_direct_w + e_ambient) + l_glint + f_sky * (e_ambient / PI);
     } else {
         let e_direct = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG);
@@ -665,8 +667,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // Finished-visible appearance controls are LAND-only and precede the legacy
         // land gain/aerial veil, matching render::surface_toa_radiance exactly.
         l_surf = l_surf * land_appearance_gain_gpu(sun_elev, albedo);
-        // LAND daytime brightness lift (round 2): ground-only surface-reflectance gain,
-        // sun-gated so twilight is byte-unchanged. Applied before the aerial veil below.
+        // LAND daylight brightness lift (round 2): ground-only surface-reflectance gain,
+        // neutral at/below the horizon. Applied before the aerial veil below.
         l_surf = l_surf * land_day_gain(sun_elev);
     }
 

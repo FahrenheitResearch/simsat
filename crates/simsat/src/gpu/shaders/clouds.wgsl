@@ -25,7 +25,7 @@
 //
 // M5 mirrors (parity for the M5-GPU activation; the CPU reference in clouds.rs is the
 // shipping path): the sun term is the Wrenninge/Oz multi-scatter OCTAVE sum; the ground
-// cloud shadow is PENUMBRAL (blur radius = occluder distance x tan 0.533 deg); the sky
+// cloud shadow is PENUMBRAL (blur radius = occluder distance x tan 0.2665 deg); the sky
 // ambient is the SH-2 directional projection (bindings 14/15). surface.wgsl (the active
 // clouds-OFF pass) still carries the M2 scalar ambient — a documented CPU/GPU divergence.
 //
@@ -70,11 +70,13 @@ const SUN_ANG_R: f32 = 4.65e-3;
 const LIMB_DISK_AVG: f32 = 0.832; // 1 - a1/3 - a2/6 (M2 review FINDING 3; was 0.79)
 const STEPS: u32 = 32u;
 // True-color calibration (refinement pass; twins of render.rs constants). Round 2:
-// more de-haze, more land vibrancy, a LAND-only daytime brightness lift, and a
-// brighter + tighter sun glint. Sun-gated / water-only, so twilight is byte-unchanged.
+// more de-haze, more land vibrancy, a LAND-only daylight brightness lift, and a
+// brighter + tighter sun glint. Surface help begins above the horizon.
 const AERIAL_VEIL_DAY_SCALE: f32 = 0.40;
 const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
 const AERIAL_VEIL_ELEV_HI: f32 = 30.0; // WS2: 40 -> 30 (full daytime treatment by 30 deg; twin of render.rs)
+const SURFACE_HELP_ELEV_LO: f32 = 0.0;
+const SURFACE_HELP_ELEV_HI: f32 = 12.0;
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
 const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
@@ -87,9 +89,9 @@ const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller,
 const CLOUD_SOFTCLIP_KNEE: f32 = 0.65;   // identity below; bounded Mobius shoulder above
 const RHO_HIGHLIGHT_MAX: f32 = 1.25;     // physical reflectance ceiling -> display 1.0
 // WS2 diffuse cloud-shadow floor (twin of render::CLOUD_SHADOW_FLOOR /
-// effective_cloud_shadow): day-gated on the shared 20->30 deg ramp; the specular
-// glint keeps the RAW shadow. Was deliberately CPU-only until this activation.
-const CLOUD_SHADOW_FLOOR: f32 = 0.25;
+// effective_cloud_shadow): elevation-independent because it multiplies only direct
+// sunlight, which already vanishes at night. The specular glint keeps the RAW shadow.
+const CLOUD_SHADOW_FLOOR: f32 = 0.45;
 // Low-sun visible pass (twins of render.rs; see surface.wgsl for the full notes):
 // the SUNRISE veil ramp + the LUT-derived low-sun ILLUMINANT correction.
 const VEIL_TERMINATOR_ELEV: f32 = 2.0;   // full physical veil at/below (dusk band byte-identical)
@@ -105,7 +107,7 @@ const SYNTHETIC_GREEN_MODE: f32 = 0.0;
 const SYN_GREEN_W_RED: f32 = 0.45;
 const SYN_GREEN_W_GREEN: f32 = 0.10;
 const SYN_GREEN_W_BLUE: f32 = 0.45;
-const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daytime water-body albedo scale (twilight anchor = u.p1.y)
+const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daylight water scale (horizon/night anchor = u.p1.y)
 
 // Cloud optics — MUST match clouds.rs.
 // SCHEDULE NOTE (WS1): this GPU twin keeps the INTERACTIVE sun-march schedule
@@ -132,8 +134,8 @@ const OCTAVES: i32 = 6;               // DEFAULT_OCTAVES (the max + fallback; li
 const OCTAVE_EXTINCTION_SCALE: f32 = 0.5;
 const OCTAVE_PHASE_SCALE: f32 = 0.5;
 const OCTAVE_BRIGHTNESS_SCALE: f32 = 0.85;
-// Sun disk angular DIAMETER (rad) = 0.533 deg — the ground-shadow penumbra widener.
-const SUN_ANG_DIAM: f32 = 0.0093026;  // tan is ~= this at 0.533 deg
+// Tangent of the solar angular RADIUS (0.2665 deg), used as a disk-convolution radius.
+const SUN_ANG_RADIUS_TAN: f32 = 0.00465003;
 
 // Sub-grid cloud GRANULATION (edge-erosion detail noise) — MUST match the clouds.rs
 // granulation section (constants, hash, Worley octaves, gate, remap multiplier).
@@ -428,7 +430,7 @@ fn cox_munk_mss(wind: f32) -> f32 {
 
 // LAND daytime brightness gain (refinement pass, round 2; twin of render::land_day_gain).
 fn land_day_gain(sun_elev: f32) -> f32 {
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (LAND_DAY_GAIN - 1.0);
 }
 
 // Owner-selected v0.1.5 finished-visible LAND corrections. Exact f32 twin of
@@ -442,10 +444,10 @@ fn land_sza_normalization_gain_gpu(sun_elev: f32) -> f32 {
         return 1.0;
     }
     let mu_ref = sin(LAND_SZA_REFERENCE_ELEV * DEG2RAD);
-    let mu_floor = sin(AERIAL_VEIL_ELEV_LO * DEG2RAD);
+    let mu_floor = sin(SURFACE_HELP_ELEV_HI * DEG2RAD);
     let mu = sin(clamp(sun_elev, 0.0, 90.0) * DEG2RAD);
     let target_gain = clamp(mu_ref / max(mu, mu_floor), 1.0, max_gain);
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (target_gain - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (target_gain - 1.0);
 }
 
 fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
@@ -463,7 +465,7 @@ fn land_dark_toe_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
     let w = smoothstep(0.0, knee, y);
     let target_y = power_target * (1.0 - w) + y * w;
     let gain = clamp(target_y / y, 1.0, max_gain);
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (gain - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (gain - 1.0);
 }
 
 fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
@@ -474,25 +476,25 @@ fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
 }
 // LAND_APPEARANCE_TWIN_END
 
-// GROUND LIFT daytime gain on the WHOLE surface radiance — land AND water (twin of
+// GROUND LIFT daylight gain on the WHOLE surface radiance — land AND water (twin of
 // render::ground_day_lift; the top-down/basemap appearance pass). The lift value is
 // u.frx2.z (the CPU MarchConfig::ground_day_lift, default render::GROUND_DAY_LIFT);
-// 1.0 at/below the twilight gate so the locked twilight band is unchanged.
+// 1.0 at/below the horizon, reaching the requested lift by 12 degrees.
 fn ground_day_lift_gain(sun_elev: f32) -> f32 {
     let lift = max(u.frx2.z, 0.0);
     if (lift <= 0.0) {
         return 1.0;
     }
-    return 1.0 + smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev) * (lift - 1.0);
+    return 1.0 + smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev) * (lift - 1.0);
 }
 
 // The EFFECTIVE cloud shadow the DIFFUSE direct-sun terms see (twin of
 // render::effective_cloud_shadow, WS2): f + (1-f)*shadow with
-// f = CLOUD_SHADOW_FLOOR * smoothstep(LO, HI, sun_elev). The specular glint keeps the
+// f = CLOUD_SHADOW_FLOOR. The specular glint keeps the
 // RAW shadow (an occluded solar disk has no mirror image; the floor is diffuse fill).
 fn effective_cloud_shadow_gpu(shadow: f32, sun_elev: f32) -> f32 {
     let s = clamp(shadow, 0.0, 1.0);
-    let f = CLOUD_SHADOW_FLOOR * smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev);
+    let f = CLOUD_SHADOW_FLOOR;
     return f + (1.0 - f) * s;
 }
 
@@ -1188,12 +1190,12 @@ fn sun_od_dist_sample(p: vec3<f32>) -> f32 {
 }
 
 // PENUMBRAL ground cloud-shadow (M5) — twin of clouds.rs::SunOdMap::penumbral_shadow.
-// Blur radius = occluder distance x tan(0.533 deg) in the sun-OD map's (au, av) plane;
+// Blur radius = occluder distance x tan(0.2665 deg) in the sun-OD map's (au, av) plane;
 // transmittance-averaged over a small disk (soft, distance-widening edge).
 fn penumbral_shadow(pg: vec3<f32>) -> f32 {
     let od_scale = cloud_od_scale();
     let occ_dist = sun_od_dist_sample(pg);
-    let radius = occ_dist * SUN_ANG_DIAM;
+    let radius = occ_dist * SUN_ANG_RADIUS_TAN;
     let dim = max(u.sod_e.z, 1.0);
     let texel = max((u.sod_v.w - u.sod_u.w) / dim, (u.sod_e.y - u.sod_e.x) / dim);
     if (radius <= 0.5 * texel) {
@@ -1529,15 +1531,15 @@ fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_sha
         // models diffuse cloud-scattered fill, which has no specular component).
         let l_glint = e_sun * (glint / PI) * t_sun * (disk * LIMB_DISK_AVG * shadow_raw);
         // WS2 water direct sun (twin of render.rs): the water BODY sees the same
-        // disk-gated, cloud-shadow-weighted direct term as land, DAY-GATED so twilight
-        // is byte-unchanged, with the water albedo simultaneously retuned toward
-        // WATER_ALBEDO_DAY_SCALE on the same gate. The glint keeps the RAW shadow above.
-        let day_t = smoothstep(AERIAL_VEIL_ELEV_LO, AERIAL_VEIL_ELEV_HI, sun_elev);
+        // physical disk/Tsun/N.L, cloud-shadow-weighted direct term as land. Only the
+        // water albedo is retuned toward WATER_ALBEDO_DAY_SCALE across the 0--12 degree
+        // surface-help ramp. The glint keeps the RAW shadow above.
+        let surface_t = smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev);
         var scale_ratio = 1.0;
         if (u.p1.y > 0.0) {
-            scale_ratio = 1.0 + day_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
+            scale_ratio = 1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
         }
-        let e_direct_w = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG * shadow * day_t);
+        let e_direct_w = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG * shadow);
         l_surf = albedo * scale_ratio / PI * (e_direct_w + e_ambient) + l_glint + f_sky * (e_ambient / PI);
     } else {
         let e_direct = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG * shadow);
@@ -1545,11 +1547,11 @@ fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_sha
         // Finished-visible appearance controls are LAND-only and precede the legacy
         // land gain/ground lift/aerial veil, matching the CPU composite order.
         l_surf = l_surf * land_appearance_gain_gpu(sun_elev, albedo);
-        // LAND daytime brightness lift (round 2): ground-only surface-reflectance gain,
-        // sun-gated so twilight is byte-unchanged. Applied before the aerial veil below.
+        // LAND daylight brightness lift (round 2): ground-only surface-reflectance gain,
+        // neutral at/below the horizon. Applied before the aerial veil below.
         l_surf = l_surf * land_day_gain(sun_elev);
     }
-    // GROUND LIFT (twin of render::surface_toa_radiance): the sun-gated daytime
+    // GROUND LIFT (twin of render::surface_toa_radiance): the sun-gated daylight
     // brightness lift on the WHOLE surface radiance (land AND water), applied AFTER
     // the land gain and BEFORE the aerial veil — exactly the CPU order.
     l_surf = l_surf * ground_day_lift_gain(sun_elev);

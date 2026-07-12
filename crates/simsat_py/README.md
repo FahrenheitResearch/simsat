@@ -17,7 +17,7 @@ maturin develop --release
 The wheel is `abi3` (built against the CPython stable ABI), so ONE wheel works on any
 CPython >= 3.8 — no per-version rebuild. `numpy` is the only runtime dependency.
 
-## The eleven render functions
+## The eleven canonical render functions
 
 Each takes a wrfout file OR a cached `run.json` as `input` (a wrfout is ingested to a
 cached brick on first use, and the cache re-ingests automatically if the wrfout is
@@ -26,10 +26,10 @@ re-written over the same path) and returns `(array(s), georef)`:
 | function | returns | what it is |
 |---|---|---|
 | `render_visible_rgb(input, ...)` | `H x W x 3` uint8 | the finished true-color visible image (the shipped display look) |
-| `render_geocolor(input, ...)` | `H x W x 3` uint8 | GeoColor day/night blend: true-color by day, colored band-13 IR by night, crossfaded across the terminator (always meaningful, day or night) |
+| `render_geocolor(input, ...)` | `H x W x 3` uint8 | GeoColor Style / SimSat Day-Night Color: broad-RGB visible by day, colored band-13 IR by night, crossfaded across the terminator. It is not yet sensor-derived ABI GeoColor |
 | `render_sandwich(input, ...)` | `H x W x 3` uint8 | Sandwich severe-convection composite: visible base + color-enhanced band-13 IR overlaid on the cold cloud tops (a daytime product) |
-| `render_visible_bands(input, ...)` | `H x W x 3` float32 `[0,1]` | RAW per-channel reflectance (pre-tonemap) for custom RGB / band math |
-| `render_ir(input, ...)` | `H x W` float32 KELVIN | RAW band-13 (10.3 um) brightness temperature; `enhancement=` adds a colored `H x W x 3` uint8 (`(bt, rgb, geo)`) |
+| `render_rgb_reflectance(input, ...)` | `H x W x 3` float32 `[0,1]` | RAW broad-RGB reflectance (pre-tonemap) for custom RGB / reflectance math; not discrete ABI sensor bands |
+| `render_ir(input, ...)` | `H x W` float32 KELVIN | RAW band-13 brightness temperature; `sensor='fast-gray'` is the unchanged default, while `sensor='goes-r-abi-band13-fm4'` applies NOAA's official FM4/GOES-19 SRF; opt-in `instrument_footprint='goes-r-abi-band13-mtf-prototype'` requires exact GOES-R navigation and the ABI 2-km global lattice; `enhancement=` adds a colored `H x W x 3` uint8 (`(bt, rgb, geo)`) |
 | `render_water_vapor(input, band='6.2'\|'6.9'\|'7.3', ...)` | `H x W` float32 KELVIN | RAW water-vapor band 8/9/10 BT (upper/mid/lower-level moisture); `enhancement=` as `render_ir` |
 | `render_precipitable_water(input, ...)` | `H x W` float32 mm | RAW precipitable water (column-integrated vapor); `colormap=True` adds a basic RGB |
 | `render_cloud_top_temp(input, ...)` | `H x W` float32 KELVIN | RAW cloud-top temperature at the visible tau~1 level (`NaN` = clear); `colormap=True` as above |
@@ -37,11 +37,26 @@ re-written over the same path) and returns `(array(s), georef)`:
 | `render_cloud_layer(input, ...)` | `(H x W x 4 uint8, H x W float32, geo)` | the WEB-MAP cloud layer pair: cloud-only RGBA (straight alpha; `premultiplied=True` for the additive form) + the ground cloud-shadow MULTIPLY layer, on a Web-Mercator grid with `geo.mercator_corners` for a Mapbox ImageSource (top-down by definition; no ground is rendered — the host map is the ground) |
 | `render_perspective(input, eye=(lat,lon,alt_m), look=(lat,lon,alt_m), fov=40, size=(1280,720), ...)` | `H x W x 3` uint8 | a FREE-PERSPECTIVE frame: an eye/look/fov pinhole camera through the same marches — the angled-3D flyover product (full composite over the Blue Marble ground; sky rays composite the atmosphere limb). `cloud_layer_only=True` returns `H x W x 4` uint8 (the cloud field alone, premultiplied alpha) for a host 3-D map with a matching camera. `geo.camera_pose` always carries the camera; a FLYOVER is N calls along your own eye/look path |
 
+`render_visible_bands(...)` is a deprecated compatibility alias for
+`render_rgb_reflectance(...)`; it remains available and returns exactly the same array.
+
 `render_visible_rgb(..., backend="gpu-preview")` explicitly uses the same synchronous
 wgpu cloud pass as Studio (`backend="cpu"` is the default). It preserves `view="geo"`
 or `view="topdown"`, raises one `UserWarning` for every temporary compatibility
 substitution, and never silently falls back to CPU. Free perspective, a rotated-lat/lon
 source, or a missing GPU adapter is an error.
+
+Visible-family functions also accept `intent="display"` (the unchanged default)
+or `intent="sensor-fast-gray"`. The latter selects the explicitly limited
+`simsat-fast-gray-v1` operator: unscaled cloud extinction, neutral display
+shaping, full modeled path airlight, and no edge feather/granulation/stratiform
+reconstruction/synthetic green. Model fractional clouds are retained. Exact
+substitutions and limitations ride on `geo.intent`,
+`geo.observation_operator`, `geo.intent_adjustments`, and
+`geo.intent_limitations` and are also raised as `UserWarning`s. It is not yet an
+instrument-SRF-integrated ABI/AHI channel; use `render_rgb_reflectance` for the
+pre-tonemap broad-RGB reflectance output. Sensor Fast Gray currently requires
+`backend="cpu"` because GPU preview cannot preserve this strict contract.
 
 Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default: one output
@@ -50,17 +65,18 @@ pixel per source-model grid cell, not necessarily the highest output resolution;
 downsample a fine WRF grid), `margin=0.0`
 (zoom-out fraction added on each side — real surrounding earth, clear sky, frames the
 domain), `cache=<dir>`, `threads=<n>`. Finished/display visible functions and cloud
-layers additionally take `exposure=1.5`; raw visible bands deliberately do not.
+layers additionally take `exposure=1.5`; raw RGB reflectance deliberately does not.
 Visible-family functions also take `multiscatter=True`, `cloud_multiscatter=None`,
 `beer_powder=False`, `granulation=False`,
 `steps` (`offline`/`interactive`), `clouds=True`, `fractional_clouds=True`,
+`fractional_cloud_mode="effective-od"`,
 `feather_exposed_domain_edges=True`,
 `sun_elev`/`sun_az` (what-if sun override), `bluemarble=<path>` (single-file ground),
 `bluemarble_month`, `bluemarble_download=True`. Thermal functions (`render_ir`,
 `render_water_vapor`) take `enhancement=` (`cimss`/`bd`/`avn`/`funktop`/`rainbow`/`gray`);
 the derived-field functions take `colormap=`.
 
-The visible-family functions (including raw visible bands, cloud layer, and perspective)
+The visible-family functions (including raw RGB reflectance, cloud layer, and perspective)
 also expose the atmosphere/cloud QA controls directly:
 
 | keyword | default | effect |
@@ -70,11 +86,12 @@ also expose the atmosphere/cloud QA controls directly:
 | `atmosphere_correction` | `True` | product-facing daytime aerial-veil correction; `False` retains full modeled path airlight (other display transforms remain) |
 | `terrain_atmosphere` | `True` | shorten atmosphere columns to the WRF terrain elevation |
 | `fractional_clouds` | `True` | use model cloud fraction/subcolumns when available; `False` restores legacy horizontally-full cloudy cells |
+| `fractional_cloud_mode` | `"effective-od"` | fractional-cloud closure: unchanged fast/default `"effective-od"`, opt-in fixed-stratified CPU references `"deterministic-4"`, `"deterministic-8"`, or `"deterministic-16"`, or `"off"`; the legacy boolean remains the master switch |
 | `cloud_optical_depth_scale` | `0.15` | owner-selected cross-file visible calibration, applied consistently in view/sun/ambient/shadow paths (`0.0..=4.0`; `1.0` = unscaled model extinction) |
-| `cloud_multiscatter` | `None` | explicit transport override: `"legacy-octaves"`, `"single-scatter"`, or experimental CPU `"delta-flux-v1"` / `"delta-flux-v2b"`; omitted preserves the exact historical `multiscatter` boolean contract |
+| `cloud_multiscatter` | `None` | explicit transport override: `"legacy-octaves"`, `"single-scatter"`, or experimental CPU `"delta-flux-v1"` / `"delta-flux-v2b"` / `"delta-flux-v3-memory"`; omitted preserves the exact historical `multiscatter` boolean contract |
 | `beer_powder` | `False` | optional Schneider shaping of the direct cloud-sun term; does not change transmittance |
 | `granulation` | `False` | display-only sub-grid cloud-edge erosion; quantitative bands/thermal/derived products remain unmodified |
-| `feather_exposed_domain_edges` | `True` | owner-selected v0.1.5 presentation control: when the camera exposes a finite WRF-domain boundary, fade finished visible/cloud-layer clouds over the fixed 4% boundary band; `False` restores the exact prior margin-gated behavior; raw visible bands, thermal, and derived products remain unmodified |
+| `feather_exposed_domain_edges` | `True` | owner-selected v0.1.5 presentation control: when the camera exposes a finite WRF-domain boundary, fade finished visible/cloud-layer clouds over the fixed 4% boundary band; `False` restores the exact prior margin-gated behavior; raw RGB reflectance, thermal, and derived products remain unmodified |
 | `topdown_stratiform_regularization` | `False` | experimental top-down-only 5x5 low/liquid stratiform column reconstruction; conserves selected-area optical depth, protects high/convective cores, and is ignored by geostationary and raw-band products |
 
 `topdown_stratiform_regularization` is an opt-in observation-operator approximation,
@@ -86,13 +103,13 @@ field is never silently ignored.
 Finished visible display products (`render_visible_rgb`, `render_geocolor`,
 `render_sandwich`, and full-composite `render_perspective`) also accept these
 optional display-calibration overrides. Omitting them preserves the shipped engine
-constants; they are intentionally absent from `render_visible_bands` so raw reflectance
+constants; they are intentionally absent from `render_rgb_reflectance` so raw reflectance
 cannot be changed by a tonemap choice. The land controls are irrelevant to
 `render_cloud_layer` and `cloud_layer_only=True`, which render no ground.
 
 | keyword | omitted behavior | effect |
 |---|---:|---|
-| `exposure` | shipped `1.5` | whole finished-visible display gain before the ABI stretch (`1.0` is the exact neutral override; intentionally absent from raw visible bands) |
+| `exposure` | shipped `1.5` | whole finished-visible display gain before the ABI stretch (`1.0` is the exact neutral override; intentionally absent from raw RGB reflectance) |
 | `ground_gain` | shipped `1.0` | sun-gated daytime surface-radiance lift (`1.0` is neutral; accepted but irrelevant for ground-free cloud layers) |
 | `cloud_softclip` | shipped `0.65` | highlight shoulder knee (`1.0` disables the shoulder/hard-clamps) |
 | `cloud_highlight_max` | shipped `1.25` | physical reflectance factor mapped to display white; raising it retains structure in brighter cloud tops |
@@ -109,15 +126,24 @@ claimed physical optimum. It supersedes the earlier tied `0.20`/`0.30` midpoint 
 `1.0` preserves the model-derived extinction unchanged, and
 `0.0` makes its visible optical effects transparent. It does not alter
 `render_cloud_optical_depth`, which intentionally returns the unscaled physical input.
-The two land operators are likewise finished-visible display controls: raw visible
-bands, IR/WV, derived products, cloud-only layers, water/glint, and cloud radiance do
+The two land operators are likewise finished-visible display controls: raw RGB
+reflectance, IR/WV, derived products, cloud-only layers, water/glint, and cloud radiance do
 not consume them. Both remain independently switchable despite being shipped on.
 `fractional_clouds=True` consumes model cloud fraction when the input supplies it
 and safely falls back to full-cell coverage otherwise; set it false for the legacy A/B.
+`fractional_cloud_mode="deterministic-4"`, `"deterministic-8"`, or
+`"deterministic-16"` renders the selected number of fixed-stratified shared-u
+maximum-overlap subcolumns with independent but internally identical
+view/sun/ambient/shadow state, averages unclamped linear radiance, then applies one
+tonemap. These are deterministic ICA-style convergence references, not full
+max-random/Sobol McICA and not the shipped default. Cost grows with member count. GPU
+preview reports an explicit fallback; cloud-layer and perspective products currently
+reject these modes rather than silently substituting another closure.
 `clouds=False` remains the explicit feature bypass, while `multiscatter=False`
 disables the higher cloud-scattering octaves without changing cloud transmittance.
 Set `cloud_multiscatter="delta-flux-v1"` to opt into the experimental Stage-2
-isotropic source, or `"delta-flux-v2b"` for its upward-mean-normalized P1 reconstruction.
+isotropic source, `"delta-flux-v2b"` for its upward-mean-normalized P1 reconstruction,
+or `"delta-flux-v3-memory"` for the bounded successive-order angular-memory candidate.
 Leaving it omitted is byte-compatible with the established
 `multiscatter=True`/`False` paths.
 `beer_powder` and `granulation` are explicit opt-in appearance controls and remain off
@@ -199,13 +225,26 @@ ax.pcolormesh(geo.lon, geo.lat, bt, transform=ccrs.PlateCarree())
 # or let SimSat color it:
 bt, ir_rgb, geo = simsat.render_ir(wrfout, enhancement="cimss")
 
+# Experimental complete-radiance Band-13 footprint on the exact global ABI lattice.
+bt_mtf, geo_mtf = simsat.render_ir(
+    wrfout,
+    view="geo",
+    resolution="abi2km",
+    geo_navigation="goes-r-abi",
+    sensor="goes-r-abi-band13-fm4",
+    instrument_footprint="goes-r-abi-band13-mtf-prototype",
+)
+print(geo_mtf.instrument_footprint_metadata)
+print(geo_mtf.abi_fixed_grid_crop)
+
 # 3) Day/night-safe composite + a derived moisture field, capped to one worker thread.
 gc, geo = simsat.render_geocolor(wrfout, threads=1)
 pw, geo = simsat.render_precipitable_water(wrfout, threads=1)
 ```
 
-Pass `view="geo"` for the from-space geostationary view. See the repo's
-`notes/wrf-runner-glue.md` for the full WRF-Runner integration.
+Pass `view="geo"` for the from-space geostationary view. See the
+[repository Python-binding overview](../../README.md#python-binding) for the
+supported products and build instructions.
 
 ## Compositing the cloud layer over a Mapbox GL map
 

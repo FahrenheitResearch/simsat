@@ -23,11 +23,14 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use simsat::api::{FractionalCloudMode, RenderIntent};
 use simsat::atmosphere::OutputTransform;
-use simsat::camera::{ResolutionMode, SatellitePreset};
+use simsat::camera::{GeoNavigation, ResolutionMode, SatellitePreset};
 use simsat::clouds::{DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE, StepQuality};
 use simsat::derived::DerivedField;
+use simsat::instrument_footprint::InstrumentFootprint;
 use simsat::ir_enhance::IrEnhancement;
+use simsat::thermal_sensor::ThermalSensor;
 use simsat::wv::WvBand;
 
 use crate::{RenderMode, StudioView};
@@ -97,10 +100,19 @@ pub struct StudioSettings {
     /// Sat-store root override; `None` = the app default beside the cache dir.
     pub store_root: Option<String>,
     pub sat: String,
+    pub geo_navigation: String,
     pub resolution: String,
     pub view: String,
     pub mode: String,
+    /// Scientific/display intent. Stored as a stable token so a Sensor Fast Gray
+    /// selection survives an app restart; older files default to `display` through
+    /// the struct-level `#[serde(default)]` contract.
+    pub render_intent: String,
     pub ir_enhancement: String,
+    pub thermal_sensor: String,
+    /// Complete-radiance instrument spatial-response stage. Stable enum token;
+    /// off by default and validated against the selected geometry at render time.
+    pub instrument_footprint: String,
     pub output_transform: String,
     pub step_quality: String,
     pub margin_pct: f32,
@@ -125,6 +137,10 @@ pub struct StudioSettings {
     /// Use model cloud fraction/subcolumns when the brick provides them. `true` is
     /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
     pub fractional_clouds: bool,
+    /// Stable token for the CPU fractional-cloud observation operator.
+    /// `effective-od` is the shipped/default closure; deterministic 4/8/16 are
+    /// opt-in fixed-stratified references. The legacy boolean remains the master switch.
+    pub fractional_cloud_mode: String,
     pub multiscatter: bool,
     /// Opt-in Stage-2 Monte Carlo depth-source closure. False preserves the exact
     /// legacy octave/single-scatter dispatch.
@@ -132,9 +148,18 @@ pub struct StudioSettings {
     /// Opt-in bounded P1 directional reconstruction over the same Stage-2 LUT.
     /// False preserves every legacy/v1 path.
     pub delta_flux_v2_clouds: bool,
+    /// Opt-in successive-order angular-memory reconstruction over the Stage-2 LUT.
+    /// False preserves every legacy/v1/v2 path.
+    pub delta_flux_v3_clouds: bool,
     /// Visible cloud optical-depth calibration. The shipped default is `0.15`;
     /// `1.0` keeps the model-derived physical input unchanged.
     pub cloud_optical_depth_scale: f32,
+    /// Opt-in high-precision extinction brick storage. False keeps CompactU8.
+    pub science_cloud_f16: bool,
+    /// Experimental WRF NSSL MP18 mass/number/volume-moment particle optics.
+    pub nssl_native_cloud_optics: bool,
+    /// Experimental HRRR Thompson/Eidhammer native particle optics.
+    pub hrrr_thompson_native_cloud_optics: bool,
     /// Fade finished visible clouds at camera-exposed finite-domain boundaries.
     /// Default on in v0.1.5; false is the exact pre-feature margin-gated behavior.
     pub feather_exposed_domain_edges: bool,
@@ -144,6 +169,9 @@ pub struct StudioSettings {
     /// Top-down-only low-stratiform column-OD reconstruction. Experimental and
     /// explicitly opt-in; geostationary/raw products ignore it.
     pub topdown_stratiform_regularization: bool,
+    /// Display-only top-down pre-tonemap cloud-radiance footprint. Experimental,
+    /// explicitly opt-in, and persisted for repeatable A/B review.
+    pub topdown_cloud_footprint: bool,
     pub exposure: f32,
     /// Sun-gated daytime ground-radiance lift. `1.0` is neutral.
     pub ground_gain: f32,
@@ -175,10 +203,14 @@ impl Default for StudioSettings {
             visible_calibration_epoch: VISIBLE_CALIBRATION_EPOCH,
             store_root: None,
             sat: sat_token(SatellitePreset::GoesEast).to_string(),
+            geo_navigation: geo_navigation_token(GeoNavigation::ModelSphere).to_string(),
             resolution: resolution_token(ResolutionMode::Native).to_string(),
             view: view_token(StudioView::Geostationary).to_string(),
             mode: mode_token(RenderMode::Visible).to_string(),
+            render_intent: render_intent_token(RenderIntent::Display).to_string(),
             ir_enhancement: enhancement_token(IrEnhancement::default()).to_string(),
+            thermal_sensor: thermal_sensor_token(ThermalSensor::FastGray).to_string(),
+            instrument_footprint: instrument_footprint_token(InstrumentFootprint::Off).to_string(),
             output_transform: output_transform_token(OutputTransform::AbiReflectance).to_string(),
             step_quality: step_quality_token(StepQuality::Offline).to_string(),
             margin_pct: 0.0,
@@ -194,14 +226,21 @@ impl Default for StudioSettings {
             land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
             clouds_enabled: true,
             fractional_clouds: true,
+            fractional_cloud_mode: fractional_cloud_mode_token(FractionalCloudMode::EffectiveOd)
+                .to_string(),
             multiscatter: true,
             delta_flux_clouds: false,
             delta_flux_v2_clouds: false,
+            delta_flux_v3_clouds: false,
             cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            science_cloud_f16: false,
+            nssl_native_cloud_optics: false,
+            hrrr_thompson_native_cloud_optics: false,
             feather_exposed_domain_edges: true,
             beer_powder: false,
             granulation: false,
             topdown_stratiform_regularization: false,
+            topdown_cloud_footprint: false,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             ground_gain: simsat::render::GROUND_DAY_LIFT as f32,
             cloud_softclip: simsat::render::CLOUD_SOFTCLIP_KNEE as f32,
@@ -253,14 +292,19 @@ impl StudioSettings {
         self.land_dark_toe_max_gain = d.land_dark_toe_max_gain;
         self.clouds_enabled = d.clouds_enabled;
         self.fractional_clouds = d.fractional_clouds;
+        self.fractional_cloud_mode = d.fractional_cloud_mode;
         self.multiscatter = d.multiscatter;
         self.delta_flux_clouds = d.delta_flux_clouds;
         self.delta_flux_v2_clouds = d.delta_flux_v2_clouds;
+        self.delta_flux_v3_clouds = d.delta_flux_v3_clouds;
         self.cloud_optical_depth_scale = d.cloud_optical_depth_scale;
+        self.nssl_native_cloud_optics = d.nssl_native_cloud_optics;
+        self.hrrr_thompson_native_cloud_optics = d.hrrr_thompson_native_cloud_optics;
         self.feather_exposed_domain_edges = d.feather_exposed_domain_edges;
         self.beer_powder = d.beer_powder;
         self.granulation = d.granulation;
         self.topdown_stratiform_regularization = d.topdown_stratiform_regularization;
+        self.topdown_cloud_footprint = d.topdown_cloud_footprint;
         self.exposure = d.exposure;
         self.ground_gain = d.ground_gain;
         self.cloud_softclip = d.cloud_softclip;
@@ -317,6 +361,9 @@ impl StudioSettings {
         if sat_from_token(&self.sat).is_none() {
             self.sat = d.sat;
         }
+        if geo_navigation_from_token(&self.geo_navigation).is_none() {
+            self.geo_navigation = d.geo_navigation;
+        }
         if resolution_from_token(&self.resolution).is_none() {
             self.resolution = d.resolution;
         }
@@ -326,14 +373,33 @@ impl StudioSettings {
         if mode_from_token(&self.mode).is_none() {
             self.mode = d.mode;
         }
+        if render_intent_from_token(&self.render_intent).is_none() {
+            self.render_intent = d.render_intent;
+        }
         if enhancement_from_token(&self.ir_enhancement).is_none() {
             self.ir_enhancement = d.ir_enhancement;
+        }
+        if thermal_sensor_from_token(&self.thermal_sensor).is_none() {
+            self.thermal_sensor = d.thermal_sensor;
+        }
+        if instrument_footprint_from_token(&self.instrument_footprint).is_none() {
+            self.instrument_footprint = d.instrument_footprint;
         }
         if output_transform_from_token(&self.output_transform).is_none() {
             self.output_transform = d.output_transform;
         }
         if step_quality_from_token(&self.step_quality).is_none() {
             self.step_quality = d.step_quality;
+        }
+        if fractional_cloud_mode_from_token(&self.fractional_cloud_mode).is_none() {
+            self.fractional_cloud_mode = d.fractional_cloud_mode;
+        }
+        // Native optics are one ingest-time mode, even though the backward-compatible
+        // settings schema stores two booleans. Match the worker's established precedence
+        // (HRRR Thompson before NSSL) so a hand-edited/legacy invalid file never displays
+        // two checked modes while rendering only one.
+        if self.hrrr_thompson_native_cloud_optics {
+            self.nssl_native_cloud_optics = false;
         }
         // Recent list: drop malformed entries, dedupe (first occurrence wins,
         // i.e. most recent since the list is newest-first), cap.
@@ -365,6 +431,16 @@ pub fn sat_from_token(t: &str) -> Option<SatellitePreset> {
     SatellitePreset::ALL
         .into_iter()
         .find(|p| sat_token(*p) == t)
+}
+
+pub fn geo_navigation_token(navigation: GeoNavigation) -> &'static str {
+    navigation.slug()
+}
+
+pub fn geo_navigation_from_token(t: &str) -> Option<GeoNavigation> {
+    GeoNavigation::ALL
+        .into_iter()
+        .find(|navigation| geo_navigation_token(*navigation) == t)
 }
 
 pub fn resolution_token(r: ResolutionMode) -> &'static str {
@@ -412,6 +488,18 @@ pub fn mode_from_token(t: &str) -> Option<RenderMode> {
     RenderMode::ALL.into_iter().find(|m| mode_token(*m) == t)
 }
 
+pub fn render_intent_token(intent: RenderIntent) -> &'static str {
+    intent.slug()
+}
+
+pub fn render_intent_from_token(t: &str) -> Option<RenderIntent> {
+    match t {
+        "display" => Some(RenderIntent::Display),
+        "sensor-fast-gray" => Some(RenderIntent::SensorFastGray),
+        _ => None,
+    }
+}
+
 pub fn enhancement_token(e: IrEnhancement) -> &'static str {
     match e {
         IrEnhancement::Cimss => "cimss",
@@ -427,6 +515,22 @@ pub fn enhancement_from_token(t: &str) -> Option<IrEnhancement> {
     IrEnhancement::ALL
         .into_iter()
         .find(|e| enhancement_token(*e) == t)
+}
+
+pub fn thermal_sensor_token(sensor: ThermalSensor) -> &'static str {
+    sensor.slug()
+}
+
+pub fn thermal_sensor_from_token(t: &str) -> Option<ThermalSensor> {
+    ThermalSensor::parse(t)
+}
+
+pub fn instrument_footprint_token(footprint: InstrumentFootprint) -> &'static str {
+    footprint.slug()
+}
+
+pub fn instrument_footprint_from_token(t: &str) -> Option<InstrumentFootprint> {
+    InstrumentFootprint::parse(t)
 }
 
 pub fn output_transform_token(o: OutputTransform) -> &'static str {
@@ -453,6 +557,21 @@ pub fn step_quality_from_token(t: &str) -> Option<StepQuality> {
     [StepQuality::Offline, StepQuality::Interactive]
         .into_iter()
         .find(|s| step_quality_token(*s) == t)
+}
+
+pub fn fractional_cloud_mode_token(mode: FractionalCloudMode) -> &'static str {
+    mode.slug()
+}
+
+pub fn fractional_cloud_mode_from_token(t: &str) -> Option<FractionalCloudMode> {
+    match t {
+        "off" => Some(FractionalCloudMode::Off),
+        "effective-od" | "on" => Some(FractionalCloudMode::EffectiveOd),
+        "deterministic-4" => Some(FractionalCloudMode::Deterministic4),
+        "deterministic-8" => Some(FractionalCloudMode::Deterministic8),
+        "deterministic-16" => Some(FractionalCloudMode::Deterministic16),
+        _ => None,
+    }
 }
 
 // ── load / save ───────────────────────────────────────────────────────────────
@@ -595,10 +714,13 @@ mod tests {
             simsat::render::LAND_DARK_TOE_MAX_GAIN as f32
         );
         assert_eq!(s.output_transform, "abi-reflectance");
+        assert_eq!(s.render_intent, "display");
+        assert_eq!(s.instrument_footprint, "off");
         assert!(s.clouds_enabled);
         assert!(s.multiscatter);
         assert!(!s.delta_flux_clouds);
         assert!(!s.delta_flux_v2_clouds);
+        assert!(!s.delta_flux_v3_clouds);
         assert!(!s.beer_powder);
         assert_eq!(s.cloud_optical_depth_scale, 0.15);
         assert!(s.feather_exposed_domain_edges);
@@ -607,8 +729,10 @@ mod tests {
         assert_eq!(s.cloud_softclip, 0.65);
         assert_eq!(s.cloud_highlight_max, 1.25);
         assert!(s.fractional_clouds);
+        assert_eq!(s.fractional_cloud_mode, "effective-od");
         assert!(!s.granulation);
         assert!(!s.topdown_stratiform_regularization);
+        assert!(!s.topdown_cloud_footprint);
     }
 
     #[test]
@@ -634,12 +758,14 @@ mod tests {
             land_dark_toe_max_gain: 3.0,
             clouds_enabled: false,
             fractional_clouds: false,
+            fractional_cloud_mode: "deterministic-4".to_string(),
             multiscatter: false,
             cloud_optical_depth_scale: 2.0,
             feather_exposed_domain_edges: false,
             beer_powder: true,
             granulation: true,
             topdown_stratiform_regularization: true,
+            topdown_cloud_footprint: true,
             exposure: 4.0,
             ground_gain: 4.0,
             cloud_softclip: 1.0,
@@ -662,9 +788,11 @@ mod tests {
         assert_eq!(s.land_dark_toe_max_gain, d.land_dark_toe_max_gain);
         assert_eq!(s.clouds_enabled, d.clouds_enabled);
         assert_eq!(s.fractional_clouds, d.fractional_clouds);
+        assert_eq!(s.fractional_cloud_mode, d.fractional_cloud_mode);
         assert_eq!(s.multiscatter, d.multiscatter);
         assert_eq!(s.delta_flux_clouds, d.delta_flux_clouds);
         assert_eq!(s.delta_flux_v2_clouds, d.delta_flux_v2_clouds);
+        assert_eq!(s.delta_flux_v3_clouds, d.delta_flux_v3_clouds);
         assert_eq!(s.cloud_optical_depth_scale, d.cloud_optical_depth_scale);
         assert_eq!(
             s.feather_exposed_domain_edges,
@@ -676,6 +804,7 @@ mod tests {
             s.topdown_stratiform_regularization,
             d.topdown_stratiform_regularization
         );
+        assert_eq!(s.topdown_cloud_footprint, d.topdown_cloud_footprint);
         assert_eq!(s.exposure, d.exposure);
         assert_eq!(s.ground_gain, d.ground_gain);
         assert_eq!(s.cloud_softclip, d.cloud_softclip);
@@ -698,8 +827,20 @@ mod tests {
         for m in RenderMode::ALL {
             assert_eq!(mode_from_token(mode_token(m)), Some(m));
         }
+        for intent in [RenderIntent::Display, RenderIntent::SensorFastGray] {
+            assert_eq!(
+                render_intent_from_token(render_intent_token(intent)),
+                Some(intent)
+            );
+        }
         for e in IrEnhancement::ALL {
             assert_eq!(enhancement_from_token(enhancement_token(e)), Some(e));
+        }
+        for footprint in InstrumentFootprint::ALL {
+            assert_eq!(
+                instrument_footprint_from_token(instrument_footprint_token(footprint)),
+                Some(footprint)
+            );
         }
         for o in [OutputTransform::AbiReflectance, OutputTransform::DebugSrgb] {
             assert_eq!(
@@ -709,6 +850,18 @@ mod tests {
         }
         for s in [StepQuality::Offline, StepQuality::Interactive] {
             assert_eq!(step_quality_from_token(step_quality_token(s)), Some(s));
+        }
+        for mode in [
+            FractionalCloudMode::Off,
+            FractionalCloudMode::EffectiveOd,
+            FractionalCloudMode::Deterministic4,
+            FractionalCloudMode::Deterministic8,
+            FractionalCloudMode::Deterministic16,
+        ] {
+            assert_eq!(
+                fractional_cloud_mode_from_token(fractional_cloud_mode_token(mode)),
+                Some(mode)
+            );
         }
         // Unknown tokens map to None (they reset to defaults in sanitize).
         assert_eq!(mode_from_token("does-not-exist"), None);
@@ -737,6 +890,7 @@ mod tests {
         assert_eq!(s.sat, "himawari");
         assert_eq!(s.exposure, 2.0);
         assert_eq!(s.mode, StudioSettings::default().mode);
+        assert_eq!(s.render_intent, "display");
         assert_eq!(
             s.visible_calibration_epoch, 0,
             "pre-epoch files must preserve values and request an explicit migration choice"
@@ -910,6 +1064,7 @@ mod tests {
             land_dark_toe_max_gain: -2.0,
             cloud_optical_depth_scale: 99.0,
             fractional_clouds: false,
+            fractional_cloud_mode: "random-16".to_string(),
             exposure: 99.0,
             ground_gain: 99.0,
             cloud_softclip: -3.0,
@@ -919,6 +1074,10 @@ mod tests {
             bm_month_override: 13,
             sat: "geostationary-9".to_string(),
             mode: "x-ray".to_string(),
+            render_intent: "magic-sensor".to_string(),
+            instrument_footprint: "box-blur".to_string(),
+            nssl_native_cloud_optics: true,
+            hrrr_thompson_native_cloud_optics: true,
             orbit_tilt_deg: 90.0,
             orbit_range_km: f32::NAN,
             persp_width: 100_000,
@@ -936,6 +1095,7 @@ mod tests {
         );
         assert_eq!(s.land_dark_toe_max_gain, 1.0);
         assert_eq!(s.cloud_optical_depth_scale, 4.0);
+        assert_eq!(s.fractional_cloud_mode, "effective-od");
         assert!(
             !s.fractional_clouds,
             "sanitize must preserve an explicit legacy A/B"
@@ -952,6 +1112,16 @@ mod tests {
         assert_eq!(s.bm_month_override, 0);
         assert_eq!(s.sat, StudioSettings::default().sat);
         assert_eq!(s.mode, StudioSettings::default().mode);
+        assert_eq!(s.render_intent, StudioSettings::default().render_intent);
+        assert_eq!(
+            s.instrument_footprint,
+            StudioSettings::default().instrument_footprint
+        );
+        assert!(s.hrrr_thompson_native_cloud_optics);
+        assert!(
+            !s.nssl_native_cloud_optics,
+            "sanitize canonicalizes the two legacy booleans with worker precedence"
+        );
         // Perspective orbit fields clamp to the slider ranges (NaN -> the default).
         assert_eq!(s.orbit_tilt_deg, 85.0);
         assert_eq!(s.orbit_range_km, StudioSettings::default().orbit_range_km);
@@ -1026,6 +1196,8 @@ mod tests {
         let path = dir.join("settings.json");
         let mut s = StudioSettings {
             sat: "goes-west".to_string(),
+            render_intent: "sensor-fast-gray".to_string(),
+            instrument_footprint: "goes-r-abi-band13-mtf-prototype".to_string(),
             exposure: 2.5,
             atmosphere_correction: false,
             terrain_atmosphere: false,

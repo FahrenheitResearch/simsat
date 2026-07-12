@@ -8,13 +8,15 @@
 //! The functions each return `(numpy_array, georef)` so a meteorologist can plot the
 //! result on a cartopy map:
 //! - [`render_visible_rgb`]  -> `(H x W x 3 uint8, Georef)`  the finished true-color RGB.
-//! - [`render_geocolor`] -> `(H x W x 3 uint8, Georef)`  the GeoColor day/night blend
-//!   (true-color by day, colored band-13 IR by night) — always meaningful day OR night.
+//! - [`render_geocolor`] -> `(H x W x 3 uint8, Georef)`  SimSat Day/Night Color, a
+//!   GeoColor-style composite (true-color by day, colored band-13 IR by night). It is not
+//!   yet sensor-derived ABI GeoColor.
 //! - [`render_sandwich`] -> `(H x W x 3 uint8, Georef)`  the Sandwich composite (visible
 //!   true-color base + color-enhanced band-13 IR overlaid on the cold cloud tops) — the
 //!   classic severe-convection view; a daytime-convection product.
-//! - [`render_visible_bands`] -> `(H x W x 3 float32, Georef)`  RAW per-channel reflectance
-//!   (pre-tonemap, `[0, 1]`), for building a custom RGB / operating on bands.
+//! - [`render_rgb_reflectance`] -> `(H x W x 3 float32, Georef)` RAW broad-RGB reflectance
+//!   (pre-tonemap, `[0, 1]`), for custom RGB / reflectance math. The deprecated
+//!   [`render_visible_bands`] name remains as a compatibility alias.
 //! - [`render_ir`] -> `(H x W float32, Georef)` RAW brightness temperature in KELVIN; with
 //!   `enhancement=` it instead returns `(H x W float32, H x W x 3 uint8, Georef)`.
 //! - [`render_water_vapor`] -> `(H x W float32, Georef)` RAW water-vapor band (6.2/6.9/7.3
@@ -59,13 +61,17 @@ use pyo3::types::{PyDict, PyTuple};
 use std::path::PathBuf;
 
 use simsat_engine::api::{
-    self, BlueMarble, ExtentKind, FrameData, GroundSource, Product, RenderBackend, RenderParams,
-    RenderResult, SunOverride,
+    self, BlueMarble, ExtentKind, FractionalCloudMode, FrameData, GroundSource, Product,
+    RenderBackend, RenderIntent, RenderParams, RenderResult, SunOverride,
 };
-use simsat_engine::camera::{ResolutionMode, SatellitePreset, ViewMode};
+use simsat_engine::camera::{GeoNavigation, ResolutionMode, SatellitePreset, ViewMode};
+use simsat_engine::bricks::StorageProfile;
 use simsat_engine::clouds::{CloudMultiscatterMode, StepQuality};
 use simsat_engine::derived::DerivedField;
 use simsat_engine::ir_enhance::IrEnhancement;
+use simsat_engine::instrument_footprint::InstrumentFootprint;
+use simsat_engine::optics::CloudOpticsMode;
+use simsat_engine::thermal_sensor::ThermalSensor;
 use simsat_engine::topdown::{configure_global_rayon, effective_thread_count};
 use simsat_engine::web_layer;
 use simsat_engine::wv::WvBand;
@@ -99,6 +105,17 @@ use simsat_engine::wv::WvBand;
 ///       products use no ground texture).
 ///   ground_status (list[str]): the ground-resolution status lines (seasonal Blue
 ///       Marble download / fallback progress); empty when nothing noteworthy happened.
+///   intent (str): `display` or `sensor-fast-gray`.
+///   observation_operator (str): stable provenance slug (`simsat-display-v1` or
+///       `simsat-fast-gray-v1`).
+///   intent_adjustments (list[str]): every automatic strict-intent substitution.
+///   intent_limitations (list[str]): explicit scientific limitations of that operator.
+///   thermal_sensor (str | None): selected response for IR or an IR-containing composite.
+///   instrument_footprint (str): complete-radiance spatial-response stage (`off` by default).
+///   instrument_footprint_metadata (dict | None): source/limitation provenance when active.
+///   abi_fixed_grid_crop (dict | None): signed global half-pitch crop indices for an exact
+///       ABI 2-km lattice. SSP is the shared corner of the four +/-28-urad pixels.
+///   science_warnings (list[str]): explicit observation-operator limitations.
 #[pyclass(module = "simsat", frozen)]
 pub struct Georef {
     #[pyo3(get)]
@@ -123,6 +140,36 @@ pub struct Georef {
     ground_source: String,
     #[pyo3(get)]
     ground_status: Vec<String>,
+    /// Requested render intent (`display` or `sensor-fast-gray`).
+    #[pyo3(get)]
+    intent: String,
+    /// Stable operator provenance (`simsat-display-v1` or `simsat-fast-gray-v1`).
+    #[pyo3(get)]
+    observation_operator: String,
+    /// Exact automatic strict-intent substitutions, in application order.
+    #[pyo3(get)]
+    intent_adjustments: Vec<String>,
+    /// Honest limitations of the selected observation operator.
+    #[pyo3(get)]
+    intent_limitations: Vec<String>,
+    /// Thermal response slug for IR / IR-containing products; `None` otherwise.
+    #[pyo3(get)]
+    thermal_sensor: Option<String>,
+    /// Instrument spatial-response slug (`off` unless explicitly selected).
+    #[pyo3(get)]
+    instrument_footprint: String,
+    /// Instrument source/domain/limitation provenance when active.
+    #[pyo3(get)]
+    instrument_footprint_metadata: Option<Py<PyDict>>,
+    /// Exact ABI 2-km global-lattice crop metadata when the output uses that grid.
+    #[pyo3(get)]
+    abi_fixed_grid_crop: Option<Py<PyDict>>,
+    /// Explicit observation-operator limitations for programmatic provenance.
+    #[pyo3(get)]
+    science_warnings: Vec<String>,
+    /// Brick extinction storage profile actually decoded.
+    #[pyo3(get)]
+    storage_profile: String,
     /// The four image corner `(lon, lat)` pairs in the Mapbox GL ImageSource
     /// `coordinates` order (top-left/NW, top-right/NE, bottom-right/SE,
     /// bottom-left/SW). Only set by `render_cloud_layer` (the Web-Mercator delivery);
@@ -135,6 +182,12 @@ pub struct Georef {
     /// for every other product.
     #[pyo3(get)]
     camera_pose: Option<Py<PyDict>>,
+    /// Geostationary sensor-grid navigation slug; `None` for non-geo products.
+    #[pyo3(get)]
+    geo_navigation: Option<String>,
+    /// Exact sensor/model geometry provenance dictionary for a geo product.
+    #[pyo3(get)]
+    geo_navigation_geometry: Option<Py<PyDict>>,
 }
 
 #[pymethods]
@@ -157,23 +210,30 @@ impl Georef {
 /// Visible-family atmosphere/cloud controls are shared by RGB, bands, GeoColor,
 /// Sandwich, cloud-layer, and perspective renders: `aerosol_optical_depth` (default
 /// 0.05), `rh_aerosol_swelling` (1.5x when true), `atmosphere_correction`,
-/// `terrain_atmosphere`, `fractional_clouds` (default true), and
+/// `terrain_atmosphere`, `fractional_clouds` (default true),
+/// `fractional_cloud_mode` (`effective-od` default; opt-in fixed-stratified
+/// `deterministic-4`, `deterministic-8`, or `deterministic-16`), and
 /// `cloud_optical_depth_scale` (0..=4, shipped default 0.15 by owner cross-file visual
 /// calibration; 1.0 is unscaled model extinction), and the default-on
 /// `feather_exposed_domain_edges` finite-domain presentation control. Fractional clouds
 /// use the model cloud
-/// fraction when present; false restores legacy horizontally-full cells. The OD scale is
+/// fraction when present; false restores legacy horizontally-full cells. The
+/// deterministic mode performs four fixed shared-u CPU marches, averages linear
+/// radiance, then tonemaps once. The OD scale is
 /// a visible sensitivity control and does not alter the quantitative
 /// `render_cloud_optical_depth` product. `clouds` remains the explicit feature bypass;
 /// `multiscatter` controls the established higher scattering octaves without changing
 /// transmittance. `cloud_multiscatter` is an explicit override accepting
 /// `legacy-octaves`, `single-scatter`, or opt-in experimental `delta-flux-v1` /
-/// `delta-flux-v2b`; leaving it unset preserves the historical boolean behavior exactly.
+/// `delta-flux-v2b` / `delta-flux-v3-memory`; leaving it unset preserves the historical
+/// boolean behavior exactly.
 /// `beer_powder` enables the optional direct-sun shaping, and `granulation` enables
 /// display-only sub-grid cloud-edge erosion; both default off. Finished visible display
 /// products also expose `topdown_stratiform_regularization`, an opt-in/default-off
 /// low/liquid-deck reconstruction used only by the top-down finished-visible path.
-/// Geostationary and raw visible bands ignore it. Finished visible display
+/// They also expose `topdown_cloud_footprint`, an opt-in/default-off seven-tap
+/// pre-tonemap footprint applied only to the cloud radiance residual, leaving terrain
+/// sharp. Geostationary and raw visible bands ignore both controls. Finished visible display
 /// products also accept `ground_gain`, `cloud_softclip`, and `cloud_highlight_max` as
 /// optional calibration overrides. The land-only controls
 /// `land_sza_normalization` / `land_sza_max_gain` and `land_dark_toe` plus its
@@ -189,15 +249,17 @@ impl Georef {
 /// Returns `(rgb, georef)` where `rgb` is a numpy `H x W x 3` uint8 array (row 0 = north).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, backend="cpu", sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", backend="cpu", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
+    topdown_cloud_footprint=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -205,8 +267,11 @@ impl Georef {
 fn render_visible_rgb<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     backend: &str,
+    intent: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
@@ -231,10 +296,13 @@ fn render_visible_rgb<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -245,7 +313,10 @@ fn render_visible_rgb<'py>(
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Georef)> {
     let mut params = build_visible_params(
         input,
+        storage_profile,
+        intent,
         sat,
+        geo_navigation,
         view,
         timestep,
         resolution,
@@ -270,10 +341,13 @@ fn render_visible_rgb<'py>(
         steps,
         clouds,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         granulation,
         topdown_stratiform_regularization,
+        topdown_cloud_footprint,
         sun_elev,
         sun_az,
         cache,
@@ -297,25 +371,29 @@ fn render_visible_rgb<'py>(
     Ok((arr, geo))
 }
 
-/// Render the GeoColor day/night blend: true-color visible by day, colored band-13 IR by
-/// night, crossfaded across the terminator by the per-pixel solar elevation (GOES's flagship
-/// product). Always meaningful day OR night — the night side shows the storm/clouds in IR
-/// where a plain visible frame would be black (no city lights; our night side is the colored
-/// IR, honestly). The sun / exposure / clouds controls apply to the visible (day) half.
+/// Render SimSat Day/Night Color, a GeoColor-style composite: true-color visible by day,
+/// colored band-13 IR by night, crossfaded across the terminator by per-pixel solar elevation.
+/// This is not yet sensor-derived ABI GeoColor: its visible side uses SimSat's broad RGB
+/// operator and its IR side uses the selected Band 13 response. It is always meaningful day
+/// or night; the night side shows storms/clouds in IR rather than city lights. Sun, exposure,
+/// and cloud controls apply to the visible (day) half.
 ///
 /// Returns `(rgb, georef)` where `rgb` is a numpy `H x W x 3` uint8 array (row 0 = north),
 /// exactly like [`render_visible_rgb`].
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
+    sensor="fast-gray", instrument_footprint="off",
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
+    topdown_cloud_footprint=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -323,11 +401,16 @@ fn render_visible_rgb<'py>(
 fn render_geocolor<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
+    intent: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
     margin: f64,
+    sensor: &str,
+    instrument_footprint: &str,
     aerosol_optical_depth: f32,
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
@@ -348,10 +431,13 @@ fn render_geocolor<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -360,9 +446,12 @@ fn render_geocolor<'py>(
     bluemarble_download: bool,
     threads: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Georef)> {
-    let params = build_visible_params(
+    let mut params = build_visible_params(
         input,
+        storage_profile,
+        intent,
         sat,
+        geo_navigation,
         view,
         timestep,
         resolution,
@@ -387,10 +476,13 @@ fn render_geocolor<'py>(
         steps,
         clouds,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         granulation,
         topdown_stratiform_regularization,
+        topdown_cloud_footprint,
         sun_elev,
         sun_az,
         cache,
@@ -398,6 +490,8 @@ fn render_geocolor<'py>(
         bluemarble_month,
         bluemarble_download,
     )?;
+    params.thermal_sensor = parse_thermal_sensor(sensor)?;
+    params.instrument_footprint = parse_instrument_footprint(instrument_footprint)?;
     apply_thread_cap(threads);
     let result = render_or_err(py, params, Product::GeoColor)?;
     warn_downgrades(py, &result, true);
@@ -424,15 +518,18 @@ fn render_geocolor<'py>(
 /// exactly like [`render_visible_rgb`].
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
+    sensor="fast-gray", instrument_footprint="off",
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
+    topdown_cloud_footprint=false,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -440,11 +537,16 @@ fn render_geocolor<'py>(
 fn render_sandwich<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
+    intent: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
     margin: f64,
+    sensor: &str,
+    instrument_footprint: &str,
     aerosol_optical_depth: f32,
     rh_aerosol_swelling: bool,
     atmosphere_correction: bool,
@@ -465,10 +567,13 @@ fn render_sandwich<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -477,9 +582,12 @@ fn render_sandwich<'py>(
     bluemarble_download: bool,
     threads: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Georef)> {
-    let params = build_visible_params(
+    let mut params = build_visible_params(
         input,
+        storage_profile,
+        intent,
         sat,
+        geo_navigation,
         view,
         timestep,
         resolution,
@@ -504,10 +612,13 @@ fn render_sandwich<'py>(
         steps,
         clouds,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         granulation,
         topdown_stratiform_regularization,
+        topdown_cloud_footprint,
         sun_elev,
         sun_az,
         cache,
@@ -515,6 +626,8 @@ fn render_sandwich<'py>(
         bluemarble_month,
         bluemarble_download,
     )?;
+    params.thermal_sensor = parse_thermal_sensor(sensor)?;
+    params.instrument_footprint = parse_instrument_footprint(instrument_footprint)?;
     apply_thread_cap(threads);
     let result = render_or_err(py, params, Product::Sandwich)?;
     warn_downgrades(py, &result, true);
@@ -530,27 +643,31 @@ fn render_sandwich<'py>(
     Ok((arr, geo))
 }
 
-/// Render the RAW per-channel reflectance (pre-tonemap), for building a custom RGB / band
-/// math.
+/// Render raw broad-RGB reflectance (pre-tonemap) for custom RGB or reflectance math.
 ///
-/// Returns `(bands, georef)` where `bands` is a numpy `H x W x 3` float32 array in `[0, 1]`
-/// (R, G, B reflectance factors; row 0 = north).
+/// Returns `(reflectance, georef)` where `reflectance` is a numpy `H x W x 3` float32
+/// array in `[0, 1]` (broad R, G, B reflectance factors; row 0 = north). These channels
+/// are not yet sensor-response-integrated ABI visible bands.
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true,
-    fractional_clouds=true, cloud_optical_depth_scale=0.15, granulation=false, sun_elev=None,
+    fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed", granulation=false, sun_elev=None,
     sun_az=None, cache=None,
     bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
-fn render_visible_bands<'py>(
+fn render_rgb_reflectance<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
+    intent: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
@@ -565,7 +682,98 @@ fn render_visible_bands<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
+    granulation: bool,
+    sun_elev: Option<f64>,
+    sun_az: Option<f64>,
+    cache: Option<String>,
+    bluemarble: Option<String>,
+    bluemarble_month: Option<u32>,
+    bluemarble_download: bool,
+    threads: Option<usize>,
+) -> PyResult<(Bound<'py, PyArray3<f32>>, Georef)> {
+    render_visible_bands(
+        py,
+        input,
+        storage_profile,
+        intent,
+        sat,
+        geo_navigation,
+        view,
+        timestep,
+        resolution,
+        margin,
+        aerosol_optical_depth,
+        rh_aerosol_swelling,
+        atmosphere_correction,
+        terrain_atmosphere,
+        multiscatter,
+        cloud_multiscatter,
+        beer_powder,
+        steps,
+        clouds,
+        fractional_clouds,
+        fractional_cloud_mode,
+        cloud_optical_depth_scale,
+        cloud_optics,
+        granulation,
+        sun_elev,
+        sun_az,
+        cache,
+        bluemarble,
+        bluemarble_month,
+        bluemarble_download,
+        threads,
+    )
+}
+
+/// Deprecated compatibility alias for [`render_rgb_reflectance`].
+///
+/// `render_visible_bands` returns exactly the same broad-RGB reflectance array and remains
+/// available for existing code. New code should use `render_rgb_reflectance`; the old name
+/// could be mistaken for discrete, sensor-response-integrated visible bands.
+///
+/// Returns `(bands, georef)` where `bands` is a numpy `H x W x 3` float32 array in `[0, 1]`
+/// (R, G, B reflectance factors; row 0 = north).
+#[pyfunction]
+#[pyo3(signature = (
+    input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
+    aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
+    terrain_atmosphere=true, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
+    steps="offline", clouds=true,
+    fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed", granulation=false, sun_elev=None,
+    sun_az=None, cache=None,
+    bluemarble=None,
+    bluemarble_month=None, bluemarble_download=true, threads=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn render_visible_bands<'py>(
+    py: Python<'py>,
+    input: String,
+    storage_profile: &str,
+    intent: &str,
+    sat: &str,
+    geo_navigation: &str,
+    view: &str,
+    timestep: usize,
+    resolution: &str,
+    margin: f64,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
+    multiscatter: bool,
+    cloud_multiscatter: Option<&str>,
+    beer_powder: bool,
+    steps: &str,
+    clouds: bool,
+    fractional_clouds: bool,
+    fractional_cloud_mode: &str,
+    cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     granulation: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
@@ -577,7 +785,10 @@ fn render_visible_bands<'py>(
 ) -> PyResult<(Bound<'py, PyArray3<f32>>, Georef)> {
     let params = build_visible_params(
         input,
+        storage_profile,
+        intent,
         sat,
+        geo_navigation,
         view,
         timestep,
         resolution,
@@ -602,9 +813,12 @@ fn render_visible_bands<'py>(
         steps,
         clouds,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         false,
         granulation,
+        false,
         false,
         sun_elev,
         sun_az,
@@ -614,7 +828,7 @@ fn render_visible_bands<'py>(
         bluemarble_download,
     )?;
     apply_thread_cap(threads);
-    let result = render_or_err(py, params, Product::VisibleBands)?;
+    let result = render_or_err(py, params, Product::RgbReflectance)?;
     warn_downgrades(py, &result, true);
     let (ny, nx) = (result.ny, result.nx);
     let geo = build_georef(py, &result)?;
@@ -633,31 +847,41 @@ fn render_visible_bands<'py>(
 /// Returns `(bt, georef)` where `bt` is a numpy `H x W` float32 array in Kelvin (NaN
 /// off-domain; row 0 = north). If `enhancement` is given (one of 'cimss', 'bd', 'avn',
 /// 'funktop', 'rainbow', 'gray') the return is instead `(bt, rgb, georef)` with `rgb` a
-/// numpy `H x W x 3` uint8 colored image.
+/// numpy `H x W x 3` uint8 colored image. `sensor='fast-gray'` preserves the historical
+/// center-wavelength response; `sensor='goes-r-abi-band13-fm4'` applies NOAA's official
+/// FM4/GOES-19 Band 13 SRF and emits a warning that absorption remains gray.
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
-    enhancement=None, cache=None, threads=None
+    input, *, storage_profile="compact-u8", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
+    sensor="fast-gray", instrument_footprint="off", enhancement=None, cache=None, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_ir<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
     margin: f64,
+    sensor: &str,
+    instrument_footprint: &str,
     enhancement: Option<String>,
     cache: Option<String>,
     threads: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
+    params.geo_navigation = parse_geo_navigation(geo_navigation)?;
     params.view = parse_view(view)?;
     params.timestep = timestep;
     params.resolution = parse_resolution(resolution)?;
     params.margin_frac = parse_margin(margin)?;
+    params.thermal_sensor = parse_thermal_sensor(sensor)?;
+    params.instrument_footprint = parse_instrument_footprint(instrument_footprint)?;
     params.bluemarble = BlueMarble::FlatAlbedo; // IR is thermal; no ground texture needed
     params.ir_enhancement = match &enhancement {
         Some(e) => Some(parse_enhancement(e)?),
@@ -705,15 +929,17 @@ fn render_ir<'py>(
 /// and 'gray' is a WV-scaled grayscale (cold/moist white). Thermal — works day AND night.
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, band="6.2", sat="goes-east", view="topdown", timestep=0, resolution="native",
+    input, *, storage_profile="compact-u8", band="6.2", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native",
     margin=0.0, enhancement=None, cache=None, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_water_vapor<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     band: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
@@ -724,7 +950,9 @@ fn render_water_vapor<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let wv_band = parse_wv_band(band)?;
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
+    params.geo_navigation = parse_geo_navigation(geo_navigation)?;
     params.view = parse_view(view)?;
     params.timestep = timestep;
     params.resolution = parse_resolution(resolution)?;
@@ -776,13 +1004,14 @@ fn render_water_vapor<'py>(
 /// pressure).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     colormap=false, cache=None, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_precipitable_water<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     sat: &str,
     view: &str,
     timestep: usize,
@@ -796,6 +1025,7 @@ fn render_precipitable_water<'py>(
         py,
         DerivedField::PrecipitableWater,
         input,
+        storage_profile,
         sat,
         view,
         timestep,
@@ -816,13 +1046,14 @@ fn render_precipitable_water<'py>(
 /// per-column march, day AND night (no sun input).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     colormap=false, cache=None, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_cloud_top_temp<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     sat: &str,
     view: &str,
     timestep: usize,
@@ -836,6 +1067,7 @@ fn render_cloud_top_temp<'py>(
         py,
         DerivedField::CloudTopTemp,
         input,
+        storage_profile,
         sat,
         view,
         timestep,
@@ -856,13 +1088,14 @@ fn render_cloud_top_temp<'py>(
 /// image. A per-column integral, day AND night (no sun input).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
+    input, *, storage_profile="compact-u8", sat="goes-east", view="topdown", timestep=0, resolution="native", margin=0.0,
     colormap=false, cache=None, threads=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn render_cloud_optical_depth<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
     sat: &str,
     view: &str,
     timestep: usize,
@@ -876,6 +1109,7 @@ fn render_cloud_optical_depth<'py>(
         py,
         DerivedField::CloudOpticalDepth,
         input,
+        storage_profile,
         sat,
         view,
         timestep,
@@ -914,19 +1148,22 @@ fn render_cloud_optical_depth<'py>(
 /// sphere fed through standard EPSG:3857 — the usual WRF-on-a-web-map approximation.
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, sat="goes-east", timestep=0, margin=0.0, aerosol_optical_depth=0.05,
+    input, *, storage_profile="compact-u8", intent="display", sat="goes-east", timestep=0, margin=0.0, aerosol_optical_depth=0.05,
     rh_aerosol_swelling=false, atmosphere_correction=true, terrain_atmosphere=true,
     exposure=None, ground_gain=None, cloud_softclip=None, cloud_highlight_max=None,
     multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true,
-    fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false, sun_elev=None, sun_az=None, cache=None,
     premultiplied=false, threads=None
 ))]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn render_cloud_layer<'py>(
     py: Python<'py>,
     input: String,
+    storage_profile: &str,
+    intent: &str,
     sat: &str,
     timestep: usize,
     margin: f64,
@@ -944,7 +1181,9 @@ fn render_cloud_layer<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     sun_elev: Option<f64>,
@@ -954,6 +1193,8 @@ fn render_cloud_layer<'py>(
     threads: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Bound<'py, PyArray2<f32>>, Georef)> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
+    params.intent = parse_intent(intent)?;
     params.satellite = parse_sat(sat)?;
     params.timestep = timestep;
     params.margin_frac = parse_margin(margin)?;
@@ -964,7 +1205,9 @@ fn render_cloud_layer<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         beer_powder,
         granulation,
@@ -1040,13 +1283,14 @@ fn render_cloud_layer<'py>(
 /// simply N calls along your own eye/look path (each frame is an independent render).
 #[pyfunction]
 #[pyo3(signature = (
-    input, *, eye, look, fov=40.0, size=(1280, 720), timestep=0,
+    input, *, eye, look, storage_profile="compact-u8", intent="display", fov=40.0, size=(1280, 720), timestep=0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
     terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     cloud_layer_only=false, sun_elev=None, sun_az=None,
     cache=None, bluemarble=None, bluemarble_month=None, bluemarble_download=true, threads=None
@@ -1057,6 +1301,8 @@ fn render_perspective<'py>(
     input: String,
     eye: (f64, f64, f64),
     look: (f64, f64, f64),
+    storage_profile: &str,
+    intent: &str,
     fov: f64,
     size: (usize, usize),
     timestep: usize,
@@ -1080,7 +1326,9 @@ fn render_perspective<'py>(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     cloud_layer_only: bool,
@@ -1093,6 +1341,8 @@ fn render_perspective<'py>(
     threads: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
+    params.intent = parse_intent(intent)?;
     params.timestep = timestep;
     apply_visible_physics_controls(
         &mut params,
@@ -1101,7 +1351,9 @@ fn render_perspective<'py>(
         atmosphere_correction,
         terrain_atmosphere,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         beer_powder,
         granulation,
@@ -1218,6 +1470,7 @@ fn render_derived_impl<'py>(
     py: Python<'py>,
     field: DerivedField,
     input: String,
+    storage_profile: &str,
     sat: &str,
     view: &str,
     timestep: usize,
@@ -1228,6 +1481,7 @@ fn render_derived_impl<'py>(
     threads: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
     params.view = parse_view(view)?;
     params.timestep = timestep;
@@ -1276,7 +1530,10 @@ fn render_or_err(py: Python<'_>, params: RenderParams, product: Product) -> PyRe
 #[allow(clippy::too_many_arguments)]
 fn build_visible_params(
     input: String,
+    storage_profile: &str,
+    intent: &str,
     sat: &str,
+    geo_navigation: &str,
     view: &str,
     timestep: usize,
     resolution: &str,
@@ -1301,10 +1558,13 @@ fn build_visible_params(
     steps: &str,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     granulation: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -1313,7 +1573,10 @@ fn build_visible_params(
     bluemarble_download: bool,
 ) -> PyResult<RenderParams> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    params.storage_profile = parse_storage_profile(storage_profile)?;
+    params.intent = parse_intent(intent)?;
     params.satellite = parse_sat(sat)?;
+    params.geo_navigation = parse_geo_navigation(geo_navigation)?;
     params.view = parse_view(view)?;
     params.timestep = timestep;
     params.resolution = parse_resolution(resolution)?;
@@ -1325,7 +1588,9 @@ fn build_visible_params(
         atmosphere_correction,
         terrain_atmosphere,
         fractional_clouds,
+        fractional_cloud_mode,
         cloud_optical_depth_scale,
+        cloud_optics,
         feather_exposed_domain_edges,
         beer_powder,
         granulation,
@@ -1353,6 +1618,7 @@ fn build_visible_params(
     params.steps = parse_steps(steps)?;
     params.clouds = clouds;
     params.topdown_stratiform_regularization = topdown_stratiform_regularization;
+    params.topdown_cloud_footprint = topdown_cloud_footprint;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
         Some(SunOverride {
             elev_deg: sun_elev,
@@ -1377,6 +1643,7 @@ fn build_visible_params(
 /// Validate and apply the common visible-atmosphere/cloud calibration controls. Keeping
 /// this in one helper makes the Python defaults and bounds identical across RGB, raw bands,
 /// GeoColor, Sandwich, cloud-layer, and perspective entry points.
+#[allow(clippy::too_many_arguments)]
 fn apply_visible_physics_controls(
     params: &mut RenderParams,
     aerosol_optical_depth: f32,
@@ -1384,7 +1651,9 @@ fn apply_visible_physics_controls(
     atmosphere_correction: bool,
     terrain_atmosphere: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: &str,
     cloud_optical_depth_scale: f32,
+    cloud_optics: &str,
     feather_exposed_domain_edges: bool,
     beer_powder: bool,
     granulation: bool,
@@ -1405,8 +1674,19 @@ fn apply_visible_physics_controls(
     params.rh_aerosol_swelling = rh_aerosol_swelling;
     params.atmosphere_correction = atmosphere_correction;
     params.terrain_atmosphere = terrain_atmosphere;
-    params.fractional_clouds = fractional_clouds;
+    let mode = parse_fractional_cloud_mode(fractional_cloud_mode)?;
+    params.fractional_clouds = fractional_clouds && mode != FractionalCloudMode::Off;
+    params.fractional_cloud_mode = if params.fractional_clouds {
+        mode
+    } else {
+        FractionalCloudMode::Off
+    };
     params.cloud_optical_depth_scale = cloud_optical_depth_scale;
+    params.cloud_optics = CloudOpticsMode::parse(cloud_optics).ok_or_else(|| {
+        value_err(format!(
+            "cloud_optics must be 'fixed', 'nssl-native', or 'hrrr-thompson-native', got '{cloud_optics}'"
+        ))
+    })?;
     params.feather_exposed_domain_edges = feather_exposed_domain_edges;
     params.beer_powder = beer_powder;
     params.granulation = Some(granulation);
@@ -1498,6 +1778,60 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
         }
         None => None,
     };
+    let geo_navigation = g
+        .geo_navigation
+        .map(|nav| nav.navigation.slug().to_string());
+    let geo_navigation_geometry = match g.geo_navigation {
+        Some(nav) => {
+            let d = PyDict::new(py);
+            d.set_item("navigation", nav.navigation.slug())?;
+            d.set_item(
+                "perspective_point_height_m",
+                nav.perspective_point_height_m,
+            )?;
+            d.set_item("semi_major_axis_m", nav.semi_major_axis_m)?;
+            d.set_item("semi_minor_axis_m", nav.semi_minor_axis_m)?;
+            d.set_item("fixed_grid_origin_lon_deg", nav.sub_lon_deg)?;
+            d.set_item("model_camera_sub_lon_deg", nav.model_sub_lon_deg)?;
+            d.set_item("sweep_angle_axis", nav.sweep_angle_axis)?;
+            Some(d.unbind())
+        }
+        None => None,
+    };
+    let footprint_meta = result.instrument_footprint.metadata();
+    let instrument_footprint_metadata = if result.instrument_footprint == InstrumentFootprint::Off
+    {
+        None
+    } else {
+        let d = PyDict::new(py);
+        d.set_item("slug", footprint_meta.slug)?;
+        d.set_item("label", footprint_meta.label)?;
+        d.set_item("channel", footprint_meta.channel)?;
+        d.set_item("domain", footprint_meta.domain)?;
+        d.set_item("sample_angle_urad", footprint_meta.sample_angle_urad)?;
+        d.set_item("source_url", footprint_meta.source_url)?;
+        d.set_item("limitation", footprint_meta.limitation)?;
+        Some(d.unbind())
+    };
+    let abi_fixed_grid_crop = result
+        .raster
+        .scan
+        .abi_2km_global_indices()
+        .map(|(x_min, x_max, y_min, y_max)| -> PyResult<Py<PyDict>> {
+            let d = PyDict::new(py);
+            d.set_item("sample_angle_urad", 56.0)?;
+            d.set_item("ssp_is_four_pixel_corner", true)?;
+            d.set_item("x_index_min", x_min)?;
+            d.set_item("x_index_max", x_max)?;
+            d.set_item("y_index_min", y_min)?;
+            d.set_item("y_index_max", y_max)?;
+            d.set_item("nx", result.raster.scan.nx)?;
+            d.set_item("ny", result.raster.scan.ny)?;
+            d.set_item("x_min_rad", result.raster.scan.x_min)?;
+            d.set_item("y_max_rad", result.raster.scan.y_max)?;
+            Ok(d.unbind())
+        })
+        .transpose()?;
     Ok(Georef {
         // A perspective frame is its own view kind (internally it reuses the geo
         // extent semantics; the pose dict is the discriminator).
@@ -1520,10 +1854,31 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
             .map(|s| s.slug().to_string())
             .unwrap_or_else(|| "none".to_string()),
         ground_status: result.ground_status.clone(),
+        intent: result.intent.slug().to_string(),
+        observation_operator: result.observation_operator.to_string(),
+        intent_adjustments: result
+            .intent_adjustments
+            .iter()
+            .map(|a| a.label().to_string())
+            .collect(),
+        intent_limitations: result
+            .intent
+            .limitations()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        thermal_sensor: result.thermal_sensor.map(|s| s.slug().to_string()),
+        instrument_footprint: result.instrument_footprint.slug().to_string(),
+        instrument_footprint_metadata,
+        abi_fixed_grid_crop,
+        science_warnings: result.science_warnings.clone(),
+        storage_profile: result.storage_profile.slug().to_string(),
         mercator_corners: g
             .mercator_corners_lonlat
             .map(|c| c.iter().map(|p| (p[0], p[1])).collect()),
         camera_pose,
+        geo_navigation,
+        geo_navigation_geometry,
     })
 }
 
@@ -1538,6 +1893,19 @@ fn warn_downgrades(py: Python<'_>, result: &RenderResult, sun_dependent: bool) {
             adjustment.label()
         ));
     }
+    for adjustment in &result.intent_adjustments {
+        msgs.push(format!(
+            "simsat: intent={} temporary adjustment: {}",
+            result.intent.slug(),
+            adjustment.label()
+        ));
+    }
+    msgs.extend(
+        result
+            .science_warnings
+            .iter()
+            .map(|warning| format!("simsat: science limitation: {warning}")),
+    );
     if sun_dependent && result.time_is_fallback {
         msgs.push(
             "simsat: the source carried no parseable valid time; the sun position and \
@@ -1653,11 +2021,43 @@ fn parse_backend(v: &str) -> PyResult<RenderBackend> {
     }
 }
 
+fn parse_storage_profile(v: &str) -> PyResult<StorageProfile> {
+    StorageProfile::parse(v).ok_or_else(|| {
+        value_err(format!(
+            "unknown storage_profile '{v}' (compact-u8|science-cloud-f16)"
+        ))
+    })
+}
+
+fn parse_intent(v: &str) -> PyResult<RenderIntent> {
+    match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "display" => Ok(RenderIntent::Display),
+        "sensor" | "sensor-fast-gray" | "fast-gray" | "simsat-fast-gray-v1" => {
+            Ok(RenderIntent::SensorFastGray)
+        }
+        _ => Err(value_err(format!(
+            "unknown intent '{v}' (expected 'display' or 'sensor-fast-gray')"
+        ))),
+    }
+}
+
 fn parse_view(v: &str) -> PyResult<ViewMode> {
     match v.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
         "geo" | "geostationary" | "fromspace" | "space" => Ok(ViewMode::Geostationary),
         "topdown" | "top" | "map" | "topdownmap" | "nadir" => Ok(ViewMode::TopDownMap),
         _ => Err(value_err(format!("unknown view '{v}' (topdown|geo)"))),
+    }
+}
+
+fn parse_geo_navigation(v: &str) -> PyResult<GeoNavigation> {
+    match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "model-sphere" | "sphere" | "model" | "default" => Ok(GeoNavigation::ModelSphere),
+        "goes-r-abi" | "goes-r" | "abi" | "ellipsoid" => {
+            Ok(GeoNavigation::GoesRAbiFixedGrid)
+        }
+        _ => Err(value_err(format!(
+            "unknown geo_navigation '{v}' (expected 'model-sphere' or 'goes-r-abi')"
+        ))),
     }
 }
 
@@ -1694,15 +2094,37 @@ fn parse_steps(v: &str) -> PyResult<StepQuality> {
     }
 }
 
+fn parse_fractional_cloud_mode(v: &str) -> PyResult<FractionalCloudMode> {
+    match v.to_ascii_lowercase().replace('_', "-").as_str() {
+        "on" | "true" | "effective" | "effective-od" => Ok(FractionalCloudMode::EffectiveOd),
+        "deterministic-4" | "deterministic4" | "ica-4" | "mcica-4" => {
+            Ok(FractionalCloudMode::Deterministic4)
+        }
+        "deterministic-8" | "deterministic8" => {
+            Ok(FractionalCloudMode::Deterministic8)
+        }
+        "deterministic-16" | "deterministic16" => {
+            Ok(FractionalCloudMode::Deterministic16)
+        }
+        "off" | "false" | "legacy" => Ok(FractionalCloudMode::Off),
+        _ => Err(value_err(format!(
+            "unknown fractional_cloud_mode '{v}' (off|effective-od|deterministic-4|deterministic-8|deterministic-16)"
+        ))),
+    }
+}
+
 fn parse_cloud_multiscatter(v: &str) -> PyResult<CloudMultiscatterMode> {
     match v.to_ascii_lowercase().replace('_', "-").as_str() {
         "legacy" | "legacy-octaves" | "octaves" => Ok(CloudMultiscatterMode::LegacyOctaves),
         "single" | "single-scatter" | "off" => Ok(CloudMultiscatterMode::SingleScatter),
         "delta-flux-v1" | "delta-flux" | "stage2" => Ok(CloudMultiscatterMode::DeltaFluxV1),
         "delta-flux-v2b" | "delta-flux-v2" | "stage2-p1" => Ok(CloudMultiscatterMode::DeltaFluxV2),
+        "delta-flux-v3-memory" | "delta-flux-v3" | "stage2-memory" => {
+            Ok(CloudMultiscatterMode::DeltaFluxV3)
+        }
         _ => Err(value_err(format!(
             "unknown cloud_multiscatter '{v}' \
-             (legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b)"
+             (legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b|delta-flux-v3-memory)"
         ))),
     }
 }
@@ -1711,6 +2133,22 @@ fn parse_wv_band(v: &str) -> PyResult<WvBand> {
     WvBand::parse(v).ok_or_else(|| {
         value_err(format!(
             "unknown water-vapor band '{v}' (6.2|6.9|7.3, or upper|mid|low)"
+        ))
+    })
+}
+
+fn parse_thermal_sensor(v: &str) -> PyResult<ThermalSensor> {
+    ThermalSensor::parse(v).ok_or_else(|| {
+        value_err(format!(
+            "unknown sensor '{v}' (fast-gray|goes-r-abi-band13-fm4)"
+        ))
+    })
+}
+
+fn parse_instrument_footprint(v: &str) -> PyResult<InstrumentFootprint> {
+    InstrumentFootprint::parse(v).ok_or_else(|| {
+        value_err(format!(
+            "unknown instrument_footprint '{v}' (off|goes-r-abi-band13-mtf-prototype)"
         ))
     })
 }
@@ -1748,6 +2186,104 @@ mod tests {
     }
 
     #[test]
+    fn storage_profile_parser_defaults_compact_and_exposes_science() {
+        assert_eq!(
+            RenderParams::new(PathBuf::from("input")).storage_profile,
+            StorageProfile::CompactU8
+        );
+        assert_eq!(
+            parse_storage_profile("science-cloud-f16").unwrap(),
+            StorageProfile::ScienceCloudF16
+        );
+        assert!(parse_storage_profile("raw-f32").is_err());
+    }
+
+    #[test]
+    fn render_intent_parser_exposes_strict_sensor_fast_gray_semantics() {
+        assert_eq!(
+            RenderParams::new(PathBuf::from("input")).intent,
+            RenderIntent::Display
+        );
+        assert_eq!(parse_intent("display").unwrap(), RenderIntent::Display);
+        assert_eq!(
+            parse_intent("sensor-fast-gray").unwrap(),
+            RenderIntent::SensorFastGray
+        );
+        assert_eq!(
+            parse_intent("simsat-fast-gray-v1").unwrap(),
+            RenderIntent::SensorFastGray
+        );
+        assert!(parse_intent("abi-band-2").is_err());
+
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        params.intent = parse_intent("sensor").unwrap();
+        params.granulation = Some(true);
+        let (effective, changes) = api::plan_render_intent(&params);
+        assert_eq!(effective.cloud_optical_depth_scale, 1.0);
+        assert!(effective.fractional_clouds);
+        assert_eq!(effective.granulation, Some(false));
+        assert!(changes.contains(&simsat_engine::api::RenderIntentAdjustment::GranulationOff));
+    }
+
+    #[test]
+    fn fractional_mode_parser_exposes_reference_and_preserves_effective_alias() {
+        for token in ["on", "effective", "effective_od", "effective-od"] {
+            assert_eq!(
+                parse_fractional_cloud_mode(token).unwrap(),
+                FractionalCloudMode::EffectiveOd
+            );
+        }
+        assert_eq!(
+            parse_fractional_cloud_mode("deterministic-4").unwrap(),
+            FractionalCloudMode::Deterministic4
+        );
+        assert_eq!(
+            parse_fractional_cloud_mode("deterministic-8").unwrap(),
+            FractionalCloudMode::Deterministic8
+        );
+        assert_eq!(
+            parse_fractional_cloud_mode("deterministic_16").unwrap(),
+            FractionalCloudMode::Deterministic16
+        );
+        assert_eq!(
+            parse_fractional_cloud_mode("off").unwrap(),
+            FractionalCloudMode::Off
+        );
+        assert!(parse_fractional_cloud_mode("random-4").is_err());
+        assert!(parse_fractional_cloud_mode("mcica-8").is_err());
+    }
+
+    #[test]
+    fn thermal_sensor_parser_preserves_default_and_accepts_official_srf() {
+        assert_eq!(
+            RenderParams::new(PathBuf::from("input")).thermal_sensor,
+            ThermalSensor::FastGray
+        );
+        assert_eq!(
+            parse_thermal_sensor("fast-gray").unwrap(),
+            ThermalSensor::FastGray
+        );
+        assert_eq!(
+            parse_thermal_sensor("goes-r-abi-band13-fm4").unwrap(),
+            ThermalSensor::GoesRAbiBand13Fm4
+        );
+        assert!(parse_thermal_sensor("gaussian-ish").is_err());
+    }
+
+    #[test]
+    fn instrument_footprint_parser_is_explicit_and_default_off() {
+        assert_eq!(
+            RenderParams::new(PathBuf::from("input")).instrument_footprint,
+            InstrumentFootprint::Off
+        );
+        assert_eq!(
+            parse_instrument_footprint("goes-r-abi-band13-mtf-prototype").unwrap(),
+            InstrumentFootprint::GoesRAbiBand13Mtf
+        );
+        assert!(parse_instrument_footprint("generic-blur").is_err());
+    }
+
+    #[test]
     fn visible_physics_helper_assigns_every_binding_control() {
         let mut params = RenderParams::new(PathBuf::from("input"));
         apply_visible_physics_controls(
@@ -1757,7 +2293,9 @@ mod tests {
             false,
             false,
             false,
+            "deterministic-4",
             0.5,
+            "fixed",
             true,
             true,
             true,
@@ -1768,6 +2306,7 @@ mod tests {
         assert!(!params.atmosphere_correction);
         assert!(!params.terrain_atmosphere);
         assert!(!params.fractional_clouds);
+        assert_eq!(params.fractional_cloud_mode, FractionalCloudMode::Off);
         assert_eq!(params.cloud_optical_depth_scale, 0.5);
         assert!(params.feather_exposed_domain_edges);
         assert!(params.beer_powder);
@@ -1785,7 +2324,9 @@ mod tests {
             true,
             true,
             true,
+            "effective-od",
             simsat_engine::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            "fixed",
             false,
             false,
             false,
@@ -1798,6 +2339,11 @@ mod tests {
         assert!(!params.rh_aerosol_swelling);
         assert!(params.atmosphere_correction);
         assert!(params.terrain_atmosphere);
+        assert!(params.fractional_clouds);
+        assert_eq!(
+            params.fractional_cloud_mode,
+            FractionalCloudMode::EffectiveOd
+        );
         assert!(params.fractional_clouds);
         assert_eq!(
             params.cloud_optical_depth_scale,
@@ -1890,6 +2436,10 @@ mod tests {
             parse_cloud_multiscatter("delta-flux-v2b").unwrap(),
             CloudMultiscatterMode::DeltaFluxV2
         );
+        assert_eq!(
+            parse_cloud_multiscatter("delta-flux-v3-memory").unwrap(),
+            CloudMultiscatterMode::DeltaFluxV3
+        );
         assert!(parse_cloud_multiscatter("unknown").is_err());
     }
 
@@ -1916,7 +2466,7 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "__doc__",
         "SimSat — physically-based simulated visible/IR satellite imagery from WRF output. \
-         render_visible_rgb / render_geocolor / render_sandwich / render_visible_bands / \
+         render_visible_rgb / render_geocolor / render_sandwich / render_rgb_reflectance / \
          render_ir / render_water_vapor / render_precipitable_water / render_cloud_top_temp / \
          render_cloud_optical_depth each return a numpy array plus a Georef (projection params \
          + imshow extent + lat/lon mesh + render-honesty metadata: time_is_fallback, \
@@ -1932,6 +2482,7 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_visible_rgb, m)?)?;
     m.add_function(wrap_pyfunction!(render_geocolor, m)?)?;
     m.add_function(wrap_pyfunction!(render_sandwich, m)?)?;
+    m.add_function(wrap_pyfunction!(render_rgb_reflectance, m)?)?;
     m.add_function(wrap_pyfunction!(render_visible_bands, m)?)?;
     m.add_function(wrap_pyfunction!(render_ir, m)?)?;
     m.add_function(wrap_pyfunction!(render_water_vapor, m)?)?;

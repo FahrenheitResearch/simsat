@@ -21,6 +21,39 @@
 /// The denominator of the linear-u8 cloud-fraction encoding.
 pub const FRACTION_BINS: usize = 255;
 
+/// Number of fixed midpoint samples used by the original opt-in deterministic
+/// reference closure. Kept as a compatibility constant for callers that explicitly
+/// request the four-member reference.
+pub const DETERMINISTIC_SUBCOLUMN_COUNT: usize = 4;
+
+/// Selectable fixed-stratified ensemble sizes. These deliberately remain a small,
+/// bounded set: 4 is the interactive reference while 8 and 16 are convergence
+/// experiments with correspondingly higher CPU cost.
+pub const DETERMINISTIC_SUBCOLUMN_COUNTS: [usize; 3] = [4, 8, 16];
+
+/// Midpoint coordinate of one deterministic stratified subcolumn.
+///
+/// The four valid coordinates are `0.125, 0.375, 0.625, 0.875`. Returning
+/// `None` for an invalid index keeps callers from silently wrapping a requested
+/// sample and biasing the ensemble mean.
+#[inline]
+pub fn deterministic_subcolumn_u(index: usize) -> Option<f64> {
+    deterministic_subcolumn_u_for_count(index, DETERMINISTIC_SUBCOLUMN_COUNT)
+}
+
+/// Midpoint coordinate of one member in a selectable deterministic stratified
+/// ensemble. One coordinate is shared through every vertical layer and every
+/// view/sun/shadow construction for that member, preserving maximum overlap.
+///
+/// Only the reviewed 4/8/16 sizes are accepted. Returning `None` for an unsupported
+/// count or out-of-range index prevents accidental silent wrapping or a zero-sized
+/// ensemble from biasing the radiance mean.
+#[inline]
+pub fn deterministic_subcolumn_u_for_count(index: usize, count: usize) -> Option<f64> {
+    (DETERMINISTIC_SUBCOLUMN_COUNTS.contains(&count) && index < count)
+        .then_some((index as f64 + 0.5) / count as f64)
+}
+
 /// Large finite value used to keep hostile inputs from overflowing accumulators.
 /// Optical depths remotely near this value already have zero representable
 /// transmittance, so the clamp has no observable transfer effect.
@@ -242,6 +275,42 @@ mod tests {
     fn empty_stack_is_clear_and_neutral() {
         let c = maximum_overlap_closure(std::iter::empty());
         assert_eq!(c, MaximumOverlapClosure::default());
+    }
+
+    #[test]
+    fn deterministic_four_uses_fixed_stratified_midpoints() {
+        let got: Vec<f64> = (0..DETERMINISTIC_SUBCOLUMN_COUNT)
+            .map(|n| deterministic_subcolumn_u(n).unwrap())
+            .collect();
+        assert_eq!(got, vec![0.125, 0.375, 0.625, 0.875]);
+        assert_eq!(
+            deterministic_subcolumn_u(DETERMINISTIC_SUBCOLUMN_COUNT),
+            None
+        );
+    }
+
+    #[test]
+    fn selectable_deterministic_ensembles_use_reproducible_stratified_midpoints() {
+        for count in DETERMINISTIC_SUBCOLUMN_COUNTS {
+            let first = deterministic_subcolumn_u_for_count(0, count).unwrap();
+            let last = deterministic_subcolumn_u_for_count(count - 1, count).unwrap();
+            assert_eq!(first, 0.5 / count as f64);
+            assert_eq!(last, 1.0 - 0.5 / count as f64);
+            assert_eq!(deterministic_subcolumn_u_for_count(count, count), None);
+            for index in 0..count {
+                let a = deterministic_subcolumn_u_for_count(index, count).unwrap();
+                let b = deterministic_subcolumn_u_for_count(index, count).unwrap();
+                assert_eq!(a.to_bits(), b.to_bits());
+                assert!(a > 0.0 && a < 1.0);
+                if index > 0 {
+                    let previous = deterministic_subcolumn_u_for_count(index - 1, count).unwrap();
+                    assert_eq!((a - previous).to_bits(), (1.0 / count as f64).to_bits());
+                }
+            }
+        }
+        assert_eq!(deterministic_subcolumn_u_for_count(0, 0), None);
+        assert_eq!(deterministic_subcolumn_u_for_count(0, 2), None);
+        assert_eq!(deterministic_subcolumn_u_for_count(0, 32), None);
     }
 
     #[test]

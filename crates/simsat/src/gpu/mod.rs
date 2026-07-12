@@ -2216,6 +2216,8 @@ mod tests {
         quant.insert("tau_up".to_string(), zero);
         quant.insert("qvapor".to_string(), zero);
         VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,
@@ -2901,14 +2903,14 @@ mod tests {
             let mu_ref = (crate::render::LAND_SZA_REFERENCE_ELEV_DEG as f32)
                 .to_radians()
                 .sin();
-            let mu_floor = (crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32)
+            let mu_floor = (crate::render::SURFACE_HELP_ELEV_HI_DEG as f32)
                 .to_radians()
                 .sin();
             let mu = sun_elev.clamp(0.0, 90.0).to_radians().sin();
             let target = (mu_ref / mu.max(mu_floor)).clamp(1.0, land0[1]);
             1.0 + wgsl_smoothstep(
-                crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32,
-                crate::render::AERIAL_VEIL_ELEV_HI_DEG as f32,
+                crate::render::SURFACE_HELP_ELEV_LO_DEG as f32,
+                crate::render::SURFACE_HELP_ELEV_HI_DEG as f32,
                 sun_elev,
             ) * (target - 1.0)
         };
@@ -2923,8 +2925,8 @@ mod tests {
                 let target = power_target * (1.0 - w) + y * w;
                 let gain = (target / y).clamp(1.0, land1[1]);
                 1.0 + wgsl_smoothstep(
-                    crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32,
-                    crate::render::AERIAL_VEIL_ELEV_HI_DEG as f32,
+                    crate::render::SURFACE_HELP_ELEV_LO_DEG as f32,
+                    crate::render::SURFACE_HELP_ELEV_HI_DEG as f32,
                     sun_elev,
                 ) * (gain - 1.0)
             };
@@ -3022,8 +3024,8 @@ mod tests {
                         delta <= 3.0e-5,
                         "CPU/WGSL land gain delta {delta} at elev={elev}, albedo={albedo:?}, config={config:?}: gpu={gpu}, cpu={cpu}"
                     );
-                    if elev <= crate::render::AERIAL_VEIL_ELEV_LO_DEG as f32 {
-                        assert_eq!(gpu.to_bits(), 1.0f32.to_bits(), "twilight identity");
+                    if elev <= crate::render::SURFACE_HELP_ELEV_LO_DEG as f32 {
+                        assert_eq!(gpu.to_bits(), 1.0f32.to_bits(), "horizon identity");
                     }
                 }
             }
@@ -3075,6 +3077,35 @@ mod tests {
                 "{name} WGSL highlight ceiling drifted from Rust"
             );
         }
+    }
+
+    #[test]
+    fn wgsl_surface_help_shadow_and_penumbra_constants_match_rust() {
+        assert_eq!(crate::render::SURFACE_HELP_ELEV_LO_DEG, 0.0);
+        assert_eq!(crate::render::SURFACE_HELP_ELEV_HI_DEG, 12.0);
+        for (name, shader) in [("surface", SURFACE_WGSL), ("clouds", CLOUDS_WGSL)] {
+            assert!(
+                shader.contains("const SURFACE_HELP_ELEV_LO: f32 = 0.0;"),
+                "{name} WGSL surface-help lower anchor drifted from Rust"
+            );
+            assert!(
+                shader.contains("const SURFACE_HELP_ELEV_HI: f32 = 12.0;"),
+                "{name} WGSL surface-help upper anchor drifted from Rust"
+            );
+        }
+
+        assert_eq!(crate::render::CLOUD_SHADOW_FLOOR, 0.45);
+        assert!(
+            CLOUDS_WGSL.contains("const CLOUD_SHADOW_FLOOR: f32 = 0.45;"),
+            "clouds WGSL shadow floor drifted from Rust"
+        );
+
+        let radius_tan = crate::atmosphere::SUN_ANGULAR_RADIUS_RAD.tan() as f32;
+        assert!((radius_tan - 0.00465003).abs() < 1.0e-8);
+        assert!(
+            CLOUDS_WGSL.contains("const SUN_ANG_RADIUS_TAN: f32 = 0.00465003;"),
+            "clouds WGSL penumbra half-angle drifted from Rust"
+        );
     }
 
     #[test]

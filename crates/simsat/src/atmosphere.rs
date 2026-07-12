@@ -2204,6 +2204,8 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("qvapor".to_string(), qv_scale);
         VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,

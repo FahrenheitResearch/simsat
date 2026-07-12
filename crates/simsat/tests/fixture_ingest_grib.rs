@@ -165,16 +165,12 @@ fn optional_rrfs_fixture_crop_ingests_and_ratchets() {
     let precip = brick.quant.get("ext_precip");
     let qv = brick.quant.get("qvapor");
     println!(
-        "RRFS BRICK QUANT: liquid vmax={:.3e} ice vmax={:.3e} precip vmax={:.3e} \
-         qvapor vmax={:.3e}",
-        liquid.vmax, ice.vmax, precip.vmax, qv.vmax
+        "RRFS BRICK QUANT: liquid vmax={:.3e} ice vmax={:.3e} snow vmax={:.3e} \
+         precip vmax={:.3e} qvapor vmax={:.3e}",
+        liquid.vmax, ice.vmax, snow.vmax, precip.vmax, qv.vmax
     );
-    assert!(liquid.vmax > 0.0 && ice.vmax > 0.0 && precip.vmax > 0.0);
-    assert_eq!(
-        snow.vmax, 0.0,
-        "initial GRIB v4+ snow subset is unavailable"
-    );
-    assert!(brick.ext_snow.iter().all(|&v| v == 0));
+    assert!(liquid.vmax > 0.0 && ice.vmax > 0.0 && snow.vmax > 0.0 && precip.vmax > 0.0);
+    assert!(brick.ext_snow.iter().any(|&v| v > 0));
     assert!(!brick.has_cloud_fraction);
     assert!(brick.cloud_fraction.iter().all(|&v| v == 255));
     assert!(qv.vmax > 1.0e-3);
@@ -297,8 +293,9 @@ fn ingest_and_check(path: &Path) {
     let precip_quant = brick.quant.get("ext_precip");
     let qv_quant = brick.quant.get("qvapor");
     println!(
-        "GRIB BRICK QUANT: liquid vmax={:.3e} ice vmax={:.3e} precip vmax={:.3e} qvapor vmax={:.3e}",
-        liquid_quant.vmax, ice_quant.vmax, precip_quant.vmax, qv_quant.vmax
+        "GRIB BRICK QUANT: liquid vmax={:.3e} ice vmax={:.3e} snow vmax={:.3e} \
+         precip vmax={:.3e} qvapor vmax={:.3e}",
+        liquid_quant.vmax, ice_quant.vmax, snow_quant.vmax, precip_quant.vmax, qv_quant.vmax
     );
     assert!(
         liquid_quant.vmax > 0.0,
@@ -313,11 +310,11 @@ fn ingest_and_check(path: &Path) {
         "CONUS afternoon should have precip"
     );
     assert!(qv_quant.vmax > 1.0e-3, "qvapor should be moist somewhere");
-    assert_eq!(
-        snow_quant.vmax, 0.0,
-        "initial GRIB v4+ snow subset is unavailable"
+    assert!(
+        snow_quant.vmax > 0.0,
+        "HRRR SNMR should populate the SSB v6 snow auxiliary"
     );
-    assert!(brick.ext_snow.iter().all(|&c| c == 0));
+    assert!(brick.ext_snow.iter().any(|&c| c > 0));
     assert!(
         brick.has_cloud_fraction,
         "HRRR wrfnat carries complete cc (0/6/32) hybrid levels"

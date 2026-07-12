@@ -8041,3 +8041,16 @@ OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 END OF ADDENDUM
+
+--------------------------------------------------------------------------------
+PUBLIC-DOMAIN DATA: NOAA/NESDIS GOES-R ABI FM4 Band 13 spectral response
+--------------------------------------------------------------------------------
+File: crates/simsat/assets/abi_srf/GOES-R_ABI_FM4_SRF_CWG_ch13.txt
+Source: NOAA National Calibration Center / NESDIS Calibration Working Group
+Release page: https://ncc.nesdis.noaa.gov/GOESR/ABI.php
+Archive: https://ncc.nesdis.noaa.gov/GOESR/docs/GOES-R_ABI_FM4_SRF_CWG.zip
+
+NOAA states that information on government web pages is in the public domain
+unless specifically annotated otherwise. No contrary annotation is present in
+the SRF release or data file. NOAA is credited as the source; inclusion does not
+state or imply NOAA endorsement. See https://sos.noaa.gov/copyright/ .

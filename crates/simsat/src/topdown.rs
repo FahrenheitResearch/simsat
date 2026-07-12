@@ -42,8 +42,9 @@ use crate::ir::{IrScene, march_ir_bt};
 #[cfg(test)]
 use crate::render::{CLOUD_SOFTCLIP_KNEE, GROUND_DAY_LIFT};
 use crate::render::{
-    FrameContext, SurfacePixel, apply_low_sun_illuminant, day_lerp_ramp, effective_cloud_shadow,
-    radiance_to_rgba_softclip, reflectance_from_radiance, surface_toa_radiance,
+    FrameContext, SurfacePixel, apply_low_sun_illuminant, day_lerp_ramp,
+    effective_cloud_shadow_layer, radiance_to_rgba_softclip_with_synthetic_green,
+    reflectance_from_radiance, surface_toa_radiance,
 };
 
 /// TOP-DOWN CLOUD NORMALIZATION — a sun-gated multiplier on the top-down (near-nadir)
@@ -94,6 +95,7 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         ground_day_lift: base.ground_day_lift,
         cloud_softclip_knee: base.cloud_softclip_knee,
         cloud_highlight_max: base.cloud_highlight_max,
+        synthetic_green: base.synthetic_green,
         atmosphere_correction: base.atmosphere_correction,
         terrain_atmosphere: base.terrain_atmosphere,
         land_appearance: base.land_appearance,
@@ -156,12 +158,15 @@ pub fn render_topdown_frame_rgba(
                         // pixel is on-earth); identity outside the 2-30 deg band. The
                         // raw-bands path below does NOT apply it (physical product).
                         let l = apply_low_sun_illuminant(l, true, sun_elev_deg as f64, surf.luts);
-                        radiance_to_rgba_softclip(
+                        radiance_to_rgba_softclip_with_synthetic_green(
                             l,
                             surf.output_transform,
                             surf.exposure,
                             softclip_knee,
                             highlight_max,
+                            scene
+                                .map(|s| s.cfg.synthetic_green)
+                                .unwrap_or(surf.synthetic_green),
                         )
                     }
                 };
@@ -175,9 +180,300 @@ pub fn render_topdown_frame_rgba(
     rows.into_iter().flatten().collect()
 }
 
+/// Render the finished top-down visible frame with an optional, DISPLAY-only finite
+/// cloud footprint. The surface remains sampled at the output pixel centre and is never
+/// filtered. Only the cloud radiance residual is filtered, in linear radiance before the
+/// shared low-sun correction and tonemap:
+///
+/// `L_out = L_surface_unshadowed + footprint(L_cloud_composite - L_surface_unshadowed)`.
+///
+/// The residual therefore includes ground cloud shadow, cloud attenuation, and cloud
+/// in-scatter. The separable seven-tap binomial kernel (`[1 6 15 20 15 6 1] / 64`,
+/// sigma ~= 1.225 px) is the bounded match to the owner-reviewed sigma-1.25 prototype.
+/// Missing/padding neighbours retain their weight on the centre pixel; this makes each
+/// one-dimensional pass symmetric and stochastic, preserving both constant fields and
+/// the signed residual sum (to floating-point roundoff) without leaking cloud into map
+/// padding. `enabled=false` and cloud-free renders take the exact legacy path above.
+#[allow(clippy::too_many_arguments)]
+pub fn render_topdown_frame_rgba_with_cloud_footprint(
+    surf: &FrameContext,
+    scene: Option<&CloudScene>,
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    ny: usize,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+    enabled: bool,
+) -> Vec<u8> {
+    if !enabled || scene.is_none() {
+        return render_topdown_frame_rgba(surf, scene, lat, lon, nx, ny, assemble);
+    }
+
+    let scene = scene.expect("scene checked above");
+    let cloud_norm_target = scene.cfg.topdown_cloud_norm;
+    let softclip_knee = scene.cfg.cloud_softclip_knee;
+    let highlight_max = scene.cfg.cloud_highlight_max;
+    let synthetic_green = scene.cfg.synthetic_green;
+
+    let sample_rows: Vec<Vec<TopdownRadianceComponents>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            (0..nx)
+                .map(|px| {
+                    topdown_pixel_radiance_components(
+                        surf,
+                        scene,
+                        lat,
+                        lon,
+                        nx,
+                        px,
+                        py,
+                        &assemble,
+                        cloud_norm_target,
+                    )
+                    .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    let samples: Vec<TopdownRadianceComponents> = sample_rows.into_iter().flatten().collect();
+    let valid: Vec<bool> = samples.iter().map(|s| s.valid).collect();
+    let residual: Vec<[f64; 3]> = samples
+        .iter()
+        .map(|s| {
+            if s.valid {
+                [
+                    s.composite[0] - s.base[0],
+                    s.composite[1] - s.base[1],
+                    s.composite[2] - s.base[2],
+                ]
+            } else {
+                [0.0; 3]
+            }
+        })
+        .collect();
+    let filtered = filter_cloud_radiance_residual(&residual, &valid, nx, ny);
+
+    let before = residual_sum(&residual, &valid);
+    let after = residual_sum(&filtered, &valid);
+    let max_relative_drift = (0..3)
+        .map(|c| (after[c] - before[c]).abs() / before[c].abs().max(1.0e-12))
+        .fold(0.0f64, f64::max);
+    crate::log_line!(
+        "simsat topdown: cloud radiance footprint ON (7-tap binomial, sigma 1.225 px); \
+         signed residual sum rgb [{:.6e}, {:.6e}, {:.6e}] -> \
+         [{:.6e}, {:.6e}, {:.6e}] (max relative drift {:.3e})",
+        before[0],
+        before[1],
+        before[2],
+        after[0],
+        after[1],
+        after[2],
+        max_relative_drift,
+    );
+
+    let rows: Vec<Vec<u8>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = Vec::with_capacity(nx * 4);
+            for px in 0..nx {
+                let idx = py * nx + px;
+                let s = samples[idx];
+                let rgba = if !s.valid {
+                    [0.0, 0.0, 0.0, 0.0]
+                } else {
+                    let l = [
+                        s.base[0] + filtered[idx][0],
+                        s.base[1] + filtered[idx][1],
+                        s.base[2] + filtered[idx][2],
+                    ];
+                    let l = apply_low_sun_illuminant(l, true, s.sun_elev_deg as f64, surf.luts);
+                    radiance_to_rgba_softclip_with_synthetic_green(
+                        l,
+                        surf.output_transform,
+                        surf.exposure,
+                        softclip_knee,
+                        highlight_max,
+                        synthetic_green,
+                    )
+                };
+                for &v in &rgba {
+                    row.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TopdownRadianceComponents {
+    /// Unshadowed surface + atmosphere radiance. This is the sharp, immutable base.
+    base: [f64; 3],
+    /// Full legacy cloud composite, including cloud shadow/attenuation/in-scatter.
+    composite: [f64; 3],
+    sun_elev_deg: f32,
+    valid: bool,
+}
+
+impl Default for TopdownRadianceComponents {
+    fn default() -> Self {
+        Self {
+            base: [0.0; 3],
+            composite: [0.0; 3],
+            sun_elev_deg: 0.0,
+            valid: false,
+        }
+    }
+}
+
+/// Compute the sharp unshadowed surface and the complete legacy cloud composite for one
+/// map pixel. This is used only by the opt-in footprint path, so the default renderer
+/// retains its exact single-surface-evaluation behavior and bytes.
+#[allow(clippy::too_many_arguments)]
+fn topdown_pixel_radiance_components(
+    surf: &FrameContext,
+    scene: &CloudScene,
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    px: usize,
+    py: usize,
+    assemble: &(impl Fn(usize, usize) -> SurfacePixel + Sync),
+    cloud_norm_target: f64,
+) -> Option<TopdownRadianceComponents> {
+    let idx = py * nx + px;
+    let (la, lo) = (lat[idx], lon[idx]);
+    if !la.is_finite() || !lo.is_finite() {
+        return None;
+    }
+    let (cam, view) = topdown_nadir_ray(la as f64, lo as f64);
+    let ctx = frame_ctx_with_camera(surf, cam);
+    let mut pixel = assemble(px, py);
+    pixel.view_dir = view;
+    let ground_lift = scene.cfg.ground_day_lift;
+
+    let base = surface_toa_radiance(&ctx, &pixel, 1.0, ground_lift)?;
+    let shadow = ground_cloud_shadow(scene, cam, view);
+    let shadowed_surface = if shadow == 1.0 {
+        base
+    } else {
+        surface_toa_radiance(&ctx, &pixel, shadow, ground_lift)?
+    };
+    let marched = march_cloud(scene, cam, view);
+    let composite = if marched.transmittance >= 1.0 && marched.inscatter == [0.0; 3] {
+        shadowed_surface
+    } else {
+        let norm = topdown_cloud_norm(pixel.sun_elev_deg as f64, cloud_norm_target);
+        [
+            shadowed_surface[0] * marched.transmittance + norm * marched.inscatter[0],
+            shadowed_surface[1] * marched.transmittance + norm * marched.inscatter[1],
+            shadowed_surface[2] * marched.transmittance + norm * marched.inscatter[2],
+        ]
+    };
+    Some(TopdownRadianceComponents {
+        base,
+        composite,
+        sun_elev_deg: pixel.sun_elev_deg,
+        valid: true,
+    })
+}
+
+/// Separable sigma~=1.225 pixel cloud-residual footprint. At an image or padding edge,
+/// the unavailable tap weight stays on the centre sample. The resulting matrix is
+/// symmetric and each row sums to one, so every pass is also column-stochastic and
+/// preserves signed residual sum while never bleeding into invalid padding.
+fn filter_cloud_radiance_residual(
+    input: &[[f64; 3]],
+    valid: &[bool],
+    nx: usize,
+    ny: usize,
+) -> Vec<[f64; 3]> {
+    debug_assert_eq!(input.len(), nx * ny);
+    debug_assert_eq!(valid.len(), nx * ny);
+    const WEIGHTS: [f64; 7] = [
+        1.0 / 64.0,
+        6.0 / 64.0,
+        15.0 / 64.0,
+        20.0 / 64.0,
+        15.0 / 64.0,
+        6.0 / 64.0,
+        1.0 / 64.0,
+    ];
+
+    let horizontal_rows: Vec<Vec<[f64; 3]>> = (0..ny)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![[0.0; 3]; nx];
+            for (x, out) in row.iter_mut().enumerate() {
+                let idx = y * nx + x;
+                if !valid[idx] {
+                    continue;
+                }
+                for (tap, weight) in WEIGHTS.iter().copied().enumerate() {
+                    let dx = tap as isize - 3;
+                    let neighbour = x
+                        .checked_add_signed(dx)
+                        .filter(|&xx| xx < nx)
+                        .map(|xx| y * nx + xx)
+                        .filter(|&j| valid[j])
+                        .unwrap_or(idx);
+                    for c in 0..3 {
+                        out[c] += weight * input[neighbour][c];
+                    }
+                }
+            }
+            row
+        })
+        .collect();
+    let horizontal: Vec<[f64; 3]> = horizontal_rows.into_iter().flatten().collect();
+
+    let vertical_rows: Vec<Vec<[f64; 3]>> = (0..ny)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![[0.0; 3]; nx];
+            for (x, out) in row.iter_mut().enumerate() {
+                let idx = y * nx + x;
+                if !valid[idx] {
+                    continue;
+                }
+                for (tap, weight) in WEIGHTS.iter().copied().enumerate() {
+                    let dy = tap as isize - 3;
+                    let neighbour = y
+                        .checked_add_signed(dy)
+                        .filter(|&yy| yy < ny)
+                        .map(|yy| yy * nx + x)
+                        .filter(|&j| valid[j])
+                        .unwrap_or(idx);
+                    for c in 0..3 {
+                        out[c] += weight * horizontal[neighbour][c];
+                    }
+                }
+            }
+            row
+        })
+        .collect();
+    vertical_rows.into_iter().flatten().collect()
+}
+
+fn residual_sum(values: &[[f64; 3]], valid: &[bool]) -> [f64; 3] {
+    values
+        .iter()
+        .zip(valid)
+        .filter(|(_, ok)| **ok)
+        .fold([0.0; 3], |mut sum, (v, _)| {
+            for c in 0..3 {
+                sum[c] += v[c];
+            }
+            sum
+        })
+}
+
 /// Render a full TOP-DOWN VISIBLE frame to row-major RAW REFLECTANCE (`nx*ny*3` f32 in
 /// `[0, 1]`, row 0 = north; space/padding pixels are `0`) — the PRE-TONEMAP per-band
-/// product the Python binding's `render_visible_bands` returns for the top-down view.
+/// product the Python binding's `render_rgb_reflectance` returns for the top-down view
+/// (`render_visible_bands` is the deprecated compatibility alias).
 /// Identical assembly to [`render_topdown_frame_rgba`] (same per-pixel nadir ray, same
 /// composite via [`topdown_pixel_radiance`]); each pixel's composited radiance is converted
 /// to the reflectance factor ([`reflectance_from_radiance`]) instead of the display
@@ -211,6 +507,54 @@ pub fn render_topdown_frame_reflectance(
         })
         .collect();
     rows.into_iter().flatten().collect()
+}
+
+/// Render unclamped linear radiance for deterministic fractional-subcolumn
+/// integration. `cloud_norm_target` is the same display-only cloud normalization
+/// used by [`render_topdown_frame_rgba`]; pass `1.0` for the physical raw-bands
+/// product. The caller averages explicit subcolumns and tonemaps once.
+#[allow(clippy::too_many_arguments)]
+pub fn render_topdown_frame_linear_radiance(
+    surf: &FrameContext,
+    scene: Option<&CloudScene>,
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    ny: usize,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+    cloud_norm_target: f64,
+) -> (Vec<f64>, Vec<u8>) {
+    let rows: Vec<(Vec<f64>, Vec<u8>)> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut radiance = vec![0.0f64; nx * 3];
+            let mut alpha = vec![0u8; nx];
+            for px in 0..nx {
+                if let Some((l, _)) = topdown_pixel_radiance(
+                    surf,
+                    scene,
+                    lat,
+                    lon,
+                    nx,
+                    px,
+                    py,
+                    &assemble,
+                    cloud_norm_target,
+                ) {
+                    radiance[px * 3..px * 3 + 3].copy_from_slice(&l);
+                    alpha[px] = 255;
+                }
+            }
+            (radiance, alpha)
+        })
+        .collect();
+    let mut radiance = Vec::with_capacity(nx * ny * 3);
+    let mut alpha = Vec::with_capacity(nx * ny);
+    for (r, a) in rows {
+        radiance.extend(r);
+        alpha.extend(a);
+    }
+    (radiance, alpha)
 }
 
 /// The composited top-of-atmosphere LINEAR RADIANCE of one top-down map pixel (surface +
@@ -331,11 +675,10 @@ pub struct CloudLayerFrame {
     /// [`crate::web_layer::unpremultiply_rgba`] for straight-alpha hosts/PNG.
     pub rgba_premul: Vec<u8>,
     /// The ground cloud-shadow MULTIPLY field (`nx*ny`, `[0,1]`, 1.0 = no shadow):
-    /// the EFFECTIVE shadow the shipped surface pass consumes
-    /// ([`effective_cloud_shadow`] of the penumbral sun-OD shadow — floored +
-    /// day-gated identically to the shipped ground), so a host multiplying its
-    /// basemap by this field shadows it exactly as our own ground is shadowed.
-    /// Out-of-coverage pixels are `1.0` (neutral).
+    /// the host-safe EFFECTIVE shadow from the penumbral sun-OD field. It is neutral at/
+    /// below the horizon and reaches the shipped direct-term floor by 12 degrees, so a
+    /// host never darkens an already-nighttime basemap. Out-of-coverage pixels are
+    /// `1.0` (neutral).
     pub shadow: Vec<f32>,
 }
 
@@ -384,7 +727,7 @@ pub fn render_cloud_layer_frame(
                 }
                 let (cam, view) = topdown_nadir_ray(la as f64, lo as f64);
                 // Per-pixel sun elevation (local up . ECEF sun) — drives the shadow
-                // day gate, the cloud-norm sun gate, and the illuminant correction.
+                // host-layer shadow fade, cloud-norm sun gate, and illuminant correction.
                 let (lar, lor) = ((la as f64).to_radians(), (lo as f64).to_radians());
                 let up = [lar.cos() * lor.cos(), lar.cos() * lor.sin(), lar.sin()];
                 let mu = up[0] * sun[0] + up[1] * sun[1] + up[2] * sun[2];
@@ -392,7 +735,7 @@ pub fn render_cloud_layer_frame(
 
                 // The ground shadow field (computed for clear pixels too).
                 let raw_shadow = ground_cloud_shadow(scene, cam, view);
-                *shadow_px = effective_cloud_shadow(raw_shadow, elev) as f32;
+                *shadow_px = effective_cloud_shadow_layer(raw_shadow, elev) as f32;
 
                 let m = march_cloud(scene, cam, view);
                 let alpha = (1.0 - m.transmittance).clamp(0.0, 1.0);
@@ -409,12 +752,13 @@ pub fn render_cloud_layer_frame(
                     norm * m.inscatter[2],
                 ];
                 let l = apply_low_sun_illuminant(l, true, elev, scene.luts);
-                let disp = radiance_to_rgba_softclip(
+                let disp = radiance_to_rgba_softclip_with_synthetic_green(
                     l,
                     output_transform,
                     exposure,
                     scene.cfg.cloud_softclip_knee,
                     scene.cfg.cloud_highlight_max,
+                    scene.cfg.synthetic_green,
                 );
                 let o = px * 4;
                 for c in 0..3 {
@@ -527,12 +871,15 @@ pub fn render_perspective_frame_rgba(
                             pixel.sun_elev_deg as f64,
                             surf.luts,
                         );
-                        radiance_to_rgba_softclip(
+                        radiance_to_rgba_softclip_with_synthetic_green(
                             l,
                             surf.output_transform,
                             surf.exposure,
                             softclip_knee,
                             highlight_max,
+                            scene
+                                .map(|s| s.cfg.synthetic_green)
+                                .unwrap_or(surf.synthetic_green),
                         )
                     }
                 };
@@ -587,12 +934,13 @@ pub fn render_perspective_cloud_layer(
                 let mu = (p[0] * sun[0] + p[1] * sun[1] + p[2] * sun[2]) / r;
                 let elev = mu.clamp(-1.0, 1.0).asin().to_degrees();
                 let l = apply_low_sun_illuminant(m.inscatter, true, elev, scene.luts);
-                let disp = radiance_to_rgba_softclip(
+                let disp = radiance_to_rgba_softclip_with_synthetic_green(
                     l,
                     output_transform,
                     exposure,
                     scene.cfg.cloud_softclip_knee,
                     scene.cfg.cloud_highlight_max,
+                    scene.cfg.synthetic_green,
                 );
                 let o = px * 4;
                 for c in 0..3 {
@@ -715,6 +1063,56 @@ mod tests {
     use crate::ir::{IrConfig, IrScene, IrVolume};
     use crate::render::{DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, WATER_ALBEDO_SCALE};
 
+    #[test]
+    fn cloud_radiance_footprint_is_the_separable_seven_tap_binomial() {
+        let (nx, ny) = (9usize, 9usize);
+        let mut impulse = vec![[0.0; 3]; nx * ny];
+        impulse[4 * nx + 4] = [64.0, 32.0, -16.0];
+        let valid = vec![true; nx * ny];
+        let got = filter_cloud_radiance_residual(&impulse, &valid, nx, ny);
+        let w = [1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0];
+        for y in 1..=7 {
+            for x in 1..=7 {
+                let expected_r = w[y - 1] * w[x - 1] / 64.0;
+                let px = got[y * nx + x];
+                assert!((px[0] - expected_r).abs() < 1.0e-12);
+                assert!((px[1] - 0.5 * expected_r).abs() < 1.0e-12);
+                assert!((px[2] + 0.25 * expected_r).abs() < 1.0e-12);
+            }
+        }
+        let sum = residual_sum(&got, &valid);
+        assert!((sum[0] - 64.0).abs() < 1.0e-12);
+        assert!((sum[1] - 32.0).abs() < 1.0e-12);
+        assert!((sum[2] + 16.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn cloud_radiance_footprint_preserves_constants_and_energy_at_padding() {
+        let (nx, ny) = (11usize, 8usize);
+        let mut valid = vec![true; nx * ny];
+        // Irregular padding notch plus the usual invalid outer corner.
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (5, 3), (5, 4), (6, 4)] {
+            valid[y * nx + x] = false;
+        }
+        let input: Vec<[f64; 3]> = valid
+            .iter()
+            .map(|ok| if *ok { [0.75, -0.25, 1.5] } else { [0.0; 3] })
+            .collect();
+        let got = filter_cloud_radiance_residual(&input, &valid, nx, ny);
+        for (px, ok) in got.iter().zip(&valid) {
+            if *ok {
+                assert_eq!(*px, [0.75, -0.25, 1.5]);
+            } else {
+                assert_eq!(*px, [0.0; 3]);
+            }
+        }
+        let before = residual_sum(&input, &valid);
+        let after = residual_sum(&got, &valid);
+        for c in 0..3 {
+            assert!((after[c] - before[c]).abs() < 1.0e-10);
+        }
+    }
+
     fn test_georef(nx: usize, ny: usize, dx: f64) -> GridGeoref {
         let proj = MapProjection::lambert(30.0, 60.0, -100.0);
         GridGeoref::new(
@@ -766,6 +1164,7 @@ mod tests {
                 vmin: 0.0,
                 vmax: 0.0,
             },
+            science_ext_snow: Vec::new(),
             ext_precip,
             tau_up: vec![0.0f32; n],
             cloud_fraction: vec![255; n],
@@ -796,6 +1195,7 @@ mod tests {
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
+            synthetic_green: false,
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
@@ -1132,6 +1532,7 @@ mod tests {
             ext_liquid: ext_l.clone(),
             ext_ice: ext_i.clone(),
             ext_precip: ext_p.clone(),
+            ext_snow: vec![0.0; nx * ny * nz],
             temperature_k: temp.clone(),
             qvapor: qv.clone(),
             tsk: vec![tsk; nx * ny],
@@ -1150,6 +1551,7 @@ mod tests {
                 vmin: 0.0,
                 vmax: 0.0,
             },
+            science_ext_snow: Vec::new(),
             ext_precip: ext_p.clone(),
             tau_up: vec![0.0; nx * ny * nz],
             cloud_fraction: vec![255; nx * ny * nz],
@@ -1194,6 +1596,7 @@ mod tests {
             ext_liquid: ext_l,
             ext_ice: ext_i.clone(),
             ext_precip: ext_p,
+            ext_snow: vec![0.0; nx * ny * nz],
             temperature_k: temp,
             qvapor: qv,
             tsk: vec![tsk; nx * ny],
@@ -1212,6 +1615,7 @@ mod tests {
                 vmin: 0.0,
                 vmax: 0.0,
             },
+            science_ext_snow: Vec::new(),
             ext_precip: vec![0.0; nx * ny * nz],
             tau_up: vec![0.0; nx * ny * nz],
             cloud_fraction: vec![255; nx * ny * nz],

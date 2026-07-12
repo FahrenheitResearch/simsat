@@ -13,6 +13,9 @@ name: Release artifacts (manual, no publish)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,13 +25,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The committed .cargo/config.toml already carries
       # `-C target-feature=+crt-static` for x86_64-pc-windows-msvc, so this exe
       # is a single self-contained binary (no VC++ redistributable needed).
       - name: cargo build --release -p simsat_studio
-        run: cargo build --release -p simsat_studio
+        run: cargo build --release --locked -p simsat_studio
       - uses: actions/upload-artifact@v4
         with:
           name: simsat-studio-windows-x86_64
@@ -40,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Linux system deps (winit/wayland/xkb build headers)
         run: |
           sudo apt-get update
@@ -51,7 +58,7 @@ jobs:
       # simsat-render-frame + simsat-render-ir: the [[bin]] targets pointing at
       # the identically-bodied example files (crates/simsat/Cargo.toml).
       - name: cargo build --release -p simsat --bins
-        run: cargo build --release -p simsat --bins
+        run: cargo build --release --locked -p simsat --bins
       - uses: actions/upload-artifact@v4
         with:
           name: simsat-cli-linux-x86_64
@@ -65,6 +72,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       # crates/simsat_py is its own standalone cargo workspace (excluded from the
       # repo root) with its own [patch.crates-io]; maturin-action builds it in a
       # manylinux container. abi3 -> one wheel for CPython >= 3.8.
@@ -72,8 +84,12 @@ jobs:
         with:
           working-directory: crates/simsat_py
           command: build
-          args: --release
+          args: --release --locked
           manylinux: auto
+      - name: Install the exact wheel artifact
+        run: python -m pip install crates/simsat_py/target/wheels/simsat-*.whl
+      - name: Import and render a generated tiny scene
+        run: python .github/scripts/python-wheel-smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: simsat-python-wheel

@@ -1,6 +1,6 @@
 //! Streaming NOAA HRRR / RRFS GRIB2 -> `.ssb` brick ingest (parallel to [`crate::ingest`]).
 //!
-//! This module writes the same SSB v5 u8 channels + f16-Celsius temperature +
+//! This module writes the same SSB v6 u8 channels + f16-Celsius temperature +
 //! 2-D planes + `run.json` manifest that the wrfout path writes, so an operational HRRR
 //! brick is indistinguishable from a WRF brick to every downstream consumer
 //! (visible/IR/WV/GeoColor/Sandwich/derived, geo + top-down, studio, Python).
@@ -22,8 +22,9 @@
 //! Physics mapping (per-species, the SAME `optics.rs` constants as WRF):
 //! CLMR -> ext_liquid; CIMIXR (HRRR, 0/1/82) or ICMR (RRFS, 0/1/23) -> ext_ice;
 //! RWMR + GRLE + SNMR -> total ext_precip (each at its OWN beta, the SSB v3 rule).
-//! The v4+ snow-only auxiliary subset is conservatively unavailable for the initial
-//! GRIB path (`ext_snow = 0`). HRRR's native `cc` field (0/6/32) supplies trusted
+//! The v4+ snow-only auxiliary subset is encoded directly from SNMR, while SNMR also
+//! remains inside total `ext_precip` (the auxiliary is not additive). HRRR's native
+//! `cc` field (0/6/32) supplies trusted
 //! fractional coverage when it is a complete 1..N hybrid-level volume on the same
 //! vertical grid as the hydrometeors. Missing, partial, malformed, or differently
 //! scaled coverage retains the exact legacy fallback (`cloud_fraction = 255`,
@@ -57,7 +58,8 @@ use grib_core::grib2::{Grib2File, GridDefinition, grid_latlon, unpack_message};
 
 use crate::bricks::{
     self, CELSIUS_OFFSET_K, ChannelQuant, LogQuant, ManifestProjection, ManifestTimestep,
-    QUANT_DYNAMIC_RANGE, RunManifest, VolumeBrick, f16_bits_to_f32, f32_to_f16_bits,
+    QUANT_DYNAMIC_RANGE, RunManifest, ScienceCloudF16Payload, StorageProfile, VolumeBrick,
+    f16_bits_to_f32, f32_to_f16_bits,
 };
 use crate::frame::{
     FrameError, MAP_PROJ_ROTATED_LATLON, ROTATED_LATLON_M_PER_DEG, WrfProjectionParams,
@@ -66,7 +68,7 @@ use crate::ingest::{
     Extrap, GridGeometry, IngestConfig, IngestReport, integrate_tau_up_column, resample_column,
     resample_column_conservative, resample_column_fraction_max_overlap, source_identity,
 };
-use crate::optics::{self, HydrometeorClass};
+use crate::optics::{self, HydrometeorClass, ThompsonHydrometeorClass};
 use crate::platform;
 
 // ── errors ─────────────────────────────────────────────────────────────────────
@@ -225,6 +227,18 @@ pub const CODE_RWMR: FieldCode = fc(0, 1, 24);
 pub const CODE_SNMR: FieldCode = fc(0, 1, 25);
 /// Graupel mixing ratio.
 pub const CODE_GRLE: FieldCode = fc(0, 1, 32);
+/// Number concentration of cloud droplets (kg^-1), WMO GRIB2 table 4.2-0-6.
+pub const CODE_NCONCD: FieldCode = fc(0, 6, 28);
+/// Number concentration of cloud ice (kg^-1), WMO GRIB2 table 4.2-0-6.
+pub const CODE_NCCICE: FieldCode = fc(0, 6, 29);
+/// Specific number concentration of rain (kg^-1), NCEP local parameter.
+pub const CODE_SPNCR: FieldCode = fc(0, 1, 100);
+/// HRRR smoke/aerosol mass density (kg m^-3), *not* atmospheric air density.
+///
+/// UPP `post_avblflds_raphrrr.xml` maps 0/20/0 on hybrid levels to
+/// `SMOKE_ON_HYBRID_LVL` / particulate organic matter. It must never replace
+/// `PRES/(R*T)` in hydrometeor optics despite the generic `MASSDEN` short name.
+pub const CODE_MASSDEN: FieldCode = fc(0, 20, 0);
 /// Fraction of cloud cover (`cc`, numeric fraction 0..1).
 pub const CODE_CLOUD_FRACTION: FieldCode = fc(0, 6, 32);
 /// Snow depth (m).
@@ -814,6 +828,8 @@ pub fn default_grib_run_id(path: &Path, reference: NaiveDateTime) -> String {
 
 // ── two-pass channel encoding (no brick-resolution f32 buffer) ─────────────────
 
+type ProfiledChannelEncoding = (LogQuant, Vec<u8>, Option<Vec<u16>>);
+
 /// Iterate every column of a native volume, resampling onto the brick axis with
 /// the integral-conserving kernel, and hand each column to `sink(base_ci, col)`.
 #[allow(clippy::too_many_arguments)]
@@ -866,8 +882,41 @@ pub fn resample_encode_channel(
     nz_brick: usize,
     below: Extrap,
     above: Extrap,
-    mut beta_total_f16: Option<&mut [u16]>,
+    beta_total_f16: Option<&mut [u16]>,
 ) -> (LogQuant, Vec<u8>) {
+    let (quant, compact, _) = resample_encode_channel_profiled(
+        native,
+        z,
+        nx,
+        ny,
+        nz_native,
+        z_min,
+        dz,
+        nz_brick,
+        below,
+        above,
+        beta_total_f16,
+        false,
+    )
+    .expect("compact resampling does not encode a fallible science channel");
+    (quant, compact)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resample_encode_channel_profiled(
+    native: &[f32],
+    z: &[f32],
+    nx: usize,
+    ny: usize,
+    nz_native: usize,
+    z_min: f64,
+    dz: f64,
+    nz_brick: usize,
+    below: Extrap,
+    above: Extrap,
+    mut beta_total_f16: Option<&mut [u16]>,
+    science_profile: bool,
+) -> Result<ProfiledChannelEncoding, bricks::BrickError> {
     let plane = nx * ny;
     // Pass 1: the exact `LogQuant::from_values` statistic over the values pass 2
     // will encode (each column value cast to f32 first, as the stored volume is).
@@ -905,6 +954,8 @@ pub fn resample_encode_channel(
     };
     // Pass 2: encode + (optionally) accumulate the running total extinction.
     let mut codes = vec![0u8; plane * nz_brick];
+    let mut science_codes = science_profile.then(|| vec![bricks::SCIENCE_ZERO_BITS; codes.len()]);
+    let mut science_error = None;
     for_each_resampled_column(
         native,
         z,
@@ -921,6 +972,13 @@ pub fn resample_encode_channel(
                 let vf = v as f32;
                 let idx = m * plane + ci;
                 codes[idx] = quant.encode(vf);
+                if let Some(science) = science_codes.as_mut() {
+                    match bricks::try_encode_log2_f16("grib_extinction", idx, vf) {
+                        Ok(bits) => science[idx] = bits,
+                        Err(error) if science_error.is_none() => science_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
                 if let Some(bt) = beta_total_f16.as_deref_mut()
                     && vf.is_finite()
                     && vf > 0.0
@@ -930,7 +988,10 @@ pub fn resample_encode_channel(
             }
         },
     );
-    (quant, codes)
+    if let Some(error) = science_error {
+        return Err(error);
+    }
+    Ok((quant, codes, science_codes))
 }
 
 /// Point-sample (linear) temperature resample straight to the brick's f16-Celsius
@@ -1109,7 +1170,7 @@ fn cloud_fraction_channel_or_fallback(candidate: Option<Vec<u8>>, cells: usize) 
 }
 
 /// Maximum-overlap resample of the native intensive coverage profile directly
-/// into SSB v5's linear-u8 channel. This is the same vertical closure as the WRF
+/// into SSB v6's linear-u8 channel. This is the same vertical closure as the WRF
 /// ingest and avoids materializing a brick-resolution f32 volume.
 #[allow(clippy::too_many_arguments)]
 fn resample_encode_cloud_fraction(
@@ -1209,6 +1270,184 @@ fn add_species_beta(
         }
     }
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ThompsonSpeciesReport {
+    present: bool,
+    native_cells: u64,
+    fallback_cells: u64,
+    clamped_cells: u64,
+    radius_min_m: f64,
+    radius_max_m: f64,
+}
+
+impl ThompsonSpeciesReport {
+    fn record_native(&mut self, radius_m: f64, clamped: bool) {
+        self.native_cells += 1;
+        if self.radius_min_m == 0.0 {
+            self.radius_min_m = radius_m;
+        } else {
+            self.radius_min_m = self.radius_min_m.min(radius_m);
+        }
+        self.radius_max_m = self.radius_max_m.max(radius_m);
+        self.clamped_cells += u64::from(clamped);
+    }
+}
+
+fn optional_complete_hybrid_entries(
+    catalog: &GribCatalog,
+    code: FieldCode,
+    field: &str,
+    nz: usize,
+) -> Result<Option<Vec<CatalogEntry>>, String> {
+    let map = hybrid_level_entries(catalog, code);
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let levels: Vec<u32> = map.keys().copied().collect();
+    let n = validate_complete_levels(&levels, field).map_err(|e| e.to_string())?;
+    if n != nz {
+        return Err(format!("{field} has {n} hybrid levels, expected {nz}"));
+    }
+    Ok(Some(map.into_values().collect()))
+}
+
+/// Convert the existing dry-density buffer to the exact moist-density expression used
+/// by Thompson `calc_effectRad`, streaming SPFH one level at a time. This is called only
+/// for the explicit native adapter, so fixed-optics cache bytes remain unchanged.
+#[allow(clippy::too_many_arguments)]
+fn apply_thompson_moist_density(
+    file: &mut File,
+    catalog: &GribCatalog,
+    rho: &mut [f32],
+    nz: usize,
+    rect: &CropRect,
+    buf: &mut Vec<u8>,
+) -> Result<(), GribIngestError> {
+    let entries =
+        require_hybrid_volume_entries(catalog, CODE_SPFH, "SPFH (specific humidity)", nz)?;
+    let full_nx = catalog.grid.nx as usize;
+    let plane = rect.nx() * rect.ny();
+    for (k, entry) in entries.iter().enumerate() {
+        let values = crop_values(decode_entry(file, catalog, entry, buf)?, full_nx, rect);
+        let base = k * plane;
+        for (i, &specific_humidity) in values.iter().enumerate() {
+            let mixing_ratio = spfh_to_mixing_ratio(specific_humidity);
+            // Existing rho used R_D=287.0. Thompson uses R=287.04 and
+            // rho=.622*p/(R*T*(qv+.622)). Apply the exact ratio in place.
+            let factor = (optics::R_D / 287.04) * 0.622 / (mixing_ratio + 0.622);
+            if factor.is_finite() && factor > 0.0 {
+                rho[base + i] *= factor as f32;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Thompson-native sibling of [`add_species_beta`]. Native number fields are optional
+/// at this seam: an absent/partial field falls back for that species while valid cells
+/// in the same field remain native. Snow streams TMP alongside SNMR for the official
+/// Field-et-al. temperature moment conversion; no full extra temperature volume lives
+/// through ingest.
+#[allow(clippy::too_many_arguments)]
+fn add_species_beta_thompson(
+    file: &mut File,
+    catalog: &GribCatalog,
+    code: FieldCode,
+    field: &str,
+    class: HydrometeorClass,
+    thompson_class: ThompsonHydrometeorClass,
+    number_field: Option<(FieldCode, &'static str)>,
+    rho: &[f32],
+    beta: &mut [f32],
+    nz: usize,
+    rect: &CropRect,
+    buf: &mut Vec<u8>,
+) -> Result<ThompsonSpeciesReport, GribIngestError> {
+    let map = hybrid_level_entries(catalog, code);
+    if map.is_empty() {
+        return Ok(ThompsonSpeciesReport::default());
+    }
+    let entries = require_hybrid_volume_entries(catalog, code, field, nz)?;
+    let number_entries = if let Some((number_code, number_name)) = number_field {
+        match optional_complete_hybrid_entries(catalog, number_code, number_name, nz) {
+            Ok(value) => value,
+            Err(reason) => {
+                crate::log_line!(
+                    "simsat grib ingest warning: {reason}; {field} uses per-cell fixed fallback"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let temperature_entries = if thompson_class == ThompsonHydrometeorClass::Snow {
+        Some(require_hybrid_volume_entries(
+            catalog,
+            CODE_TMP,
+            "TMP (temperature for Thompson snow)",
+            nz,
+        )?)
+    } else {
+        None
+    };
+
+    let full_nx = catalog.grid.nx as usize;
+    let plane = rect.nx() * rect.ny();
+    let radius_fixed = class.effective_radius_m();
+    let mut report = ThompsonSpeciesReport {
+        present: true,
+        ..ThompsonSpeciesReport::default()
+    };
+    for (k, entry) in entries.iter().enumerate() {
+        let values = crop_values(decode_entry(file, catalog, entry, buf)?, full_nx, rect);
+        let numbers = if let Some(entries) = &number_entries {
+            Some(crop_values(
+                decode_entry(file, catalog, &entries[k], buf)?,
+                full_nx,
+                rect,
+            ))
+        } else {
+            None
+        };
+        let temperatures = if let Some(entries) = &temperature_entries {
+            Some(crop_values(
+                decode_entry(file, catalog, &entries[k], buf)?,
+                full_nx,
+                rect,
+            ))
+        } else {
+            None
+        };
+        let base = k * plane;
+        for (i, &q) in values.iter().enumerate() {
+            if !q.is_finite() || q <= 0.0 {
+                continue;
+            }
+            let number = numbers.as_ref().map(|values| values[i]);
+            let temperature = temperatures
+                .as_ref()
+                .map(|values| values[i])
+                .unwrap_or(273.15);
+            if let Some(native) = optics::thompson_native_optics(
+                thompson_class,
+                rho[base + i] as f64,
+                temperature,
+                q,
+                number,
+            ) {
+                beta[base + i] += native.extinction_m_inv as f32;
+                report.record_native(native.effective_radius_m, native.radius_was_clamped);
+            } else {
+                beta[base + i] +=
+                    optics::extinction_coefficient(rho[base + i] as f64, q, radius_fixed) as f32;
+                report.fallback_cells += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Read a single-level plane as f32 (brick row order), cropped to `rect`.
@@ -1384,7 +1623,7 @@ pub const GRIB_PEAK_RSS_BUDGET_BYTES: u64 = 2_500_000_000;
 /// brick: estimate 2.37 GB, measured 2.34 GB). Two candidate peaks:
 /// the FOLD phase (three native f32 volumes: z + rho + the per-channel beta,
 /// plus the f16 running total, the finished u8 channels, the f16 temperature)
-/// and the WRITE phase. SSB v5's writer streams directly into zlib, so WRITE no
+/// and the WRITE phase. SSB v6's writer streams directly into zlib, so WRITE no
 /// longer duplicates the complete raw payload; the two v4+ fallback channels are
 /// allocated only after native fold buffers are dropped. The fixed term covers
 /// the one decoded full-grid f64 plane in flight plus process overhead.
@@ -1684,6 +1923,29 @@ pub fn ingest_grib_timestep_with(
     let (geom, rect) = grib_geometry(&catalog, options)?;
     let (nx, ny, nz) = (geom.nx, geom.ny, geom.nz);
     let plane = nx * ny;
+    let thompson_requested = config.cloud_optics == optics::CloudOpticsMode::HrrrThompsonNative;
+    let thompson_number_capability = [
+        (CODE_NCONCD, "NCONCD"),
+        (CODE_NCCICE, "NCCICE"),
+        (CODE_SPNCR, "SPNCR"),
+    ]
+    .iter()
+    .all(|&(code, name)| {
+        matches!(
+            optional_complete_hybrid_entries(&catalog, code, name, nz),
+            Ok(Some(_))
+        )
+    });
+    let thompson_native = thompson_requested && thompson_number_capability;
+    if thompson_requested && !thompson_native {
+        crate::log_line!(
+            "simsat grib ingest warning: cloud-optics=hrrr-thompson-native requires complete NCONCD, NCCICE, and SPNCR hybrid volumes; using the fixed optical table for this source"
+        );
+    } else if config.cloud_optics == optics::CloudOpticsMode::NsslNative {
+        crate::log_line!(
+            "simsat grib ingest warning: cloud-optics=nssl-native is WRF MP18-only; using the fixed optical table for GRIB input"
+        );
+    }
     let (z_min, dz, nz_brick) = (config.z_min_m, config.dz_m, config.nz_brick);
     // Peak-RSS admission (the < 2.5 GB contract): refuse before allocating.
     let full_plane_points = (catalog.grid.nx as usize) * (catalog.grid.ny as usize);
@@ -1728,6 +1990,9 @@ pub fn ingest_grib_timestep_with(
     for (r, &t) in rho.iter_mut().zip(t_kelvin.iter()) {
         *r = optics::air_density(*r as f64, t as f64) as f32;
     }
+    if thompson_native {
+        apply_thompson_moist_density(&mut file, &catalog, &mut rho, nz, &rect, &mut buf)?;
+    }
     if z_filled + t_filled + p_filled > 0 {
         crate::log_line!(
             "simsat grib ingest: filled {} masked cells from column neighbors (z {}, T {}, p {})",
@@ -1745,22 +2010,42 @@ pub fn ingest_grib_timestep_with(
     // below the u8 log-quant step the renderer reads).
     let mut beta_total_f16 = vec![0u16; plane * nz_brick];
     let mut beta = vec![0f32; plane * nz];
+    let mut thompson_reports: Vec<(&'static str, ThompsonSpeciesReport)> = Vec::new();
+    let science_profile = config.storage_profile == StorageProfile::ScienceCloudF16;
 
     // ext_liquid = CLMR at cloud-droplet optics.
-    let (ql, ext_liquid) = {
-        add_species_beta(
-            &mut file,
-            &catalog,
-            CODE_CLMR,
-            "CLMR (cloud water)",
-            HydrometeorClass::CloudLiquid,
-            &rho,
-            &mut beta,
-            nz,
-            &rect,
-            &mut buf,
-        )?;
-        resample_encode_channel(
+    let (ql, ext_liquid, science_ext_liquid) = {
+        if thompson_native {
+            let report = add_species_beta_thompson(
+                &mut file,
+                &catalog,
+                CODE_CLMR,
+                "CLMR (cloud water)",
+                HydrometeorClass::CloudLiquid,
+                ThompsonHydrometeorClass::CloudLiquid,
+                Some((CODE_NCONCD, "NCONCD (cloud droplet number, kg^-1)")),
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            thompson_reports.push(("liquid", report));
+        } else {
+            add_species_beta(
+                &mut file,
+                &catalog,
+                CODE_CLMR,
+                "CLMR (cloud water)",
+                HydrometeorClass::CloudLiquid,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+        }
+        resample_encode_channel_profiled(
             &beta,
             &z,
             nx,
@@ -1772,25 +2057,47 @@ pub fn ingest_grib_timestep_with(
             Extrap::Zero,
             Extrap::Zero,
             Some(&mut beta_total_f16),
+            science_profile,
         )
+        .map_err(GribIngestError::Brick)?
     };
 
     // ext_ice = cloud ice at small-ice optics. HRRR writes the NCEP-local CIMIXR
     // (0/1/82); RRFS writes the WMO ICMR (0/1/23). Prefer CIMIXR when present.
-    let (qi, ext_ice) = {
+    let (qi, ext_ice, science_ext_ice) = {
         beta.iter_mut().for_each(|b| *b = 0.0);
-        let had_cimixr = add_species_beta(
-            &mut file,
-            &catalog,
-            CODE_CIMIXR,
-            "CIMIXR (cloud ice)",
-            HydrometeorClass::Ice,
-            &rho,
-            &mut beta,
-            nz,
-            &rect,
-            &mut buf,
-        )?;
+        let had_cimixr = if thompson_native {
+            let report = add_species_beta_thompson(
+                &mut file,
+                &catalog,
+                CODE_CIMIXR,
+                "CIMIXR (cloud ice)",
+                HydrometeorClass::Ice,
+                ThompsonHydrometeorClass::Ice,
+                Some((CODE_NCCICE, "NCCICE (cloud ice number, kg^-1)")),
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            let present = report.present;
+            thompson_reports.push(("ice", report));
+            present
+        } else {
+            add_species_beta(
+                &mut file,
+                &catalog,
+                CODE_CIMIXR,
+                "CIMIXR (cloud ice)",
+                HydrometeorClass::Ice,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?
+        };
         if !had_cimixr {
             add_species_beta(
                 &mut file,
@@ -1805,7 +2112,7 @@ pub fn ingest_grib_timestep_with(
                 &mut buf,
             )?;
         }
-        resample_encode_channel(
+        resample_encode_channel_profiled(
             &beta,
             &z,
             nx,
@@ -1817,50 +2124,120 @@ pub fn ingest_grib_timestep_with(
             Extrap::Zero,
             Extrap::Zero,
             Some(&mut beta_total_f16),
+            science_profile,
         )
+        .map_err(GribIngestError::Brick)?
     };
 
-    // ext_precip = RWMR + GRLE (rain/graupel optics) + SNMR (snow aggregate
-    // optics) — each species at its OWN beta before the sum (SSB v3).
-    let (qp, ext_precip) = {
+    // Snow-only auxiliary plus total large-particle extinction. Decode SNMR once,
+    // encode its auxiliary subset, then accumulate rain/graupel into the SAME native
+    // buffer before encoding total ext_precip. This preserves per-species optics and
+    // snow identity without a duplicate full-field GRIB decode.
+    let (qs, ext_snow, science_ext_snow, qp, ext_precip, science_ext_precip) = {
         beta.iter_mut().for_each(|b| *b = 0.0);
-        add_species_beta(
-            &mut file,
-            &catalog,
-            CODE_RWMR,
-            "RWMR (rain)",
-            HydrometeorClass::Rain,
-            &rho,
-            &mut beta,
+        if thompson_native {
+            let snow = add_species_beta_thompson(
+                &mut file,
+                &catalog,
+                CODE_SNMR,
+                "SNMR (snow)",
+                HydrometeorClass::Snow,
+                ThompsonHydrometeorClass::Snow,
+                None,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            thompson_reports.push(("snow", snow));
+        } else {
+            add_species_beta(
+                &mut file,
+                &catalog,
+                CODE_SNMR,
+                "SNMR (snow)",
+                HydrometeorClass::Snow,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+        }
+        let (qs, ext_snow, science_ext_snow) = resample_encode_channel_profiled(
+            &beta,
+            &z,
+            nx,
+            ny,
             nz,
-            &rect,
-            &mut buf,
-        )?;
-        add_species_beta(
-            &mut file,
-            &catalog,
-            CODE_GRLE,
-            "GRLE (graupel)",
-            HydrometeorClass::Graupel,
-            &rho,
-            &mut beta,
-            nz,
-            &rect,
-            &mut buf,
-        )?;
-        add_species_beta(
-            &mut file,
-            &catalog,
-            CODE_SNMR,
-            "SNMR (snow)",
-            HydrometeorClass::Snow,
-            &rho,
-            &mut beta,
-            nz,
-            &rect,
-            &mut buf,
-        )?;
-        resample_encode_channel(
+            z_min,
+            dz,
+            nz_brick,
+            Extrap::Zero,
+            Extrap::Zero,
+            None,
+            science_profile,
+        )
+        .map_err(GribIngestError::Brick)?;
+        if thompson_native {
+            let rain = add_species_beta_thompson(
+                &mut file,
+                &catalog,
+                CODE_RWMR,
+                "RWMR (rain)",
+                HydrometeorClass::Rain,
+                ThompsonHydrometeorClass::Rain,
+                Some((CODE_SPNCR, "SPNCR (rain number, kg^-1)")),
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            thompson_reports.push(("rain", rain));
+            let graupel = add_species_beta_thompson(
+                &mut file,
+                &catalog,
+                CODE_GRLE,
+                "GRLE (graupel)",
+                HydrometeorClass::Graupel,
+                ThompsonHydrometeorClass::Graupel,
+                None,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            thompson_reports.push(("graupel", graupel));
+        } else {
+            add_species_beta(
+                &mut file,
+                &catalog,
+                CODE_RWMR,
+                "RWMR (rain)",
+                HydrometeorClass::Rain,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+            add_species_beta(
+                &mut file,
+                &catalog,
+                CODE_GRLE,
+                "GRLE (graupel)",
+                HydrometeorClass::Graupel,
+                &rho,
+                &mut beta,
+                nz,
+                &rect,
+                &mut buf,
+            )?;
+        }
+        let (qp, ext_precip, science_ext_precip) = resample_encode_channel_profiled(
             &beta,
             &z,
             nx,
@@ -1872,8 +2249,33 @@ pub fn ingest_grib_timestep_with(
             Extrap::Zero,
             Extrap::Zero,
             Some(&mut beta_total_f16),
+            science_profile,
+        )
+        .map_err(GribIngestError::Brick)?;
+        (
+            qs,
+            ext_snow,
+            science_ext_snow,
+            qp,
+            ext_precip,
+            science_ext_precip,
         )
     };
+    if thompson_native {
+        for (species, report) in &thompson_reports {
+            crate::log_line!(
+                "simsat grib ingest: cloud-optics=hrrr-thompson-native species={species} native_cells={} fallback_cells={} clamped_cells={} radius_um={:.3}..{:.3}",
+                report.native_cells,
+                report.fallback_cells,
+                report.clamped_cells,
+                report.radius_min_m * 1.0e6,
+                report.radius_max_m * 1.0e6,
+            );
+        }
+        crate::log_line!(
+            "simsat grib ingest: MASSDEN 0/20/0 is UPP smoke/aerosol mass density and was not used as air density"
+        );
+    }
     drop(rho);
 
     // qvapor channel: SPFH -> mixing ratio, integral-conserving (the PW column
@@ -1953,13 +2355,6 @@ pub fn ingest_grib_timestep_with(
     let (qt, tau_up) = encode_tau_from_beta_total(&beta_total_f16, nx, ny, nz_brick, dz);
     drop(beta_total_f16);
 
-    // SNMR remains in total ext_precip exactly as before; the snow-only
-    // auxiliary subset is still conservatively unavailable.
-    let qs = LogQuant {
-        vmin: 0.0,
-        vmax: 0.0,
-    };
-    let ext_snow = vec![0u8; plane * nz_brick];
     let (cloud_fraction, has_cloud_fraction) =
         cloud_fraction_channel_or_fallback(cloud_fraction_candidate, plane * nz_brick);
 
@@ -2057,7 +2452,19 @@ pub fn ingest_grib_timestep_with(
     quant_map.insert("qvapor".to_string(), qv);
     let quant = ChannelQuant(quant_map);
 
+    let science_cloud_f16 = if science_profile {
+        Some(ScienceCloudF16Payload {
+            ext_liquid: science_ext_liquid.expect("science profile encoded liquid"),
+            ext_ice: science_ext_ice.expect("science profile encoded ice"),
+            ext_snow: science_ext_snow.expect("science profile encoded snow"),
+            ext_precip: science_ext_precip.expect("science profile encoded precipitation"),
+        })
+    } else {
+        None
+    };
     let brick = VolumeBrick {
+        storage_profile: config.storage_profile,
+        science_cloud_f16,
         nx,
         ny,
         nz: nz_brick,
@@ -2088,13 +2495,18 @@ pub fn ingest_grib_timestep_with(
         .run_id
         .clone()
         .unwrap_or_else(|| default_grib_run_id(path, catalog.reference_time));
-    let dir = bricks::run_dir(&config.cache_dir, &run_id);
+    let effective_cache_dir = crate::ingest::brick_cache_dir(
+        &config.cache_dir,
+        config.cloud_optics,
+        config.storage_profile,
+    );
+    let dir = bricks::run_dir(&effective_cache_dir, &run_id);
     let stamp = bricks::time_stamp(geom.time_iso.as_deref(), geom.hhmm);
     let brick_file = bricks::brick_file_name(&stamp);
     let brick_path = dir.join(&brick_file);
-    let ssb_bytes = bricks::write_ssb(&brick_path, &brick)?;
+    let ssb_bytes = bricks::write_ssb_profiled(&brick_path, &brick)?;
 
-    let manifest_path = RunManifest::path(&config.cache_dir, &run_id);
+    let manifest_path = RunManifest::path(&effective_cache_dir, &run_id);
     let planes_2d = brick.planes_2d_names();
     let p = &geom.params;
     let projection = ManifestProjection {
@@ -2107,8 +2519,9 @@ pub fn ingest_grib_timestep_with(
         dx_m: p.dx_m,
         dy_m: p.dy_m,
     };
-    let mut manifest = RunManifest::load_or_new(
+    let mut manifest = RunManifest::load_or_new_profiled(
         &manifest_path,
+        config.storage_profile,
         &run_id,
         nx,
         ny,
@@ -2306,6 +2719,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(duplicate.contains("duplicate"), "{duplicate}");
+    }
+
+    #[test]
+    fn hrrr_thompson_moment_codes_and_massden_hazard_are_locked() {
+        assert_eq!(CODE_NCONCD, fc(0, 6, 28));
+        assert_eq!(CODE_NCCICE, fc(0, 6, 29));
+        assert_eq!(CODE_SPNCR, fc(0, 1, 100));
+        // UPP writes particulate-organic-matter smoke at this generic short name;
+        // it is intentionally distinct from pressure/temperature air density.
+        assert_eq!(CODE_MASSDEN, fc(0, 20, 0));
+        assert_ne!(CODE_MASSDEN, CODE_PRES);
     }
 
     #[test]

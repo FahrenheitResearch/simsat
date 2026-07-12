@@ -33,19 +33,21 @@ use eframe::egui;
 use eframe::egui_wgpu::wgpu;
 
 mod pipeline;
+mod presets;
 mod settings;
 
+use simsat::api::{FractionalCloudMode, RenderIntent, RenderIntentAdjustment};
 use simsat::asset_pack;
 use simsat::atmosphere::{
     self, AtmosphereLuts, AtmosphereParams, CameraGeometry, OutputTransform, SOLAR_IRRADIANCE_RGB,
     SkyShTable,
 };
 use simsat::bluemarble;
-use simsat::bricks::{self, RunManifest};
+use simsat::bricks::{self, RunManifest, StorageProfile};
 use simsat::camera::{
-    GeoCamera, MAX_AXIS, PerspectiveBasis, PerspectiveCamera, ResolutionMode, SatellitePreset,
-    SurfaceRaster, build_map_raster_mode, build_perspective_raster, build_surface_raster_mode,
-    extended_native_counts,
+    GeoCamera, GeoNavigation, MAX_AXIS, PerspectiveBasis, PerspectiveCamera, ResolutionMode,
+    SatellitePreset, SurfaceRaster, build_map_raster_mode, build_perspective_raster,
+    build_surface_raster_mode, extended_native_counts,
 };
 use simsat::clouds::{self, CloudMultiscatterMode, MarchConfig, StepQuality};
 use simsat::derived::{self, DerivedField};
@@ -58,16 +60,21 @@ use simsat::gpu::{
 use simsat::horizon::HorizonMap;
 use simsat::ingest::{self, IngestConfig};
 use simsat::ingest_grib;
+use simsat::instrument_footprint::{
+    InstrumentFootprint, apply_band13_radiance_footprint_validated,
+};
 use simsat::ir::{self, IrConfig, IrScene, IrVolume};
 use simsat::ir_enhance::{IrEnhancement, render_ir_rgba};
+use simsat::optics::CloudOpticsMode;
 use simsat::render::{
     CLOUD_SOFTCLIP_KNEE, FLAT_ALBEDO_SRGB, FrameContext, GROUND_DAY_LIFT, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, blend_snow, normals_from_hgt,
-    shade_surface, snow_fraction,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow,
+    normals_from_hgt, radiance_to_rgba_softclip, shade_surface, snow_fraction,
 };
 use simsat::sandwich;
 use simsat::solar::{self, SolarFrame};
 use simsat::store_out::{self, IrFrame, VisibleFrame, WrittenVisibleFrame};
+use simsat::thermal_sensor::ThermalSensor;
 use simsat::topdown;
 use simsat::wv::WvBand;
 
@@ -78,9 +85,8 @@ use simsat::wv::WvBand;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
     Visible,
-    /// GeoColor day/night blend: true-color visible by day, colored band-13 IR by night,
-    /// crossfaded across the terminator (GOES's flagship product). NOT thermal — it uses the
-    /// sun + exposure for the visible (day) half AND marches band-13 IR for the night half.
+    /// SimSat Day/Night Color: a GeoColor-style blend with broad-RGB visible by day and
+    /// colored band-13 IR by night. It is not yet sensor-derived ABI GeoColor.
     GeoColor,
     /// Sandwich composite (the classic severe-convection view): the visible true-color RGB as
     /// the base, with a color-enhanced band-13 IR overlaid on the COLD (high) cloud tops (alpha
@@ -98,6 +104,62 @@ enum RenderMode {
 /// Maximum viewport zoom, as a factor over the fit-to-window scale (display-side only).
 const MAX_VIEW_ZOOM: f32 = 16.0;
 
+/// Keep expanded configuration/detail content bounded so the rendered image never
+/// gets squeezed out of an ordinary laptop-sized window. The Settings and Quick
+/// mode Details sections are collapsed by default; this is their expanded height.
+fn settings_scroll_max_height(window_height: f32) -> f32 {
+    (window_height * 0.28).clamp(160.0, 250.0)
+}
+
+/// Fixed selector widths for the second toolbar row. The compact policy fits the
+/// 900 px RC smoke-test window without scrolling; the regular policy uses the
+/// extra room at 1360 px for the full selected labels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ToolbarLayout {
+    mode_width: f32,
+    intent_width: f32,
+    sat_width: f32,
+    navigation_width: f32,
+    view_width: f32,
+    timestep_width: f32,
+}
+
+impl ToolbarLayout {
+    /// Approximate fixed row budget: six captions plus eleven 4 px item gaps.
+    #[cfg(test)]
+    fn estimated_selector_width(self) -> f32 {
+        self.mode_width
+            + self.intent_width
+            + self.sat_width
+            + self.navigation_width
+            + self.view_width
+            + self.timestep_width
+            + 220.0
+    }
+}
+
+fn toolbar_layout(available_width: f32) -> ToolbarLayout {
+    if available_width < 1_200.0 {
+        ToolbarLayout {
+            mode_width: 112.0,
+            intent_width: 76.0,
+            sat_width: 88.0,
+            navigation_width: 100.0,
+            view_width: 88.0,
+            timestep_width: 132.0,
+        }
+    } else {
+        ToolbarLayout {
+            mode_width: 190.0,
+            intent_width: 100.0,
+            sat_width: 135.0,
+            navigation_width: 190.0,
+            view_width: 150.0,
+            timestep_width: 180.0,
+        }
+    }
+}
+
 impl RenderMode {
     const ALL: [RenderMode; 10] = [
         RenderMode::Visible,
@@ -114,7 +176,7 @@ impl RenderMode {
     fn label(self) -> &'static str {
         match self {
             RenderMode::Visible => "Visible",
-            RenderMode::GeoColor => "GeoColor (day/night)",
+            RenderMode::GeoColor => "GeoColor Style (SimSat day/night)",
             RenderMode::Sandwich => "Sandwich (vis + cold-top IR)",
             RenderMode::Ir => "IR (band 13)",
             RenderMode::WaterVapor(WvBand::Upper) => "WV 6.2 um (upper)",
@@ -464,6 +526,8 @@ struct PreparedRender {
     /// The ABI band of the thermal frame (13 window, or 8/9/10 for WV) — keys the
     /// enhancement palette + the single-band Kelvin store write.
     ir_band: u8,
+    /// Instrument spatial response actually applied to the thermal component.
+    instrument_footprint: InstrumentFootprint,
     /// The DERIVED scalar field + its RAW resampled values (`Some` only in a derived-field
     /// mode). Kept for the status line's value-range readout; the displayed frame is the basic
     /// colormap already baked into `cloud_rgba`.
@@ -549,6 +613,9 @@ impl GpuPreviewAdjustments {
     const INTERACTIVE_STEPS: u16 = 1 << 8;
     const LEGACY_CLOUD_TRANSPORT: u16 = 1 << 9;
     const TOPDOWN_STRATIFORM_REGULARIZATION_OFF: u16 = 1 << 10;
+    const TOPDOWN_CLOUD_FOOTPRINT_OFF: u16 = 1 << 11;
+    const INSTRUMENT_FOOTPRINT_OFF: u16 = 1 << 12;
+    const MODEL_SPHERE_NAVIGATION: u16 = 1 << 13;
 
     fn insert(&mut self, flag: u16) {
         self.0 |= flag;
@@ -576,6 +643,18 @@ impl GpuPreviewAdjustments {
             (
                 Self::TOPDOWN_STRATIFORM_REGULARIZATION_OFF,
                 "Top-down stratiform reconstruction -> Off",
+            ),
+            (
+                Self::TOPDOWN_CLOUD_FOOTPRINT_OFF,
+                "Top-down cloud footprint -> Off",
+            ),
+            (
+                Self::INSTRUMENT_FOOTPRINT_OFF,
+                "ABI Band 13 instrument footprint -> Off",
+            ),
+            (
+                Self::MODEL_SPHERE_NAVIGATION,
+                "Navigation -> model sphere (GPU-compatible)",
             ),
             (
                 Self::EXPOSED_EDGE_FEATHER_OFF,
@@ -776,6 +855,8 @@ struct RenderedState {
     ir_enhancement: IrEnhancement,
     /// The ABI band of the thermal frame (13, or 8/9/10 for WV).
     ir_band: u8,
+    /// Instrument spatial response actually applied to the thermal component.
+    instrument_footprint: InstrumentFootprint,
     /// The DERIVED scalar field + its precomputed value-range stats (`Some` only in a
     /// derived-field mode) — the header's value-range readout, computed once at render.
     derived: Option<(DerivedField, derived::FieldStats)>,
@@ -862,6 +943,8 @@ struct SimSatStudioApp {
     gpu_error: Option<String>,
     store_root: PathBuf,
     preset: SatellitePreset,
+    /// Geostationary sensor-grid navigation; model sphere remains the default.
+    geo_navigation: GeoNavigation,
     /// Output-raster resolution mode (default Native — one pixel per WRF cell).
     resolution: ResolutionMode,
     /// View mode: the from-space geostationary product (default), the top-down
@@ -925,8 +1008,16 @@ struct SimSatStudioApp {
     frame_cap: usize,
     /// Render mode: Visible (the M1-M5 physically-based path) or IR (M6, band 13).
     render_mode: RenderMode,
+    /// Display (shipped appearance) or the strict `simsat-fast-gray-v1` operator.
+    /// Session-scoped so startup remains the familiar Display mode.
+    render_intent: RenderIntent,
     /// The IR enhancement (colour curve) applied to the BT plane in IR mode.
     ir_enhancement: IrEnhancement,
+    /// Band-13 source/response model. Fast gray is the unchanged default; the
+    /// official FM4/GOES-19 ABI SRF is an opt-in observation-operator prototype.
+    thermal_sensor: ThermalSensor,
+    /// Complete-radiance ABI Band 13 spatial-response stage. Experimental/default off.
+    instrument_footprint: InstrumentFootprint,
     // M2 atmosphere controls (design section 3 / 6).
     aod: f32,
     rh_swelling: bool,
@@ -950,15 +1041,28 @@ struct SimSatStudioApp {
     /// Use model cloud fraction/subcolumns when available. On is the physical default;
     /// off is the legacy full-horizontal-cell cloud coverage A/B.
     fractional_clouds: bool,
+    /// CPU fractional-cloud observation operator. Effective-OD is the unchanged
+    /// shipped default; deterministic 4/8/16 are expensive fixed-stratified references.
+    fractional_cloud_mode: FractionalCloudMode,
     multiscatter: bool,
     /// Opt-in Stage-2 Monte Carlo depth-source cloud closure. False keeps the exact
     /// established octave/single-scatter dispatch.
     delta_flux_clouds: bool,
     /// Opt-in bounded P1 directional reconstruction over the Stage-2 closure.
     delta_flux_v2_clouds: bool,
+    /// Opt-in bounded successive-order angular-memory reconstruction.
+    delta_flux_v3_clouds: bool,
     /// Visible cloud optical-depth calibration. The shipped 0.15 is the owner's
     /// cross-file visual selection; 1.0 uses model extinction without scaling.
     cloud_optical_depth_scale: f32,
+    /// Opt-in ScienceCloudF16 on-disk extinction precision. CompactU8 remains default.
+    science_cloud_f16: bool,
+    /// Experimental WRF NSSL MP18 mass/number/volume-moment particle optics.
+    /// False is the stable fixed-radius table; true uses a separate ingest cache.
+    nssl_native_cloud_optics: bool,
+    /// Experimental HRRR Thompson mass/number/temperature particle optics.
+    /// False is exact fixed optics; true uses a separate versioned ingest cache.
+    hrrr_thompson_native_cloud_optics: bool,
     /// Default-off presentation experiment: taper finished visible clouds where the
     /// camera exposes the finite WRF domain boundary even without a zoom-out margin.
     feather_exposed_domain_edges: bool,
@@ -974,6 +1078,9 @@ struct SimSatStudioApp {
     /// Top-down-only source-space reconstruction for broad low stratiform cloud.
     /// Opt-in/default off while v0.1.6 multi-case QA is in progress.
     topdown_stratiform_regularization: bool,
+    /// Display-only sigma~=1.225 px cloud-radiance footprint for finished top-down
+    /// visible frames. The sharp surface/base map is never filtered.
+    topdown_cloud_footprint: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL "GPU clouds" toggle (the M5-GPU cloud-pass activation): when on,
     /// the DISPLAYED Geostationary or Top-down Visible clouds-on frame renders through the
@@ -1068,6 +1175,7 @@ impl SimSatStudioApp {
             gpu_error,
             store_root: default_store_root(),
             preset: SatellitePreset::GoesEast,
+            geo_navigation: GeoNavigation::ModelSphere,
             // Native (full WRF resolution) is the default the owner sees — never the
             // coarse fixed ABI pitch that undersampled and pixelated fine domains.
             resolution: ResolutionMode::Native,
@@ -1106,8 +1214,11 @@ impl SimSatStudioApp {
             frame_cap: 120,
             // Visible is the default mode; IR (band 13) is the M6 toggle.
             render_mode: RenderMode::Visible,
+            render_intent: RenderIntent::Display,
             // CIMSS ramp is the default IR enhancement (the classic coloured look).
             ir_enhancement: IrEnhancement::default(),
+            thermal_sensor: ThermalSensor::FastGray,
+            instrument_footprint: InstrumentFootprint::Off,
             aod: atmosphere::DEFAULT_AOD as f32,
             rh_swelling: false,
             atmosphere_correction: true,
@@ -1122,12 +1233,17 @@ impl SimSatStudioApp {
             clouds_enabled: true,
             // Model fractional cloud coverage ON by default; missing fields fall back safely.
             fractional_clouds: true,
+            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
             // Wrenninge multi-scatter octaves ON by default (M5): the bright-anvil look.
             multiscatter: true,
             delta_flux_clouds: false,
             delta_flux_v2_clouds: false,
+            delta_flux_v3_clouds: false,
             // Owner-selected v0.1.4 cross-file visible calibration.
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            science_cloud_f16: false,
+            nssl_native_cloud_optics: false,
+            hrrr_thompson_native_cloud_optics: false,
             // Owner-selected v0.1.5 finite-domain cloud-edge presentation default.
             feather_exposed_domain_edges: true,
             // Beer-powder OFF by default (M5): octaves now supply the real forward-
@@ -1136,6 +1252,7 @@ impl SimSatStudioApp {
             // Sub-grid granulation OPT-IN (off) as of v0.1.1 — see the field doc.
             granulation: false,
             topdown_stratiform_regularization: false,
+            topdown_cloud_footprint: false,
             // Offline (384 steps, full quality) is the default so the displayed AND
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.
@@ -1203,6 +1320,8 @@ impl SimSatStudioApp {
             self.store_root = PathBuf::from(root);
         }
         self.preset = settings::sat_from_token(&s.sat).unwrap_or(SatellitePreset::GoesEast);
+        self.geo_navigation = settings::geo_navigation_from_token(&s.geo_navigation)
+            .unwrap_or(GeoNavigation::ModelSphere);
         self.resolution =
             settings::resolution_from_token(&s.resolution).unwrap_or(ResolutionMode::Native);
         self.view = settings::view_from_token(&s.view).unwrap_or(StudioView::Geostationary);
@@ -1213,8 +1332,14 @@ impl SimSatStudioApp {
         self.persp_width = s.persp_width;
         self.persp_height = s.persp_height;
         self.render_mode = settings::mode_from_token(&s.mode).unwrap_or(RenderMode::Visible);
+        self.render_intent =
+            settings::render_intent_from_token(&s.render_intent).unwrap_or(RenderIntent::Display);
         self.ir_enhancement =
             settings::enhancement_from_token(&s.ir_enhancement).unwrap_or_default();
+        self.thermal_sensor =
+            settings::thermal_sensor_from_token(&s.thermal_sensor).unwrap_or_default();
+        self.instrument_footprint =
+            settings::instrument_footprint_from_token(&s.instrument_footprint).unwrap_or_default();
         self.output_transform = settings::output_transform_from_token(&s.output_transform)
             .unwrap_or(OutputTransform::AbiReflectance);
         self.step_quality =
@@ -1232,14 +1357,22 @@ impl SimSatStudioApp {
         self.land_dark_toe_max_gain = s.land_dark_toe_max_gain;
         self.clouds_enabled = s.clouds_enabled;
         self.fractional_clouds = s.fractional_clouds;
+        self.fractional_cloud_mode =
+            settings::fractional_cloud_mode_from_token(&s.fractional_cloud_mode)
+                .unwrap_or(FractionalCloudMode::EffectiveOd);
         self.multiscatter = s.multiscatter;
         self.delta_flux_clouds = s.delta_flux_clouds;
         self.delta_flux_v2_clouds = s.delta_flux_v2_clouds;
+        self.delta_flux_v3_clouds = s.delta_flux_v3_clouds;
         self.cloud_optical_depth_scale = s.cloud_optical_depth_scale;
+        self.science_cloud_f16 = s.science_cloud_f16;
+        self.nssl_native_cloud_optics = s.nssl_native_cloud_optics;
+        self.hrrr_thompson_native_cloud_optics = s.hrrr_thompson_native_cloud_optics;
         self.feather_exposed_domain_edges = s.feather_exposed_domain_edges;
         self.beer_powder = s.beer_powder;
         self.granulation = s.granulation;
         self.topdown_stratiform_regularization = s.topdown_stratiform_regularization;
+        self.topdown_cloud_footprint = s.topdown_cloud_footprint;
         self.exposure = s.exposure;
         self.ground_gain = s.ground_gain;
         self.cloud_softclip = s.cloud_softclip;
@@ -1257,10 +1390,15 @@ impl SimSatStudioApp {
             visible_calibration_epoch: self.visible_calibration_epoch,
             store_root: Some(self.store_root.display().to_string()),
             sat: settings::sat_token(self.preset).to_string(),
+            geo_navigation: settings::geo_navigation_token(self.geo_navigation).to_string(),
             resolution: settings::resolution_token(self.resolution).to_string(),
             view: settings::view_token(self.view).to_string(),
             mode: settings::mode_token(self.render_mode).to_string(),
+            render_intent: settings::render_intent_token(self.render_intent).to_string(),
             ir_enhancement: settings::enhancement_token(self.ir_enhancement).to_string(),
+            thermal_sensor: settings::thermal_sensor_token(self.thermal_sensor).to_string(),
+            instrument_footprint: settings::instrument_footprint_token(self.instrument_footprint)
+                .to_string(),
             output_transform: settings::output_transform_token(self.output_transform).to_string(),
             step_quality: settings::step_quality_token(self.step_quality).to_string(),
             margin_pct: self.margin_pct,
@@ -1276,14 +1414,23 @@ impl SimSatStudioApp {
             land_dark_toe_max_gain: self.land_dark_toe_max_gain,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
+            fractional_cloud_mode: settings::fractional_cloud_mode_token(
+                self.fractional_cloud_mode,
+            )
+            .to_string(),
             multiscatter: self.multiscatter,
             delta_flux_clouds: self.delta_flux_clouds,
             delta_flux_v2_clouds: self.delta_flux_v2_clouds,
+            delta_flux_v3_clouds: self.delta_flux_v3_clouds,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            science_cloud_f16: self.science_cloud_f16,
+            nssl_native_cloud_optics: self.nssl_native_cloud_optics,
+            hrrr_thompson_native_cloud_optics: self.hrrr_thompson_native_cloud_optics,
             feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
+            topdown_cloud_footprint: self.topdown_cloud_footprint,
             exposure: self.exposure,
             ground_gain: self.ground_gain,
             cloud_softclip: self.cloud_softclip,
@@ -1604,11 +1751,17 @@ impl SimSatStudioApp {
     }
 
     fn open_cached_run(&mut self, run_json: PathBuf) {
-        let manifest = match RunManifest::load(&run_json) {
+        let storage_profile = if self.science_cloud_f16 {
+            StorageProfile::ScienceCloudF16
+        } else {
+            StorageProfile::CompactU8
+        };
+        let manifest = match RunManifest::load_for_profile(&run_json, storage_profile) {
             Ok(m) => m,
             Err(e) => {
                 self.logerr(format!(
-                    "Not a valid run.json ({e}): {}",
+                    "Not a valid {} run.json ({e}): {}. Select the matching storage profile before opening a cached run.",
+                    storage_profile.slug(),
                     run_json.display()
                 ));
                 return;
@@ -1802,6 +1955,18 @@ impl SimSatStudioApp {
     /// are intentionally absent: the action uses a temporary compatible preview copy.
     fn gpu_render_action_blockers(&self) -> Vec<String> {
         let mut reasons = Vec::new();
+        if self.science_cloud_f16 {
+            reasons.push(
+                "ScienceCloudF16 is CPU-only: the GPU preview uploads CompactU8 texture codes directly and would discard the selected precision"
+                    .to_string(),
+            );
+        }
+        if self.render_intent == RenderIntent::SensorFastGray {
+            reasons.push(
+                "Sensor Fast Gray requires the CPU path so model cloud fraction and strict neutral highlights are preserved"
+                    .to_string(),
+            );
+        }
         if self.gpu.is_none() {
             reasons.push(
                 self.gpu_error
@@ -1938,6 +2103,24 @@ impl SimSatStudioApp {
         let resolution = self.resolution;
         // The parity request is one-shot: consumed by this render.
         self.parity_pending = false;
+        if atmo.render_intent == RenderIntent::SensorFastGray {
+            let changes = atmo
+                .intent_adjustments
+                .iter()
+                .map(|a| a.label())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.logline(format!(
+                "Sensor Fast Gray ({}): {}. Limitations: {}",
+                atmo.render_intent.observation_operator(),
+                if changes.is_empty() {
+                    "current controls already satisfy the strict operator"
+                } else {
+                    &changes
+                },
+                atmo.render_intent.limitations().join("; ")
+            ));
+        }
         if atmo.parity {
             self.parity = None;
             if !atmo.fractional_clouds {
@@ -1967,7 +2150,18 @@ impl SimSatStudioApp {
         {
             self.logline(
                 "GPU clouds: top-down stratiform reconstruction is CPU-only; using the CPU \
-                 composite so the requested reconstructed cloud field is not ignored.",
+                composite so the requested reconstructed cloud field is not ignored.",
+            );
+        }
+        if (atmo.gpu_clouds || atmo.parity)
+            && !gpu_topdown_cloud_footprint_preview_compatible(
+                atmo.view_mode == StudioView::TopDownMap,
+                atmo.topdown_cloud_footprint,
+            )
+        {
+            self.logline(
+                "GPU clouds: top-down cloud footprint is CPU-only; using the CPU composite \
+                 so the requested pre-tonemap residual filter is not ignored.",
             );
         }
         if (atmo.gpu_clouds || atmo.parity) && atmo.terrain_atmosphere {
@@ -1987,7 +2181,9 @@ impl SimSatStudioApp {
         if (atmo.gpu_clouds || atmo.parity)
             && matches!(
                 atmo.cloud_multiscatter,
-                CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+                CloudMultiscatterMode::DeltaFluxV1
+                    | CloudMultiscatterMode::DeltaFluxV2
+                    | CloudMultiscatterMode::DeltaFluxV3
             )
         {
             self.logline("GPU clouds: delta-flux transport is CPU-only; using the CPU composite.");
@@ -1996,7 +2192,9 @@ impl SimSatStudioApp {
             && atmo.render_mode.uses_visible_controls()
             && matches!(
                 atmo.cloud_multiscatter,
-                CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+                CloudMultiscatterMode::DeltaFluxV1
+                    | CloudMultiscatterMode::DeltaFluxV2
+                    | CloudMultiscatterMode::DeltaFluxV3
             )
         {
             self.logline(format!(
@@ -2012,6 +2210,19 @@ impl SimSatStudioApp {
                 "Legacy cloud coverage active: model cloud fraction disabled; every non-zero \
                  cloudy cell is horizontally full.",
             );
+        }
+        if atmo.clouds_enabled
+            && atmo.render_mode.uses_visible_controls()
+            && atmo.fractional_clouds
+            && atmo.fractional_cloud_mode.is_deterministic()
+        {
+            self.logline(format!(
+                "Fractional clouds: {} CPU reference ({} fixed-stratified shared-u marches, average linear radiance, one tonemap).",
+                atmo.fractional_cloud_mode.slug(),
+                atmo.fractional_cloud_mode
+                    .deterministic_subcolumn_count()
+                    .expect("deterministic mode count")
+            ));
         }
         if atmo.clouds_enabled
             && atmo.render_mode.uses_visible_controls()
@@ -2172,7 +2383,10 @@ impl SimSatStudioApp {
     /// (shared by the single Render and the batch loop so every frame uses the current
     /// satellite/exposure/view/mode/enhancement settings).
     fn capture_atmo(&self) -> AtmoSettings {
-        AtmoSettings {
+        let mut atmo = AtmoSettings {
+            render_intent: self.render_intent,
+            geo_navigation: self.geo_navigation,
+            intent_adjustments: Vec::new(),
             view_mode: self.view,
             orbit: pipeline::OrbitParams {
                 az_deg: self.orbit_az_deg as f64,
@@ -2187,6 +2401,8 @@ impl SimSatStudioApp {
             margin_frac: self.margin_pct as f64 / 100.0,
             render_mode: self.render_mode,
             ir_enhancement: self.ir_enhancement,
+            thermal_sensor: self.thermal_sensor,
+            instrument_footprint: self.instrument_footprint,
             aod: self.aod as f64,
             rh_swelling: self.rh_swelling,
             atmosphere_correction: self.atmosphere_correction,
@@ -2195,16 +2411,33 @@ impl SimSatStudioApp {
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
+            fractional_cloud_mode: self.fractional_cloud_mode,
             cloud_multiscatter: studio_cloud_multiscatter_mode(
                 self.multiscatter,
                 self.delta_flux_clouds,
                 self.delta_flux_v2_clouds,
+                self.delta_flux_v3_clouds,
             ),
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            storage_profile: if self.science_cloud_f16 {
+                StorageProfile::ScienceCloudF16
+            } else {
+                StorageProfile::CompactU8
+            },
+            cloud_optics: if self.hrrr_thompson_native_cloud_optics
+                && self.render_mode == RenderMode::Visible
+            {
+                CloudOpticsMode::HrrrThompsonNative
+            } else if self.nssl_native_cloud_optics && self.render_mode == RenderMode::Visible {
+                CloudOpticsMode::NsslNative
+            } else {
+                CloudOpticsMode::Fixed
+            },
             feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             beer_powder: self.beer_powder,
             granulation: self.granulation,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
+            topdown_cloud_footprint: self.topdown_cloud_footprint,
             step_quality: self.step_quality,
             gpu_clouds: self.gpu_clouds,
             parity: self.parity_pending,
@@ -2226,7 +2459,9 @@ impl SimSatStudioApp {
                 .contains(&self.bm_month_override)
                 .then_some(self.bm_month_override),
             bm_allow_download: self.bm_allow_download,
-        }
+        };
+        configure_render_intent(&mut atmo);
+        atmo
     }
 
     fn finish_prepared(&mut self, ctx: &egui::Context, mut prep: PreparedRender) {
@@ -2286,6 +2521,7 @@ impl SimSatStudioApp {
             ir_bt,
             ir_enhancement,
             ir_band,
+            instrument_footprint: prep.instrument_footprint,
             derived: derived_summary,
             render_mode: prep.render_mode,
             gpu_ms,
@@ -2325,7 +2561,7 @@ impl SimSatStudioApp {
             // IR/WV is thermal: report the BT range (cold cloud/moisture tops vs warm
             // ground) and the enhancement instead of the sun/PW/Blue-Marble fields.
             self.logline(format!(
-                "Rendered {} {}x{} {}{} ({:.0}% in-domain, {} enhancement; \
+                "Rendered {} {}x{} {}{} ({:.0}% in-domain, {} enhancement, footprint {}; \
                  cold {:.1} K, warm {:.1} K, median {:.1} K).",
                 band_display(ir_band),
                 prep.width,
@@ -2334,6 +2570,7 @@ impl SimSatStudioApp {
                 if prep.res_clamped { " [clamped]" } else { "" },
                 prep.on_earth_frac * 100.0,
                 ir_enhancement.label(),
+                prep.instrument_footprint.slug(),
                 stats.min_bt,
                 stats.max_bt,
                 stats.median_bt,
@@ -2551,7 +2788,7 @@ impl SimSatStudioApp {
                     total
                 )));
                 let t0 = Instant::now();
-                match prepare_render(job, preset, resolution, atmo, &cache, &tx) {
+                match prepare_render(job, preset, resolution, atmo.clone(), &cache, &tx) {
                     Ok(prep) => {
                         rendered += 1;
                         if tx
@@ -2790,12 +3027,9 @@ impl SimSatStudioApp {
         }
     }
 
-    /// The always-visible top strip (one row): the Open menu + loaded-source name + the
-    /// product / satellite / view / timestep pickers on the LEFT, and the Render / Render
-    /// sequence / Write-store action cluster PINNED to the RIGHT edge. The cluster is laid out
-    /// in a nested right-to-left layout so it renders at the far right FIRST — no label length
-    /// or window width can push the Render button off the row (the owner's exact complaint:
-    /// Render used to reflow off-row behind a long timestep label in the wrap flow).
+    /// Stable two-row toolbar. Row one keeps Open/source at left and every action pinned
+    /// at right; row two uses fixed responsive selector widths. There is deliberately no
+    /// horizontal ScrollArea, so keyboard focus can never retain an offset that hides Open.
     fn top_strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let can_render = self.can_render();
         let can_seq = self.can_render_sequence();
@@ -2851,7 +3085,7 @@ impl SimSatStudioApp {
                 if ui
                     .add_enabled(can_gpu_render, egui::Button::new("GPU Render"))
                     .on_hover_text(
-                        "One-click fast cloud preview. It retains Geostationary or Top-down, \
+                        "No setup required: one-click fast cloud preview. It retains Geostationary or Top-down, \
                          temporarily uses Visible + Clouds on, and substitutes only the CPU-only controls \
                          needed by the current WGSL pass. Studio settings are unchanged; every \
                          difference is shown, and stored/sequence output stays on the CPU \
@@ -2917,80 +3151,88 @@ impl SimSatStudioApp {
                 }
                 ui.separator();
 
-                // Left content fills the remaining width (left-aligned) inside a
-                // horizontal scroll region (top_strip_left): without the clip, a long
-                // timestep label or a wide mode's pickers PAINTED OVER the pinned right
-                // cluster and stole its clicks (owner-reported: Save PNG unreachable in
-                // Derived mode). Overflow now clips and scrolls; the right cluster is
-                // always visible and clickable.
+                // Open and the source label use only the remaining width. The source
+                // label truncates visually but exposes the full identity on hover.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    self.top_strip_left(ui);
+                    self.top_source_row_left(ui);
                 });
             });
         });
+        self.top_selector_row(ui);
     }
 
-    /// The left cluster of the top strip (Open menu / source name / Mode / Sat / View /
-    /// Timestep) inside a horizontal scroll region, so it clips instead of overflowing
-    /// under the strip's right-pinned action buttons.
-    fn top_strip_left(&mut self, ui: &mut egui::Ui) {
+    /// Row-one left cluster. The right-pinned action buttons have already claimed
+    /// their width before this is called.
+    fn top_source_row_left(&mut self, ui: &mut egui::Ui) {
         let source_name = self.source_display_name();
-        egui::ScrollArea::horizontal()
-            .auto_shrink([false, true])
-            .id_salt("top_strip_left")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.menu_button("Open", |ui| {
-                        if ui.button("Open wrfout / GRIB2...").clicked() {
-                            ui.close();
-                            self.dialog_open_wrfout();
-                        }
-                        if ui.button("Open cached run.json...").clicked() {
-                            ui.close();
-                            self.dialog_open_cached();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Open sequence (folder)...")
-                            .on_hover_text(
-                                "Pick a DIRECTORY of wrfout files (e.g. the Enderlin folder). \
+        ui.horizontal(|ui| {
+            ui.menu_button("Open", |ui| {
+                if ui.button("Open wrfout / GRIB2...").clicked() {
+                    ui.close();
+                    self.dialog_open_wrfout();
+                }
+                if ui.button("Open cached run.json...").clicked() {
+                    ui.close();
+                    self.dialog_open_cached();
+                }
+                ui.separator();
+                if ui
+                    .button("Open sequence (folder)...")
+                    .on_hover_text(
+                        "Pick a DIRECTORY of wrfout files (e.g. the Enderlin folder). \
                                  They are ordered by valid time into a loop you batch render, \
                                  then scrub/play.",
-                            )
-                            .clicked()
-                        {
-                            ui.close();
-                            self.dialog_open_sequence_folder();
-                        }
-                        if ui
-                            .button("Open sequence (files)...")
-                            .on_hover_text("Or multi-select the wrfout files for the sequence.")
-                            .clicked()
-                        {
-                            ui.close();
-                            self.dialog_open_sequence_files();
-                        }
-                        // Recent open actions (newest first, capped, pruned on load).
-                        if !self.recent.is_empty() {
-                            ui.separator();
-                            ui.label(egui::RichText::new("Recent").weak());
-                            let entries = self.recent.clone();
-                            for entry in &entries {
-                                if ui.button(entry.label()).clicked() {
-                                    ui.close();
-                                    self.reopen_recent(entry);
-                                }
-                            }
-                        }
-                    });
-                    ui.label(egui::RichText::new(source_name).strong());
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.dialog_open_sequence_folder();
+                }
+                if ui
+                    .button("Open sequence (files)...")
+                    .on_hover_text("Or multi-select the wrfout files for the sequence.")
+                    .clicked()
+                {
+                    ui.close();
+                    self.dialog_open_sequence_files();
+                }
+                // Recent open actions (newest first, capped, pruned on load).
+                if !self.recent.is_empty() {
                     ui.separator();
+                    ui.label(egui::RichText::new("Recent").weak());
+                    let entries = self.recent.clone();
+                    for entry in &entries {
+                        if ui.button(entry.label()).clicked() {
+                            ui.close();
+                            self.reopen_recent(entry);
+                        }
+                    }
+                }
+            });
+            let source_width = ui.available_width().max(24.0);
+            ui.add_sized(
+                [source_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new(&source_name).strong()).truncate(),
+            )
+            .on_hover_text(source_name);
+        });
+    }
+
+    /// Row-two product/camera selectors. At the 900 px smoke-test width compact
+    /// selected labels fit in one deterministic row; menu choices retain full labels.
+    fn top_selector_row(&mut self, ui: &mut egui::Ui) {
+        let toolbar = toolbar_layout(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
 
                     // Product mode (Visible / GeoColor / Sandwich / IR / WV / Derived); the
                     // context-driven drawer below adapts its groups to the selection.
                     ui.label("Mode:");
+                    let previous_render_mode = self.render_mode;
                     egui::ComboBox::from_id_salt("mode")
+                        .width(toolbar.mode_width)
                         .selected_text(self.render_mode.label())
+                        .truncate()
                         .show_ui(ui, |ui| {
                             for m in RenderMode::ALL {
                                 ui.selectable_value(&mut self.render_mode, m, m.label());
@@ -2998,9 +3240,10 @@ impl SimSatStudioApp {
                         })
                         .response
                         .on_hover_text(
-                            "Visible = physically-based Blue Marble + clouds + sun. GeoColor = \
-                             the day/night blend (true-color by day, colored band-13 IR by \
-                             night, crossfaded across the terminator). Sandwich = the true-color \
+                            "Visible = physically-based Blue Marble + clouds + sun. GeoColor \
+                             Style = SimSat Day/Night Color (broad-RGB by day, colored band-13 \
+                             IR by night, crossfaded across the terminator); it is not yet \
+                             sensor-derived ABI GeoColor. Sandwich = the true-color \
                              visible with color-enhanced band-13 IR overlaid on the cold cloud \
                              tops (the classic severe-convection view; a daytime product). IR = \
                              synthetic band 13 (10.3 um) window BT. Water Vapor = ABI bands \
@@ -3008,13 +3251,51 @@ impl SimSatStudioApp {
                              per-column scalar map. IR / WV / Derived are thermal or column \
                              products (day AND night).",
                         );
-                    ui.separator();
+                    if self.render_mode != previous_render_mode
+                        && let Some(cleared) = clear_incompatible_instrument_footprint(
+                            self.render_mode,
+                            &mut self.instrument_footprint,
+                        )
+                    {
+                        self.save_settings_now();
+                        self.logline(format!(
+                            "Turned off {} because Mode {} has no compatible Band 13 instrument stage. The hidden setting was cleared and saved; Render is ready.",
+                            cleared.label(),
+                            self.render_mode.label()
+                        ));
+                    }
+                    ui.label("Intent:");
+                    egui::ComboBox::from_id_salt("render-intent")
+                        .width(toolbar.intent_width)
+                        .selected_text(self.render_intent.label())
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.render_intent,
+                                RenderIntent::Display,
+                                "Display",
+                            );
+                            ui.selectable_value(
+                                &mut self.render_intent,
+                                RenderIntent::SensorFastGray,
+                                "Sensor Fast Gray",
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "Display preserves the shipped reviewed appearance. Sensor Fast Gray \
+                             uses simsat-fast-gray-v1: unscaled cloud extinction and neutral \
+                             display shaping on a temporary render copy, with every adjustment \
+                             logged. It is not yet an SRF-integrated ABI/AHI channel simulator.",
+                        );
                     ui.label("Sat:");
                     // The satellite preset drives the geostationary scan camera; in
                     // Perspective view the orbit camera IS the view, so grey it out.
                     ui.add_enabled_ui(self.view != StudioView::Perspective, |ui| {
                         egui::ComboBox::from_id_salt("sat")
+                            .width(toolbar.sat_width)
                             .selected_text(self.preset.label())
+                            .truncate()
                             .show_ui(ui, |ui| {
                                 for p in SatellitePreset::ALL {
                                     ui.selectable_value(&mut self.preset, p, p.label());
@@ -3026,12 +3307,45 @@ impl SimSatStudioApp {
                                  (Camera group) defines the view.",
                             );
                     });
-                    ui.separator();
+                    if self.preset == SatellitePreset::Himawari
+                        && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+                    {
+                        self.geo_navigation = GeoNavigation::ModelSphere;
+                    }
+                    ui.label("Nav:");
+                    ui.add_enabled_ui(
+                        self.view == StudioView::Geostationary
+                            && self.preset != SatellitePreset::Himawari,
+                        |ui| {
+                            egui::ComboBox::from_id_salt("geo-navigation")
+                                .width(toolbar.navigation_width)
+                                .selected_text(self.geo_navigation.label())
+                                .truncate()
+                                .show_ui(ui, |ui| {
+                                    for navigation in GeoNavigation::ALL {
+                                        ui.selectable_value(
+                                            &mut self.geo_navigation,
+                                            navigation,
+                                            navigation.label(),
+                                        );
+                                    }
+                                });
+                        },
+                    )
+                    .response
+                    .on_hover_text(
+                        "Model sphere preserves the shipped WRF-consistent camera. GOES-R ABI \
+                         ellipsoid uses official sweep-x fixed-grid navigation and metadata, \
+                         then maps each geodetic pixel onto the existing spherical model rays. \
+                         This is registration geometry, not a claim of exact ABI radiometry.",
+                    );
                     // View toggle: from-space geostationary <-> the top-down map-registered
                     // product <-> the Perspective (3-D) orbit view (CPU-rendered like top-down).
                     ui.label("View:");
                     egui::ComboBox::from_id_salt("view")
+                        .width(toolbar.view_width)
                         .selected_text(self.view.label())
+                        .truncate()
                         .show_ui(ui, |ui| {
                             for v in StudioView::ALL {
                                 ui.selectable_value(&mut self.view, v, v.label());
@@ -3048,22 +3362,24 @@ impl SimSatStudioApp {
                              3-D storm shots with true parallax; Visible mode only in v1. \
                              Top-down and Perspective render on the CPU.",
                         );
-                    ui.separator();
-                    ui.label("Timestep:");
+                    ui.label("Time:");
                     let current = self
                         .timesteps
                         .get(self.selected_ts)
                         .map(|t| t.label.clone())
                         .unwrap_or_else(|| "-".to_string());
                     egui::ComboBox::from_id_salt("ts")
-                        .selected_text(current)
+                        .width(toolbar.timestep_width)
+                        .selected_text(&current)
+                        .truncate()
                         .show_ui(ui, |ui| {
                             for (i, t) in self.timesteps.iter().enumerate() {
                                 ui.selectable_value(&mut self.selected_ts, i, &t.label);
                             }
-                        });
-                });
-            });
+                        })
+                        .response
+                        .on_hover_text(current);
+        });
     }
 
     /// Non-destructive calibration migration. Settings written before the v0.1.5
@@ -3102,6 +3418,134 @@ impl SimSatStudioApp {
             });
     }
 
+    /// Compact, always-visible entry points into the three reviewed configurations.
+    /// Exact diffs/descriptions stay available in one bounded Details drawer, while
+    /// an immediate Current/Custom chip makes subsequent manual edits honest.
+    fn recommended_presets(&mut self, ui: &mut egui::Ui) {
+        let current = self.settings_snapshot();
+        let runtime = presets::PresetRuntime {
+            gpu_clouds: self.gpu_clouds,
+            parity_pending: self.parity_pending,
+        };
+        let plans: Vec<_> = presets::StudioPreset::ALL
+            .into_iter()
+            .map(|preset| (preset, presets::plan(preset, &current, runtime)))
+            .collect();
+        let active = presets::active(&current, runtime);
+        let mut selected = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Quick mode:").strong());
+            for (preset, planned) in &plans {
+                match planned {
+                    Ok(plan) => {
+                        let response = ui
+                            .add_enabled(
+                                !self.busy,
+                                egui::Button::new(preset.quick_label())
+                                    .selected(active == Some(*preset)),
+                            )
+                            .on_hover_text(format!(
+                                "{}\n\nExact changes now:\n{}",
+                                preset.description(),
+                                plan.change_summary()
+                            ))
+                            .on_disabled_hover_text(
+                                "Wait for the current render to finish before changing its saved configuration.",
+                            );
+                        if response.clicked() {
+                            selected = Some((*preset, plan.clone()));
+                        }
+                    }
+                    Err(reason) => {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(preset.quick_label()).selected(false),
+                        )
+                        .on_disabled_hover_text(format!(
+                            "{}\n\nUnavailable: {reason}",
+                            preset.description()
+                        ));
+                    }
+                }
+            }
+            ui.separator();
+            let (current_label, current_color) = match active {
+                Some(preset) => (
+                    preset.quick_label(),
+                    egui::Color32::from_rgb(135, 205, 145),
+                ),
+                None => ("Custom", egui::Color32::from_rgb(235, 185, 110)),
+            };
+            ui.colored_label(current_color, format!("Current: {current_label}"));
+            ui.separator();
+            ui.weak("GPU Render is a one-click fast preview; no settings setup required.");
+        });
+
+        let details_height = settings_scroll_max_height(ui.ctx().content_rect().height());
+        egui::CollapsingHeader::new("Details")
+            .id_salt("quick-mode-details")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("quick-mode-details-scroll")
+                    .max_height(details_height)
+                    .show(ui, |ui| {
+                        ui.weak(
+                            "Quick modes save only their listed fields. They never hide the \
+                             individual controls or silently change the selected product/source.",
+                        );
+                        for (index, (preset, planned)) in plans.iter().enumerate() {
+                            if index != 0 {
+                                ui.separator();
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(preset.label()).strong());
+                                if active == Some(*preset) {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(135, 205, 145),
+                                        "Current",
+                                    );
+                                }
+                            });
+                            ui.label(preset.description());
+                            match planned {
+                                Ok(plan) if plan.changes.is_empty() => {
+                                    ui.weak("Already active — no settings change.");
+                                }
+                                Ok(plan) => {
+                                    ui.weak(format!("Exact changes now ({}):", plan.changes.len()));
+                                    for change in &plan.changes {
+                                        ui.monospace(change.to_string());
+                                    }
+                                }
+                                Err(reason) => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(235, 180, 105),
+                                        format!("Unavailable: {reason}"),
+                                    );
+                                }
+                            }
+                        }
+                    });
+            });
+
+        if let Some((preset, plan)) = selected {
+            let exact = plan.change_summary();
+            self.apply_settings(&plan.settings);
+            self.gpu_clouds = plan.runtime.gpu_clouds;
+            self.parity_pending = plan.runtime.parity_pending;
+            // Presets are deliberate button actions, so persist immediately instead
+            // of waiting for the normal slider-drag debounce.
+            self.save_settings_now();
+            self.logline(format!(
+                "Applied and saved {}. Render again to update the image. {}",
+                preset.label(),
+                exact
+            ));
+        }
+    }
+
     /// A slim, colored one-line note under the strip explaining the current product and which
     /// drawer groups apply — only shown for the modes whose controls differ from plain Visible
     /// (so the owner knows why the Sun / atmosphere / cloud groups are absent in a thermal or
@@ -3122,8 +3566,9 @@ impl SimSatStudioApp {
             ui.add_space(2.0);
             ui.colored_label(
                 egui::Color32::from_rgb(140, 200, 150),
-                "GeoColor (day/night): true-color visible by day, colored band-13 IR by night, \
-                 crossfaded across the terminator. The Sun / exposure / atmosphere / cloud \
+                "GeoColor Style — SimSat Day/Night Color: broad-RGB visible by day, colored \
+                 band-13 IR by night, crossfaded across the terminator. It is not yet \
+                 sensor-derived ABI GeoColor. The Sun / exposure / atmosphere / cloud \
                  controls light the VISIBLE (day) half; the night half is thermal IR (no city \
                  lights — the night side is the colored IR).",
             );
@@ -3152,6 +3597,135 @@ impl SimSatStudioApp {
                     } else {
                         unit
                     },
+                ),
+            );
+        }
+
+        // Brick storage is a source/precision choice, not a visible-cloud appearance
+        // control. Keep it available for every product (including IR, WV, and derived
+        // fields) and even when the visible cloud layer is disabled.
+        egui::CollapsingHeader::new("Storage / precision")
+            .default_open(false)
+            .show(ui, |ui| {
+                let science_storage_response = ui
+                    .checkbox(
+                        &mut self.science_cloud_f16,
+                        "ScienceCloudF16 precision (CPU, experimental)",
+                    )
+                    .on_hover_text(
+                        "Store liquid, ice, snow, and total precipitation extinction as bounded \
+                         log2-f16 source values in an isolated v7 cache. CompactU8 remains the \
+                         production default. ScienceCloudF16 improves thin-cloud and thermal \
+                         precision but uses a larger cache and requires a source re-ingest. It \
+                         applies to visible, IR, water-vapor, and derived products. GPU preview \
+                         stays unavailable because its textures consume CompactU8 codes directly.",
+                    );
+                if science_storage_response.changed() && self.science_cloud_f16 {
+                    self.gpu_clouds = false;
+                    self.parity_pending = false;
+                }
+                ui.weak(if self.science_cloud_f16 {
+                    "Selected storage: ScienceCloudF16 (CPU-only experimental cache)."
+                } else {
+                    "Selected storage: CompactU8 (production default)."
+                });
+            });
+
+        if matches!(
+            mode,
+            RenderMode::Ir | RenderMode::GeoColor | RenderMode::Sandwich
+        ) {
+            egui::CollapsingHeader::new("Thermal response")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Band 13 sensor:");
+                        egui::ComboBox::from_id_salt("thermal-sensor")
+                            .selected_text(self.thermal_sensor.label())
+                            .show_ui(ui, |ui| {
+                                for sensor in ThermalSensor::ALL {
+                                    ui.selectable_value(
+                                        &mut self.thermal_sensor,
+                                        sensor,
+                                        sensor.label(),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Fast gray preserves the historical 10.3 um center-wavelength path. \
+                                 GOES-R ABI Band 13 integrates Planck emission through NOAA's \
+                                 official FM4/GOES-19 spectral response and inverts that response \
+                                 to brightness temperature.",
+                            );
+                    });
+                    if let Some(warning) = self.thermal_sensor.limitation_warning() {
+                        ui.colored_label(egui::Color32::YELLOW, format!("Science limitation: {warning}"));
+                    }
+                    ui.separator();
+                    let mut footprint_on =
+                        self.instrument_footprint == InstrumentFootprint::GoesRAbiBand13Mtf;
+                    if ui
+                        .checkbox(&mut footprint_on, "ABI Band 13 MTF footprint (experimental)")
+                        .on_hover_text(
+                            "Applies the GOES-16-measured Band 13 EW MTF-informed [0.15, 0.70, \
+                             0.15] response to complete FM4 channel radiance before BT inversion. \
+                             Enabling it selects GOES-East if needed, Geostationary view, GOES-R \
+                             exact sweep-x navigation, ABI 2 km, and the FM4/GOES-19 response. \
+                             The 56-urad grid is globally lattice-snapped with SSP at the corner \
+                             of four pixels. Default off; GOES-16 MTF transfer to GOES-19 is \
+                             explicitly unvalidated.",
+                        )
+                        .changed()
+                    {
+                        self.instrument_footprint = if footprint_on {
+                            if self.preset == SatellitePreset::Himawari {
+                                self.preset = SatellitePreset::GoesEast;
+                            }
+                            self.view = StudioView::Geostationary;
+                            self.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+                            self.resolution = ResolutionMode::Abi2km;
+                            self.thermal_sensor = ThermalSensor::GoesRAbiBand13Fm4;
+                            self.gpu_clouds = false;
+                            self.parity_pending = false;
+                            InstrumentFootprint::GoesRAbiBand13Mtf
+                        } else {
+                            InstrumentFootprint::Off
+                        };
+                    }
+                    if self.instrument_footprint != InstrumentFootprint::Off {
+                        let compatible = self.view == StudioView::Geostationary
+                            && self.preset != SatellitePreset::Himawari
+                            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+                            && self.resolution == ResolutionMode::Abi2km
+                            && self.thermal_sensor == ThermalSensor::GoesRAbiBand13Fm4;
+                        ui.colored_label(
+                            if compatible {
+                                egui::Color32::from_rgb(140, 200, 150)
+                            } else {
+                                egui::Color32::YELLOW
+                            },
+                            if compatible {
+                                "Exact global 56-urad lattice active; crop/mask perimeter is no-data for validation."
+                            } else {
+                                "Footprint needs Geostationary + GOES-R exact + ABI 2 km + FM4; toggle it off/on to reapply those requirements."
+                            },
+                        );
+                        ui.weak(
+                            "Science limitation: GOES-16 EW MTF transferred to GOES-19/FM4; \
+                             Band 13 NS MTF, temporal integration, and detector variation remain unmodeled.",
+                        );
+                    }
+                });
+        }
+        if let Some(state) = &self.rendered
+            && state.instrument_footprint != InstrumentFootprint::Off
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(140, 200, 150),
+                format!(
+                    "Rendered instrument footprint: {} (experimental, default off).",
+                    state.instrument_footprint.label()
                 ),
             );
         }
@@ -3187,6 +3761,7 @@ impl SimSatStudioApp {
     /// kept directly under the strip (not buried in a collapsible) so the owner must confirm
     /// before the heavy ingest, exactly as before.
     fn size_gate_confirms(&mut self, ui: &mut egui::Ui) {
+        let mut source_confirmed_now = false;
         if let Some(Source::Wrfout {
             needs_confirm,
             confirmed,
@@ -3210,10 +3785,17 @@ impl SimSatStudioApp {
                 );
                 if ui.button("Confirm and continue").clicked() {
                     *confirmed = true;
+                    source_confirmed_now = true;
                 }
             });
         }
+        if source_confirmed_now {
+            self.logline(
+                "Large source confirmed. Ready to Render; an existing cache will be reused or ingest will start on demand.",
+            );
+        }
 
+        let mut sequence_confirmed_now = false;
         if let Some(Source::Sequence {
             needs_confirm,
             confirmed,
@@ -3237,8 +3819,14 @@ impl SimSatStudioApp {
                 );
                 if ui.button("Confirm and continue").clicked() {
                     *confirmed = true;
+                    sequence_confirmed_now = true;
                 }
             });
+        }
+        if sequence_confirmed_now {
+            self.logline(
+                "Large sequence confirmed. Ready to Render sequence; cached frames will be reused or ingested on demand.",
+            );
         }
     }
 
@@ -3587,15 +4175,76 @@ impl SimSatStudioApp {
                                 .changed()
                                 && self.fractional_clouds
                             {
+                                if self.fractional_cloud_mode == FractionalCloudMode::Off {
+                                    self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+                                }
                                 // The current WGSL preview has no fractional-subcolumn closure.
                                 // Do not leave a now-disabled preview silently checked.
                                 self.gpu_clouds = false;
                                 self.parity_pending = false;
                             }
+                            if self.fractional_clouds {
+                                ui.label("Closure:");
+                                egui::ComboBox::from_id_salt("fractional-cloud-mode")
+                                    .selected_text(match self.fractional_cloud_mode {
+                                        FractionalCloudMode::EffectiveOd => {
+                                            "Effective OD (fast/default)"
+                                        }
+                                        FractionalCloudMode::Deterministic4 => {
+                                            "Deterministic 4 (reference)"
+                                        }
+                                        FractionalCloudMode::Deterministic8 => {
+                                            "Deterministic 8 (convergence)"
+                                        }
+                                        FractionalCloudMode::Deterministic16 => {
+                                            "Deterministic 16 (convergence)"
+                                        }
+                                        FractionalCloudMode::Off => "Off",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
+                                            FractionalCloudMode::EffectiveOd,
+                                            "Effective OD (fast/default)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
+                                            FractionalCloudMode::Deterministic4,
+                                            "Deterministic 4 (4x CPU reference)",
+                                        )
+                                        .on_hover_text(
+                                            "Four fixed shared-u maximum-overlap subcolumns. Each \
+                                             gets its own view/sun/shadow march; linear radiance is \
+                                             averaged before one tonemap. Much slower and intended \
+                                             for physics QA, not the shipped default.",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
+                                            FractionalCloudMode::Deterministic8,
+                                            "Deterministic 8 (8x convergence reference)",
+                                        )
+                                        .on_hover_text(
+                                            "Eight fixed-stratified shared-u maximum-overlap \
+                                             members. Higher quadrature resolution at roughly \
+                                             twice the cost of Deterministic 4.",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
+                                            FractionalCloudMode::Deterministic16,
+                                            "Deterministic 16 (16x convergence reference)",
+                                        )
+                                        .on_hover_text(
+                                            "Sixteen fixed-stratified shared-u maximum-overlap \
+                                             members. Expensive convergence reference; Effective \
+                                             OD remains the default.",
+                                        );
+                                    });
+                            }
                             let previous_transport = studio_cloud_multiscatter_mode(
                                 self.multiscatter,
                                 self.delta_flux_clouds,
                                 self.delta_flux_v2_clouds,
+                                self.delta_flux_v3_clouds,
                             );
                             let mut cloud_transport = previous_transport;
                             ui.horizontal_wrapped(|ui| {
@@ -3611,6 +4260,9 @@ impl SimSatStudioApp {
                                         }
                                         CloudMultiscatterMode::DeltaFluxV2 => {
                                             "Delta-flux v2b P1 (experimental)"
+                                        }
+                                        CloudMultiscatterMode::DeltaFluxV3 => {
+                                            "Delta-flux v3 order memory (experimental)"
                                         }
                                     })
                                     .show_ui(ui, |ui| {
@@ -3634,12 +4286,19 @@ impl SimSatStudioApp {
                                             CloudMultiscatterMode::DeltaFluxV2,
                                             "Delta-flux v2b P1 (experimental, CPU)",
                                         );
+                                        ui.selectable_value(
+                                            &mut cloud_transport,
+                                            CloudMultiscatterMode::DeltaFluxV3,
+                                            "Delta-flux v3 order memory (experimental, CPU)",
+                                        );
                                     });
                             });
                             self.delta_flux_clouds =
                                 cloud_transport == CloudMultiscatterMode::DeltaFluxV1;
                             self.delta_flux_v2_clouds =
                                 cloud_transport == CloudMultiscatterMode::DeltaFluxV2;
+                            self.delta_flux_v3_clouds =
+                                cloud_transport == CloudMultiscatterMode::DeltaFluxV3;
                             self.multiscatter =
                                 cloud_transport == CloudMultiscatterMode::LegacyOctaves;
                             if cloud_transport != previous_transport
@@ -3647,6 +4306,7 @@ impl SimSatStudioApp {
                                     cloud_transport,
                                     CloudMultiscatterMode::DeltaFluxV1
                                         | CloudMultiscatterMode::DeltaFluxV2
+                                        | CloudMultiscatterMode::DeltaFluxV3
                                 )
                             {
                                 self.gpu_clouds = false;
@@ -3665,6 +4325,9 @@ impl SimSatStudioApp {
                                 CloudMultiscatterMode::DeltaFluxV2 => {
                                     "Brightness-neutral Stage-2 P1 upper-escape directionality; CPU-only and opt-in."
                                 }
+                                CloudMultiscatterMode::DeltaFluxV3 => {
+                                    "Stage-2 source with bounded second-order angular memory; reduces thin-cloud isotropic overfill without an exposure change; CPU-only and opt-in."
+                                }
                             });
                             ui.add(
                                 egui::Slider::new(
@@ -3681,6 +4344,40 @@ impl SimSatStudioApp {
                                  extinction unchanged, and 0 disables visible cloud extinction. \
                                  This does not change IR or derived products.",
                             );
+                            let nssl_optics_response = ui.checkbox(
+                                &mut self.nssl_native_cloud_optics,
+                                "NSSL native particle optics (experimental)",
+                            )
+                            .on_hover_text(
+                                "WRF MP_PHYSICS=18 only: derive per-cell effective radii from \
+                                 NSSL's saved mass, number, and graupel/hail volume moments, \
+                                 including hail. Invalid cells fall back independently to the \
+                                 fixed v0.1.6 table. Off is exact legacy fixed optics. The first \
+                                 render after switching uses a separate cache and must re-ingest \
+                                 the source. Visible mode only; thermal/GeoColor/Sandwich keep \
+                                 fixed optics so their IR mass recovery stays self-consistent.",
+                            );
+                            if nssl_optics_response.changed() && self.nssl_native_cloud_optics {
+                                self.hrrr_thompson_native_cloud_optics = false;
+                            }
+                            let thompson_optics_response = ui
+                                .checkbox(
+                                    &mut self.hrrr_thompson_native_cloud_optics,
+                                    "HRRR Thompson native particle optics (experimental)",
+                                )
+                                .on_hover_text(
+                                    "HRRR native GRIB only: use saved NCONCD/NCCICE/SPNCR number \
+                                     moments for liquid, ice, and rain; the official Field/Thompson \
+                                     diagnostics for snow and graupel; and per-cell fixed fallback \
+                                     for invalid moments. A versioned cache keeps fixed output \
+                                     untouched. Visible mode only because IR mass recovery remains \
+                                     tied to fixed radii.",
+                                );
+                            if thompson_optics_response.changed()
+                                && self.hrrr_thompson_native_cloud_optics
+                            {
+                                self.nssl_native_cloud_optics = false;
+                            }
                             if ui
                                 .add_enabled(
                                     (self.cloud_optical_depth_scale
@@ -3768,6 +4465,26 @@ impl SimSatStudioApp {
                                  and excluding high/convective cores. Geostationary, raw bands, \
                                  thermal and derived products are unchanged. Default off.",
                             );
+                            if ui
+                                .checkbox(
+                                    &mut self.topdown_cloud_footprint,
+                                    "Top-down cloud footprint",
+                                )
+                                .on_hover_text(
+                                    "Experimental display-only observation footprint for native \
+                                     top-down visible imagery. It applies a bounded seven-tap \
+                                     sigma~=1.225 px filter to the PRE-TONEMAP cloud radiance \
+                                     residual (cloud shadow, attenuation and in-scatter), then \
+                                     adds the unchanged sharp terrain/base map and tonemaps once. \
+                                     Geostationary, raw bands, thermal, derived, cloud-layer and \
+                                     perspective products are unchanged. CPU-only; default off.",
+                                )
+                                .changed()
+                                && self.topdown_cloud_footprint
+                            {
+                                self.gpu_clouds = false;
+                                self.parity_pending = false;
+                            }
                             ui.label("Steps:");
                             egui::ComboBox::from_id_salt("stepq")
                                 .selected_text(match self.step_quality {
@@ -3789,15 +4506,36 @@ impl SimSatStudioApp {
                         });
                     });
                     if self.clouds_enabled {
-                        ui.weak(if self.fractional_clouds {
-                            "Model cloud fraction: CPU physical path (missing fields fall back safely)."
+                        let fraction_note = if self.fractional_clouds {
+                            if let Some(count) = self
+                                .fractional_cloud_mode
+                                .deterministic_subcolumn_count()
+                            {
+                                format!(
+                                    "Model cloud fraction: deterministic {count}-member fixed-stratified CPU reference (about {count}x march cost)."
+                                )
+                            } else {
+                                "Model cloud fraction: effective-OD CPU path (missing fields fall back safely)."
+                                    .to_string()
+                            }
                         } else {
                             "Legacy cloud coverage: each non-zero cloudy cell is horizontally full."
-                        });
+                                .to_string()
+                        };
+                        ui.weak(fraction_note);
                     }
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 190, 235),
+                        "Use GPU Render in the top bar for a one-click fast preview. It needs no \
+                         manual setup, reports every temporary difference, and leaves saved \
+                         settings unchanged.",
+                    );
                     // EXPERIMENTAL GPU cloud pass (the M5-GPU activation): Geostationary
                     // or Top-down Visible clouds-on; the CPU composite stays the shipping default
                     // and the ONLY stored-frame path.
+                    egui::CollapsingHeader::new("Advanced GPU controls")
+                        .default_open(false)
+                        .show(ui, |ui| {
                     let gpu_tonemap_ok = (self.cloud_softclip
                         - CLOUD_SOFTCLIP_KNEE as f32)
                         .abs()
@@ -3807,6 +4545,7 @@ impl SimSatStudioApp {
                     let gpu_land_appearance_ok =
                         gpu_land_appearance_compatible(self.land_appearance_config());
                     let gpu_applicable = self.gpu.is_some()
+                        && !self.science_cloud_f16
                         && matches!(self.render_mode, RenderMode::Visible)
                         && self.view != StudioView::Perspective
                         && self.clouds_enabled
@@ -3820,11 +4559,16 @@ impl SimSatStudioApp {
                             self.view == StudioView::TopDownMap,
                             self.topdown_stratiform_regularization,
                         )
+                        && gpu_topdown_cloud_footprint_preview_compatible(
+                            self.view == StudioView::TopDownMap,
+                            self.topdown_cloud_footprint,
+                        )
                         && gpu_exposed_edge_feather_compatible(
                             self.feather_exposed_domain_edges,
                         )
                         && !self.delta_flux_clouds
                         && !self.delta_flux_v2_clouds
+                        && !self.delta_flux_v3_clouds
                         && gpu_tonemap_ok
                         && gpu_land_appearance_ok;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
@@ -3869,14 +4613,23 @@ impl SimSatStudioApp {
                         ) {
                             unmet.push("Top-down stratiform reconstruction off".to_string());
                         }
+                        if !gpu_topdown_cloud_footprint_preview_compatible(
+                            self.view == StudioView::TopDownMap,
+                            self.topdown_cloud_footprint,
+                        ) {
+                            unmet.push("Top-down cloud footprint off".to_string());
+                        }
                         if self.feather_exposed_domain_edges {
                             unmet.push(
                                 "Feather exposed domain edges is On; requires Off".to_string(),
                             );
                         }
-                        if self.delta_flux_clouds || self.delta_flux_v2_clouds {
+                        if self.delta_flux_clouds
+                            || self.delta_flux_v2_clouds
+                            || self.delta_flux_v3_clouds
+                        {
                             unmet.push(
-                                "Delta-flux v1/v2b transport is CPU-only; requires Legacy octaves \
+                                "Delta-flux v1/v2b/v3 transport is CPU-only; requires Legacy octaves \
                                  or Single scatter"
                                     .to_string(),
                             );
@@ -3898,11 +4651,6 @@ impl SimSatStudioApp {
                             format!("Manual GPU toggle blocked: {}.", unmet.join("; "))
                         }
                     };
-                    ui.colored_label(
-                        egui::Color32::from_rgb(120, 190, 235),
-                        "One click: use GPU Render in the top bar. It makes a temporary compatible \
-                         preview, reports every difference, and leaves these settings unchanged.",
-                    );
                     ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(gpu_applicable, |ui| {
                             ui.checkbox(
@@ -3977,6 +4725,7 @@ impl SimSatStudioApp {
                     if dismiss_parity {
                         self.parity = None;
                     }
+                        });
                 });
 
             // Ground / Blue Marble.
@@ -4449,10 +5198,19 @@ impl eframe::App for SimSatStudioApp {
                     });
             }
             self.calibration_epoch_banner(ui);
+            self.recommended_presets(ui);
             self.context_note(ui);
             self.size_gate_confirms(ui);
             ui.separator();
-            self.advanced_drawer(ui, &ctx);
+            let settings_height = settings_scroll_max_height(ctx.content_rect().height());
+            egui::CollapsingHeader::new("Settings (all controls)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("studio-settings-scroll")
+                        .max_height(settings_height)
+                        .show(ui, |ui| self.advanced_drawer(ui, &ctx));
+                });
             ui.add_space(2.0);
         });
 
@@ -4803,8 +5561,14 @@ impl eframe::App for SimSatStudioApp {
 // ── worker-side preparation (no egui, runs on the below-normal thread) ─────────
 
 /// The M2 atmosphere + M4 cloud + M6 IR controls captured from the UI for one render.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AtmoSettings {
+    /// Output semantics selected in Studio.
+    render_intent: RenderIntent,
+    /// Sensor-grid navigation for geostationary renders.
+    geo_navigation: GeoNavigation,
+    /// Exact temporary strict-intent substitutions; persistent sliders are untouched.
+    intent_adjustments: Vec<RenderIntentAdjustment>,
     /// View mode (Geostationary from-space, the top-down map-registered product, or the
     /// Perspective (3-D) orbit view). Top-down and Perspective render on the CPU.
     view_mode: StudioView,
@@ -4822,6 +5586,10 @@ struct AtmoSettings {
     render_mode: RenderMode,
     /// IR/WV enhancement (colour curve) for the BT plane in a thermal mode.
     ir_enhancement: IrEnhancement,
+    /// Spectral response used for Band 13 (IR/GeoColor/Sandwich only).
+    thermal_sensor: ThermalSensor,
+    /// Complete-radiance ABI Band 13 spatial response. Default off.
+    instrument_footprint: InstrumentFootprint,
     aod: f64,
     rh_swelling: bool,
     /// Daytime aerial-veil correction (product-facing default on; off = full path airlight).
@@ -4836,11 +5604,17 @@ struct AtmoSettings {
     /// Use the source's cloud-fraction/subcolumn closure when available. The CPU
     /// renderer consumes this; `false` requests the legacy horizontally-full cells.
     fractional_clouds: bool,
+    /// Effective-OD (fast/default) or deterministic 4/8/16 explicit CPU members.
+    fractional_cloud_mode: FractionalCloudMode,
     /// Explicit visible-cloud higher-order transport selection. The Studio's two
     /// persisted compatibility booleans are resolved to this engine enum at capture.
     cloud_multiscatter: CloudMultiscatterMode,
     /// Visible cloud optical-depth scale. Shipped = 0.15; 1.0 is unscaled.
     cloud_optical_depth_scale: f32,
+    /// Authoritative brick storage precision for this render.
+    storage_profile: StorageProfile,
+    /// Ingest-time WRF hydrometeor particle optics.
+    cloud_optics: CloudOpticsMode,
     /// Fade finished visible clouds at camera-exposed finite-domain boundaries.
     feather_exposed_domain_edges: bool,
     beer_powder: bool,
@@ -4850,6 +5624,8 @@ struct AtmoSettings {
     granulation: bool,
     /// Top-down-only low-stratiform column optical-depth reconstruction.
     topdown_stratiform_regularization: bool,
+    /// Display-only pre-tonemap footprint over the cloud radiance residual.
+    topdown_cloud_footprint: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL: render a Geostationary or Top-down Visible clouds-on frame through the
     /// GPU cloud pass (Interactive schedule) instead of the CPU composite. Only the
@@ -4884,6 +5660,61 @@ struct AtmoSettings {
     bm_allow_download: bool,
 }
 
+/// Apply the strict Sensor Fast Gray contract to a per-render copy. Display is an
+/// exact no-op; persistent Studio controls remain available when the user switches
+/// back. Model fractional-cloud handling and all physical/model controls not listed
+/// here are deliberately retained.
+fn configure_render_intent(atmo: &mut AtmoSettings) {
+    if atmo.render_intent == RenderIntent::Display {
+        return;
+    }
+    let mut changed = Vec::new();
+    if (atmo.cloud_optical_depth_scale - 1.0).abs() > f32::EPSILON {
+        atmo.cloud_optical_depth_scale = 1.0;
+        changed.push(RenderIntentAdjustment::CloudOpticalDepthUnscaled);
+    }
+    if (atmo.exposure - 1.0).abs() > f64::EPSILON {
+        atmo.exposure = 1.0;
+        changed.push(RenderIntentAdjustment::ExposureNeutral);
+    }
+    if (atmo.ground_gain - 1.0).abs() > f64::EPSILON {
+        atmo.ground_gain = 1.0;
+        changed.push(RenderIntentAdjustment::GroundLiftNeutral);
+    }
+    if atmo.land_appearance != LandAppearanceConfig::identity() {
+        atmo.land_appearance = LandAppearanceConfig::identity();
+        changed.push(RenderIntentAdjustment::LandAppearanceIdentity);
+    }
+    if atmo.feather_exposed_domain_edges {
+        atmo.feather_exposed_domain_edges = false;
+        changed.push(RenderIntentAdjustment::ExposedEdgeFeatherOff);
+    }
+    if atmo.granulation {
+        atmo.granulation = false;
+        changed.push(RenderIntentAdjustment::GranulationOff);
+    }
+    if atmo.topdown_stratiform_regularization {
+        atmo.topdown_stratiform_regularization = false;
+        changed.push(RenderIntentAdjustment::TopdownStratiformRegularizationOff);
+    }
+    if atmo.topdown_cloud_footprint {
+        atmo.topdown_cloud_footprint = false;
+        changed.push(RenderIntentAdjustment::TopdownCloudFootprintOff);
+    }
+    if atmo.atmosphere_correction {
+        atmo.atmosphere_correction = false;
+        changed.push(RenderIntentAdjustment::AtmosphereCorrectionOff);
+    }
+    if (atmo.cloud_softclip - 1.0).abs() > f64::EPSILON
+        || (atmo.cloud_highlight_max - 1.0).abs() > f64::EPSILON
+    {
+        atmo.cloud_softclip = 1.0;
+        atmo.cloud_highlight_max = 1.0;
+        changed.push(RenderIntentAdjustment::HighlightShoulderIdentity);
+    }
+    atmo.intent_adjustments = changed;
+}
+
 /// Convert a captured render configuration into the GPU cloud shader's supported
 /// preview envelope. This mutates only the per-render copy: the user's persistent
 /// Studio controls remain untouched. Geostationary and Top-down retain their camera;
@@ -4893,6 +5724,14 @@ fn configure_one_click_gpu_preview(atmo: &mut AtmoSettings) -> GpuPreviewAdjustm
     if atmo.render_mode != RenderMode::Visible {
         changes.insert(GpuPreviewAdjustments::MODE_VISIBLE);
         atmo.render_mode = RenderMode::Visible;
+    }
+    if atmo.instrument_footprint != InstrumentFootprint::Off {
+        changes.insert(GpuPreviewAdjustments::INSTRUMENT_FOOTPRINT_OFF);
+        atmo.instrument_footprint = InstrumentFootprint::Off;
+    }
+    if atmo.geo_navigation == GeoNavigation::GoesRAbiFixedGrid {
+        changes.insert(GpuPreviewAdjustments::MODEL_SPHERE_NAVIGATION);
+        atmo.geo_navigation = GeoNavigation::ModelSphere;
     }
     if atmo.view_mode == StudioView::Perspective {
         changes.insert(GpuPreviewAdjustments::VIEW_GEOSTATIONARY);
@@ -4909,6 +5748,7 @@ fn configure_one_click_gpu_preview(atmo: &mut AtmoSettings) -> GpuPreviewAdjustm
     if atmo.fractional_clouds {
         changes.insert(GpuPreviewAdjustments::FRACTIONAL_CLOUDS_OFF);
         atmo.fractional_clouds = false;
+        atmo.fractional_cloud_mode = FractionalCloudMode::Off;
     }
     if atmo.granulation {
         changes.insert(GpuPreviewAdjustments::GRANULATION_OFF);
@@ -4917,6 +5757,10 @@ fn configure_one_click_gpu_preview(atmo: &mut AtmoSettings) -> GpuPreviewAdjustm
     if atmo.topdown_stratiform_regularization {
         changes.insert(GpuPreviewAdjustments::TOPDOWN_STRATIFORM_REGULARIZATION_OFF);
         atmo.topdown_stratiform_regularization = false;
+    }
+    if atmo.topdown_cloud_footprint {
+        changes.insert(GpuPreviewAdjustments::TOPDOWN_CLOUD_FOOTPRINT_OFF);
+        atmo.topdown_cloud_footprint = false;
     }
     if atmo.feather_exposed_domain_edges {
         changes.insert(GpuPreviewAdjustments::EXPOSED_EDGE_FEATHER_OFF);
@@ -4979,6 +5823,82 @@ fn clamp_pan(pan: egui::Vec2, img: egui::Vec2, viewport: egui::Vec2) -> egui::Ve
     egui::vec2(pan.x.clamp(-mx, mx), pan.y.clamp(-my, my))
 }
 
+/// Products whose render path contains the Band 13 instrument stage.
+fn mode_supports_instrument_footprint(mode: RenderMode) -> bool {
+    matches!(
+        mode,
+        RenderMode::Ir | RenderMode::GeoColor | RenderMode::Sandwich
+    )
+}
+
+/// Clear an instrument footprint before an incompatible product can hide its
+/// control. Returning the previous value lets the UI explain and persist the
+/// automatic safety transition exactly once.
+fn clear_incompatible_instrument_footprint(
+    mode: RenderMode,
+    footprint: &mut InstrumentFootprint,
+) -> Option<InstrumentFootprint> {
+    if *footprint == InstrumentFootprint::Off || mode_supports_instrument_footprint(mode) {
+        return None;
+    }
+    let previous = *footprint;
+    *footprint = InstrumentFootprint::Off;
+    Some(previous)
+}
+
+/// Validate the Studio's instrument-stage contract before touching input I/O.
+/// The GUI's enable action selects these settings, while this guard catches any
+/// later manual edit and prevents a silently misattributed footprint.
+fn validate_studio_instrument_footprint(
+    atmo: &AtmoSettings,
+    preset: SatellitePreset,
+    resolution: ResolutionMode,
+) -> Result<(), String> {
+    if atmo.instrument_footprint == InstrumentFootprint::Off {
+        return Ok(());
+    }
+    if !mode_supports_instrument_footprint(atmo.render_mode) {
+        return Err(format!(
+            "Instrument footprint {} supports Band 13, GeoColor, and Sandwich only.",
+            atmo.instrument_footprint.slug()
+        ));
+    }
+    if atmo.thermal_sensor != ThermalSensor::GoesRAbiBand13Fm4 {
+        return Err(format!(
+            "Instrument footprint {} requires the GOES-R ABI Band 13 FM4 response.",
+            atmo.instrument_footprint.slug()
+        ));
+    }
+    if atmo.view_mode != StudioView::Geostationary
+        || atmo.geo_navigation != GeoNavigation::GoesRAbiFixedGrid
+        || resolution != ResolutionMode::Abi2km
+        || preset == SatellitePreset::Himawari
+    {
+        return Err(format!(
+            "Instrument footprint {} requires a GOES-East/West Geostationary render with \
+             GOES-R exact navigation and ABI 2 km resolution. Toggle the footprint off/on \
+             in Thermal response to apply those settings.",
+            atmo.instrument_footprint.slug()
+        ));
+    }
+    Ok(())
+}
+
+fn read_brick_for_profile(
+    path: &Path,
+    expected: StorageProfile,
+) -> Result<simsat::bricks::VolumeBrick, bricks::BrickError> {
+    let profiled = bricks::read_ssb_profiled(path)?;
+    if profiled.profile != expected {
+        return Err(bricks::BrickError::CacheMismatch(format!(
+            "brick uses storage_profile={}, but Studio requested {}; profiles are never substituted",
+            profiled.profile.slug(),
+            expected.slug()
+        )));
+    }
+    Ok(profiled.brick)
+}
+
 /// Prepare all CPU inputs for one render (ingest if needed, brick decode, camera
 /// raster, solar, Blue Marble crop, normals/landmask, LUTs). Sends `Status` messages
 /// over `tx` and RETURNS the prepared frame (or an error string). Returning it (rather
@@ -5002,6 +5922,15 @@ fn prepare_render(
         let _ = tx.send(WorkerMsg::Status(s.to_string()));
     };
 
+    validate_studio_instrument_footprint(&atmo, preset, resolution)?;
+    if atmo.instrument_footprint != InstrumentFootprint::Off {
+        status(&format!(
+            "Instrument footprint {}: complete FM4 radiance on exact global 56-urad ABI lattice \
+             (GOES-16 MTF -> GOES-19 remains experimental).",
+            atmo.instrument_footprint.slug()
+        ));
+    }
+
     // Resolve: brick path, georef, params, time, sector — and, for a cached run,
     // the brick itself (it is read ONCE here to anchor the georef and passed
     // through; the second `read_ssb` of the same file is gone).
@@ -5022,7 +5951,20 @@ fn prepare_render(
                     .map_err(|e| format!("read geometry: {e}"))?
             };
             let georef = geom.georef().map_err(|e| format!("georef: {e}"))?;
-            let brick_path = bricks::run_dir(&cache_dir, &run_id).join(
+            let cloud_optics = if is_grib {
+                if atmo.cloud_optics == CloudOpticsMode::HrrrThompsonNative {
+                    atmo.cloud_optics
+                } else {
+                    CloudOpticsMode::Fixed
+                }
+            } else if atmo.cloud_optics == CloudOpticsMode::NsslNative {
+                atmo.cloud_optics
+            } else {
+                CloudOpticsMode::Fixed
+            };
+            let brick_cache =
+                ingest::brick_cache_dir(&cache_dir, cloud_optics, atmo.storage_profile);
+            let brick_path = bricks::run_dir(&brick_cache, &run_id).join(
                 bricks::brick_file_name_for(geom.time_iso.as_deref(), geom.hhmm),
             );
             // A cached brick counts only if it actually DECODES: an old-format or
@@ -5031,7 +5973,7 @@ fn prepare_render(
             // cache MISS with the wrfout right here as the source of truth, so
             // re-ingest instead of surfacing the decode error.
             let peeked = if brick_path.is_file() {
-                match bricks::read_ssb(&brick_path) {
+                match read_brick_for_profile(&brick_path, atmo.storage_profile) {
                     Ok(b) => Some(b),
                     Err(e) => {
                         status(&format!("Cached brick unusable ({e}); re-ingesting..."));
@@ -5046,6 +5988,8 @@ fn prepare_render(
                 let mut config = IngestConfig::new(cache_dir.clone());
                 config.run_id = Some(run_id.clone());
                 config.timestep = ts_index;
+                config.cloud_optics = cloud_optics;
+                config.storage_profile = atmo.storage_profile;
                 if is_grib {
                     ingest_grib::ingest_grib_timestep(&path, &config)
                         .map_err(|e| format!("grib ingest: {e}"))?;
@@ -5079,16 +6023,17 @@ fn prepare_render(
             // A cached-run open has no source wrfout to re-ingest from, so an
             // old-format brick keeps the hard refusal — but with the remedy spelled
             // out instead of the raw decode error.
-            let brick = bricks::read_ssb(&brick_path).map_err(|e| match e {
-                bricks::BrickError::UnsupportedVersion(v) => format!(
-                    "this cached run's bricks are an older format (.ssb v{v}; this \
+            let brick =
+                read_brick_for_profile(&brick_path, atmo.storage_profile).map_err(|e| match e {
+                    bricks::BrickError::UnsupportedVersion(v) => format!(
+                        "this cached run's bricks are an older format (.ssb v{v}; this \
                      build reads v{}). The cache is regenerable: open the ORIGINAL \
                      wrfout (Open menu) to re-ingest, or delete the run's cache \
                      directory.",
-                    simsat::SSB_FORMAT_VERSION
-                ),
-                e => format!("read brick: {e}"),
-            })?;
+                        atmo.storage_profile.format_version()
+                    ),
+                    e => format!("read brick: {e}"),
+                })?;
             let georef = GridGeoref::from_params_center(&params, brick.nx, brick.ny)
                 .map_err(|e| format!("georef: {e}"))?;
             (
@@ -5107,7 +6052,8 @@ fn prepare_render(
         Some(b) => b,
         None => {
             status("Decoding brick...");
-            bricks::read_ssb(&brick_path).map_err(|e| format!("read brick: {e}"))?
+            read_brick_for_profile(&brick_path, atmo.storage_profile)
+                .map_err(|e| format!("read brick: {e}"))?
         }
     };
     let (nx, ny) = (brick.nx, brick.ny);
@@ -5122,7 +6068,7 @@ fn prepare_render(
     // a huge domain forces the MAX_AXIS clamp.
     let is_topdown = atmo.view_mode == StudioView::TopDownMap;
     let is_persp = atmo.view_mode == StudioView::Perspective;
-    let camera = GeoCamera::new(preset);
+    let camera = GeoCamera::for_navigation(preset, atmo.geo_navigation).map_err(str::to_string)?;
     let (map_dx_m, map_dy_m) = if params.map_proj == 6 {
         (params.dx_m * 111_195.0, params.dy_m * 111_195.0)
     } else {
@@ -5187,6 +6133,7 @@ fn prepare_render(
         margin_bits: margin.to_bits(),
         view: view_ordinal(atmo.view_mode),
         sat: sat_ordinal(preset),
+        navigation: geo_navigation_ordinal(atmo.geo_navigation),
     };
     let (raster_arc, raster_hit) = if let Some((cam, basis)) = &persp {
         // Perspective rasters BYPASS the scene cache: the cache key does not carry
@@ -5258,7 +6205,8 @@ fn prepare_render(
     // render takes it too (both paths run) even when the live toggle is off. A
     // projection the WGSL forward does not implement (rotated lat-lon = GRIB RRFS)
     // falls back to the CPU composite with a log line.
-    let gpu_projection_ok = gpu::projection_supported(&georef);
+    let gpu_projection_ok =
+        gpu::projection_supported(&georef) && atmo.geo_navigation == GeoNavigation::ModelSphere;
     if atmo.one_click_gpu_render && !gpu_projection_ok {
         return Err(
             "GPU Render unavailable for this source: rotated lat-lon (RRFS) has no WGSL \
@@ -5285,6 +6233,10 @@ fn prepare_render(
         is_topdown,
         atmo.topdown_stratiform_regularization,
     );
+    // The footprint is a CPU post-composite radiance operator. The current WGSL path
+    // returns already-tonemapped pixels, so it cannot reproduce the requested seam.
+    let gpu_topdown_cloud_footprint_ok =
+        gpu_topdown_cloud_footprint_preview_compatible(is_topdown, atmo.topdown_cloud_footprint);
     // The exposed-domain edge control resolves against the camera raster. The WGSL
     // preview has only the legacy margin value, so keep the requested presentation exact
     // by routing it through CPU until the shader receives a reviewed twin.
@@ -5312,7 +6264,9 @@ fn prepare_render(
     // shader twin; never silently substitute a different cloud closure.
     let gpu_cloud_transport_ok = !matches!(
         atmo.cloud_multiscatter,
-        CloudMultiscatterMode::DeltaFluxV1 | CloudMultiscatterMode::DeltaFluxV2
+        CloudMultiscatterMode::DeltaFluxV1
+            | CloudMultiscatterMode::DeltaFluxV2
+            | CloudMultiscatterMode::DeltaFluxV3
     );
     let use_gpu_clouds = (atmo.gpu_clouds || atmo.parity)
         && atmo.clouds_enabled
@@ -5323,6 +6277,7 @@ fn prepare_render(
         && gpu_fractional_clouds_ok
         && gpu_granulation_ok
         && gpu_topdown_stratiform_ok
+        && gpu_topdown_cloud_footprint_ok
         && gpu_exposed_edge_feather_ok
         && gpu_cloud_tonemap_ok
         && gpu_land_appearance_ok
@@ -5351,6 +6306,12 @@ fn prepare_render(
              composite so the reconstructed cloud field is not silently ignored.",
         );
     }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_topdown_cloud_footprint_ok {
+        status(
+            "GPU clouds: top-down cloud footprint is CPU-only; using the CPU composite \
+             so the requested pre-tonemap residual filter is not silently ignored.",
+        );
+    }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_exposed_edge_feather_ok {
         status(
             "GPU clouds: exposed-domain edge feathering is CPU-only; using the CPU \
@@ -5361,7 +6322,7 @@ fn prepare_render(
         status("GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU composite.");
     }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_transport_ok {
-        status("GPU clouds: delta-flux-v1 transport is CPU-only; using the CPU composite.");
+        status("GPU clouds: delta-flux transport is CPU-only; using the CPU composite.");
     }
     if !atmo.clouds_enabled
         && matches!(atmo.render_mode, RenderMode::Visible)
@@ -5557,7 +6518,7 @@ fn prepare_render(
     let luts = &atmo_arc.0;
     let sky_sh = &atmo_arc.1;
 
-    let mut cam_geo = CameraGeometry::from_sub_lon(preset.sub_lon_deg());
+    let mut cam_geo = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
     if let Some((_, basis)) = &persp {
         // ONE camera per frame — the perspective EYE (the engine's perspective
         // contract: FrameContext.cam.camera is the ray origin for the surface and
@@ -5660,10 +6621,13 @@ fn prepare_render(
     } else if ir_mode {
         // Band 13 window OR a WV band (8/9/10) — the SAME thermal march, only the
         // `IrConfig` (wavelength + WV mass-absorption) and the enhancement band differ.
-        let cfg = atmo
-            .render_mode
-            .ir_config()
-            .expect("thermal mode has an IrConfig");
+        let cfg = match atmo.render_mode {
+            RenderMode::Ir => IrConfig::band13_with_sensor(atmo.thermal_sensor),
+            _ => atmo
+                .render_mode
+                .ir_config()
+                .expect("thermal mode has an IrConfig"),
+        };
         status(&format!(
             "Marching {} ({})...",
             atmo.render_mode.thermal_label(),
@@ -5691,8 +6655,13 @@ fn prepare_render(
                 raster.nx,
                 raster.ny,
             )
+        } else if atmo.instrument_footprint != InstrumentFootprint::Off {
+            let (bt, footprint_status) =
+                render_geo_band13_bt_with_footprint(&scene, &cam_geo, raster);
+            status(&footprint_status);
+            bt
         } else {
-            ir::render_ir_bt_frame(&scene, &cam_geo, &raster.scan, &raster.grid_i)
+            ir::render_ir_bt_frame(&scene, &cam_geo, raster)
         };
         let rgba = render_ir_rgba(&bt, ir_band, atmo.ir_enhancement);
         status("Thermal march complete.");
@@ -5724,7 +6693,7 @@ fn prepare_render(
                 },
             )
         } else {
-            let scan_rect = clouds::scan_rect_of(&raster.scan);
+            let scan_rect = raster.model_scan_rect();
             (
                 CloudViewMode::Geostationary,
                 Vec::new(),
@@ -5758,7 +6727,8 @@ fn prepare_render(
                 CloudMultiscatterMode::LegacyOctaves => clouds::DEFAULT_OCTAVES,
                 CloudMultiscatterMode::SingleScatter
                 | CloudMultiscatterMode::DeltaFluxV1
-                | CloudMultiscatterMode::DeltaFluxV2 => 1,
+                | CloudMultiscatterMode::DeltaFluxV2
+                | CloudMultiscatterMode::DeltaFluxV3 => 1,
             },
             edge_feather_cells: clouds::edge_feather_cells_for_margin(margin, nx, ny),
             ..MarchConfig::new(StepQuality::Interactive, pitch)
@@ -5833,6 +6803,7 @@ fn prepare_render(
                 ground_day_lift: atmo.ground_gain,
                 cloud_softclip_knee: atmo.cloud_softclip,
                 cloud_highlight_max: atmo.cloud_highlight_max,
+                synthetic_green: false,
                 atmosphere_correction: atmo.atmosphere_correction,
                 terrain_atmosphere: atmo.terrain_atmosphere,
                 land_appearance: atmo.land_appearance,
@@ -5879,7 +6850,7 @@ fn prepare_render(
                 }
             };
             Some(if is_topdown {
-                topdown::render_topdown_frame_rgba(
+                topdown::render_topdown_frame_rgba_with_cloud_footprint(
                     &surf,
                     Some(&scene),
                     &raster.lat,
@@ -5887,9 +6858,10 @@ fn prepare_render(
                     raster.nx,
                     raster.ny,
                     assemble,
+                    atmo.topdown_cloud_footprint,
                 )
             } else {
-                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, raster, assemble)
             })
         } else {
             None
@@ -5996,8 +6968,26 @@ fn prepare_render(
         } else {
             status("Rendering clear-sky surface (clouds off)...");
         }
-        let fractional_clouds =
-            atmo.clouds_enabled && atmo.fractional_clouds && brick.has_cloud_fraction;
+        let deterministic_fractional = atmo.clouds_enabled
+            && atmo.fractional_clouds
+            && atmo.fractional_cloud_mode.is_deterministic()
+            && brick.has_cloud_fraction;
+        if deterministic_fractional && is_persp {
+            return Err(format!(
+                "{} fractional clouds do not yet support Perspective; use Geostationary/Top-down or Effective OD",
+                atmo.fractional_cloud_mode.slug()
+            ));
+        }
+        if deterministic_fractional && is_topdown && atmo.topdown_stratiform_regularization {
+            return Err(format!(
+                "{} fractional clouds cannot be combined with Top-down stratiform reconstruction; disable one operator for an attributable QA render",
+                atmo.fractional_cloud_mode.slug()
+            ));
+        }
+        let fractional_clouds = atmo.clouds_enabled
+            && atmo.fractional_clouds
+            && atmo.fractional_cloud_mode == FractionalCloudMode::EffectiveOd
+            && brick.has_cloud_fraction;
         let mut vol = if fractional_clouds {
             clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m)
         } else {
@@ -6014,7 +7004,7 @@ fn prepare_render(
                 "Marching clouds (model fraction adjusted {}/{} columns, tau {:.2}x)...",
                 stats.columns_modified, stats.columns_total, ratio
             ));
-        } else if atmo.clouds_enabled && atmo.fractional_clouds {
+        } else if atmo.clouds_enabled && atmo.fractional_clouds && !deterministic_fractional {
             status("Marching clouds (model fraction unavailable; legacy coverage)...");
         }
         if is_topdown && atmo.clouds_enabled && atmo.topdown_stratiform_regularization {
@@ -6045,7 +7035,8 @@ fn prepare_render(
                 CloudMultiscatterMode::LegacyOctaves => clouds::DEFAULT_OCTAVES,
                 CloudMultiscatterMode::SingleScatter
                 | CloudMultiscatterMode::DeltaFluxV1
-                | CloudMultiscatterMode::DeltaFluxV2 => 1,
+                | CloudMultiscatterMode::DeltaFluxV2
+                | CloudMultiscatterMode::DeltaFluxV3 => 1,
             },
             multiscatter_mode: atmo.cloud_multiscatter,
             // The legacy behavior described below remains exact when the new switch is
@@ -6097,6 +7088,7 @@ fn prepare_render(
             ground_day_lift: atmo.ground_gain,
             cloud_softclip_knee: atmo.cloud_softclip,
             cloud_highlight_max: atmo.cloud_highlight_max,
+            synthetic_green: false,
             atmosphere_correction: atmo.atmosphere_correction,
             terrain_atmosphere: atmo.terrain_atmosphere,
             land_appearance: atmo.land_appearance,
@@ -6179,7 +7171,126 @@ fn prepare_render(
         // fan into the same shading (no froxel either — the topdown precedent the engine
         // documents; the surface keeps its full per-ray aerial perspective). Clouds
         // toggled off -> surface only in all three.
-        let rgba = if let Some((_, basis)) = &persp {
+        let rgba = if deterministic_fractional {
+            let froxel = if is_topdown {
+                None
+            } else {
+                let scan_rect = raster.model_scan_rect();
+                Some(atmosphere::build_aerial_froxel(
+                    luts,
+                    &params,
+                    &cam_geo,
+                    sun_ecef,
+                    scan_rect,
+                    atmosphere::AERIAL_FROXEL_DIM,
+                ))
+            };
+            let members = atmo
+                .fractional_cloud_mode
+                .deterministic_subcolumn_count()
+                .expect("deterministic worker branch requires member count");
+            let mut radiance_sum = vec![0.0f64; raster.nx * raster.ny * 3];
+            let mut alpha = vec![0u8; raster.nx * raster.ny];
+            let mut grid_mean_tau = 0.0f64;
+            let mut represented_tau_sum = 0.0f64;
+            for member in 0..members {
+                status(&format!(
+                    "Deterministic fractional clouds: marching member {}/{}...",
+                    member + 1,
+                    members
+                ));
+                let mut member_vol = clouds::DecodedVolume::from_brick(&brick, horiz_pitch_m);
+                let sub =
+                    member_vol.apply_deterministic_fractional_subcolumn_count(member, members)?;
+                if member == 0 {
+                    grid_mean_tau = sub.grid_mean_cloud_tau;
+                }
+                represented_tau_sum += sub.subcolumn_cloud_tau;
+                let member_mip =
+                    clouds::OccupancyMip::build(&member_vol, clouds::OCCUPANCY_MIP_FACTOR);
+                let member_sun_od = clouds::accumulate_sun_od_granulated(
+                    &member_vol,
+                    &georef,
+                    sun_ecef,
+                    SUN_OD_RESOLUTION,
+                    clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+                    granulation,
+                );
+                let member_scene = clouds::CloudScene {
+                    vol: &member_vol,
+                    mip: &member_mip,
+                    sun_od: &member_sun_od,
+                    georef: &georef,
+                    luts,
+                    sky_sh,
+                    sun_ecef,
+                    cfg,
+                };
+                let (member_radiance, member_alpha) = if is_topdown {
+                    topdown::render_topdown_frame_linear_radiance(
+                        &surf,
+                        Some(&member_scene),
+                        &raster.lat,
+                        &raster.lon,
+                        raster.nx,
+                        raster.ny,
+                        assemble,
+                        cfg.topdown_cloud_norm,
+                    )
+                } else {
+                    clouds::render_cloud_frame_linear_radiance(
+                        &member_scene,
+                        &surf,
+                        froxel.as_ref().expect("geo deterministic froxel"),
+                        raster,
+                        assemble,
+                    )
+                };
+                for (sum, value) in radiance_sum.iter_mut().zip(member_radiance) {
+                    *sum += value;
+                }
+                if member == 0 {
+                    alpha = member_alpha;
+                } else {
+                    debug_assert_eq!(alpha, member_alpha);
+                }
+            }
+            let members_f = members as f64;
+            let represented_mean_tau = represented_tau_sum / members_f;
+            status(&format!(
+                "{} complete: ensemble cloud OD ratio {:.4}; averaging linear radiance then one tonemap...",
+                atmo.fractional_cloud_mode.slug(),
+                if grid_mean_tau > 0.0 {
+                    represented_mean_tau / grid_mean_tau
+                } else {
+                    1.0
+                }
+            ));
+            let mut rgba = vec![0u8; raster.nx * raster.ny * 4];
+            for idx in 0..raster.nx * raster.ny {
+                if alpha[idx] == 0 {
+                    continue;
+                }
+                let mut l = [
+                    radiance_sum[idx * 3] / members_f,
+                    radiance_sum[idx * 3 + 1] / members_f,
+                    radiance_sum[idx * 3 + 2] / members_f,
+                ];
+                let pixel = assemble(idx % raster.nx, idx / raster.nx);
+                l = apply_low_sun_illuminant(l, pixel.on_earth, pixel.sun_elev_deg as f64, luts);
+                let display = radiance_to_rgba_softclip(
+                    l,
+                    atmo.output_transform,
+                    atmo.exposure,
+                    cfg.cloud_softclip_knee,
+                    cfg.cloud_highlight_max,
+                );
+                for c in 0..4 {
+                    rgba[idx * 4 + c] = (display[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+            rgba
+        } else if let Some((_, basis)) = &persp {
             let scene_opt = if atmo.clouds_enabled {
                 Some(&scene)
             } else {
@@ -6192,7 +7303,7 @@ fn prepare_render(
             } else {
                 None
             };
-            topdown::render_topdown_frame_rgba(
+            topdown::render_topdown_frame_rgba_with_cloud_footprint(
                 &surf,
                 scene_opt,
                 &raster.lat,
@@ -6200,10 +7311,11 @@ fn prepare_render(
                 raster.nx,
                 raster.ny,
                 assemble,
+                atmo.topdown_cloud_footprint,
             )
         } else {
             render_geo_visible_rgba(atmo.clouds_enabled, &surf, raster, &assemble, |assemble| {
-                let scan_rect = clouds::scan_rect_of(&raster.scan);
+                let scan_rect = raster.model_scan_rect();
                 let froxel = atmosphere::build_aerial_froxel(
                     luts,
                     &params,
@@ -6212,7 +7324,7 @@ fn prepare_render(
                     scan_rect,
                     atmosphere::AERIAL_FROXEL_DIM,
                 );
-                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, &raster.scan, assemble)
+                clouds::render_cloud_frame_rgba(&scene, &surf, &froxel, raster, assemble)
             })
         };
         status("Render complete.");
@@ -6229,7 +7341,7 @@ fn prepare_render(
                 vol: &ir_vol,
                 mip: &mip,
                 georef: &georef,
-                cfg: IrConfig::band13(),
+                cfg: IrConfig::band13_with_sensor(atmo.thermal_sensor),
             };
             let bt = if is_topdown {
                 topdown::render_topdown_ir_bt_frame(
@@ -6240,8 +7352,13 @@ fn prepare_render(
                     raster.nx,
                     raster.ny,
                 )
+            } else if atmo.instrument_footprint != InstrumentFootprint::Off {
+                let (bt, footprint_status) =
+                    render_geo_band13_bt_with_footprint(&ir_scene, &cam_geo, raster);
+                status(&footprint_status);
+                bt
             } else {
-                ir::render_ir_bt_frame(&ir_scene, &cam_geo, &raster.scan, &raster.grid_i)
+                ir::render_ir_bt_frame(&ir_scene, &cam_geo, raster)
             };
             let n = raster.nx * raster.ny;
             let blended = if is_sandwich {
@@ -6265,7 +7382,7 @@ fn prepare_render(
                     .collect();
                 let (_rgb, blended) =
                     geocolor::blend_rgba(&rgba, &ir_rgb, n, |i| lut_light[i * 4 + 3] as f64);
-                status("GeoColor blend complete.");
+                status("SimSat Day/Night Color blend complete.");
                 blended
             };
             (Some(blended), None)
@@ -6316,6 +7433,7 @@ fn prepare_render(
         ir_bt,
         ir_enhancement: atmo.ir_enhancement,
         ir_band,
+        instrument_footprint: atmo.instrument_footprint,
         derived: derived_out,
         render_mode: atmo.render_mode,
         clouds_enabled: atmo.clouds_enabled,
@@ -6351,6 +7469,43 @@ fn build_light_lut(raster: &SurfaceRaster, solar: &SolarFrame) -> Vec<f32> {
     light
 }
 
+/// Studio twin of the public API's instrument stage: march complete Band 13
+/// radiance, apply the spatial response on the exact global ABI lattice, exclude
+/// its crop/invalid-mask perimeter, then invert the FM4 response to BT.
+fn render_geo_band13_bt_with_footprint(
+    scene: &IrScene<'_>,
+    cam_geo: &CameraGeometry,
+    raster: &SurfaceRaster,
+) -> (Vec<f32>, String) {
+    debug_assert_eq!(scene.cfg.band, 13);
+    debug_assert_eq!(scene.cfg.sensor, ThermalSensor::GoesRAbiBand13Fm4);
+    let radiance = ir::render_ir_radiance_frame(scene, cam_geo, raster);
+    let filtered = apply_band13_radiance_footprint_validated(&radiance, raster.nx, raster.ny);
+    let valid = filtered.validation_mask.iter().filter(|&&v| v != 0).count();
+    let (x0, x1, y0, y1) = raster
+        .scan
+        .abi_2km_global_indices()
+        .expect("Studio footprint validation selects exact ABI 2-km navigation");
+    let status = format!(
+        "ABI footprint: global crop x={x0}..{x1}, y={y0}..{y1}, exact 56 urad; \
+         validation support {valid}/{} px ({} finite crop/mask-perimeter px emitted no-data).",
+        raster.nx * raster.ny,
+        filtered.excluded_finite_samples
+    );
+    let bt = filtered
+        .radiance
+        .into_iter()
+        .map(|value| {
+            if value.is_finite() {
+                scene.cfg.brightness_temperature(value) as f32
+            } else {
+                f32::NAN
+            }
+        })
+        .collect();
+    (bt, status)
+}
+
 /// Stable ordinals for the scene-cache keys (see `pipeline::RasterCacheKey`).
 fn resolution_ordinal(r: ResolutionMode) -> u8 {
     match r {
@@ -6375,6 +7530,13 @@ fn sat_ordinal(p: SatellitePreset) -> u8 {
         SatellitePreset::GoesEast => 0,
         SatellitePreset::GoesWest => 1,
         SatellitePreset::Himawari => 2,
+    }
+}
+
+fn geo_navigation_ordinal(navigation: GeoNavigation) -> u8 {
+    match navigation {
+        GeoNavigation::ModelSphere => 0,
+        GeoNavigation::GoesRAbiFixedGrid => 1,
     }
 }
 
@@ -6603,8 +7765,11 @@ fn studio_cloud_multiscatter_mode(
     multiscatter: bool,
     delta_flux_clouds: bool,
     delta_flux_v2_clouds: bool,
+    delta_flux_v3_clouds: bool,
 ) -> CloudMultiscatterMode {
-    if delta_flux_v2_clouds {
+    if delta_flux_v3_clouds {
+        CloudMultiscatterMode::DeltaFluxV3
+    } else if delta_flux_v2_clouds {
         CloudMultiscatterMode::DeltaFluxV2
     } else if delta_flux_clouds {
         CloudMultiscatterMode::DeltaFluxV1
@@ -6629,6 +7794,16 @@ fn gpu_topdown_stratiform_preview_compatible(
     topdown_stratiform_regularization: bool,
 ) -> bool {
     !is_topdown || !topdown_stratiform_regularization
+}
+
+/// The top-down cloud footprint filters the linear-radiance cloud residual before the
+/// display transform. The current GPU preview returns a finished tonemapped frame, so a
+/// top-down request with this control enabled must remain on CPU.
+fn gpu_topdown_cloud_footprint_preview_compatible(
+    is_topdown: bool,
+    topdown_cloud_footprint: bool,
+) -> bool {
+    !is_topdown || !topdown_cloud_footprint
 }
 
 /// The current WGSL preview accepts only the legacy margin-derived feather width;
@@ -6890,6 +8065,7 @@ mod tests {
             ground_day_lift: GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: RHO_HIGHLIGHT_MAX,
+            synthetic_green: false,
             atmosphere_correction: true,
             terrain_atmosphere: false,
             land_appearance: LandAppearanceConfig::identity(),
@@ -6898,6 +8074,9 @@ mod tests {
 
     fn incompatible_gpu_preview_atmo() -> AtmoSettings {
         AtmoSettings {
+            render_intent: RenderIntent::Display,
+            geo_navigation: GeoNavigation::ModelSphere,
+            intent_adjustments: Vec::new(),
             view_mode: StudioView::TopDownMap,
             orbit: pipeline::OrbitParams {
                 az_deg: 180.0,
@@ -6910,6 +8089,8 @@ mod tests {
             margin_frac: 0.25,
             render_mode: RenderMode::Ir,
             ir_enhancement: IrEnhancement::default(),
+            thermal_sensor: ThermalSensor::GoesRAbiBand13Fm4,
+            instrument_footprint: InstrumentFootprint::Off,
             aod: 0.05,
             rh_swelling: true,
             atmosphere_correction: true,
@@ -6918,12 +8099,16 @@ mod tests {
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: false,
             fractional_clouds: true,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic4,
             cloud_multiscatter: CloudMultiscatterMode::DeltaFluxV1,
             cloud_optical_depth_scale: 0.15,
+            storage_profile: StorageProfile::CompactU8,
+            cloud_optics: CloudOpticsMode::Fixed,
             feather_exposed_domain_edges: true,
             beer_powder: false,
             granulation: true,
             topdown_stratiform_regularization: true,
+            topdown_cloud_footprint: true,
             step_quality: StepQuality::Offline,
             gpu_clouds: false,
             parity: true,
@@ -6940,6 +8125,109 @@ mod tests {
     }
 
     #[test]
+    fn studio_sensor_fast_gray_uses_temporary_strict_controls_and_keeps_fractional_clouds() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        atmo.render_intent = RenderIntent::SensorFastGray;
+        let original_fractional = atmo.fractional_clouds;
+        configure_render_intent(&mut atmo);
+
+        assert_eq!(atmo.cloud_optical_depth_scale, 1.0);
+        assert_eq!(atmo.exposure, 1.0);
+        assert_eq!(atmo.ground_gain, 1.0);
+        assert_eq!(atmo.land_appearance, LandAppearanceConfig::identity());
+        assert!(!atmo.feather_exposed_domain_edges);
+        assert!(!atmo.granulation);
+        assert!(!atmo.topdown_stratiform_regularization);
+        assert!(!atmo.topdown_cloud_footprint);
+        assert!(!atmo.atmosphere_correction);
+        assert_eq!(atmo.cloud_softclip, 1.0);
+        assert_eq!(atmo.cloud_highlight_max, 1.0);
+        assert_eq!(atmo.fractional_clouds, original_fractional);
+        assert!(
+            atmo.intent_adjustments
+                .contains(&RenderIntentAdjustment::CloudOpticalDepthUnscaled)
+        );
+        assert!(
+            atmo.intent_adjustments
+                .contains(&RenderIntentAdjustment::HighlightShoulderIdentity)
+        );
+        assert_eq!(
+            atmo.render_intent.observation_operator(),
+            "simsat-fast-gray-v1"
+        );
+    }
+
+    #[test]
+    fn studio_abi_footprint_guard_requires_the_exact_sensor_geometry() {
+        let mut atmo = incompatible_gpu_preview_atmo();
+        atmo.instrument_footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+        let err = validate_studio_instrument_footprint(
+            &atmo,
+            SatellitePreset::GoesEast,
+            ResolutionMode::Abi2km,
+        )
+        .unwrap_err();
+        assert!(err.contains("GOES-R exact navigation"), "{err}");
+
+        atmo.view_mode = StudioView::Geostationary;
+        atmo.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+        validate_studio_instrument_footprint(
+            &atmo,
+            SatellitePreset::GoesEast,
+            ResolutionMode::Abi2km,
+        )
+        .unwrap();
+        assert!(
+            validate_studio_instrument_footprint(
+                &atmo,
+                SatellitePreset::Himawari,
+                ResolutionMode::Abi2km,
+            )
+            .is_err()
+        );
+
+        atmo.instrument_footprint = InstrumentFootprint::Off;
+        atmo.render_mode = RenderMode::Visible;
+        validate_studio_instrument_footprint(
+            &atmo,
+            SatellitePreset::Himawari,
+            ResolutionMode::Native,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn incompatible_product_switch_clears_hidden_abi_footprint() {
+        for mode in [
+            RenderMode::Visible,
+            RenderMode::WaterVapor(WvBand::Upper),
+            RenderMode::Derived(DerivedField::CloudOpticalDepth),
+        ] {
+            let mut footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+            assert_eq!(
+                clear_incompatible_instrument_footprint(mode, &mut footprint),
+                Some(InstrumentFootprint::GoesRAbiBand13Mtf),
+                "{mode:?}"
+            );
+            assert_eq!(footprint, InstrumentFootprint::Off, "{mode:?}");
+        }
+
+        for mode in [RenderMode::Ir, RenderMode::GeoColor, RenderMode::Sandwich] {
+            let mut footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+            assert_eq!(
+                clear_incompatible_instrument_footprint(mode, &mut footprint),
+                None,
+                "{mode:?}"
+            );
+            assert_eq!(
+                footprint,
+                InstrumentFootprint::GoesRAbiBand13Mtf,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn one_click_gpu_render_selects_compatible_preview_without_touching_calibration() {
         let mut atmo = incompatible_gpu_preview_atmo();
         let original_exposure = atmo.exposure;
@@ -6952,8 +8240,10 @@ mod tests {
         assert!(atmo.clouds_enabled);
         assert!(!atmo.terrain_atmosphere);
         assert!(!atmo.fractional_clouds);
+        assert_eq!(atmo.fractional_cloud_mode, FractionalCloudMode::Off);
         assert!(!atmo.granulation);
         assert!(!atmo.topdown_stratiform_regularization);
+        assert!(!atmo.topdown_cloud_footprint);
         assert!(!atmo.feather_exposed_domain_edges);
         assert_eq!(
             atmo.cloud_multiscatter,
@@ -6973,6 +8263,7 @@ mod tests {
         assert!(changes.summary().contains("legacy full-cell coverage"));
         assert!(changes.summary().contains("Legacy octaves"));
         assert!(changes.summary().contains("stratiform reconstruction"));
+        assert!(changes.summary().contains("cloud footprint"));
     }
 
     #[test]
@@ -6990,6 +8281,37 @@ mod tests {
         );
         assert_ne!(changes.0 & GpuPreviewAdjustments::LEGACY_CLOUD_TRANSPORT, 0);
         assert!(changes.summary().contains("Legacy octaves"));
+    }
+
+    #[test]
+    fn one_click_gpu_render_temporarily_disables_abi_footprint_and_exact_navigation() {
+        let mut persistent = incompatible_gpu_preview_atmo();
+        persistent.render_mode = RenderMode::Ir;
+        persistent.view_mode = StudioView::Geostationary;
+        persistent.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+        persistent.instrument_footprint = InstrumentFootprint::GoesRAbiBand13Mtf;
+        let mut preview = persistent.clone();
+
+        let changes = configure_one_click_gpu_preview(&mut preview);
+
+        assert_eq!(persistent.geo_navigation, GeoNavigation::GoesRAbiFixedGrid);
+        assert_eq!(
+            persistent.instrument_footprint,
+            InstrumentFootprint::GoesRAbiBand13Mtf
+        );
+        assert_eq!(preview.render_mode, RenderMode::Visible);
+        assert_eq!(preview.geo_navigation, GeoNavigation::ModelSphere);
+        assert_eq!(preview.instrument_footprint, InstrumentFootprint::Off);
+        assert_ne!(
+            changes.0 & GpuPreviewAdjustments::INSTRUMENT_FOOTPRINT_OFF,
+            0
+        );
+        assert_ne!(
+            changes.0 & GpuPreviewAdjustments::MODEL_SPHERE_NAVIGATION,
+            0
+        );
+        assert!(changes.summary().contains("instrument footprint -> Off"));
+        assert!(changes.summary().contains("model sphere"));
     }
 
     #[test]
@@ -7034,6 +8356,8 @@ mod tests {
             lon: vec![-75.2; 2],
             grid_i: vec![0.0; 2],
             grid_j: vec![0.0; 2],
+            model_scan: None,
+            navigation_geometry: None,
         };
         let assemble = |px: usize, _py: usize| SurfacePixel {
             on_earth: true,
@@ -7086,26 +8410,31 @@ mod tests {
     #[test]
     fn studio_cloud_transport_matches_rust_cli_and_python_dispatch() {
         assert_eq!(
-            studio_cloud_multiscatter_mode(true, false, false),
+            studio_cloud_multiscatter_mode(true, false, false, false),
             CloudMultiscatterMode::LegacyOctaves
         );
         assert_eq!(
-            studio_cloud_multiscatter_mode(false, false, false),
+            studio_cloud_multiscatter_mode(false, false, false, false),
             CloudMultiscatterMode::SingleScatter
         );
         assert_eq!(
-            studio_cloud_multiscatter_mode(true, true, false),
+            studio_cloud_multiscatter_mode(true, true, false, false),
             CloudMultiscatterMode::DeltaFluxV1,
             "the explicit experimental selection overrides the legacy boolean"
         );
         assert_eq!(
-            studio_cloud_multiscatter_mode(false, true, false),
+            studio_cloud_multiscatter_mode(false, true, false, false),
             CloudMultiscatterMode::DeltaFluxV1
         );
         assert_eq!(
-            studio_cloud_multiscatter_mode(true, true, true),
+            studio_cloud_multiscatter_mode(true, true, true, false),
             CloudMultiscatterMode::DeltaFluxV2,
             "the explicitly selected v2 reconstruction has highest precedence"
+        );
+        assert_eq!(
+            studio_cloud_multiscatter_mode(true, true, true, true),
+            CloudMultiscatterMode::DeltaFluxV3,
+            "the explicitly selected v3 reconstruction has highest precedence"
         );
     }
 
@@ -7121,6 +8450,14 @@ mod tests {
         assert!(gpu_topdown_stratiform_preview_compatible(false, true));
         assert!(gpu_topdown_stratiform_preview_compatible(true, false));
         assert!(!gpu_topdown_stratiform_preview_compatible(true, true));
+    }
+
+    #[test]
+    fn gpu_preview_never_silently_drops_topdown_cloud_footprint() {
+        assert!(gpu_topdown_cloud_footprint_preview_compatible(false, false));
+        assert!(gpu_topdown_cloud_footprint_preview_compatible(false, true));
+        assert!(gpu_topdown_cloud_footprint_preview_compatible(true, false));
+        assert!(!gpu_topdown_cloud_footprint_preview_compatible(true, true));
     }
 
     #[test]
@@ -7355,6 +8692,26 @@ mod tests {
         assert_eq!(MAX_VIEW_ZOOM, 16.0);
     }
 
+    #[test]
+    fn expanded_settings_are_bounded_on_reviewed_window_sizes() {
+        assert_eq!(settings_scroll_max_height(500.0), 160.0);
+        assert!((settings_scroll_max_height(650.0) - 182.0).abs() < f32::EPSILON);
+        assert!((settings_scroll_max_height(860.0) - 240.8).abs() < 1e-3);
+        assert_eq!(settings_scroll_max_height(1200.0), 250.0);
+    }
+
+    #[test]
+    fn responsive_toolbar_fits_the_900_and_1360_pixel_rc_widths_without_scrolling() {
+        // Content width after the ordinary panel margins in the two RC smoke-test windows.
+        let compact = toolbar_layout(884.0);
+        assert_eq!(compact.mode_width, 112.0);
+        assert!(compact.estimated_selector_width() <= 884.0);
+
+        let regular = toolbar_layout(1344.0);
+        assert_eq!(regular.mode_width, 190.0);
+        assert!(regular.estimated_selector_width() <= 1344.0);
+    }
+
     /// The studio-side light-LUT twin (used on a geo-LUT cache hit) must stay
     /// BIT-EXACT with the light half of `gpu::build_luts` — the divergence guard
     /// for the WS4 scene cache. Space (NaN) pixels stay zeroed in both.
@@ -7377,6 +8734,8 @@ mod tests {
             lon: vec![-97.0, -96.5, f32::NAN, -95.75, -100.0, -98.25],
             grid_i: vec![0.5; 6],
             grid_j: vec![0.5; 6],
+            model_scan: None,
+            navigation_geometry: None,
         };
         let solar = SolarFrame::new(2025, 6, 21, 2.25);
         let (_geo, engine_light) = gpu::build_luts(&raster, None, 4, 4, &solar);

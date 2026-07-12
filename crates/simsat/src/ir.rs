@@ -17,8 +17,10 @@
 //! 10.3 um absorption of each hydrometeor class recovered from the brick's stored
 //! VISIBLE extinction (`optics::ir_absorption_from_ext`) plus a weak water-vapor
 //! continuum from the qvapor column (`optics::ir_wv_continuum_absorption`); the
-//! voxel emits `B(T_voxel, 10.3 um)` (`optics::planck_radiance`) weighted by that
-//! absorption. The march runs FRONT-TO-BACK (space -> down) with a running
+//! voxel emits the configured thermal source radiance weighted by that absorption:
+//! either the historical `B(T_voxel, 10.3 um)` center sample or the opt-in official
+//! ABI FM4 Band 13 SRF integration (`thermal_sensor`). The march runs FRONT-TO-BACK
+//! (space -> down) with a running
 //! transmittance; after the volume the surface term `emissivity * B(TSK)` is added
 //! through the remaining transmittance. The accumulated band radiance is inverted
 //! to a brightness temperature (`optics::inverse_planck`). An optically thick
@@ -37,15 +39,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 
 use crate::atmosphere::{CameraGeometry, R_GROUND_M};
-use crate::bricks::{VolumeBrick, decode_temperature_kelvin};
-use crate::camera::ScanGrid;
+use crate::bricks::{StorageProfile, VolumeBrick, decode_log2_f16, decode_temperature_kelvin};
+use crate::camera::SurfaceRaster;
 use crate::clouds::{OccupancyMip, ecef_to_brick, ray_shell_segment};
 use crate::frame::GridGeoref;
+#[cfg(test)]
+use crate::optics::planck_radiance;
 use crate::optics::{
     HydrometeorClass, IR_BAND13_WAVELENGTH_M, IR_SURFACE_EMISSIVITY,
-    IR_WV_CONTINUUM_MASS_ABS_M2_KG, inverse_planck, ir_absorption_from_ext, planck_radiance,
-    wv_absorption,
+    IR_WV_CONTINUUM_MASS_ABS_M2_KG, inverse_planck, ir_absorption_from_ext, wv_absorption,
 };
+use crate::thermal_sensor::ThermalSensor;
 
 /// ABI band number for the 10.3 um clean longwave window (the design's band 13).
 pub const IR_BAND: u8 = 13;
@@ -74,8 +78,9 @@ fn madd3(a: [f64; 3], b: [f64; 3], s: f64) -> [f64; 3] {
 
 // ── decoded IR volume ─────────────────────────────────────────────────────────
 
-/// A brick decoded for the IR emission march: the three VISIBLE extinction classes
-/// (from which the 10.3 um absorption is recovered per class), the absolute
+/// A brick decoded for the IR emission march: the three additive VISIBLE extinction
+/// classes plus the snow-only auxiliary subset (from which the 10.3 um absorption
+/// is recovered per physical class), the absolute
 /// temperature field (Kelvin), the water-vapor mixing ratio (for the continuum),
 /// and the 2-D skin-temperature plane (the surface emission source). Index
 /// `(k*ny + j)*nx + i` for the 3-D fields, `j*nx + i` for `tsk`.
@@ -95,6 +100,10 @@ pub struct IrVolume {
     pub ext_ice: Vec<f32>,
     /// Large-particle (QRAIN+QGRAUP+QSNOW) visible extinction (m^-1).
     pub ext_precip: Vec<f32>,
+    /// QSNOW-only auxiliary subset of `ext_precip` (m^-1). This is not additive;
+    /// it lets IR apply snow's unresolved-small-ice correction only to snow while
+    /// rain/graupel retain their geometric large-particle absorption.
+    pub ext_snow: Vec<f32>,
     /// Absolute temperature (K), decoded from the f16-Celsius Texture B.
     pub temperature_k: Vec<f32>,
     /// Water-vapor mixing ratio (kg kg^-1).
@@ -109,6 +118,7 @@ pub struct IrSample {
     pub ext_liquid: f64,
     pub ext_ice: f64,
     pub ext_precip: f64,
+    pub ext_snow: f64,
     pub temperature_k: f64,
     pub qvapor: f64,
 }
@@ -142,9 +152,14 @@ impl IrVolume {
         let ql = brick.quant.get("ext_liquid");
         let qi = brick.quant.get("ext_ice");
         let qp = brick.quant.get("ext_precip");
+        let qs = brick.quant.get("ext_snow");
         let qv = brick.quant.get("qvapor");
         let (nx, ny, nz) = (brick.nx, brick.ny, brick.nz);
         let temperature_k = decode_temperature_kelvin(&brick.temperature_f16);
+        let science = (brick.storage_profile == StorageProfile::ScienceCloudF16)
+            .then_some(brick.science_cloud_f16.as_ref())
+            .flatten();
+        let decode_science = |values: &[u16]| values.iter().map(|&v| decode_log2_f16(v)).collect();
 
         let mut qvapor: Vec<f32> = brick.qvapor.iter().map(|&c| qv.decode(c)).collect();
         if brick.hgt.len() == nx * ny {
@@ -186,9 +201,22 @@ impl IrVolume {
             z_min_m: brick.z_min_m,
             dz_m: brick.dz_m,
             horiz_pitch_m,
-            ext_liquid: brick.ext_liquid.iter().map(|&c| ql.decode(c)).collect(),
-            ext_ice: brick.ext_ice.iter().map(|&c| qi.decode(c)).collect(),
-            ext_precip: brick.ext_precip.iter().map(|&c| qp.decode(c)).collect(),
+            ext_liquid: science.map_or_else(
+                || brick.ext_liquid.iter().map(|&c| ql.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_liquid),
+            ),
+            ext_ice: science.map_or_else(
+                || brick.ext_ice.iter().map(|&c| qi.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_ice),
+            ),
+            ext_precip: science.map_or_else(
+                || brick.ext_precip.iter().map(|&c| qp.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_precip),
+            ),
+            ext_snow: science.map_or_else(
+                || brick.ext_snow.iter().map(|&c| qs.decode(c)).collect(),
+                |payload| decode_science(&payload.ext_snow),
+            ),
             temperature_k,
             qvapor,
             tsk,
@@ -200,18 +228,18 @@ impl IrVolume {
         (k * self.ny + j) * self.nx + i
     }
 
-    /// Trilinearly sample at fractional grid coords, EDGE-CLAMPING each axis to
-    /// `[0, n-1]`. Edge-clamp (rather than zero-outside like the cloud march) keeps
-    /// the temperature field physical everywhere along the slant ray — a 0 K sample
-    /// would emit no radiance and corrupt the BT. The domain edge is normally clear
-    /// (near-zero extinction), so clamping the extinction there is benign; a limb
-    /// ray that grazes just outside the horizontal domain reads the domain edge (a
-    /// documented approximation, tiny for the near-nadir geostationary-over-domain
-    /// geometry).
+    /// Trilinearly sample at fractional grid coords with a split outside-domain
+    /// policy. Temperature and moisture use the nearest edge profile so an oblique
+    /// ray never encounters an unphysical 0 K atmosphere. Hydrometeor extinction is
+    /// zero outside the horizontal model domain: clamping it would laterally extend
+    /// an edge cloud along a slant ray. The vertical coordinate remains edge-clamped
+    /// to the decoded atmospheric column.
     pub fn sample(&self, fi: f64, fj: f64, fk: f64) -> IrSample {
         if !(fi.is_finite() && fj.is_finite() && fk.is_finite()) {
             return IrSample::default();
         }
+        let outside_horizontal =
+            fi < 0.0 || fi > (self.nx - 1) as f64 || fj < 0.0 || fj > (self.ny - 1) as f64;
         let fi = fi.clamp(0.0, (self.nx - 1) as f64);
         let fj = fj.clamp(0.0, (self.ny - 1) as f64);
         let fk = fk.clamp(0.0, (self.nz - 1) as f64);
@@ -235,22 +263,43 @@ impl IrVolume {
             c0 * (1.0 - tk) + c1 * tk
         };
         IrSample {
-            ext_liquid: trilerp(&self.ext_liquid),
-            ext_ice: trilerp(&self.ext_ice),
-            ext_precip: trilerp(&self.ext_precip),
+            ext_liquid: if outside_horizontal {
+                0.0
+            } else {
+                trilerp(&self.ext_liquid)
+            },
+            ext_ice: if outside_horizontal {
+                0.0
+            } else {
+                trilerp(&self.ext_ice)
+            },
+            ext_precip: if outside_horizontal {
+                0.0
+            } else {
+                trilerp(&self.ext_precip)
+            },
+            ext_snow: if outside_horizontal {
+                0.0
+            } else {
+                trilerp(&self.ext_snow)
+            },
             temperature_k: trilerp(&self.temperature_k),
             qvapor: trilerp(&self.qvapor),
         }
     }
 
     /// Bilinearly sample the 2-D skin-temperature plane (K) at fractional `(fi, fj)`,
-    /// edge-clamped. Returns `NaN` if the coords are non-finite.
+    /// returning `NaN` when the point is non-finite or outside the horizontal model
+    /// domain. A ray outside the WRF surface has no model surface-emission term.
     pub fn sample_tsk(&self, fi: f64, fj: f64) -> f64 {
-        if !(fi.is_finite() && fj.is_finite()) {
+        if !(fi.is_finite() && fj.is_finite())
+            || fi < 0.0
+            || fi > (self.nx - 1) as f64
+            || fj < 0.0
+            || fj > (self.ny - 1) as f64
+        {
             return f64::NAN;
         }
-        let fi = fi.clamp(0.0, (self.nx - 1) as f64);
-        let fj = fj.clamp(0.0, (self.ny - 1) as f64);
         let i0 = fi.floor() as usize;
         let j0 = fj.floor() as usize;
         let i1 = (i0 + 1).min(self.nx - 1);
@@ -263,23 +312,23 @@ impl IrVolume {
         a * (1.0 - tj) + b * tj
     }
 
-    /// The 10.3 um cloud absorption coefficient (m^-1) of a sample: the sum over the
-    /// three channels of `optics::ir_absorption_from_ext`. Ice carries QICE only
-    /// (small-ice mass absorption). Precip carries QRAIN+QGRAUP+QSNOW; ONE
-    /// per-channel recovery can carry the mix because every large-particle species
-    /// shares the size-independent geometric ratio `beta_abs/beta_vis = Q_abs/Q_ext
-    /// ~ 0.467` (SSB v3 snow-optics fix), and the channel uses the SNOW class — its
-    /// cold-relevant species — which folds in the documented unresolved-size-
-    /// spectrum factor (`optics::IR_SNOW_SMALL_ICE_FACTOR`). For the rain/graupel
-    /// share that factor over-absorbs ~2x, which is BT-invisible where rain lives
-    /// (low and warm, T ~ T_sfc: what it absorbs it re-emits at nearly the same
-    /// temperature); where the channel is COLD-relevant (anvils, canopies, shields)
-    /// it is snow.
+    /// The 10.3 um cloud absorption coefficient (m^-1) of a sample. Ice carries
+    /// QICE only. SSB's snow-only auxiliary subset lets snow receive its documented
+    /// unresolved-small-ice correction while the remaining rain/graupel share uses
+    /// the geometric large-particle coefficient. This removes the former ~2x
+    /// over-absorption of non-snow precipitation without changing the brick format.
     #[inline]
     pub fn cloud_ir_absorption(&self, s: &IrSample) -> f64 {
+        // `ext_snow` is an auxiliary subset of total `ext_precip`, not another
+        // additive phase. Clamp the subset so independent u8 quantization and
+        // trilinear interpolation cannot create negative non-snow extinction.
+        let precip = s.ext_precip.max(0.0);
+        let snow = s.ext_snow.clamp(0.0, precip);
+        let rain_graupel = precip - snow;
         ir_absorption_from_ext(HydrometeorClass::CloudLiquid, s.ext_liquid)
             + ir_absorption_from_ext(HydrometeorClass::Ice, s.ext_ice)
-            + ir_absorption_from_ext(HydrometeorClass::Snow, s.ext_precip)
+            + ir_absorption_from_ext(HydrometeorClass::Snow, snow)
+            + ir_absorption_from_ext(HydrometeorClass::Rain, rain_graupel)
     }
 
     /// Top-of-brick ECEF radius (m).
@@ -308,8 +357,12 @@ impl IrVolume {
 pub struct IrConfig {
     /// ABI band number recorded in the output (13).
     pub band: u8,
-    /// Band centre wavelength (m) for the Planck / inverse-Planck.
+    /// Band centre wavelength (m), used by the fast-gray Planck/inverse-Planck
+    /// path and retained as band metadata for an SRF response.
     pub wavelength_m: f64,
+    /// Spectral source/response model. [`ThermalSensor::FastGray`] preserves the
+    /// historical centre-wavelength path; the ABI Band 13 SRF is opt-in.
+    pub sensor: ThermalSensor,
     /// Longwave surface emissivity for the `epsilon * B(TSK)` surface term.
     pub surface_emissivity: f64,
     /// Coarse-step multiplier of the voxel pitch through cloud-free space (the mip
@@ -336,9 +389,15 @@ pub struct IrConfig {
 impl IrConfig {
     /// Defaults for a band-13 IR frame at a given voxel pitch.
     pub fn band13() -> Self {
+        Self::band13_with_sensor(ThermalSensor::FastGray)
+    }
+
+    /// Band-13 defaults with an explicit spectral response model.
+    pub fn band13_with_sensor(sensor: ThermalSensor) -> Self {
         Self {
             band: IR_BAND,
             wavelength_m: IR_BAND13_WAVELENGTH_M,
+            sensor,
             surface_emissivity: IR_SURFACE_EMISSIVITY,
             coarse_mult: 4.0,
             fine_mult: 0.5,
@@ -347,6 +406,20 @@ impl IrConfig {
             wv_mass_abs_m2_kg: IR_WV_CONTINUUM_MASS_ABS_M2_KG,
             transmittance_floor: 1.0e-4,
         }
+    }
+
+    /// Planck source radiance in the selected response model's native units.
+    #[inline]
+    pub fn source_radiance(self, temperature_k: f64) -> f64 {
+        self.sensor
+            .source_radiance(temperature_k, self.wavelength_m)
+    }
+
+    /// Invert accumulated radiance through the selected response model.
+    #[inline]
+    pub fn brightness_temperature(self, radiance: f64) -> f64 {
+        self.sensor
+            .brightness_temperature(radiance, self.wavelength_m)
     }
 }
 
@@ -369,7 +442,8 @@ pub struct IrScene<'a> {
 /// The result of one IR view-ray march.
 #[derive(Debug, Clone, Copy)]
 pub struct IrMarch {
-    /// Accumulated upwelling 10.3 um band radiance at the satellite (W m^-3 sr^-1).
+    /// Accumulated upwelling band radiance in [`IrConfig::sensor`]'s native units
+    /// (fast gray: W m^-3 sr^-1; ABI SRF: mW m^-2 sr^-1 (cm^-1)^-1).
     pub radiance: f64,
     /// Transmittance from space down to the surface (1 = clear, ~0 = opaque cloud).
     pub surface_transmittance: f64,
@@ -382,6 +456,12 @@ impl IrMarch {
     #[inline]
     pub fn brightness_temperature(&self, wavelength_m: f64) -> f64 {
         inverse_planck(self.radiance, wavelength_m)
+    }
+
+    /// Brightness temperature through an explicit centre/SRF response model.
+    #[inline]
+    pub fn brightness_temperature_for(&self, cfg: IrConfig) -> f64 {
+        cfg.brightness_temperature(self.radiance)
     }
 }
 
@@ -429,7 +509,7 @@ pub fn march_ir(scene: &IrScene, cam: [f64; 3], view: [f64; 3]) -> Option<IrMarc
         }
         if beta > 0.0 {
             let step_t = (-beta * ds).exp();
-            let b = planck_radiance(s.temperature_k, cfg.wavelength_m);
+            let b = cfg.source_radiance(s.temperature_k);
             radiance += trans * b * (1.0 - step_t);
             trans *= step_t;
         }
@@ -446,7 +526,7 @@ pub fn march_ir(scene: &IrScene, cam: [f64; 3], view: [f64; 3]) -> Option<IrMarc
     if (rg - vol.r_bottom()).abs() < vol.dz_m {
         let tsk = vol.sample_tsk(gi, gj);
         if tsk.is_finite() && tsk > 0.0 {
-            radiance += trans * cfg.surface_emissivity * planck_radiance(tsk, cfg.wavelength_m);
+            radiance += trans * cfg.surface_emissivity * cfg.source_radiance(tsk);
             hit_surface = true;
         }
     }
@@ -461,7 +541,7 @@ pub fn march_ir(scene: &IrScene, cam: [f64; 3], view: [f64; 3]) -> Option<IrMarc
 /// The brightness temperature (K) of one view ray, or `None` if the ray misses the
 /// brick shell.
 pub fn march_ir_bt(scene: &IrScene, cam: [f64; 3], view: [f64; 3]) -> Option<f64> {
-    march_ir(scene, cam, view).map(|m| m.brightness_temperature(scene.cfg.wavelength_m))
+    march_ir(scene, cam, view).map(|m| m.brightness_temperature_for(scene.cfg))
 }
 
 /// Render a full IR brightness-temperature plane (Kelvin) for a scan raster: for
@@ -475,23 +555,53 @@ pub fn march_ir_bt(scene: &IrScene, cam: [f64; 3], view: [f64; 3]) -> Option<f64
 pub fn render_ir_bt_frame(
     scene: &IrScene,
     cam: &CameraGeometry,
-    scan: &ScanGrid,
-    grid_i: &[f32],
+    raster: &SurfaceRaster,
 ) -> Vec<f32> {
-    let (nx, ny) = (scan.nx, scan.ny);
+    let (nx, ny) = (raster.nx, raster.ny);
     let rows: Vec<Vec<f32>> = (0..ny)
         .into_par_iter()
         .map(|py| {
             let mut row = vec![f32::NAN; nx];
             for (px, out) in row.iter_mut().enumerate() {
                 let idx = py * nx + px;
-                if !grid_i[idx].is_finite() {
+                if !raster.grid_i[idx].is_finite() {
                     continue; // off-earth or outside the WRF domain -> no IR data
                 }
-                let (sx, sy) = scan.scan_angle(px, py);
+                let (sx, sy) = raster.model_scan_angle(px, py);
                 let view = cam.view_dir(sx, sy);
                 if let Some(bt) = march_ir_bt(scene, cam.camera, view) {
                     *out = bt as f32;
+                }
+            }
+            row
+        })
+        .collect();
+    rows.into_iter().flatten().collect()
+}
+
+/// Render the un-inverted band-radiance plane for an instrument spatial-response
+/// stage.  This is intentionally separate from [`render_ir_bt_frame`] so the default
+/// path remains byte-for-byte unchanged.  A channel footprint must mix linear band
+/// radiance, never brightness temperature or an enhanced display image.
+pub fn render_ir_radiance_frame(
+    scene: &IrScene,
+    cam: &CameraGeometry,
+    raster: &SurfaceRaster,
+) -> Vec<f64> {
+    let (nx, ny) = (raster.nx, raster.ny);
+    let rows: Vec<Vec<f64>> = (0..ny)
+        .into_par_iter()
+        .map(|py| {
+            let mut row = vec![f64::NAN; nx];
+            for (px, out) in row.iter_mut().enumerate() {
+                let idx = py * nx + px;
+                if !raster.grid_i[idx].is_finite() {
+                    continue;
+                }
+                let (sx, sy) = raster.model_scan_angle(px, py);
+                let view = cam.view_dir(sx, sy);
+                if let Some(march) = march_ir(scene, cam.camera, view) {
+                    *out = march.radiance;
                 }
             }
             row
@@ -605,6 +715,7 @@ mod tests {
             ext_liquid,
             ext_ice,
             ext_precip,
+            ext_snow: vec![0.0; n],
             temperature_k,
             qvapor,
             tsk: vec![tsk_k; nx * ny],
@@ -628,12 +739,72 @@ mod tests {
                 vmin: 0.0,
                 vmax: 0.0,
             },
+            science_ext_snow: Vec::new(),
             ext_precip: vol.ext_precip.clone(),
             tau_up: vec![0.0; vol.ext_liquid.len()],
             cloud_fraction: vec![255; vol.ext_liquid.len()],
             has_cloud_fraction: false,
         };
         OccupancyMip::build(&dv, OCCUPANCY_MIP_FACTOR)
+    }
+
+    #[test]
+    fn outside_domain_uses_background_air_but_never_extends_cloud_or_surface() {
+        let vol = build_ir_volume(3, 3, 3, 500.0, 3000.0, 301.0, |i, j, k| {
+            (
+                0.01 + i as f64 * 0.001,
+                0.02 + j as f64 * 0.001,
+                0.03 + k as f64 * 0.001,
+                280.0 + i as f64 + 2.0 * j as f64 - 5.0 * k as f64,
+                0.001 + i as f64 * 0.0001 + j as f64 * 0.0002,
+            )
+        });
+
+        let edge_air = vol.sample(0.0, 1.25, 0.75);
+        let outside = vol.sample(-0.01, 1.25, 0.75);
+        assert_eq!(outside.ext_liquid, 0.0);
+        assert_eq!(outside.ext_ice, 0.0);
+        assert_eq!(outside.ext_precip, 0.0);
+        assert_eq!(outside.ext_snow, 0.0);
+        assert_eq!(outside.temperature_k, edge_air.temperature_k);
+        assert_eq!(outside.qvapor, edge_air.qvapor);
+
+        assert_eq!(vol.sample_tsk(1.25, 0.5), 301.0);
+        assert!(vol.sample_tsk(-0.01, 0.5).is_nan());
+        assert!(vol.sample_tsk(0.5, 2.01).is_nan());
+    }
+
+    #[test]
+    fn snow_auxiliary_subset_selects_the_correct_precip_absorption() {
+        let vol = build_ir_volume(1, 1, 1, 500.0, 3000.0, 290.0, |_, _, _| {
+            (0.0, 0.0, 0.0, 280.0, 0.0)
+        });
+        let total = 2.0e-2;
+        let all_rain = IrSample {
+            ext_precip: total,
+            ext_snow: 0.0,
+            ..IrSample::default()
+        };
+        let all_snow = IrSample {
+            ext_precip: total,
+            ext_snow: total,
+            ..IrSample::default()
+        };
+        let quant_roundoff = IrSample {
+            ext_precip: total,
+            ext_snow: total * 1.01,
+            ..IrSample::default()
+        };
+
+        let expected_rain = ir_absorption_from_ext(HydrometeorClass::Rain, total);
+        let expected_snow = ir_absorption_from_ext(HydrometeorClass::Snow, total);
+        assert!((vol.cloud_ir_absorption(&all_rain) - expected_rain).abs() < 1.0e-15);
+        assert!((vol.cloud_ir_absorption(&all_snow) - expected_snow).abs() < 1.0e-15);
+        assert!(expected_snow > expected_rain);
+        assert_eq!(
+            vol.cloud_ir_absorption(&quant_roundoff),
+            vol.cloud_ir_absorption(&all_snow)
+        );
     }
 
     /// The nadir view ray from a geostationary camera to the domain centre ground.
@@ -1166,6 +1337,8 @@ mod tests {
         map.insert("tau_up".to_string(), zero);
         map.insert("qvapor".to_string(), qv);
         VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,

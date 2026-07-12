@@ -13,7 +13,9 @@
 //!
 //!   input=<path>        REQUIRED. A wrfout file (ingested if not cached) OR a run.json.
 //!   out=<file.png>      REQUIRED. Output PNG path (RGB8, row 0 = north).
+//!   bt-out=<path.bin>   OPTIONAL audit dump: north-first unletterboxed f32le Kelvin plane.
 //!   sat=<preset>        goes-east | goes-west | himawari    (default goes-east)
+//!   geo-navigation=<mode> model-sphere | goes-r-abi (default model-sphere)
 //!   timestep=<n>        time index (default 0).
 //!   resolution=<mode>   native | abi1km | abi2km            (default native)
 //!                       native = one output pixel per source grid cell. ABI 1/2 km are
@@ -33,15 +35,19 @@
 //! On completion it prints a one-line `IRSUMMARY ...` with dims, on-earth fraction, the
 //! coldest cloud-top BT, the warmest ground BT, the median BT, and the wall time.
 
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use image::RgbImage;
 use simsat::api::{self, BlueMarble, FrameData, Product, RenderParams};
-use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
+use simsat::bricks::StorageProfile;
+use simsat::camera::{GeoNavigation, ResolutionMode, SatellitePreset, ViewMode};
 use simsat::derived::{self, DerivedField};
+use simsat::instrument_footprint::InstrumentFootprint;
 use simsat::ir::ir_frame_stats;
 use simsat::ir_enhance::IrEnhancement;
+use simsat::thermal_sensor::ThermalSensor;
 use simsat::topdown;
 use simsat::wv::WvBand;
 
@@ -56,8 +62,12 @@ fn main() {
 
 struct Opts {
     input: PathBuf,
+    storage_profile: StorageProfile,
     out: PathBuf,
+    /// Optional audit dump of the raw, unletterboxed brightness-temperature plane.
+    bt_out: Option<PathBuf>,
     sat: SatellitePreset,
+    geo_navigation: GeoNavigation,
     timestep: usize,
     resolution: ResolutionMode,
     /// Zoom-out / domain margin as a FRACTION added on each side (0.0 = edge-to-edge). The
@@ -75,6 +85,10 @@ struct Opts {
     /// `Some(field)` renders a DERIVED scalar-field map (precipitable water / cloud-top temp /
     /// cloud optical depth) instead of a brightness-temperature band. Takes precedence over wv.
     derived: Option<DerivedField>,
+    /// Spectral response for the Band 13 window product.
+    sensor: ThermalSensor,
+    /// Complete-radiance ABI Band 13 angular-grid footprint (default off).
+    instrument_footprint: InstrumentFootprint,
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -93,11 +107,15 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(|f| f.label().to_string())
         .unwrap_or_else(|| band_label.clone());
     eprintln!(
-        "render_ir: input={} product={} view={} sat={} ts={} res={} enhancement={} canvas={} threads={}",
+        "render_ir: input={} product={} sensor={} instrument-footprint={} storage-profile={} view={} sat={} geo-navigation={} ts={} res={} enhancement={} canvas={} threads={}",
         opts.input.display(),
         product_label,
+        opts.sensor.slug(),
+        opts.instrument_footprint.slug(),
+        opts.storage_profile.slug(),
         opts.view.slug(),
         opts.sat.slug(),
+        opts.geo_navigation.slug(),
         opts.timestep,
         opts.resolution.label(),
         opts.enhancement.slug(),
@@ -116,13 +134,17 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let params = RenderParams {
         input: opts.input.clone(),
+        storage_profile: opts.storage_profile,
         satellite: opts.sat,
+        geo_navigation: opts.geo_navigation,
         timestep: opts.timestep,
         view: opts.view,
         resolution: opts.resolution,
         margin_frac: opts.margin as f32,
         cache: opts.cache.clone(),
         ir_enhancement: Some(opts.enhancement),
+        thermal_sensor: opts.sensor,
+        instrument_footprint: opts.instrument_footprint,
         // A derived field asks the api to also produce the basic studio colormap RGB (the
         // harness writes a coloured PNG). Ignored by the IR/WV products.
         derived_colormap: opts.derived.is_some(),
@@ -139,6 +161,16 @@ fn run(args: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     let result = api::render(&params, product)?;
     let wall = t0.elapsed();
+    let abi_lattice_crop = result
+        .raster
+        .scan
+        .abi_2km_global_indices()
+        .map(|(x0, x1, y0, y1)| format!("x{x0}:{x1},y{y0}:{y1}"))
+        .unwrap_or_else(|| "none".to_string());
+
+    for warning in &result.science_warnings {
+        eprintln!("render_ir: SCIENCE WARNING: {warning}");
+    }
 
     // A DERIVED scalar-field map (precipitable water / cloud-top temp / cloud optical depth):
     // write the basic colormap PNG + a DERIVEDSUMMARY of the raw field. The RAW array is the
@@ -219,6 +251,16 @@ fn run(args: &[String]) -> Result<(), String> {
         wall.as_secs_f64(),
     );
 
+    if let Some(path) = &opts.bt_out {
+        write_f32le(path, bt)?;
+        eprintln!(
+            "render_ir: wrote north-first {}x{} f32le Kelvin audit plane {}",
+            rnx,
+            rny,
+            path.display()
+        );
+    }
+
     // Optional canvas letterbox to a fixed figure size.
     let (final_nx, final_ny, final_rgb) = match opts.canvas {
         Some((cw, ch)) => (cw, ch, topdown::letterbox_rgb(rgb, rnx, rny, cw, ch)),
@@ -231,11 +273,15 @@ fn run(args: &[String]) -> Result<(), String> {
     let on_earth_frac = stats.finite as f64 / (rnx * rny).max(1) as f64;
     eprintln!("render_ir: wrote {}", opts.out.display());
     println!(
-        "IRSUMMARY file={} band={} view={} dims={}x{} canvas={} res={}{} sat={} enhancement={} \
+        "IRSUMMARY file={} band={} sensor={} response={} instrument_footprint={} abi_lattice_crop={} view={} dims={}x{} canvas={} res={}{} sat={} enhancement={} \
          on_earth_frac={:.3} cold_top_bt={:.1} warm_ground_bt={:.1} median_bt={:.1} \
          all_finite={} tsk_fallback={} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         band,
+        opts.sensor.slug(),
+        opts.sensor.metadata().response.replace(' ', "_"),
+        result.instrument_footprint.slug(),
+        abi_lattice_crop,
         opts.view.slug(),
         final_nx,
         final_ny,
@@ -272,10 +318,31 @@ fn write_rgb8_png(path: &Path, nx: usize, ny: usize, rgb: &[u8]) -> Result<(), S
         .map_err(|e| format!("write PNG {}: {e}", path.display()))
 }
 
+/// Write a north-first scalar f32le plane without changing NaN no-data values.
+///
+/// This is deliberately an audit-only CLI dump, not a display setting. It is written
+/// before any optional canvas letterbox so its layout remains exactly `ny * nx`.
+fn write_f32le(path: &Path, values: &[f32]) -> Result<(), String> {
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("create f32le BT dump {}: {e}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for value in values {
+        writer
+            .write_all(&value.to_le_bytes())
+            .map_err(|e| format!("write f32le BT dump {}: {e}", path.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush f32le BT dump {}: {e}", path.display()))
+}
+
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut input: Option<PathBuf> = None;
+    let mut storage_profile = StorageProfile::CompactU8;
     let mut out: Option<PathBuf> = None;
+    let mut bt_out: Option<PathBuf> = None;
     let mut sat = SatellitePreset::GoesEast;
+    let mut geo_navigation = GeoNavigation::ModelSphere;
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
     let mut margin = 0.0f64;
@@ -286,6 +353,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut threads: Option<usize> = None;
     let mut wv: Option<WvBand> = None;
     let mut derived: Option<DerivedField> = None;
+    let mut sensor = ThermalSensor::FastGray;
+    let mut instrument_footprint = InstrumentFootprint::Off;
     let mut enhancement_explicit = false;
 
     for a in args {
@@ -295,7 +364,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         match k {
             "input" | "wrfout" | "in" => input = Some(PathBuf::from(v)),
             "out" | "output" | "png" => out = Some(PathBuf::from(v)),
+            "bt-out" | "bt_out" | "btout" => bt_out = Some(PathBuf::from(v)),
             "sat" | "satellite" => sat = parse_sat(v)?,
+            "geo-navigation" | "geo_navigation" | "navigation" => {
+                geo_navigation = parse_geo_navigation(v)?
+            }
             "timestep" | "ts" => timestep = v.parse().map_err(|_| format!("bad timestep '{v}'"))?,
             "resolution" | "res" => resolution = parse_resolution(v)?,
             "margin" | "zoom-out" | "zoomout" => {
@@ -316,6 +389,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 enhancement_explicit = true;
             }
             "cache" => cache = PathBuf::from(v),
+            "storage-profile" | "storage_profile" | "brick-storage" => {
+                storage_profile = StorageProfile::parse(v).ok_or_else(|| {
+                    format!("bad storage-profile '{v}' (expected compact-u8|science-cloud-f16)")
+                })?;
+            }
             "view" => view = parse_view(v)?,
             "canvas" | "figure" | "size" => canvas = Some(parse_canvas(v)?),
             "threads" | "rayon-threads" | "num-threads" => {
@@ -332,6 +410,15 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                         .ok_or_else(|| format!("bad derived field '{v}' (pw|ctt|cod)"))?,
                 )
             }
+            "sensor" | "response" | "spectral-response" => {
+                sensor = ThermalSensor::parse(v)
+                    .ok_or_else(|| format!("bad sensor '{v}' (fast-gray|goes-r-abi-band13-fm4)"))?
+            }
+            "instrument-footprint" | "instrument_footprint" | "channel-footprint" => {
+                instrument_footprint = InstrumentFootprint::parse(v).ok_or_else(|| {
+                    format!("bad instrument-footprint '{v}' (off|goes-r-abi-band13-mtf-prototype)")
+                })?
+            }
             other => return Err(format!("unknown key '{other}'")),
         }
     }
@@ -340,10 +427,22 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     if wv.is_some() && !enhancement_explicit {
         enhancement = IrEnhancement::Cimss;
     }
+    if sensor != ThermalSensor::FastGray && (wv.is_some() || derived.is_some()) {
+        return Err("sensor=goes-r-abi-band13-fm4 applies only to the Band 13 window product (omit wv=/derived=)".to_string());
+    }
+    if bt_out.is_some() && derived.is_some() {
+        return Err(
+            "bt-out= applies only to thermal IR/WV brightness-temperature products (omit derived=)"
+                .to_string(),
+        );
+    }
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
+        storage_profile,
         out: out.ok_or("missing required out=<file.png>")?,
+        bt_out,
         sat,
+        geo_navigation,
         timestep,
         resolution,
         margin,
@@ -354,6 +453,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         threads,
         wv,
         derived,
+        sensor,
+        instrument_footprint,
     })
 }
 
@@ -362,6 +463,16 @@ fn parse_view(v: &str) -> Result<ViewMode, String> {
         "geo" | "geostationary" | "fromspace" | "space" => Ok(ViewMode::Geostationary),
         "topdown" | "top" | "map" | "topdownmap" | "nadir" => Ok(ViewMode::TopDownMap),
         _ => Err(format!("unknown view '{v}' (geo|topdown)")),
+    }
+}
+
+fn parse_geo_navigation(v: &str) -> Result<GeoNavigation, String> {
+    match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "model-sphere" | "sphere" | "model" | "default" => Ok(GeoNavigation::ModelSphere),
+        "goes-r-abi" | "goes-r" | "abi" | "ellipsoid" => Ok(GeoNavigation::GoesRAbiFixedGrid),
+        _ => Err(format!(
+            "unknown geo-navigation '{v}' (expected model-sphere|goes-r-abi)"
+        )),
     }
 }
 
@@ -410,6 +521,8 @@ fn print_usage() {
          KEYS:\n\
          \x20 input=<path>        wrfout (ingest-if-needed) or a cached run.json  [required]\n\
          \x20 out=<file.png>      output PNG (RGB8, row 0 = north)                [required]\n\
+         \x20 bt-out=<file.bin>   audit dump: north-first unletterboxed f32le Kelvin plane\n\
+         \x20 storage-profile=<mode> compact-u8 | science-cloud-f16 (default compact-u8)\n\
          \x20 sat=<preset>        goes-east | goes-west | himawari   (default goes-east)\n\
          \x20 timestep=<n>        time index (default 0)\n\
          \x20 resolution=<mode>   native | abi1km | abi2km           (default native)\n\
@@ -417,6 +530,8 @@ fn print_usage() {
          \x20                     upsample coarse or downsample fine model grids\n\
          \x20 margin=<frac>       zoom-out margin fraction on each side (default 0.0; thermal margin = no-data)\n\
          \x20 enhancement=<name>  cimss|bd|avn|funktop|rainbow|gray  (default gray; cimss for WV)\n\
+         \x20 sensor=<response>   fast-gray (default) | goes-r-abi-band13-fm4 (official NOAA SRF)\n\
+         \x20 instrument-footprint=<mode> off (default) | goes-r-abi-band13-mtf-prototype; exact global 56-urad lattice (requires FM4 + GOES-R exact nav + geo ABI2km)\n\
          \x20 wv=<band>           6.2|6.9|7.3  render a water-vapor band (else band 13)\n\
          \x20 derived=<field>     pw|ctt|cod  render a derived scalar-field map (mm/K/tau)\n\
          \x20 cache=<dir>         brick cache root (default: studio cache dir)\n\
@@ -424,4 +539,24 @@ fn print_usage() {
          \x20 canvas=<WxH>        letterbox into a fixed figure size, black pad (e.g. 1100x850)\n\
          \x20 threads=<N>         rayon thread cap (else honor RAYON_NUM_THREADS)\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_profile_defaults_compact_and_parses_science() {
+        let base = vec!["input=input".to_string(), "out=out.png".to_string()];
+        assert_eq!(
+            parse_opts(&base).unwrap().storage_profile,
+            StorageProfile::CompactU8
+        );
+        let mut science = base;
+        science.push("storage-profile=science-cloud-f16".to_string());
+        assert_eq!(
+            parse_opts(&science).unwrap().storage_profile,
+            StorageProfile::ScienceCloudF16
+        );
+    }
 }

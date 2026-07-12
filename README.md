@@ -19,7 +19,7 @@ supercell case and Hurricane Michael), thumbnailed for the README.
 |---|---|
 | ![True-color visible](docs/images/visible_geo.png) **True-color visible** — from-space geostationary view, volumetric clouds with cloud shadows | ![Hurricane + margin](docs/images/visible_hurricane.png) **Hurricane Michael** — with the zoom-out margin: the WRF domain framed by the real surrounding earth |
 | ![Top-down map view](docs/images/visible_topdown.png) **Top-down map view** — north-up, registered to the WRF domain's own map projection | ![IR band 13](docs/images/ir_band13.png) **Infrared band 13 (10.3 um)** — true-Kelvin brightness temperature, Rainbow enhancement; works day and night |
-| ![Water vapor](docs/images/wv_62.png) **Water vapor 6.2 um (band 8)** — upper-level moisture, classic WV palette | ![GeoColor](docs/images/geocolor.png) **GeoColor** — true-color day, IR night, blended across the real terminator (shown here at sunset) |
+| ![Water vapor](docs/images/wv_62.png) **Water vapor 6.2 um (band 8)** — upper-level moisture, classic WV palette | ![GeoColor Style](docs/images/geocolor.png) **GeoColor Style / SimSat Day-Night Color** — broad-RGB day, IR night, blended across the real terminator (shown here at sunset) |
 | ![Sandwich](docs/images/sandwich.png) **Sandwich** — visible texture with color-enhanced cold cloud tops (severe-convection view) | ![Precipitable water](docs/images/derived_pw.png) **Derived fields** — precipitable water, cloud-top temperature, cloud optical depth as raw map-registered arrays |
 
 ## Products
@@ -34,8 +34,9 @@ supercell case and Hurricane Michael), thumbnailed for the README.
   temperature; enhancements: Grayscale, BD, Rainbow, CIMSS, AVN, Funktop.
 - **Water vapor 6.2 / 6.9 / 7.3 um (bands 8/9/10)** — the same thermal march
   with water vapor as the dominant emitter; upper/mid/lower-level moisture.
-- **GeoColor** — day/night composite: true-color by day, IR by night, crossfaded
-  per pixel across the terminator.
+- **GeoColor Style / SimSat Day-Night Color** — broad-RGB visible by day, IR by night,
+  crossfaded per pixel across the terminator. This is not yet sensor-derived ABI GeoColor;
+  the established `geocolor` CLI/Python token remains supported.
 - **Sandwich** — color-enhanced IR overlaid on the visible base over cold cloud
   tops (a daytime severe-convection product).
 - **Derived fields** — precipitable water (mm), cloud-top temperature (K), and
@@ -51,6 +52,45 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
 
+New in v0.1.7 development: **explicit render intent and provenance**. `Display`
+is the unchanged default and preserves the reviewed SimSat look. `Sensor Fast
+Gray` (`simsat-fast-gray-v1`) uses unscaled cloud extinction and neutralizes
+display-only exposure, land, haze-correction, edge-feather, granulation,
+stratiform-reconstruction, highlight, and synthetic-green shaping on a cloned
+request. Every automatic adjustment is reported, and model fractional clouds
+remain enabled. This is intentionally named *Fast Gray*: it is not yet an
+instrument-SRF-integrated ABI/AHI channel, science-brick profile, or PSF/MTF
+simulation. See [the render-intent note](docs/v017-render-intent.md).
+The same development line also adds official GOES-R ABI ellipsoid/fixed-grid
+navigation, an official GOES-19 Band-13 spectral-response option, exact-grid
+visible and raw-Kelvin GOES validators, deterministic fractional-subcolumn and
+directional-transport references, and opt-in native-moment cloud optics where
+the source microphysics supplies enough information. These science paths are
+explicitly labeled and do not silently replace the reviewed Display defaults.
+
+New in v0.1.8 development: Studio adds three transparent one-click setting
+presets: **Recommended Display**, **High Quality Visible**, and **Sensor QA**.
+Each shows its exact current before/after diff, saves immediately, and leaves all
+individual controls available. Invalid product/camera/satellite combinations are
+refused instead of silently converted. CLI and Python equivalents remain explicit
+to avoid duplicating Studio-only policy; see
+[the recommended-settings contract](docs/v018-recommended-presets.md).
+
+New in the v0.1.9 local RC: visible surface lighting now stays physically useful
+through low sun instead of switching important land controls on only after the
+scene is already well into daylight. Land normalization, dark-toe recovery,
+ground lift, and water-albedo assistance share a 0--12 degree surface-help ramp;
+direct water sunlight is no longer artificially day-gated. The reviewed display
+path uses a `0.45` diffuse cloud-shadow floor, while standalone cloud layers stay
+neutral at night so they cannot black out a host basemap. Finite-sun cloud-shadow
+softening now uses the Sun's angular radius rather than its diameter. CPU and GPU
+implementations are covered by parity/regression locks. The selected behavior
+passed a seven-anchor lighting review plus an 11-image sweep over ten distinct
+WRF/HRRR runs (Hurricane Michael was checked in both geostationary and top-down
+views). This is a targeted lighting correction: it does not add another global
+gamma transform or change the reviewed visible defaults of exposure `1.5`,
+aerosol optical depth `0.05`, and cloud-OD scale `0.15`.
+
 New in v0.1.6: **faster GPU preview and improved top-down rendering**. Studio has
 a one-click GPU Render action, while Rust, the CLI, and Python expose the same
 `gpu-preview` backend with every temporary compatibility adjustment reported.
@@ -58,7 +98,8 @@ Top-down renders now honor Model native, ABI 1 km, and ABI 2 km resolution, and
 preserve the physical aspect ratio when capped. An opt-in, default-off
 stratiform reconstruction control can reduce source-grid cloud rings in affected
 HRRR fields without changing geostationary or raw-band output. Optional bounded
-delta-flux cloud-transport experiments are also available across the interfaces.
+delta-flux cloud-transport experiments (including the opt-in successive-order
+angular-memory candidate) are also available across the interfaces.
 
 New in v0.1.5: **brighter terrain and natural finite-domain cloud edges**.
 The visible preset raises exposure while retaining highlight control, adds
@@ -79,11 +120,12 @@ full-cell fallback.
 The current visible preset uses cloud-OD scale `0.15`, exposure `1.5`, neutral ground lift `1.0`,
 highlight knee `0.65`, and highlight ceiling `1.25`. The OD value is the owner's
 cross-file visual selection, superseding the earlier tied `0.20`/`0.30` midpoint
-candidate. It is not a claimed physical optimum; every value remains overridable. Raw visible bands, thermal
-products, and derived cloud optical depth do not consume these display controls.
-The SSB format is v5, so source-backed v0.1.3/v4 caches re-ingest once to acquire
-the corrected cloud-fraction semantics; a cached-only run needs its original
-source file to upgrade.
+candidate. It is not a claimed physical optimum; every value remains overridable. Raw RGB
+reflectance, thermal products, and derived cloud optical depth do not consume these display
+controls. The High Quality Visible preset retains this baseline except for its selected
+deterministic-4 cloud geometry and `0.45` cloud-highlight knee. The SSB format is v6, so older source-backed caches rebuild once. That rebuild
+preserves the available HRRR/RRFS `SNMR` snow identity instead of discarding it after the
+total-precipitation merge; a cached-only run still needs its original source file to upgrade.
 
 New in v0.1.3: **atmosphere and cloud fidelity controls** — terrain-height
 atmospheric columns, consistent daytime aerial-veil correction across the
@@ -116,17 +158,30 @@ Two named binaries render without a GPU or GUI (`cargo build --release --bins`):
 
 ```
 simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
-    sat=goes-east view=geo aod=0.05 rh-swelling=off \
+    intent=display sat=goes-east view=geo aod=0.05 rh-swelling=off \
     atmosphere-correction=on terrain-atmosphere=on fractional-clouds=on cloud-od-scale=0.15 \
     multiscatter=on beer-powder=off granulation=off feather-exposed-domain-edges=on clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
-    enhancement=rainbow
+    bt-out=ir-band13-kelvin.bin enhancement=rainbow sensor=goes-r-abi-band13-fm4
 ```
 
-`simsat-render-frame` renders the visible/GeoColor/Sandwich composites;
+`simsat-render-frame` renders visible, GeoColor Style/SimSat Day-Night Color, and Sandwich;
 `simsat-render-ir` renders IR, water vapor (`wv=6.2|6.9|7.3`), and the derived
 fields (`derived=pw|ctt|cod`). Both take `key=value` arguments (run with
 `--help` for the full list) and print a machine-readable `SUMMARY` line.
+Use `intent=display|sensor-fast-gray`; `mode=` remains an alias for `view=`.
+Sensor Fast Gray currently requires the CPU backend because the bounded GPU
+preview would disable model fractional-cloud handling and restore display
+highlights, violating the strict operator.
+
+Band 13 defaults to the existing `sensor=fast-gray` center-wavelength response.
+The opt-in `sensor=goes-r-abi-band13-fm4` response integrates Planck emission
+through NOAA's official FM4/GOES-19 ABI channel-13 SRF and uses the same response
+for BT inversion. Cloud/gas absorption remains gray and is explicitly warned in
+CLI/API/Python/Studio metadata.
+The CLI-only `bt-out=<file.bin>` audit option writes the raw, unletterboxed
+north-first scalar brightness-temperature plane as little-endian float32 Kelvin;
+NaN denotes no data. It is intentionally not a Studio display option.
 Visible renders expose the same atmosphere/cloud QA controls as Studio and Python:
 numeric aerosol AOD (`0` disables aerosol), RH swelling, reduced-versus-full
 aerial airlight, terrain-height atmosphere, model fractional clouds, multiscatter,
@@ -138,7 +193,13 @@ calibration, not a claimed physical optimum. Finished RGB products also expose
 `exposure=`, `ground-gain=`, `cloud-softclip=`, and `cloud-highlight-max=`;
 omitting them keeps the shipped `1.5` exposure, neutral `1.0` ground gain, `0.65`
 highlight knee, and `1.25` highlight ceiling.
-`fractional-clouds=off` restores legacy horizontally-full cloudy cells. The scale
+`fractional-clouds=off` restores legacy horizontally-full cloudy cells; `on` remains
+the alias for the unchanged `effective-od` default. The opt-in
+`fractional-clouds=deterministic-4`, `deterministic-8`, and `deterministic-16` CPU
+references march the selected number of fixed-stratified shared-u maximum-overlap
+subcolumns and average linear radiance before one tonemap. These are deterministic
+convergence references, not full max-random/Sobol McICA; cost grows with member count.
+The scale
 is an explicit sensitivity control and does not alter the raw derived cloud-optical-
 depth product; beer-powder and granulation remain opt-in/off by default. Owner-selected
 v0.1.5 edge feathering defaults on. `feather-exposed-domain-edges=on` reuses the fixed 4% cloud-edge
@@ -180,6 +241,7 @@ rgb, geo = simsat.render_visible_rgb(
     land_sza_normalization=True,   # owner-selected v0.1.5 display default
     land_dark_toe=True,            # independently switchable; both false = legacy identity
     fractional_clouds=True,
+    fractional_cloud_mode="effective-od",  # or deterministic-4/-8/-16 CPU QA reference
     cloud_optical_depth_scale=0.15,
     beer_powder=False,
     granulation=False,
@@ -190,10 +252,11 @@ ax.imshow(rgb, extent=geo.extent, origin="upper")
 ```
 
 See [crates/simsat_py/README.md](crates/simsat_py/README.md) for the full API
-(`render_visible_rgb`, `render_visible_bands`, `render_ir`,
+(`render_visible_rgb`, `render_rgb_reflectance`, `render_ir`,
 `render_water_vapor`, `render_geocolor`, `render_sandwich`,
 `render_precipitable_water`, `render_cloud_top_temp`,
-`render_cloud_optical_depth`) and wheel-building instructions.
+`render_cloud_optical_depth`) and wheel-building instructions. The deprecated
+`render_visible_bands` alias remains available and returns exactly the same array.
 
 The experimental `topdown_stratiform_regularization` switch is off by default. It is
 a bounded, optical-depth-conserving observation-operator approximation for coarse-grid
@@ -202,13 +265,47 @@ cannot recover unresolved cloud/clear structure. Geostationary and raw-band prod
 ignore it; Studio falls back to CPU if a GPU preview cannot consume the reconstructed
 field exactly.
 
+## Exact-grid GOES validation
+
+`scripts/fetch-goes-abi-reference.py --align` is the single fetch/navigation path for
+official ABI references. After rendering the same north-first target grid, the focused
+validator compares either a finished PNG or `render_frame rgb-reflectance-out=...` f32le RGB
+dump (`bands-out=` remains a deprecated compatibility alias):
+
+```powershell
+python scripts/simsat-validate-goes.py `
+  --synthetic simsat-rho.bin `
+  --reference abi-reference-aligned.npz `
+  --output-dir goes-validation
+```
+
+Band 13 uses the same exact grid and the raw `render_ir bt-out=...` plane:
+
+```powershell
+python scripts/simsat-validate-goes.py `
+  --product abi-band13 `
+  --synthetic ir-band13-kelvin.bin `
+  --reference abi-reference-aligned.npz `
+  --output-dir goes-band13-validation
+```
+
+The output includes observed/synthetic/difference images, a joint histogram, explicit
+ABI clear/land/cloud-temperature masks, JSON bias/MAE/RMSE/quantiles/correlation,
+multi-scale brightness FSS, spatial-spectrum summaries, and input/source hashes. These
+are collocation diagnostics, not forecast pixel-match or observation-operator skill.
+For Band 13, the fixed 180--320 K cold-white enhancement, signed ±40 K difference,
+cold-event area/contingency/FSS at 260/235/220/205 K, and NumPy-only connected-object
+centroid summaries are documented in the JSON. The command requires NumPy and Pillow;
+`--self-check` exercises visible PNG/RGB and Band 13 scalar layouts without network access.
+
 ## Honest limitations
 
 Clouds and weather exist only inside your WRF domain — the zoom-out margin shows
 the real surrounding earth under a clear sky, not extrapolated weather. The
 earth is spherical (R = 6370 km, WRF's own geometry): the standard is physical
-plausibility, not pixel-level registration against real ABI imagery. GeoColor's
-night side is the IR composite only — no city-lights layer yet. The IR and
+plausibility, not pixel-level registration against real ABI imagery. SimSat Day/Night
+Color is GeoColor-style rather than sensor-derived ABI GeoColor, and its night side is
+the IR composite only — no city-lights layer yet. The IR and
 water-vapor bands use gray band-averaged absorption coefficients (documented in
 the code) rather than line-by-line radiative transfer. The shipping render path
 is CPU (rayon-parallel; a native-resolution 800x800 composite renders in about a

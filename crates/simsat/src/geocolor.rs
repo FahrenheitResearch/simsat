@@ -1,6 +1,8 @@
-//! GeoColor day/night blend (the GOES flagship product): true-color visible by day,
-//! colored infrared by night, crossfaded across the terminator by the PER-PIXEL solar
-//! elevation.
+//! SimSat Day/Night Color: a GeoColor-style blend with true-color visible by day, colored
+//! infrared by night, crossfaded across the terminator by per-pixel solar elevation.
+//!
+//! This is not yet sensor-derived ABI GeoColor. The day side uses SimSat's broad-RGB
+//! visible operator, and the night side uses the configured Band 13 response.
 //!
 //! This module holds the pure, node-testable blend math + the documented thresholds. The
 //! render orchestration (rendering the visible frame and the IR frame through the SAME

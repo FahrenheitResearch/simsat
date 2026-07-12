@@ -36,8 +36,7 @@
 //!    of the decoded extinction is used instead, matching the PW integration style and giving
 //!    a clean analytic test.) Clear -> 0; a thick storm core -> tens+.
 
-use crate::bricks::VolumeBrick;
-use crate::bricks::decode_temperature_kelvin;
+use crate::bricks::{StorageProfile, VolumeBrick, decode_log2_f16, decode_temperature_kelvin};
 use crate::ir_enhance::{IrEnhancement, bt_to_rgba};
 use crate::optics::standard_air_density_kg_m3;
 
@@ -190,6 +189,9 @@ pub fn cloud_top_temp_field(brick: &VolumeBrick) -> Vec<f32> {
     let qp = brick.quant.get("ext_precip");
     let dz = brick.dz_m;
     let temp_k = decode_temperature_kelvin(&brick.temperature_f16);
+    let science = (brick.storage_profile == StorageProfile::ScienceCloudF16)
+        .then_some(brick.science_cloud_f16.as_ref())
+        .flatten();
     let mut out = vec![f32::NAN; nx * ny];
     for j in 0..ny {
         for i in 0..nx {
@@ -197,9 +199,18 @@ pub fn cloud_top_temp_field(brick: &VolumeBrick) -> Vec<f32> {
             // Top (k = nz-1) down to the surface (k = 0).
             for k in (0..nz).rev() {
                 let c = cell3(nx, ny, i, j, k);
-                let ext = ql.decode(brick.ext_liquid[c]) as f64
-                    + qi.decode(brick.ext_ice[c]) as f64
-                    + qp.decode(brick.ext_precip[c]) as f64;
+                let ext = science.map_or_else(
+                    || {
+                        ql.decode(brick.ext_liquid[c]) as f64
+                            + qi.decode(brick.ext_ice[c]) as f64
+                            + qp.decode(brick.ext_precip[c]) as f64
+                    },
+                    |payload| {
+                        decode_log2_f16(payload.ext_liquid[c]) as f64
+                            + decode_log2_f16(payload.ext_ice[c]) as f64
+                            + decode_log2_f16(payload.ext_precip[c]) as f64
+                    },
+                );
                 let layer_od = ext.max(0.0) * dz;
                 if cum + layer_od >= CLOUD_TOP_TAU {
                     out[j * nx + i] = temp_k[c];
@@ -221,15 +232,27 @@ pub fn cloud_optical_depth_field(brick: &VolumeBrick) -> Vec<f32> {
     let qi = brick.quant.get("ext_ice");
     let qp = brick.quant.get("ext_precip");
     let dz = brick.dz_m;
+    let science = (brick.storage_profile == StorageProfile::ScienceCloudF16)
+        .then_some(brick.science_cloud_f16.as_ref())
+        .flatten();
     let mut out = vec![0.0f32; nx * ny];
     for j in 0..ny {
         for i in 0..nx {
             let mut tau = 0.0f64;
             for k in 0..nz {
                 let c = cell3(nx, ny, i, j, k);
-                let ext = ql.decode(brick.ext_liquid[c]) as f64
-                    + qi.decode(brick.ext_ice[c]) as f64
-                    + qp.decode(brick.ext_precip[c]) as f64;
+                let ext = science.map_or_else(
+                    || {
+                        ql.decode(brick.ext_liquid[c]) as f64
+                            + qi.decode(brick.ext_ice[c]) as f64
+                            + qp.decode(brick.ext_precip[c]) as f64
+                    },
+                    |payload| {
+                        decode_log2_f16(payload.ext_liquid[c]) as f64
+                            + decode_log2_f16(payload.ext_ice[c]) as f64
+                            + decode_log2_f16(payload.ext_precip[c]) as f64
+                    },
+                );
                 tau += ext.max(0.0) * dz;
             }
             out[j * nx + i] = tau as f32;
@@ -442,6 +465,8 @@ mod tests {
         );
         map.insert("qvapor".to_string(), qv);
         VolumeBrick {
+            storage_profile: crate::bricks::StorageProfile::CompactU8,
+            science_cloud_f16: None,
             nx,
             ny,
             nz,

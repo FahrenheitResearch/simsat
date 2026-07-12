@@ -216,16 +216,7 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 sun_ecef,
                 cfg,
             };
-            cloud_frame_stats(
-                &scene,
-                &cam_geo,
-                &raster.lat,
-                &raster.lon,
-                &raster.grid_i,
-                &raster.scan,
-                stride,
-                0.98,
-            )
+            cloud_frame_stats(&scene, &cam_geo, &raster, stride, 0.98)
         };
 
         // Single scatter (octaves=1) == the fix2 baseline; multi-scatter (default N).
@@ -355,6 +346,7 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 ground_day_lift: simsat::render::GROUND_DAY_LIFT,
                 cloud_softclip_knee: simsat::render::CLOUD_SOFTCLIP_KNEE,
                 cloud_highlight_max: simsat::render::RHO_HIGHLIGHT_MAX,
+                synthetic_green: false,
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
                 land_appearance: simsat::render::LandAppearanceConfig::identity(),
@@ -375,7 +367,7 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 }
             };
             let t0 = std::time::Instant::now();
-            let rgba = render_cloud_frame_rgba(&scene_off, &surf, &froxel, &native.scan, assemble);
+            let rgba = render_cloud_frame_rgba(&scene_off, &surf, &froxel, &native, assemble);
             let wall = t0.elapsed();
             println!(
                 "NATIVE RENDER: raster={}x{} ({} px, WRF grid {}x{}) Offline(384) parallel \

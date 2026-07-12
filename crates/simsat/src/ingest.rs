@@ -25,11 +25,12 @@ use wrf_core::WrfFile;
 
 use crate::bricks::{
     self, ChannelQuant, ManifestAnchor, ManifestProjection, ManifestTimestep, RunManifest,
-    VolumeBrick,
+    ScienceCloudF16Payload, StorageProfile, VolumeBrick,
 };
 use crate::frame::{FrameError, GridGeoref, WrfProjectionParams, wrf_center_anchor};
 use crate::optics::{self, HydrometeorClass};
 use crate::platform;
+use crate::precision_audit::{PrecisionAuditCapture, PrecisionAuditConfig};
 
 /// Default uniform vertical spacing of the brick axis (m).
 pub const DEFAULT_DZ_M: f64 = 250.0;
@@ -65,6 +66,11 @@ pub struct IngestConfig {
     pub dz_m: f64,
     pub z_min_m: f64,
     pub nz_brick: usize,
+    /// Hydrometeor mass-to-extinction mapping. Fixed is the stable default; the
+    /// native mode is explicitly limited to WRF NSSL MP18 moment fields.
+    pub cloud_optics: optics::CloudOpticsMode,
+    /// On-disk extinction precision. CompactU8 is the shipping default.
+    pub storage_profile: StorageProfile,
 }
 
 impl IngestConfig {
@@ -77,7 +83,37 @@ impl IngestConfig {
             dz_m: DEFAULT_DZ_M,
             z_min_m: DEFAULT_Z_MIN_M,
             nz_brick: DEFAULT_NZ_BRICK,
+            cloud_optics: optics::CloudOpticsMode::Fixed,
+            storage_profile: StorageProfile::CompactU8,
         }
+    }
+}
+
+/// Keep experimental ingest-time optical states out of the stable fixed-optics cache.
+/// The version suffix is intentional: changing moment equations later cannot silently
+/// reuse a brick produced by an older experiment.
+pub fn cloud_optics_cache_dir(cache_dir: &Path, mode: optics::CloudOpticsMode) -> PathBuf {
+    match mode {
+        optics::CloudOpticsMode::Fixed => cache_dir.to_path_buf(),
+        optics::CloudOpticsMode::NsslNative => cache_dir.join("cloud-optics-nssl-native-v1"),
+        optics::CloudOpticsMode::HrrrThompsonNative => {
+            cache_dir.join("cloud-optics-hrrr-thompson-native-v1")
+        }
+    }
+}
+
+/// Complete cache identity for an ingest. CompactU8 preserves the historical
+/// paths exactly; opt-in profiles live below a versioned namespace and therefore
+/// cannot reuse or overwrite a compact brick or manifest.
+pub fn brick_cache_dir(
+    cache_dir: &Path,
+    mode: optics::CloudOpticsMode,
+    profile: StorageProfile,
+) -> PathBuf {
+    let optics_dir = cloud_optics_cache_dir(cache_dir, mode);
+    match profile.cache_namespace() {
+        Some(namespace) => optics_dir.join(namespace),
+        None => optics_dir,
     }
 }
 
@@ -146,6 +182,7 @@ pub enum IngestError {
     Wrf(String),
     Frame(FrameError),
     Brick(bricks::BrickError),
+    PrecisionAudit(String),
     MissingVar(String),
     Shape(String),
 }
@@ -156,6 +193,7 @@ impl std::fmt::Display for IngestError {
             Self::Wrf(s) => write!(f, "wrf read error: {s}"),
             Self::Frame(e) => write!(f, "projection error: {e}"),
             Self::Brick(e) => write!(f, "brick error: {e}"),
+            Self::PrecisionAudit(s) => write!(f, "precision audit error: {s}"),
             Self::MissingVar(s) => write!(f, "required variable missing: {s}"),
             Self::Shape(s) => write!(f, "unexpected shape: {s}"),
         }
@@ -897,6 +935,85 @@ fn beta_from_q(q: &[f32], rho: &[f32], effective_radius_m: f64) -> Vec<f32> {
         .collect()
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct NativeOpticsStats {
+    positive_mass_cells: usize,
+    native_cells: usize,
+    fallback_cells: usize,
+    density_clamped_cells: usize,
+    radius_min_um: f64,
+    radius_max_um: f64,
+}
+
+/// Convert one NSSL species with its co-timed number/volume moments. Invalid cells
+/// fall back independently so a single bad number streak cannot erase the species.
+/// Hail passes `fixed_radius_m=None`, preserving the v0.1.6 zero-hail baseline only
+/// where a native state is unavailable.
+fn beta_from_nssl_moments(
+    label: &str,
+    class: optics::NsslHydrometeorClass,
+    q: &[f32],
+    number_per_kg: Option<&[f32]>,
+    volume_m3_per_kg: Option<&[f32]>,
+    rho: &[f32],
+    fixed_radius_m: Option<f64>,
+) -> (Vec<f32>, NativeOpticsStats) {
+    debug_assert_eq!(q.len(), rho.len());
+    debug_assert!(number_per_kg.is_none_or(|v| v.len() == q.len()));
+    debug_assert!(volume_m3_per_kg.is_none_or(|v| v.len() == q.len()));
+    let mut out = Vec::with_capacity(q.len());
+    let mut stats = NativeOpticsStats {
+        radius_min_um: f64::INFINITY,
+        ..NativeOpticsStats::default()
+    };
+    for index in 0..q.len() {
+        let qi = q[index] as f64;
+        let ri = rho[index] as f64;
+        if !qi.is_finite() || qi <= 0.0 {
+            out.push(0.0);
+            continue;
+        }
+        stats.positive_mass_cells += 1;
+        let native = number_per_kg.and_then(|number| {
+            optics::nssl_native_optics(
+                class,
+                ri,
+                qi,
+                number[index] as f64,
+                volume_m3_per_kg.map(|volume| volume[index] as f64),
+            )
+        });
+        if let Some(native) = native {
+            stats.native_cells += 1;
+            stats.density_clamped_cells += usize::from(native.density_was_clamped);
+            let radius_um = native.effective_radius_m * 1.0e6;
+            stats.radius_min_um = stats.radius_min_um.min(radius_um);
+            stats.radius_max_um = stats.radius_max_um.max(radius_um);
+            out.push(native.extinction_m_inv as f32);
+        } else {
+            stats.fallback_cells += 1;
+            out.push(
+                fixed_radius_m
+                    .map(|radius| optics::extinction_coefficient(ri, qi, radius) as f32)
+                    .unwrap_or(0.0),
+            );
+        }
+    }
+    if stats.native_cells == 0 {
+        stats.radius_min_um = 0.0;
+    }
+    crate::log_line!(
+        "simsat ingest: NSSL native {label} optics — {} / {} positive-mass cells native, {} fixed/zero fallback, {} density clamps, radius {:.2}..{:.2} um",
+        stats.native_cells,
+        stats.positive_mass_cells,
+        stats.fallback_cells,
+        stats.density_clamped_cells,
+        stats.radius_min_um,
+        stats.radius_max_um,
+    );
+    (out, stats)
+}
+
 /// Add a second species' extinction into an existing beta buffer at its OWN
 /// effective radius. Extinctions add linearly, so a shared brick channel can carry
 /// several species as long as each converts at its own optics before the sum.
@@ -1381,20 +1498,63 @@ pub fn probe_wrf(path: &Path) -> Result<WrfProbe, IngestError> {
 /// only the scratch fields it needs and compacts repair candidates before reading
 /// humidity. Logs wall time and peak RSS.
 pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestReport, IngestError> {
+    ingest_timestep_impl(path, config, None)
+}
+
+/// Re-ingest one WRF timestep while retaining the post-resample f32 fields long
+/// enough to measure current compact-SSB representation error. This explicit
+/// validation entry point keeps [`IngestConfig`] and ordinary ingest unchanged.
+pub fn ingest_timestep_with_precision_audit(
+    path: &Path,
+    config: &IngestConfig,
+    audit: &PrecisionAuditConfig,
+) -> Result<IngestReport, IngestError> {
+    ingest_timestep_impl(path, config, Some(audit))
+}
+
+fn ingest_timestep_impl(
+    path: &Path,
+    config: &IngestConfig,
+    precision_audit_config: Option<&PrecisionAuditConfig>,
+) -> Result<IngestReport, IngestError> {
     platform::lower_ingest_thread_priority();
     let start = Instant::now();
 
     let wrf = WrfFile::open(path).map_err(|e| IngestError::Wrf(e.to_string()))?;
+    let mp_physics = wrf.global_attr_i32("MP_PHYSICS").ok();
     if let Some(warning) = nssl_advection_warning(
-        wrf.global_attr_i32("MP_PHYSICS").ok(),
+        mp_physics,
         wrf.global_attr_i32("MOIST_ADV_OPT").ok(),
         wrf.global_attr_i32("SCALAR_ADV_OPT").ok(),
     ) {
         crate::log_line!("simsat ingest warning: {warning}");
     }
+    let nssl_native_optics =
+        config.cloud_optics == optics::CloudOpticsMode::NsslNative && mp_physics == Some(18);
+    if config.cloud_optics == optics::CloudOpticsMode::NsslNative && !nssl_native_optics {
+        crate::log_line!(
+            "simsat ingest warning: cloud-optics=nssl-native requested for MP_PHYSICS={}; using the fixed optical table for this source",
+            mp_physics
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    } else if config.cloud_optics == optics::CloudOpticsMode::HrrrThompsonNative {
+        crate::log_line!(
+            "simsat ingest warning: cloud-optics=hrrr-thompson-native requires HRRR native GRIB input; using the fixed optical table for WRF input"
+        );
+    }
     let geom = read_geometry(&wrf, config.timestep)?;
     let (nx, ny, nz, nz_stag) = (geom.nx, geom.ny, geom.nz, geom.nz_stag);
     let (z_min, dz, nz_brick) = (config.z_min_m, config.dz_m, config.nz_brick);
+    let mut precision_audit = precision_audit_config.cloned().map(|audit| {
+        crate::log_line!(
+            "simsat ingest: precision audit enabled â€” retaining post-resample f32 reference fields; output={}",
+            audit.output_dir.display()
+        );
+        PrecisionAuditCapture::new(audit, nx, ny, nz_brick, z_min, dz)
+    });
+    let mut science_cloud_f16 = (config.storage_profile == StorageProfile::ScienceCloudF16)
+        .then(ScienceCloudF16Payload::default);
     // The selected time index. Every atmospheric/surface field read below uses `t`
     // (M1-review MAJOR-1: field reads previously hardcoded time 0, so any
     // `config.timestep > 0` cached time-0 data mislabeled with the later time).
@@ -1505,36 +1665,41 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         false
     };
 
-    let encode_cloud_fraction = |mut native: Vec<f32>| {
-        // Never pass NaN/fill values into max-overlap aggregation. Keep every
-        // finite positive model/diagnosed value, bounded to the physical fraction
-        // range; all other values become explicit zero.
-        for value in &mut native {
-            *value = if value.is_finite() {
-                value.clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-        }
-        let fraction = resample_volume_fraction_max_overlap(
-            &native,
-            &z,
-            nx,
-            ny,
-            nz,
-            z_min,
-            dz,
-            nz_brick,
-            Extrap::Zero,
-            Extrap::Zero,
-        );
-        bricks::encode_cloud_fraction(&fraction)
-    };
+    let encode_cloud_fraction =
+        |mut native: Vec<f32>, precision_audit: &mut Option<PrecisionAuditCapture>| {
+            // Never pass NaN/fill values into max-overlap aggregation. Keep every
+            // finite positive model/diagnosed value, bounded to the physical fraction
+            // range; all other values become explicit zero.
+            for value in &mut native {
+                *value = if value.is_finite() {
+                    value.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+            }
+            let fraction = resample_volume_fraction_max_overlap(
+                &native,
+                &z,
+                nx,
+                ny,
+                nz,
+                z_min,
+                dz,
+                nz_brick,
+                Extrap::Zero,
+                Extrap::Zero,
+            );
+            let codes = bricks::encode_cloud_fraction(&fraction);
+            if let Some(audit) = precision_audit.as_mut() {
+                audit.record_cloud_fraction(&fraction, &codes);
+            }
+            codes
+        };
     let mut cloud_fraction = if xu_repair_enabled {
         None
     } else {
         Some(match cf_native.take() {
-            Some(native) => encode_cloud_fraction(native),
+            Some(native) => encode_cloud_fraction(native, &mut precision_audit),
             None => vec![255u8; nx * ny * nz_brick],
         })
     };
@@ -1562,7 +1727,11 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         Extrap::ClampEdge,
     );
     let temperature_f16 = bricks::encode_temperature_celsius(&temp_k_f32);
-    drop(temp_k_f32);
+    if let Some(audit) = precision_audit.as_mut() {
+        audit.record_temperature(temp_k_f32, &temperature_f16);
+    } else {
+        drop(temp_k_f32);
+    }
     let t_for_repair = xu_repair_enabled.then_some(t_kelvin);
 
     let mut beta_total = vec![0f32; nx * ny * nz_brick];
@@ -1576,7 +1745,21 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
                 {
                     *candidates = xu_collect_liquid_candidates(fraction, &q);
                 }
-                beta_from_q(&q, &rho, HydrometeorClass::CloudLiquid.effective_radius_m())
+                if nssl_native_optics {
+                    let number = read_3d_opt(&wrf, "QNDROP", nz, ny, nx, t)?;
+                    beta_from_nssl_moments(
+                        "cloud-liquid",
+                        optics::NsslHydrometeorClass::CloudLiquid,
+                        &q,
+                        number.as_deref(),
+                        None,
+                        &rho,
+                        Some(HydrometeorClass::CloudLiquid.effective_radius_m()),
+                    )
+                    .0
+                } else {
+                    beta_from_q(&q, &rho, HydrometeorClass::CloudLiquid.effective_radius_m())
+                }
             }
             None => vec![0f32; ncell],
         };
@@ -1592,7 +1775,25 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::Zero,
             Extrap::Zero,
         );
-        accumulate_and_encode(&mut beta_total, &ext)
+        let (quant, codes) = accumulate_and_encode(&mut beta_total, &ext);
+        if let Some(science) = science_cloud_f16.as_mut() {
+            science.ext_liquid = ext
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| bricks::try_encode_log2_f16("ext_liquid", index, value))
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(audit) = precision_audit.as_mut() {
+            audit.record_extinction(
+                "ext_liquid",
+                Some(HydrometeorClass::CloudLiquid),
+                true,
+                &ext,
+                quant,
+                &codes,
+            );
+        }
+        (quant, codes)
     };
     // ext_ice = QICE only (small pristine ice). SSB v3 snow-optics fix: QSNOW no
     // longer shares cloud-ice optics here — sharing them inflated snow's visible
@@ -1607,7 +1808,21 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
                 {
                     xu_merge_frozen_candidates(candidates, fraction, &q);
                 }
-                beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m())
+                if nssl_native_optics {
+                    let number = read_3d_opt(&wrf, "QNICE", nz, ny, nx, t)?;
+                    beta_from_nssl_moments(
+                        "ice",
+                        optics::NsslHydrometeorClass::Ice,
+                        &q,
+                        number.as_deref(),
+                        None,
+                        &rho,
+                        Some(HydrometeorClass::Ice.effective_radius_m()),
+                    )
+                    .0
+                } else {
+                    beta_from_q(&q, &rho, HydrometeorClass::Ice.effective_radius_m())
+                }
             }
             None => vec![0f32; ncell],
         };
@@ -1623,7 +1838,25 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::Zero,
             Extrap::Zero,
         );
-        accumulate_and_encode(&mut beta_total, &ext)
+        let (quant, codes) = accumulate_and_encode(&mut beta_total, &ext);
+        if let Some(science) = science_cloud_f16.as_mut() {
+            science.ext_ice = ext
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| bricks::try_encode_log2_f16("ext_ice", index, value))
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(audit) = precision_audit.as_mut() {
+            audit.record_extinction(
+                "ext_ice",
+                Some(HydrometeorClass::Ice),
+                true,
+                &ext,
+                quant,
+                &codes,
+            );
+        }
+        (quant, codes)
     };
 
     // Read QSNOW at its normal single acquisition point, but convert it before the
@@ -1635,12 +1868,26 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     if let (Some(candidates), Some(fraction)) = (xu_condensate.as_mut(), cf_native.as_ref()) {
         xu_merge_frozen_candidates(candidates, fraction, &snow_beta);
     }
-    for (snow, &ri) in snow_beta.iter_mut().zip(rho.iter()) {
-        *snow = optics::extinction_coefficient(
-            ri as f64,
-            *snow as f64,
-            HydrometeorClass::Snow.effective_radius_m(),
-        ) as f32;
+    if nssl_native_optics {
+        let number = read_3d_opt(&wrf, "QNSNOW", nz, ny, nx, t)?;
+        snow_beta = beta_from_nssl_moments(
+            "snow",
+            optics::NsslHydrometeorClass::Snow,
+            &snow_beta,
+            number.as_deref(),
+            None,
+            &rho,
+            Some(HydrometeorClass::Snow.effective_radius_m()),
+        )
+        .0;
+    } else {
+        for (snow, &ri) in snow_beta.iter_mut().zip(rho.iter()) {
+            *snow = optics::extinction_coefficient(
+                ri as f64,
+                *snow as f64,
+                HydrometeorClass::Snow.effective_radius_m(),
+            ) as f32;
+        }
     }
 
     // All three cloud condensate species have now passed through their normal reads.
@@ -1674,16 +1921,67 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     // share the ice phase lobe.
     let (qs, ext_snow, qp, ext_precip) = {
         let mut beta = match read_3d_opt(&wrf, "QRAIN", nz, ny, nx, t)? {
+            Some(q) if nssl_native_optics => {
+                let number = read_3d_opt(&wrf, "QNRAIN", nz, ny, nx, t)?;
+                beta_from_nssl_moments(
+                    "rain",
+                    optics::NsslHydrometeorClass::Rain,
+                    &q,
+                    number.as_deref(),
+                    None,
+                    &rho,
+                    Some(HydrometeorClass::Rain.effective_radius_m()),
+                )
+                .0
+            }
             Some(q) => beta_from_q(&q, &rho, HydrometeorClass::Rain.effective_radius_m()),
             None => vec![0f32; ncell],
         };
         if let Some(qgraup) = read_3d_opt(&wrf, "QGRAUP", nz, ny, nx, t)? {
-            add_beta_from_q(
-                &mut beta,
-                &qgraup,
+            if nssl_native_optics {
+                let number = read_3d_opt(&wrf, "QNGRAUPEL", nz, ny, nx, t)?;
+                let volume = read_3d_opt(&wrf, "QVGRAUPEL", nz, ny, nx, t)?;
+                let native = beta_from_nssl_moments(
+                    "graupel",
+                    optics::NsslHydrometeorClass::Graupel,
+                    &qgraup,
+                    number.as_deref(),
+                    volume.as_deref(),
+                    &rho,
+                    Some(HydrometeorClass::Graupel.effective_radius_m()),
+                )
+                .0;
+                for (total, value) in beta.iter_mut().zip(native) {
+                    *total += value;
+                }
+            } else {
+                add_beta_from_q(
+                    &mut beta,
+                    &qgraup,
+                    &rho,
+                    HydrometeorClass::Graupel.effective_radius_m(),
+                );
+            }
+        }
+        // v0.1.6 omitted QHAIL entirely. Native NSSL mode has both the required
+        // number and predicted-volume moments, so it can add hail without inventing
+        // a fixed fallback size. Invalid hail moments remain the exact legacy zero.
+        if nssl_native_optics && let Some(qhail) = read_3d_opt(&wrf, "QHAIL", nz, ny, nx, t)? {
+            let number = read_3d_opt(&wrf, "QNHAIL", nz, ny, nx, t)?;
+            let volume = read_3d_opt(&wrf, "QVHAIL", nz, ny, nx, t)?;
+            let native = beta_from_nssl_moments(
+                "hail",
+                optics::NsslHydrometeorClass::Hail,
+                &qhail,
+                number.as_deref(),
+                volume.as_deref(),
                 &rho,
-                HydrometeorClass::Graupel.effective_radius_m(),
-            );
+                None,
+            )
+            .0;
+            for (total, value) in beta.iter_mut().zip(native) {
+                *total += value;
+            }
         }
         // QSNOW was converted above so the repair thermodynamics could be dropped;
         // add that unchanged beta into the legacy total, then encode its auxiliary.
@@ -1703,7 +2001,17 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::Zero,
         );
         let (qs, ext_snow) = bricks::encode_log_channel(&snow_ext);
-        drop(snow_ext);
+        if let Some(science) = science_cloud_f16.as_mut() {
+            science.ext_snow = snow_ext
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| bricks::try_encode_log2_f16("ext_snow", index, value))
+                .collect::<Result<_, _>>()?;
+        }
+        // The precision audit must retain this native snow subset until the total
+        // precipitation field is available so it can reproduce IR's exact
+        // snow-versus-rain/graupel split. Normal ingest still drops it here.
+        let snow_audit = precision_audit.as_ref().map(|_| snow_ext);
         drop(snow_beta);
         let ext = resample_volume_conservative(
             &beta,
@@ -1718,6 +2026,25 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::Zero,
         );
         let (qp, ext_precip) = accumulate_and_encode(&mut beta_total, &ext);
+        if let Some(science) = science_cloud_f16.as_mut() {
+            science.ext_precip = ext
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| bricks::try_encode_log2_f16("ext_precip", index, value))
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(audit) = precision_audit.as_mut() {
+            audit.record_precipitation(
+                snow_audit
+                    .as_deref()
+                    .expect("precision audit retained native snow extinction"),
+                qs,
+                &ext_snow,
+                &ext,
+                qp,
+                &ext_precip,
+            );
+        }
         (qs, ext_snow, qp, ext_precip)
     };
     drop(rho);
@@ -1779,7 +2106,11 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             Extrap::ClampEdge,
             Extrap::Zero,
         );
-        bricks::encode_log_channel(&qvb)
+        let (quant, codes) = bricks::encode_log_channel(&qvb);
+        if let Some(audit) = precision_audit.as_mut() {
+            audit.record_qvapor(qvb, quant, &codes);
+        }
+        (quant, codes)
     };
 
     if cloud_fraction.is_none() {
@@ -1787,6 +2118,7 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
             cf_native
                 .take()
                 .expect("eligible Xu repair retains native CLDFRA"),
+            &mut precision_audit,
         ));
     }
     let cloud_fraction = cloud_fraction.expect("cloud-fraction channel is always prepared");
@@ -1796,7 +2128,11 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     // tau_up from the accumulated total brick extinction.
     let (qt, tau_up) = {
         let tau_f32 = tau_up_volume(&beta_total, nx, ny, nz_brick, dz);
-        bricks::encode_log_channel(&tau_f32)
+        let (quant, codes) = bricks::encode_log_channel(&tau_f32);
+        if let Some(audit) = precision_audit.as_mut() {
+            audit.record_log_field("tau_up", &tau_f32, quant, &codes);
+        }
+        (quant, codes)
     };
     drop(beta_total);
 
@@ -1824,6 +2160,8 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
     let quant = ChannelQuant(quant_map);
 
     let brick = VolumeBrick {
+        storage_profile: config.storage_profile,
+        science_cloud_f16,
         nx,
         ny,
         nz: nz_brick,
@@ -1854,20 +2192,32 @@ pub fn ingest_timestep(path: &Path, config: &IngestConfig) -> Result<IngestRepor
         .run_id
         .clone()
         .unwrap_or_else(|| run_id_from_path(path));
-    let dir = bricks::run_dir(&config.cache_dir, &run_id);
+    let effective_cache_dir = brick_cache_dir(
+        &config.cache_dir,
+        config.cloud_optics,
+        config.storage_profile,
+    );
+    let dir = bricks::run_dir(&effective_cache_dir, &run_id);
     // Key the brick file + manifest entry on the full datetime (M0-review MINOR-2):
     // `t{YYYYMMDD_HHMM}.ssb`, so two timesteps at the same wall-clock HHMM on
     // different days of a >24 h run no longer collide.
     let stamp = bricks::time_stamp(geom.time_iso.as_deref(), geom.hhmm);
     let brick_file = bricks::brick_file_name(&stamp);
     let brick_path = dir.join(&brick_file);
-    let ssb_bytes = bricks::write_ssb(&brick_path, &brick)?;
+    let ssb_bytes = bricks::write_ssb_profiled(&brick_path, &brick)?;
+    if let Some(audit) = precision_audit.take() {
+        let report = audit
+            .finish(path, &brick, ssb_bytes)
+            .map_err(IngestError::PrecisionAudit)?;
+        crate::log_line!("simsat ingest: precision audit report={}", report.display());
+    }
 
-    let manifest_path = RunManifest::path(&config.cache_dir, &run_id);
+    let manifest_path = RunManifest::path(&effective_cache_dir, &run_id);
     let planes_2d = brick.planes_2d_names();
     let projection = manifest_projection(&geom.params);
-    let mut manifest = RunManifest::load_or_new(
+    let mut manifest = RunManifest::load_or_new_profiled(
         &manifest_path,
+        config.storage_profile,
         &run_id,
         nx,
         ny,
@@ -2407,6 +2757,48 @@ mod tests {
     #[test]
     fn default_cache_dir_is_nonempty() {
         assert!(!default_cache_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn native_cloud_optics_use_distinct_versioned_cache_namespaces() {
+        let root = Path::new("cache-root");
+        assert_eq!(
+            cloud_optics_cache_dir(root, optics::CloudOpticsMode::Fixed),
+            root
+        );
+        assert_eq!(
+            cloud_optics_cache_dir(root, optics::CloudOpticsMode::NsslNative),
+            root.join("cloud-optics-nssl-native-v1")
+        );
+        assert_eq!(
+            cloud_optics_cache_dir(root, optics::CloudOpticsMode::HrrrThompsonNative),
+            root.join("cloud-optics-hrrr-thompson-native-v1")
+        );
+        assert_eq!(
+            brick_cache_dir(
+                root,
+                optics::CloudOpticsMode::Fixed,
+                StorageProfile::CompactU8
+            ),
+            root
+        );
+        assert_eq!(
+            brick_cache_dir(
+                root,
+                optics::CloudOpticsMode::Fixed,
+                StorageProfile::ScienceCloudF16
+            ),
+            root.join("storage-science-cloud-f16-v1")
+        );
+        assert_eq!(
+            brick_cache_dir(
+                root,
+                optics::CloudOpticsMode::NsslNative,
+                StorageProfile::ScienceCloudF16
+            ),
+            root.join("cloud-optics-nssl-native-v1")
+                .join("storage-science-cloud-f16-v1")
+        );
     }
 
     // ── M1-review MAJOR-1: the field reads must thread the selected timestep ──
