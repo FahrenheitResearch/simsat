@@ -22,7 +22,7 @@ import numpy as np
 import simsat
 
 
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
 NX = 12
 NY = 12
 NZ = 12
