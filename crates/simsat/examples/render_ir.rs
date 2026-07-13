@@ -14,8 +14,10 @@
 //!   input=<path>        REQUIRED. A wrfout file (ingested if not cached) OR a run.json.
 //!   out=<file.png>      REQUIRED. Output PNG path (RGB8, row 0 = north).
 //!   bt-out=<path.bin>   OPTIONAL audit dump: north-first unletterboxed f32le Kelvin plane.
-//!   sat=<preset>        goes-east | goes-west | himawari    (default goes-east)
-//!   geo-navigation=<mode> model-sphere | goes-r-abi (default model-sphere)
+//!   sat=<preset>        goes-east | goes-west | himawari | mtg-i1 (default goes-east)
+//!                       MTG aliases: mtg | meteosat-12 | meteosat12. This is the 0-degree
+//!                       camera with generic thermal/WV physics, not an FCI SRF or PSF.
+//!   geo-navigation=<mode> model-sphere | goes-r-abi (GOES-East/West only; default model-sphere)
 //!   timestep=<n>        time index (default 0).
 //!   resolution=<mode>   native | abi1km | abi2km            (default native)
 //!                       native = one output pixel per source grid cell. ABI 1/2 km are
@@ -126,6 +128,13 @@ fn run(args: &[String]) -> Result<(), String> {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "auto".to_string()),
     );
+    if opts.sat == SatellitePreset::MtgI1 {
+        eprintln!(
+            "render_ir: MTG-I1 / Meteosat-12 selects the 0-degree camera only; thermal \
+             and water-vapor behavior remains SimSat's generic model (no FCI spectral \
+             response or PSF)."
+        );
+    }
     topdown::configure_global_rayon(topdown::effective_thread_count(
         opts.threads,
         std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
@@ -205,7 +214,7 @@ fn run(args: &[String]) -> Result<(), String> {
         );
         println!(
             "DERIVEDSUMMARY file={} field={} units={} view={} dims={}x{} canvas={} res={}{} \
-             sat={} in_domain_frac={:.3} min={:.3} max={:.3} median={:.3} wall_s={:.3}",
+             sat={} sat_scope=camera in_domain_frac={:.3} min={:.3} max={:.3} median={:.3} wall_s={:.3}",
             opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             field.slug(),
             if field.units().is_empty() {
@@ -273,7 +282,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let on_earth_frac = stats.finite as f64 / (rnx * rny).max(1) as f64;
     eprintln!("render_ir: wrote {}", opts.out.display());
     println!(
-        "IRSUMMARY file={} band={} sensor={} response={} instrument_footprint={} abi_lattice_crop={} view={} dims={}x{} canvas={} res={}{} sat={} enhancement={} \
+        "IRSUMMARY file={} band={} sensor={} response={} instrument_footprint={} abi_lattice_crop={} view={} dims={}x{} canvas={} res={}{} sat={} sat_scope=camera enhancement={} \
          on_earth_frac={:.3} cold_top_bt={:.1} warm_ground_bt={:.1} median_bt={:.1} \
          all_finite={} tsk_fallback={} wall_s={:.3}",
         opts.out.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
@@ -499,8 +508,9 @@ fn parse_sat(v: &str) -> Result<SatellitePreset, String> {
         "goeseast" | "goese" | "east" => Ok(SatellitePreset::GoesEast),
         "goeswest" | "goesw" | "west" => Ok(SatellitePreset::GoesWest),
         "himawari" | "ahi" => Ok(SatellitePreset::Himawari),
+        "mtg" | "mtgi1" | "meteosat12" => Ok(SatellitePreset::MtgI1),
         _ => Err(format!(
-            "unknown satellite '{v}' (goes-east|goes-west|himawari)"
+            "unknown satellite '{v}' (goes-east|goes-west|himawari|mtg-i1)"
         )),
     }
 }
@@ -523,7 +533,10 @@ fn print_usage() {
          \x20 out=<file.png>      output PNG (RGB8, row 0 = north)                [required]\n\
          \x20 bt-out=<file.bin>   audit dump: north-first unletterboxed f32le Kelvin plane\n\
          \x20 storage-profile=<mode> compact-u8 | science-cloud-f16 (default compact-u8)\n\
-         \x20 sat=<preset>        goes-east | goes-west | himawari   (default goes-east)\n\
+         \x20 sat=<preset>        goes-east | goes-west | himawari | mtg-i1 (default goes-east)\n\
+         \x20                     MTG aliases: mtg | meteosat-12 | meteosat12\n\
+         \x20                     0-degree camera with generic IR/WV; no FCI SRF/PSF\n\
+         \x20 geo-navigation=<mode> model-sphere | goes-r-abi (GOES-East/West only; default model-sphere)\n\
          \x20 timestep=<n>        time index (default 0)\n\
          \x20 resolution=<mode>   native | abi1km | abi2km           (default native)\n\
          \x20                     native = one pixel per source-grid cell; ABI 1/2 km may\n\
@@ -545,6 +558,14 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtg_camera_aliases_parse_and_report_the_canonical_slug() {
+        for token in ["mtg", "mtg-i1", "meteosat-12", "meteosat12"] {
+            assert_eq!(parse_sat(token).unwrap(), SatellitePreset::MtgI1, "{token}");
+            assert_eq!(parse_sat(token).unwrap().slug(), "mtgi1", "{token}");
+        }
+    }
 
     #[test]
     fn storage_profile_defaults_compact_and_parses_science() {

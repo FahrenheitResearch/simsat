@@ -3,7 +3,7 @@
 //! Standalone eframe/wgpu desktop app. M1 flow (design doc section 10, M1 row):
 //! open a wrfout file OR an existing cached run (`run.json`); ingest the selected
 //! timestep on a below-normal-priority worker with the M0 size-gate confirm for
-//! large files; pick a satellite (GOES-East / GOES-West / Himawari) and timestep;
+//! large files; pick a satellite (GOES-East / GOES-West / Himawari / MTG-I1) and timestep;
 //! Render the geostationary surface frame (Blue Marble ground + HGT normals +
 //! LANDMASK + point sun) and display it in-window; Write it to the sat-store so
 //! BowEcho can play it (point BowEcho's sat store dir at the shown store root).
@@ -153,7 +153,7 @@ fn toolbar_layout(available_width: f32) -> ToolbarLayout {
         ToolbarLayout {
             mode_width: 190.0,
             intent_width: 100.0,
-            sat_width: 135.0,
+            sat_width: 190.0,
             navigation_width: 190.0,
             view_width: 150.0,
             timestep_width: 180.0,
@@ -1347,6 +1347,11 @@ impl SimSatStudioApp {
         self.preset = settings::sat_from_token(&s.sat).unwrap_or(SatellitePreset::GoesEast);
         self.geo_navigation = settings::geo_navigation_from_token(&s.geo_navigation)
             .unwrap_or(GeoNavigation::ModelSphere);
+        if !supports_goes_r_abi_navigation(self.preset)
+            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+        {
+            self.geo_navigation = GeoNavigation::ModelSphere;
+        }
         self.resolution =
             settings::resolution_from_token(&s.resolution).unwrap_or(ResolutionMode::Native);
         self.view = settings::view_from_token(&s.view).unwrap_or(StudioView::Geostationary);
@@ -3366,7 +3371,7 @@ impl SimSatStudioApp {
                             "Display preserves the shipped reviewed appearance. Sensor Fast Gray \
                              uses simsat-fast-gray-v1: unscaled cloud extinction and neutral \
                              display shaping on a temporary render copy, with every adjustment \
-                             logged. It is not yet an SRF-integrated ABI/AHI channel simulator.",
+                             logged. It is not yet an SRF-integrated ABI/AHI/FCI channel simulator.",
                         );
                     ui.label("Sat:");
                     // The satellite preset drives the geostationary scan camera; in
@@ -3382,12 +3387,21 @@ impl SimSatStudioApp {
                                 }
                             })
                             .response
+                            .on_hover_text(match self.preset {
+                                SatellitePreset::MtgI1 => {
+                                    "MTG-I1 / Meteosat-12 is the 0° geostationary camera. \
+                                     It uses SimSat's existing generic visible, thermal, and \
+                                     water-vapor physics; no FCI spectral response or PSF is modeled."
+                                }
+                                _ => "The satellite preset selects geostationary camera geometry; \
+                                      sensor response is configured separately.",
+                            })
                             .on_disabled_hover_text(
                                 "Not used in Perspective (3-D) view — the orbit camera \
                                  (Camera group) defines the view.",
                             );
                     });
-                    if self.preset == SatellitePreset::Himawari
+                    if !supports_goes_r_abi_navigation(self.preset)
                         && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
                     {
                         self.geo_navigation = GeoNavigation::ModelSphere;
@@ -3395,7 +3409,7 @@ impl SimSatStudioApp {
                     ui.label("Nav:");
                     ui.add_enabled_ui(
                         self.view == StudioView::Geostationary
-                            && self.preset != SatellitePreset::Himawari,
+                            && supports_goes_r_abi_navigation(self.preset),
                         |ui| {
                             egui::ComboBox::from_id_salt("geo-navigation")
                                 .width(toolbar.navigation_width)
@@ -3760,7 +3774,7 @@ impl SimSatStudioApp {
                         .changed()
                     {
                         self.instrument_footprint = if footprint_on {
-                            if self.preset == SatellitePreset::Himawari {
+                            if !supports_goes_r_abi_navigation(self.preset) {
                                 self.preset = SatellitePreset::GoesEast;
                             }
                             self.view = StudioView::Geostationary;
@@ -3776,7 +3790,7 @@ impl SimSatStudioApp {
                     }
                     if self.instrument_footprint != InstrumentFootprint::Off {
                         let compatible = self.view == StudioView::Geostationary
-                            && self.preset != SatellitePreset::Himawari
+                            && supports_goes_r_abi_navigation(self.preset)
                             && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
                             && self.resolution == ResolutionMode::Abi2km
                             && self.thermal_sensor == ThermalSensor::GoesRAbiBand13Fm4;
@@ -6109,7 +6123,7 @@ fn validate_studio_instrument_footprint(
     if atmo.view_mode != StudioView::Geostationary
         || atmo.geo_navigation != GeoNavigation::GoesRAbiFixedGrid
         || resolution != ResolutionMode::Abi2km
-        || preset == SatellitePreset::Himawari
+        || !supports_goes_r_abi_navigation(preset)
     {
         return Err(format!(
             "Instrument footprint {} requires a GOES-East/West Geostationary render with \
@@ -7776,7 +7790,15 @@ fn sat_ordinal(p: SatellitePreset) -> u8 {
         SatellitePreset::GoesEast => 0,
         SatellitePreset::GoesWest => 1,
         SatellitePreset::Himawari => 2,
+        SatellitePreset::MtgI1 => 3,
     }
+}
+
+fn supports_goes_r_abi_navigation(preset: SatellitePreset) -> bool {
+    matches!(
+        preset,
+        SatellitePreset::GoesEast | SatellitePreset::GoesWest
+    )
 }
 
 fn geo_navigation_ordinal(navigation: GeoNavigation) -> u8 {
@@ -8457,6 +8479,14 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_studio_instrument_footprint(
+                &atmo,
+                SatellitePreset::MtgI1,
+                ResolutionMode::Abi2km,
+            )
+            .is_err()
+        );
 
         atmo.instrument_footprint = InstrumentFootprint::Off;
         atmo.render_mode = RenderMode::Visible;
@@ -9053,6 +9083,7 @@ mod tests {
 
         let regular = toolbar_layout(1344.0);
         assert_eq!(regular.mode_width, 190.0);
+        assert_eq!(regular.sat_width, 190.0);
         assert!(regular.estimated_selector_width() <= 1344.0);
     }
 

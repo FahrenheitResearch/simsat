@@ -438,9 +438,9 @@ impl StudioSettings {
         if self.bm_month_override > 12 {
             self.bm_month_override = 0;
         }
-        if sat_from_token(&self.sat).is_none() {
-            self.sat = d.sat;
-        }
+        self.sat = sat_from_token(&self.sat)
+            .map(|preset| sat_token(preset).to_string())
+            .unwrap_or(d.sat);
         if geo_navigation_from_token(&self.geo_navigation).is_none() {
             self.geo_navigation = d.geo_navigation;
         }
@@ -504,13 +504,18 @@ pub fn sat_token(p: SatellitePreset) -> &'static str {
         SatellitePreset::GoesEast => "goes-east",
         SatellitePreset::GoesWest => "goes-west",
         SatellitePreset::Himawari => "himawari",
+        SatellitePreset::MtgI1 => "mtgi1",
     }
 }
 
 pub fn sat_from_token(t: &str) -> Option<SatellitePreset> {
-    SatellitePreset::ALL
-        .into_iter()
-        .find(|p| sat_token(*p) == t)
+    match t.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+        "goeseast" | "goese" | "east" => Some(SatellitePreset::GoesEast),
+        "goeswest" | "goesw" | "west" => Some(SatellitePreset::GoesWest),
+        "himawari" | "ahi" => Some(SatellitePreset::Himawari),
+        "mtg" | "mtgi1" | "meteosat12" => Some(SatellitePreset::MtgI1),
+        _ => None,
+    }
 }
 
 pub fn geo_navigation_token(navigation: GeoNavigation) -> &'static str {
@@ -955,6 +960,11 @@ mod tests {
         for p in SatellitePreset::ALL {
             assert_eq!(sat_from_token(sat_token(p)), Some(p));
         }
+        assert_eq!(sat_token(SatellitePreset::MtgI1), "mtgi1");
+        assert_eq!(sat_from_token("mtgi1"), Some(SatellitePreset::MtgI1));
+        for alias in ["mtg", "mtg-i1", "meteosat-12", "meteosat12"] {
+            assert_eq!(sat_from_token(alias), Some(SatellitePreset::MtgI1));
+        }
         for r in ResolutionMode::ALL {
             assert_eq!(resolution_from_token(resolution_token(r)), Some(r));
         }
@@ -1004,6 +1014,25 @@ mod tests {
         // Unknown tokens map to None (they reset to defaults in sanitize).
         assert_eq!(mode_from_token("does-not-exist"), None);
         assert_eq!(sat_from_token(""), None);
+    }
+
+    #[test]
+    fn mtg_camera_selection_round_trips_the_settings_file() {
+        let dir =
+            std::env::temp_dir().join(format!("simsat-settings-mtgi1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let selected = StudioSettings {
+            sat: "meteosat-12".to_string(),
+            ..Default::default()
+        };
+
+        save(&path, &selected).expect("save MTG-I1 selection");
+        let loaded = load(&path);
+
+        assert_eq!(loaded.sat, "mtgi1");
+        assert_eq!(sat_from_token(&loaded.sat), Some(SatellitePreset::MtgI1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

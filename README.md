@@ -46,7 +46,7 @@ supercell case and Hurricane Michael), thumbnailed for the README.
   cloud optical depth as raw `f32` map-registered arrays.
 
 Three camera modes: the **from-space geostationary view** (GOES-East /
-GOES-West / Himawari presets, CGMS fixed-grid scan geometry), a **top-down map
+GOES-West / Himawari / MTG-I1 presets, CGMS fixed-grid scan geometry), a **top-down map
 view** registered to the WRF domain's own projection (drops straight onto
 matplotlib/cartopy axes), and a **free perspective camera** (arbitrary
 eye/look/FOV through the same physics — angled 3-D storm shots and flyovers;
@@ -54,6 +54,14 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 `render_perspective` in Python). A **web map layer** product renders the cloud
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
+
+The **MTG-I1 / Meteosat-12** preset places the geostationary camera at the operational
+0° service longitude, so European WRF domains use the appropriate viewpoint.
+This is deliberately camera-only support, not a claim of full FCI simulation: visible,
+thermal IR, and water-vapor products use SimSat's existing generic physics, with no FCI
+spectral-response or point-spread-function model. Studio lists the full platform name;
+the CLI and Python accept `mtg`, `mtg-i1`, `meteosat-12`, and `meteosat12`, and emit the
+canonical `mtgi1` slug. GOES-R ABI exact navigation remains GOES-East/West-only.
 
 New in v0.2.1: **CIMSS Style is the reviewed Band-13 display default**. Fresh
 Studio settings, the Recommended IR quick preset, thermal product transitions,
@@ -194,6 +202,9 @@ simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
 `simsat-render-ir` renders IR, water vapor (`wv=6.2|6.9|7.3`), and the derived
 fields (`derived=pw|ctt|cod`). Both take `key=value` arguments (run with
 `--help` for the full list) and print a machine-readable `SUMMARY` line.
+Use `sat=mtg-i1` (aliases: `mtg`, `meteosat-12`, `meteosat12`) for the 0°
+MTG-I1 / Meteosat-12 camera. Summary provenance reports `sat=mtgi1` and
+`sat_scope=camera`; no FCI sensor response is implied.
 Use `intent=display|sensor-fast-gray`; `mode=` remains an alias for `view=`.
 Sensor Fast Gray currently requires the CPU backend because the bounded GPU
 preview would disable model fractional-cloud handling and restore display

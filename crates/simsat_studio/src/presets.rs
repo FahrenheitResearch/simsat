@@ -232,12 +232,15 @@ fn validate_scope(
                     mode.label()
                 )));
             }
-            if satellite == SatellitePreset::Himawari {
-                return Err(PresetUnavailable(
-                    "GOES-R ABI fixed-grid navigation is incompatible with Himawari. Select a \
-                     GOES satellite; the preset will not relabel the source."
-                        .to_string(),
-                ));
+            if !matches!(
+                satellite,
+                SatellitePreset::GoesEast | SatellitePreset::GoesWest
+            ) {
+                return Err(PresetUnavailable(format!(
+                    "GOES-R ABI fixed-grid navigation is incompatible with {}. Select a \
+                         GOES satellite; the preset will not relabel the source.",
+                    satellite.label()
+                )));
             }
             if mode == RenderMode::Ir && satellite != SatellitePreset::GoesEast {
                 return Err(PresetUnavailable(
@@ -839,6 +842,18 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("incompatible with Himawari")
+        );
+
+        let mtg = StudioSettings {
+            mode: "visible".to_string(),
+            sat: "mtgi1".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            plan(StudioPreset::SensorQa, &mtg, runtime_on())
+                .unwrap_err()
+                .0
+                .contains("incompatible with MTG-I1")
         );
 
         let goes_west_ir = StudioSettings {
