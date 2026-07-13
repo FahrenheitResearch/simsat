@@ -27,9 +27,9 @@ pub const FRACTION_BINS: usize = 255;
 pub const DETERMINISTIC_SUBCOLUMN_COUNT: usize = 4;
 
 /// Selectable fixed-stratified ensemble sizes. These deliberately remain a small,
-/// bounded set: 4 is the interactive reference while 8 and 16 are convergence
-/// experiments with correspondingly higher CPU cost.
-pub const DETERMINISTIC_SUBCOLUMN_COUNTS: [usize; 3] = [4, 8, 16];
+/// bounded set: 2 is the fast low-order closure, 4 is the interactive reference,
+/// while 8 and 16 are convergence experiments with correspondingly higher CPU cost.
+pub const DETERMINISTIC_SUBCOLUMN_COUNTS: [usize; 4] = [2, 4, 8, 16];
 
 /// Midpoint coordinate of one deterministic stratified subcolumn.
 ///
@@ -45,7 +45,7 @@ pub fn deterministic_subcolumn_u(index: usize) -> Option<f64> {
 /// ensemble. One coordinate is shared through every vertical layer and every
 /// view/sun/shadow construction for that member, preserving maximum overlap.
 ///
-/// Only the reviewed 4/8/16 sizes are accepted. Returning `None` for an unsupported
+/// Only the reviewed 2/4/8/16 sizes are accepted. Returning `None` for an unsupported
 /// count or out-of-range index prevents accidental silent wrapping or a zero-sized
 /// ensemble from biasing the radiance mean.
 #[inline]
@@ -309,7 +309,8 @@ mod tests {
             }
         }
         assert_eq!(deterministic_subcolumn_u_for_count(0, 0), None);
-        assert_eq!(deterministic_subcolumn_u_for_count(0, 2), None);
+        assert_eq!(deterministic_subcolumn_u_for_count(2, 2), None);
+        assert_eq!(deterministic_subcolumn_u_for_count(0, 3), None);
         assert_eq!(deterministic_subcolumn_u_for_count(0, 32), None);
     }
 

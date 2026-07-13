@@ -7,8 +7,8 @@
 //
 // Camera rays are selected explicitly: the historical geostationary scan fan is
 // unchanged, while Top-down loads a reviewed per-pixel local-up vector and constructs
-// the CPU-equivalent nadir camera/ray. The geo-only front froxel is neutral in Top-down,
-// matching topdown.rs's deliberate no-extra-front-airlight contract.
+// the CPU-equivalent nadir camera/ray. GEO samples its scan-space front froxel;
+// Top-down directly marches its per-pixel camera->cloud atmospheric column.
 //
 // M4 ships the CPU render path (`clouds::shade_cloud_pixel`, tested on the headless
 // nodes); this shader is the naga-validated GPU render twin activated in M5. Kept in
@@ -204,7 +204,7 @@ struct Uniforms {
     frx2: vec4<f32>,   // froxel_dim, edge_feather_cells, ground_day_lift, visible cloud OD scale
     land0: vec4<f32>,  // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
     land1: vec4<f32>,  // dark_toe_gamma, dark_toe_max_gain, unused, unused
-    ray0: vec4<f32>,   // view_mode (0 geo, 1 per-pixel nadir), topdown camera radius, unused, unused
+    ray0: vec4<f32>,   // view_mode (0 geo, 1 per-pixel nadir), topdown camera radius, shadow-AA, unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -1189,20 +1189,45 @@ fn sun_od_dist_sample(p: vec3<f32>) -> f32 {
     return mix(a, b, fv - floor(fv));
 }
 
+// Top-down ground-shadow antialias: the exact CPU 5x5 binomial kernel in
+// TRANSMITTANCE space. Disabled is the historical single Beer sample exactly.
+fn filtered_ground_shadow(pg: vec3<f32>) -> f32 {
+    let od_scale = cloud_od_scale();
+    if (u.ray0.z < 0.5) {
+        return exp(-od_scale * sun_od_sample(pg));
+    }
+    let weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+    let dim = max(u.sod_e.z, 1.0);
+    let texel_u = (u.sod_v.w - u.sod_u.w) / dim;
+    let texel_v = (u.sod_e.y - u.sod_e.x) / dim;
+    var sum = 0.0;
+    for (var yi: i32 = 0; yi < 5; yi = yi + 1) {
+        for (var xi: i32 = 0; xi < 5; xi = xi + 1) {
+            let off = u.sod_u.xyz * (f32(xi - 2) * texel_u)
+                + u.sod_v.xyz * (f32(yi - 2) * texel_v);
+            sum = sum + weights[xi] * weights[yi]
+                * exp(-od_scale * sun_od_sample(pg + off));
+        }
+    }
+    return sum * (1.0 / 256.0);
+}
+
 // PENUMBRAL ground cloud-shadow (M5) — twin of clouds.rs::SunOdMap::penumbral_shadow.
 // Blur radius = occluder distance x tan(0.2665 deg) in the sun-OD map's (au, av) plane;
 // transmittance-averaged over a small disk (soft, distance-widening edge).
 fn penumbral_shadow(pg: vec3<f32>) -> f32 {
-    let od_scale = cloud_od_scale();
     let occ_dist = sun_od_dist_sample(pg);
     let radius = occ_dist * SUN_ANG_RADIUS_TAN;
     let dim = max(u.sod_e.z, 1.0);
     let texel = max((u.sod_v.w - u.sod_u.w) / dim, (u.sod_e.y - u.sod_e.x) / dim);
     if (radius <= 0.5 * texel) {
-        return exp(-od_scale * sun_od_sample(pg));
+        return filtered_ground_shadow(pg);
     }
     let au = u.sod_u.xyz;
     let av = u.sod_v.xyz;
+    // A physically resolved solar-disk penumbra already has its historical 17-tap
+    // integration; do not nest the 25-tap footprint inside every disk tap.
+    let od_scale = cloud_od_scale();
     var sum = exp(-od_scale * sun_od_sample(pg));
     var wsum = 1.0;
     for (var ri: i32 = 0; ri < 2; ri = ri + 1) {
@@ -1298,6 +1323,44 @@ fn atmosphere_shell_fraction(cam: vec3<f32>, view: vec3<f32>, t: f32) -> f32 {
         return 1.0;
     }
     return clamp((t - t_enter) / (t_exit - t_enter), 0.0, 1.0);
+}
+
+// Direct top-down camera->cloud atmosphere, the GPU twin of
+// topdown.rs::topdown_front_column. The RGB transmittance mean matches the scalar
+// alpha stored by the GEO froxel. A cloud at atmosphere entry has the exact neutral
+// front column (zero airlight, unit transmittance).
+fn topdown_front_column(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>, cloud_t: f32) -> vec4<f32> {
+    let top = ray_sphere(cam, view, R_TOP);
+    if (top.y < top.x || top.y <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let t_enter = max(top.x, 0.0);
+    var t_exit = top.y;
+    let gnd = ray_sphere(cam, view, R_GROUND);
+    if (gnd.y >= gnd.x && gnd.x > t_enter && gnd.x < t_exit) {
+        t_exit = gnd.x;
+    }
+    let segment_m = max(0.0, clamp(cloud_t, t_enter, t_exit) - t_enter);
+    if (segment_m <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let sc = raymarch(cam + view * t_enter, view, sun, segment_m);
+    let t_ac = dot(sc.transmittance, vec3<f32>(1.0 / 3.0));
+    return vec4<f32>(sc.inscatter, clamp(t_ac, 0.0, 1.0));
+}
+
+// Complete front-column algebra shared with the CPU top-down path. i_ac is already
+// passed through the product-facing aerial-veil scale at the call site.
+fn composite_front_column(
+    l_toa: vec3<f32>,
+    l_cloud: vec3<f32>,
+    t_cloud: f32,
+    i_ac: vec3<f32>,
+    t_ac: f32,
+) -> vec3<f32> {
+    return l_toa * t_cloud
+        + t_ac * l_cloud
+        + i_ac * (1.0 - t_cloud);
 }
 
 fn froxel_at(scan_x: f32, scan_y: f32, w: f32) -> vec4<f32> {
@@ -1618,16 +1681,17 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let m = march_cloud(cam, view, sun_ecef);
-    // Geo uses its scan-space aerial froxel. Top-down deliberately has no extra
-    // camera-to-cloud front airlight (the CPU top-down contract): ap=(0,0,0,1)
-    // leaves cloud inscatter unchanged and contributes no front veil.
-    var ap = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    // GEO uses its scan-space aerial froxel. Top-down has one local camera per pixel,
+    // so it directly marches the physical front column to the cloud optical centroid.
+    var ap: vec4<f32>;
     if (u.ray0.x < 0.5) {
         let scan_x = u.ex.w + f32(coord.x) * u.ez.w;
         let scan_y = u.ey.w - f32(coord.y) * u.solar.w;
         // Froxel depth = the atmosphere-shell fraction of the cloud centroid (FINDING 4).
         let w_froxel = atmosphere_shell_fraction(cam, view, m.mean_t);
         ap = froxel_at(scan_x, scan_y, w_froxel);
+    } else {
+        ap = topdown_front_column(cam, view, sun_ecef, m.mean_t);
     }
     // Front airlight weighted by (1 - T_cloud) to avoid double-counting the front
     // segment already inside l_toa's full-column airlight (FINDING 4).
@@ -1635,9 +1699,13 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // FRONT of cloud. p2.w is the shared SurfaceUniforms atmosphere-correction flag;
     // raw-physics mode leaves the full froxel veil intact.
     let front_veil = select(1.0, aerial_veil_scale(pixel_sun_elev), u.p2.w > 0.5);
-    let l_final = l_toa * m.transmittance
-        + ap.a * m.inscatter
-        + front_veil * ap.rgb * (1.0 - m.transmittance);
+    let l_final = composite_front_column(
+        l_toa,
+        m.inscatter,
+        m.transmittance,
+        front_veil * ap.rgb,
+        ap.a,
+    );
     // Display seam (twin of shade_cloud_pixel -> radiance_to_rgba_softclip): the
     // low-sun illuminant gains, then rho = EXPOSURE * pi * L / E_sun into the
     // exposure-aware output transform.

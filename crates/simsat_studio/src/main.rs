@@ -68,8 +68,9 @@ use simsat::ir_enhance::{IrEnhancement, render_ir_rgba};
 use simsat::optics::CloudOpticsMode;
 use simsat::render::{
     CLOUD_SOFTCLIP_KNEE, FLAT_ALBEDO_SRGB, FrameContext, GROUND_DAY_LIFT, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow,
-    normals_from_hgt, radiance_to_rgba_softclip, shade_surface, snow_fraction,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, SurfacePostlightToeConfig, WATER_ALBEDO_SCALE,
+    apply_low_sun_illuminant, blend_snow, normals_from_hgt, radiance_to_rgba_softclip,
+    shade_surface, snow_fraction,
 };
 use simsat::sandwich;
 use simsat::solar::{self, SolarFrame};
@@ -616,6 +617,7 @@ impl GpuPreviewAdjustments {
     const TOPDOWN_CLOUD_FOOTPRINT_OFF: u16 = 1 << 11;
     const INSTRUMENT_FOOTPRINT_OFF: u16 = 1 << 12;
     const MODEL_SPHERE_NAVIGATION: u16 = 1 << 13;
+    const SURFACE_POSTLIGHT_TOE_OFF: u16 = 1 << 14;
 
     fn insert(&mut self, flag: u16) {
         self.0 |= flag;
@@ -663,6 +665,10 @@ impl GpuPreviewAdjustments {
             (
                 Self::SHIPPED_HIGHLIGHTS,
                 "Highlight knee/ceiling -> shipped values",
+            ),
+            (
+                Self::SURFACE_POSTLIGHT_TOE_OFF,
+                "Post-lighting surface toe -> Off (GPU unsupported)",
             ),
             (Self::INTERACTIVE_STEPS, "Cloud steps -> Interactive (192)"),
             (
@@ -1035,6 +1041,11 @@ struct SimSatStudioApp {
     land_dark_toe_knee: f32,
     land_dark_toe_gamma: f32,
     land_dark_toe_max_gain: f32,
+    /// Default-off terrain-only toe after lighting/view attenuation and before airlight.
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f32,
+    surface_postlight_toe_gamma: f32,
+    surface_postlight_toe_max_gain: f32,
     output_transform: OutputTransform,
     // M4 cloud controls (design section 4) + M5 multi-scatter (section 4/6).
     clouds_enabled: bool,
@@ -1081,6 +1092,8 @@ struct SimSatStudioApp {
     /// Display-only sigma~=1.225 px cloud-radiance footprint for finished top-down
     /// visible frames. The sharp surface/base map is never filtered.
     topdown_cloud_footprint: bool,
+    /// Default-on display filter for top-down ground cloud-shadow map aliasing.
+    topdown_shadow_antialias: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL "GPU clouds" toggle (the M5-GPU cloud-pass activation): when on,
     /// the DISPLAYED Geostationary or Top-down Visible clouds-on frame renders through the
@@ -1170,6 +1183,7 @@ impl SimSatStudioApp {
         let settings_path = settings::settings_path();
         let loaded = settings::load(&settings_path);
         let land_appearance = LandAppearanceConfig::default();
+        let surface_postlight_toe = SurfacePostlightToeConfig::default();
         let mut app = Self {
             gpu,
             gpu_error,
@@ -1215,7 +1229,7 @@ impl SimSatStudioApp {
             // Visible is the default mode; IR (band 13) is the M6 toggle.
             render_mode: RenderMode::Visible,
             render_intent: RenderIntent::Display,
-            // CIMSS ramp is the default IR enhancement (the classic coloured look).
+            // NOAA heritage grayscale is the default/recommended Band-13 display.
             ir_enhancement: IrEnhancement::default(),
             thermal_sensor: ThermalSensor::FastGray,
             instrument_footprint: InstrumentFootprint::Off,
@@ -1229,11 +1243,15 @@ impl SimSatStudioApp {
             land_dark_toe_knee: land_appearance.dark_toe_knee as f32,
             land_dark_toe_gamma: land_appearance.dark_toe_gamma as f32,
             land_dark_toe_max_gain: land_appearance.dark_toe_max_gain as f32,
+            surface_postlight_toe: surface_postlight_toe.enabled,
+            surface_postlight_toe_knee: surface_postlight_toe.knee as f32,
+            surface_postlight_toe_gamma: surface_postlight_toe.gamma as f32,
+            surface_postlight_toe_max_gain: surface_postlight_toe.max_gain as f32,
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: true,
             // Model fractional cloud coverage ON by default; missing fields fall back safely.
             fractional_clouds: true,
-            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic2,
             // Wrenninge multi-scatter octaves ON by default (M5): the bright-anvil look.
             multiscatter: true,
             delta_flux_clouds: false,
@@ -1253,6 +1271,7 @@ impl SimSatStudioApp {
             granulation: false,
             topdown_stratiform_regularization: false,
             topdown_cloud_footprint: false,
+            topdown_shadow_antialias: true,
             // Offline (384 steps, full quality) is the default so the displayed AND
             // stored frame is full quality (owner decision: stored quality never
             // reduced); Interactive (192) is the faster preview choice.
@@ -1355,11 +1374,15 @@ impl SimSatStudioApp {
         self.land_dark_toe_knee = s.land_dark_toe_knee;
         self.land_dark_toe_gamma = s.land_dark_toe_gamma;
         self.land_dark_toe_max_gain = s.land_dark_toe_max_gain;
+        self.surface_postlight_toe = s.surface_postlight_toe;
+        self.surface_postlight_toe_knee = s.surface_postlight_toe_knee;
+        self.surface_postlight_toe_gamma = s.surface_postlight_toe_gamma;
+        self.surface_postlight_toe_max_gain = s.surface_postlight_toe_max_gain;
         self.clouds_enabled = s.clouds_enabled;
         self.fractional_clouds = s.fractional_clouds;
         self.fractional_cloud_mode =
             settings::fractional_cloud_mode_from_token(&s.fractional_cloud_mode)
-                .unwrap_or(FractionalCloudMode::EffectiveOd);
+                .unwrap_or(FractionalCloudMode::Deterministic2);
         self.multiscatter = s.multiscatter;
         self.delta_flux_clouds = s.delta_flux_clouds;
         self.delta_flux_v2_clouds = s.delta_flux_v2_clouds;
@@ -1373,6 +1396,7 @@ impl SimSatStudioApp {
         self.granulation = s.granulation;
         self.topdown_stratiform_regularization = s.topdown_stratiform_regularization;
         self.topdown_cloud_footprint = s.topdown_cloud_footprint;
+        self.topdown_shadow_antialias = s.topdown_shadow_antialias;
         self.exposure = s.exposure;
         self.ground_gain = s.ground_gain;
         self.cloud_softclip = s.cloud_softclip;
@@ -1412,6 +1436,10 @@ impl SimSatStudioApp {
             land_dark_toe_knee: self.land_dark_toe_knee,
             land_dark_toe_gamma: self.land_dark_toe_gamma,
             land_dark_toe_max_gain: self.land_dark_toe_max_gain,
+            surface_postlight_toe: self.surface_postlight_toe,
+            surface_postlight_toe_knee: self.surface_postlight_toe_knee,
+            surface_postlight_toe_gamma: self.surface_postlight_toe_gamma,
+            surface_postlight_toe_max_gain: self.surface_postlight_toe_max_gain,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
             fractional_cloud_mode: settings::fractional_cloud_mode_token(
@@ -1431,6 +1459,7 @@ impl SimSatStudioApp {
             granulation: self.granulation,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             topdown_cloud_footprint: self.topdown_cloud_footprint,
+            topdown_shadow_antialias: self.topdown_shadow_antialias,
             exposure: self.exposure,
             ground_gain: self.ground_gain,
             cloud_softclip: self.cloud_softclip,
@@ -2179,6 +2208,14 @@ impl SimSatStudioApp {
             );
         }
         if (atmo.gpu_clouds || atmo.parity)
+            && !gpu_surface_postlight_toe_compatible(atmo.surface_postlight_toe)
+        {
+            self.logline(
+                "GPU clouds: the post-lighting surface toe is CPU-only; using the CPU \
+                 composite so the requested terrain recovery is not ignored.",
+            );
+        }
+        if (atmo.gpu_clouds || atmo.parity)
             && matches!(
                 atmo.cloud_multiscatter,
                 CloudMultiscatterMode::DeltaFluxV1
@@ -2379,6 +2416,15 @@ impl SimSatStudioApp {
         }
     }
 
+    fn surface_postlight_toe_config(&self) -> SurfacePostlightToeConfig {
+        SurfacePostlightToeConfig {
+            enabled: self.surface_postlight_toe,
+            knee: self.surface_postlight_toe_knee as f64,
+            gamma: self.surface_postlight_toe_gamma as f64,
+            max_gain: self.surface_postlight_toe_max_gain as f64,
+        }
+    }
+
     /// Snapshot the M2/M4/M5/M6 render controls into the worker-side `AtmoSettings`
     /// (shared by the single Render and the batch loop so every frame uses the current
     /// satellite/exposure/view/mode/enhancement settings).
@@ -2408,6 +2454,7 @@ impl SimSatStudioApp {
             atmosphere_correction: self.atmosphere_correction,
             terrain_atmosphere: self.terrain_atmosphere,
             land_appearance: self.land_appearance_config(),
+            surface_postlight_toe: self.surface_postlight_toe_config(),
             output_transform: self.output_transform,
             clouds_enabled: self.clouds_enabled,
             fractional_clouds: self.fractional_clouds,
@@ -2438,6 +2485,7 @@ impl SimSatStudioApp {
             granulation: self.granulation,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             topdown_cloud_footprint: self.topdown_cloud_footprint,
+            topdown_shadow_antialias: self.topdown_shadow_antialias,
             step_quality: self.step_quality,
             gpu_clouds: self.gpu_clouds,
             parity: self.parity_pending,
@@ -3251,18 +3299,34 @@ impl SimSatStudioApp {
                              per-column scalar map. IR / WV / Derived are thermal or column \
                              products (day AND night).",
                         );
-                    if self.render_mode != previous_render_mode
-                        && let Some(cleared) = clear_incompatible_instrument_footprint(
+                    if self.render_mode != previous_render_mode {
+                        let enhancement_changed =
+                            apply_product_transition_enhancement_default(
+                                previous_render_mode,
+                                self.render_mode,
+                                &mut self.ir_enhancement,
+                            );
+                        let cleared = clear_incompatible_instrument_footprint(
                             self.render_mode,
                             &mut self.instrument_footprint,
-                        )
-                    {
-                        self.save_settings_now();
-                        self.logline(format!(
-                            "Turned off {} because Mode {} has no compatible Band 13 instrument stage. The hidden setting was cleared and saved; Render is ready.",
-                            cleared.label(),
-                            self.render_mode.label()
-                        ));
+                        );
+                        if enhancement_changed.is_some() || cleared.is_some() {
+                            self.save_settings_now();
+                        }
+                        if let Some(enhancement) = enhancement_changed {
+                            self.logline(format!(
+                                "Selected {} for {}. This product default applies only on an explicit Mode change.",
+                                enhancement.label(),
+                                self.render_mode.label()
+                            ));
+                        }
+                        if let Some(cleared) = cleared {
+                            self.logline(format!(
+                                "Turned off {} because Mode {} has no compatible Band 13 instrument stage. The hidden setting was cleared and saved; Render is ready.",
+                                cleared.label(),
+                                self.render_mode.label()
+                            ));
+                        }
                     }
                     ui.label("Intent:");
                     egui::ComboBox::from_id_salt("render-intent")
@@ -3382,9 +3446,9 @@ impl SimSatStudioApp {
         });
     }
 
-    /// Non-destructive calibration migration. Settings written before the v0.1.5
+    /// Non-destructive calibration migration. Settings written before the current
     /// epoch keep every saved value; this banner makes that fact visible and asks the
-    /// user to either apply the new RC preset or deliberately keep their controls.
+    /// user to either apply the current preset or deliberately keep their controls.
     fn calibration_epoch_banner(&mut self, ui: &mut egui::Ui) {
         if self.visible_calibration_epoch >= settings::VISIBLE_CALIBRATION_EPOCH {
             return;
@@ -3398,9 +3462,9 @@ impl SimSatStudioApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(245, 210, 120),
-                        "v0.1.5 has a new visible calibration. Your saved controls are still active.",
+                        "This build has a new visible calibration. Your saved controls are still active.",
                     );
-                    if ui.button("Use v0.1.5 visible preset").clicked() {
+                    if ui.button("Use current visible preset").clicked() {
                         let mut migrated = self.settings_snapshot();
                         migrated.apply_shipped_visible_calibration();
                         self.apply_settings(&migrated);
@@ -3411,9 +3475,9 @@ impl SimSatStudioApp {
                 });
                 ui.weak(
                     "Full shipped visible baseline: AOD/atmosphere/output/cloud toggles plus \
-                     OD 0.15, exposure 1.50, SZA normalization + dark-land toe on, exposed-domain \
-                     edge feathering on, ground 1.00, knee 0.65, ceiling 1.25, fractional clouds \
-                     on, granulation off.",
+                     OD 0.15, exposure 1.50, SZA normalization on with max gain 4.00, dark-land \
+                     toe on, post-light toe off, exposed-domain edge feathering on, ground 1.00, \
+                     knee 0.65, ceiling 1.25, fractional clouds on, granulation off.",
                 );
             });
     }
@@ -4047,6 +4111,49 @@ impl SimSatStudioApp {
                             );
                         });
                     });
+                    ui.separator();
+                    ui.label("Experimental post-lighting terrain recovery");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(
+                            &mut self.surface_postlight_toe,
+                            "Post-light surface toe (CPU)",
+                        )
+                        .on_hover_text(
+                            "Default-off display experiment. Applies a bounded scalar toe to \
+                             LAND after lighting and camera transmittance, before atmospheric \
+                             airlight and clouds. Ocean/glint, cloud radiance, raw bands, and \
+                             Sensor Fast Gray are unchanged.",
+                        );
+                        ui.add_enabled_ui(self.surface_postlight_toe, |ui| {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.surface_postlight_toe_knee,
+                                    0.001..=0.50,
+                                )
+                                .text("Post-light knee"),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.surface_postlight_toe_gamma,
+                                    0.05..=1.0,
+                                )
+                                .text("Post-light gamma"),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.surface_postlight_toe_max_gain,
+                                    1.0..=4.0,
+                                )
+                                .text("Post-light max gain"),
+                            );
+                        });
+                    });
+                    if self.surface_postlight_toe {
+                        ui.weak(
+                            "Experiment active for finished visible LAND on CPU; GPU preview \
+                             reports and disables it temporarily.",
+                        );
+                    }
                     if self.land_sza_normalization || self.land_dark_toe {
                         ui.weak(
                             "Land visibility corrections active for finished visible land only; \
@@ -4176,7 +4283,7 @@ impl SimSatStudioApp {
                                 && self.fractional_clouds
                             {
                                 if self.fractional_cloud_mode == FractionalCloudMode::Off {
-                                    self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+                                    self.fractional_cloud_mode = FractionalCloudMode::Deterministic2;
                                 }
                                 // The current WGSL preview has no fractional-subcolumn closure.
                                 // Do not leave a now-disabled preview silently checked.
@@ -4188,7 +4295,10 @@ impl SimSatStudioApp {
                                 egui::ComboBox::from_id_salt("fractional-cloud-mode")
                                     .selected_text(match self.fractional_cloud_mode {
                                         FractionalCloudMode::EffectiveOd => {
-                                            "Effective OD (fast/default)"
+                                            "Effective OD (fast/explicit)"
+                                        }
+                                        FractionalCloudMode::Deterministic2 => {
+                                            "Deterministic 2 (Recommended)"
                                         }
                                         FractionalCloudMode::Deterministic4 => {
                                             "Deterministic 4 (reference)"
@@ -4204,8 +4314,18 @@ impl SimSatStudioApp {
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut self.fractional_cloud_mode,
+                                            FractionalCloudMode::Deterministic2,
+                                            "Deterministic 2 (Recommended, ~2x)",
+                                        )
+                                        .on_hover_text(
+                                            "Two fixed shared-u maximum-overlap subcolumns. This \
+                                             is the fastest explicit cloudy/clear radiance closure; \
+                                             use Deterministic 4 when finer fraction quadrature matters.",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
                                             FractionalCloudMode::EffectiveOd,
-                                            "Effective OD (fast/default)",
+                                            "Effective OD (fast/explicit)",
                                         );
                                         ui.selectable_value(
                                             &mut self.fractional_cloud_mode,
@@ -4485,6 +4605,18 @@ impl SimSatStudioApp {
                                 self.gpu_clouds = false;
                                 self.parity_pending = false;
                             }
+                            ui.checkbox(
+                                &mut self.topdown_shadow_antialias,
+                                "Top-down shadow anti-aliasing",
+                            )
+                            .on_hover_text(
+                                "Default-on display filter for the top-down ground cloud-shadow \
+                                 map. It reduces fixed-grid dash/ring aliasing without blurring \
+                                 the cloud radiance or terrain. Turn it off for an exact raw \
+                                 shadow-map diagnostic. Geostationary and quantitative products \
+                                 are unchanged; Sensor Fast Gray temporarily forces it off and \
+                                 reports that substitution.",
+                            );
                             ui.label("Steps:");
                             egui::ComboBox::from_id_salt("stepq")
                                 .selected_text(match self.step_quality {
@@ -4544,6 +4676,9 @@ impl SimSatStudioApp {
                             <= f32::EPSILON;
                     let gpu_land_appearance_ok =
                         gpu_land_appearance_compatible(self.land_appearance_config());
+                    let gpu_surface_postlight_toe_ok = gpu_surface_postlight_toe_compatible(
+                        self.surface_postlight_toe_config(),
+                    );
                     let gpu_applicable = self.gpu.is_some()
                         && !self.science_cloud_f16
                         && matches!(self.render_mode, RenderMode::Visible)
@@ -4570,7 +4705,8 @@ impl SimSatStudioApp {
                         && !self.delta_flux_v2_clouds
                         && !self.delta_flux_v3_clouds
                         && gpu_tonemap_ok
-                        && gpu_land_appearance_ok;
+                        && gpu_land_appearance_ok
+                        && gpu_surface_postlight_toe_ok;
                     // egui shows NO hover text on disabled widgets, so a greyed GPU
                     // cluster was unexplained (owner-reported) — name the unmet
                     // conditions inline and on the disabled-hover instead.
@@ -4643,6 +4779,12 @@ impl SimSatStudioApp {
                         if !gpu_land_appearance_ok {
                             unmet.push(
                                 "current land appearance is not implemented in WGSL".to_string(),
+                            );
+                        }
+                        if !gpu_surface_postlight_toe_ok {
+                            unmet.push(
+                                "Post-light surface toe is On; requires Off for manual GPU"
+                                    .to_string(),
                             );
                         }
                         if unmet.is_empty() {
@@ -4812,12 +4954,14 @@ impl SimSatStudioApp {
                             .on_hover_text(if is_wv {
                                 "The colour enhancement applied to the Kelvin WV BT plane. \
                                  CIMSS = the classic WV moisture palette (white cold/moist -> \
-                                 blue -> brown warm/dry); Grayscale = a WV-scaled inverted gray. \
+                                 blue -> brown warm/dry); Natural and Legacy grayscale both use \
+                                 the readable WV-scaled inverted-gray range. \
                                  Changing it re-colours instantly (no re-render)."
                             } else {
-                                "The IR colour enhancement applied to the Kelvin BT plane \
-                                 (Grayscale / BD / Rainbow / CIMSS / AVN / Funktop). Changing it \
-                                 re-colours the current frame instantly (no re-render)."
+                                "The display enhancement applied to the Kelvin BT plane. Natural \
+                                 is NOAA's continuous heritage Band-13 grayscale and is recommended. \
+                                 Legacy false-color/threshold palettes intentionally emphasize \
+                                 temperature bands. Changing it re-colours instantly (no re-render)."
                             });
                     });
                 });
@@ -5599,6 +5743,8 @@ struct AtmoSettings {
     /// Display-only land corrections. The shipped preset enables both bounded
     /// corrections; the persisted toggles can select the exact legacy identity.
     land_appearance: LandAppearanceConfig,
+    /// Default-off display experiment over the lit/view-attenuated LAND contribution.
+    surface_postlight_toe: SurfacePostlightToeConfig,
     output_transform: OutputTransform,
     clouds_enabled: bool,
     /// Use the source's cloud-fraction/subcolumn closure when available. The CPU
@@ -5626,6 +5772,8 @@ struct AtmoSettings {
     topdown_stratiform_regularization: bool,
     /// Display-only pre-tonemap footprint over the cloud radiance residual.
     topdown_cloud_footprint: bool,
+    /// Default-on display filter for the top-down ground cloud-shadow field.
+    topdown_shadow_antialias: bool,
     step_quality: StepQuality,
     /// EXPERIMENTAL: render a Geostationary or Top-down Visible clouds-on frame through the
     /// GPU cloud pass (Interactive schedule) instead of the CPU composite. Only the
@@ -5685,6 +5833,10 @@ fn configure_render_intent(atmo: &mut AtmoSettings) {
         atmo.land_appearance = LandAppearanceConfig::identity();
         changed.push(RenderIntentAdjustment::LandAppearanceIdentity);
     }
+    if !atmo.surface_postlight_toe.is_identity() {
+        atmo.surface_postlight_toe = SurfacePostlightToeConfig::off();
+        changed.push(RenderIntentAdjustment::SurfacePostlightToeOff);
+    }
     if atmo.feather_exposed_domain_edges {
         atmo.feather_exposed_domain_edges = false;
         changed.push(RenderIntentAdjustment::ExposedEdgeFeatherOff);
@@ -5700,6 +5852,10 @@ fn configure_render_intent(atmo: &mut AtmoSettings) {
     if atmo.topdown_cloud_footprint {
         atmo.topdown_cloud_footprint = false;
         changed.push(RenderIntentAdjustment::TopdownCloudFootprintOff);
+    }
+    if atmo.topdown_shadow_antialias {
+        atmo.topdown_shadow_antialias = false;
+        changed.push(RenderIntentAdjustment::TopdownShadowAntialiasOff);
     }
     if atmo.atmosphere_correction {
         atmo.atmosphere_correction = false;
@@ -5761,6 +5917,10 @@ fn configure_one_click_gpu_preview(atmo: &mut AtmoSettings) -> GpuPreviewAdjustm
     if atmo.topdown_cloud_footprint {
         changes.insert(GpuPreviewAdjustments::TOPDOWN_CLOUD_FOOTPRINT_OFF);
         atmo.topdown_cloud_footprint = false;
+    }
+    if !atmo.surface_postlight_toe.is_identity() {
+        changes.insert(GpuPreviewAdjustments::SURFACE_POSTLIGHT_TOE_OFF);
+        atmo.surface_postlight_toe = SurfacePostlightToeConfig::off();
     }
     if atmo.feather_exposed_domain_edges {
         changes.insert(GpuPreviewAdjustments::EXPOSED_EDGE_FEATHER_OFF);
@@ -5844,6 +6004,33 @@ fn clear_incompatible_instrument_footprint(
     let previous = *footprint;
     *footprint = InstrumentFootprint::Off;
     Some(previous)
+}
+
+/// Select the reviewed display default only when the user explicitly enters a
+/// thermal product. Startup/settings loading does not call this helper, so a
+/// persisted explicit palette survives when the app opens in that same product.
+///
+/// Band 13 enters the continuous NOAA heritage Natural grayscale. Each WV product
+/// enters its own established default (currently CIMSS), avoiding a fresh-app
+/// Natural selection leaking into WV merely because the picker is shared.
+fn apply_product_transition_enhancement_default(
+    previous: RenderMode,
+    entered: RenderMode,
+    enhancement: &mut IrEnhancement,
+) -> Option<IrEnhancement> {
+    if previous == entered {
+        return None;
+    }
+    let desired = match entered {
+        RenderMode::Ir => IrEnhancement::Natural,
+        RenderMode::WaterVapor(band) => band.default_enhancement(),
+        _ => return None,
+    };
+    if *enhancement == desired {
+        return None;
+    }
+    *enhancement = desired;
+    Some(desired)
 }
 
 /// Validate the Studio's instrument-stage contract before touching input I/O.
@@ -6259,6 +6446,8 @@ fn prepare_render(
     // land corrections. Keep this predicate at the UI/worker seam so future land
     // operators cannot silently become GPU-eligible without an explicit review.
     let gpu_land_appearance_ok = gpu_land_appearance_compatible(atmo.land_appearance);
+    let gpu_surface_postlight_toe_ok =
+        gpu_surface_postlight_toe_compatible(atmo.surface_postlight_toe);
     // The current WGSL shader implements the established octave/single-scatter
     // transport only. Delta-flux is deliberately CPU-only until it has a reviewed
     // shader twin; never silently substitute a different cloud closure.
@@ -6281,6 +6470,7 @@ fn prepare_render(
         && gpu_exposed_edge_feather_ok
         && gpu_cloud_tonemap_ok
         && gpu_land_appearance_ok
+        && gpu_surface_postlight_toe_ok
         && gpu_cloud_transport_ok;
     if (atmo.gpu_clouds || atmo.parity) && !gpu_projection_ok {
         status("GPU clouds: rotated lat-lon (RRFS) is CPU-only; using the CPU composite.");
@@ -6321,12 +6511,18 @@ fn prepare_render(
     if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_tonemap_ok {
         status("GPU clouds: custom highlight knee/ceiling are CPU-only; using the CPU composite.");
     }
+    if (atmo.gpu_clouds || atmo.parity) && !gpu_surface_postlight_toe_ok {
+        status(
+            "GPU clouds: post-lighting surface toe is CPU-only; using the CPU composite so \
+             requested terrain recovery is not ignored.",
+        );
+    }
     if (atmo.gpu_clouds || atmo.parity) && !gpu_cloud_transport_ok {
         status("GPU clouds: delta-flux transport is CPU-only; using the CPU composite.");
     }
     if !atmo.clouds_enabled
         && matches!(atmo.render_mode, RenderMode::Visible)
-        && (!gpu_surface_display_ok || !gpu_land_appearance_ok)
+        && (!gpu_surface_display_ok || !gpu_land_appearance_ok || !gpu_surface_postlight_toe_ok)
     {
         status(
             "Clear-sky display calibration is not representable by the GPU surface pass; \
@@ -6723,6 +6919,7 @@ fn prepare_render(
             ground_day_lift: atmo.ground_gain,
             cloud_softclip_knee: atmo.cloud_softclip,
             cloud_highlight_max: atmo.cloud_highlight_max,
+            topdown_shadow_antialias: is_topdown && atmo.topdown_shadow_antialias,
             octaves: match atmo.cloud_multiscatter {
                 CloudMultiscatterMode::LegacyOctaves => clouds::DEFAULT_OCTAVES,
                 CloudMultiscatterMode::SingleScatter
@@ -6745,6 +6942,7 @@ fn prepare_render(
             edge_feather_cells: icfg.edge_feather_cells as f32,
             ground_day_lift: icfg.ground_day_lift as f32,
             cloud_optical_depth_scale: icfg.cloud_optical_depth_scale,
+            topdown_shadow_antialias: icfg.topdown_shadow_antialias,
         };
         let sun_od_plan = gpu::plan_sun_od(
             &georef,
@@ -6807,6 +7005,7 @@ fn prepare_render(
                 atmosphere_correction: atmo.atmosphere_correction,
                 terrain_atmosphere: atmo.terrain_atmosphere,
                 land_appearance: atmo.land_appearance,
+                surface_postlight_toe: atmo.surface_postlight_toe,
             };
             let bm_ref = bluemarble.as_ref().map(|a| &a.0);
             let rnx = raster.nx;
@@ -7029,6 +7228,7 @@ fn prepare_render(
             ground_day_lift: atmo.ground_gain,
             cloud_softclip_knee: atmo.cloud_softclip,
             cloud_highlight_max: atmo.cloud_highlight_max,
+            topdown_shadow_antialias: is_topdown && atmo.topdown_shadow_antialias,
             // Multi-scatter A/B (M5): DEFAULT_OCTAVES = the bright multiple-scatter look,
             // 1 = the fix2 single scatter.
             octaves: match atmo.cloud_multiscatter {
@@ -7092,6 +7292,7 @@ fn prepare_render(
             atmosphere_correction: atmo.atmosphere_correction,
             terrain_atmosphere: atmo.terrain_atmosphere,
             land_appearance: atmo.land_appearance,
+            surface_postlight_toe: atmo.surface_postlight_toe,
         };
         let bm_ref = bluemarble.as_ref().map(|a| &a.0);
         let rnx = raster.nx;
@@ -7862,6 +8063,13 @@ fn gpu_land_appearance_compatible(_config: LandAppearanceConfig) -> bool {
     true
 }
 
+/// The post-lighting terrain toe is intentionally CPU-only in this experiment. The
+/// manual GPU path must route enabled requests to CPU, while one-click GPU reports and
+/// temporarily disables it.
+fn gpu_surface_postlight_toe_compatible(config: SurfacePostlightToeConfig) -> bool {
+    config.is_identity()
+}
+
 /// Default sat-store root under the SimSat Studio data dir (sibling of the brick
 /// cache). Shown in the UI and changeable; the owner points BowEcho here.
 fn default_store_root() -> PathBuf {
@@ -8069,6 +8277,7 @@ mod tests {
             atmosphere_correction: true,
             terrain_atmosphere: false,
             land_appearance: LandAppearanceConfig::identity(),
+            surface_postlight_toe: SurfacePostlightToeConfig::off(),
         }
     }
 
@@ -8096,6 +8305,10 @@ mod tests {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::default(),
+            surface_postlight_toe: SurfacePostlightToeConfig {
+                enabled: true,
+                ..SurfacePostlightToeConfig::default()
+            },
             output_transform: OutputTransform::AbiReflectance,
             clouds_enabled: false,
             fractional_clouds: true,
@@ -8109,6 +8322,7 @@ mod tests {
             granulation: true,
             topdown_stratiform_regularization: true,
             topdown_cloud_footprint: true,
+            topdown_shadow_antialias: true,
             step_quality: StepQuality::Offline,
             gpu_clouds: false,
             parity: true,
@@ -8135,10 +8349,12 @@ mod tests {
         assert_eq!(atmo.exposure, 1.0);
         assert_eq!(atmo.ground_gain, 1.0);
         assert_eq!(atmo.land_appearance, LandAppearanceConfig::identity());
+        assert!(atmo.surface_postlight_toe.is_identity());
         assert!(!atmo.feather_exposed_domain_edges);
         assert!(!atmo.granulation);
         assert!(!atmo.topdown_stratiform_regularization);
         assert!(!atmo.topdown_cloud_footprint);
+        assert!(!atmo.topdown_shadow_antialias);
         assert!(!atmo.atmosphere_correction);
         assert_eq!(atmo.cloud_softclip, 1.0);
         assert_eq!(atmo.cloud_highlight_max, 1.0);
@@ -8150,6 +8366,14 @@ mod tests {
         assert!(
             atmo.intent_adjustments
                 .contains(&RenderIntentAdjustment::HighlightShoulderIdentity)
+        );
+        assert!(
+            atmo.intent_adjustments
+                .contains(&RenderIntentAdjustment::SurfacePostlightToeOff)
+        );
+        assert!(
+            atmo.intent_adjustments
+                .contains(&RenderIntentAdjustment::TopdownShadowAntialiasOff)
         );
         assert_eq!(
             atmo.render_intent.observation_operator(),
@@ -8228,6 +8452,66 @@ mod tests {
     }
 
     #[test]
+    fn thermal_product_transition_selects_product_default_but_same_product_preserves_palette() {
+        let mut enhancement = IrEnhancement::Natural;
+        assert_eq!(
+            apply_product_transition_enhancement_default(
+                RenderMode::Visible,
+                RenderMode::WaterVapor(WvBand::Upper),
+                &mut enhancement,
+            ),
+            Some(IrEnhancement::Cimss)
+        );
+        assert_eq!(enhancement, WvBand::Upper.default_enhancement());
+
+        enhancement = IrEnhancement::Rainbow;
+        assert_eq!(
+            apply_product_transition_enhancement_default(
+                RenderMode::WaterVapor(WvBand::Upper),
+                RenderMode::WaterVapor(WvBand::Mid),
+                &mut enhancement,
+            ),
+            Some(IrEnhancement::Cimss)
+        );
+        assert_eq!(enhancement, WvBand::Mid.default_enhancement());
+
+        enhancement = IrEnhancement::Cimss;
+        assert_eq!(
+            apply_product_transition_enhancement_default(
+                RenderMode::Visible,
+                RenderMode::Ir,
+                &mut enhancement,
+            ),
+            Some(IrEnhancement::Natural)
+        );
+        assert_eq!(enhancement, IrEnhancement::Natural);
+
+        // Loading the app in the same persisted product does not constitute a
+        // transition and therefore keeps the user's explicit legacy selection.
+        enhancement = IrEnhancement::Rainbow;
+        assert_eq!(
+            apply_product_transition_enhancement_default(
+                RenderMode::WaterVapor(WvBand::Upper),
+                RenderMode::WaterVapor(WvBand::Upper),
+                &mut enhancement,
+            ),
+            None
+        );
+        assert_eq!(enhancement, IrEnhancement::Rainbow);
+
+        enhancement = IrEnhancement::Cimss;
+        assert_eq!(
+            apply_product_transition_enhancement_default(
+                RenderMode::Ir,
+                RenderMode::Ir,
+                &mut enhancement,
+            ),
+            None
+        );
+        assert_eq!(enhancement, IrEnhancement::Cimss);
+    }
+
+    #[test]
     fn one_click_gpu_render_selects_compatible_preview_without_touching_calibration() {
         let mut atmo = incompatible_gpu_preview_atmo();
         let original_exposure = atmo.exposure;
@@ -8244,6 +8528,7 @@ mod tests {
         assert!(!atmo.granulation);
         assert!(!atmo.topdown_stratiform_regularization);
         assert!(!atmo.topdown_cloud_footprint);
+        assert!(atmo.surface_postlight_toe.is_identity());
         assert!(!atmo.feather_exposed_domain_edges);
         assert_eq!(
             atmo.cloud_multiscatter,
@@ -8264,6 +8549,7 @@ mod tests {
         assert!(changes.summary().contains("Legacy octaves"));
         assert!(changes.summary().contains("stratiform reconstruction"));
         assert!(changes.summary().contains("cloud footprint"));
+        assert!(changes.summary().contains("Post-lighting surface toe"));
     }
 
     #[test]

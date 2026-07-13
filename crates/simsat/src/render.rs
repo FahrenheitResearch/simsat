@@ -57,8 +57,10 @@ pub const DEFAULT_EXPOSURE: f64 = 1.5;
 pub const LAND_SZA_REFERENCE_ELEV_DEG: f64 = 60.0;
 
 /// Default upper bound for the land-only solar-zenith normalization. The correction
-/// starts at the horizon and is fully enabled by 12 degrees solar elevation.
-pub const LAND_SZA_MAX_GAIN: f64 = 1.6;
+/// starts at the horizon and is fully enabled by 12 degrees solar elevation. Multi-time
+/// low-sun QA selected `4.0`: it closely brackets the Lambertian `sin(60) / sin(12)`
+/// recovery while the existing elevation ramp keeps twilight and high-sun scenes neutral.
+pub const LAND_SZA_MAX_GAIN: f64 = 4.0;
 
 /// Linear-reflectance luminance knee for the dark-land toe. Land at or above
 /// this value is unchanged; darker positive reflectances receive a bounded scalar lift.
@@ -71,7 +73,54 @@ pub const LAND_DARK_TOE_GAMMA: f64 = 0.65;
 /// Default upper bound for the dark-land toe's scalar lift.
 pub const LAND_DARK_TOE_MAX_GAIN: f64 = 1.5;
 
-/// Display-only land appearance controls. The owner-selected v0.1.5 preset enables
+/// Default linear-reflectance knee for the opt-in post-lighting surface toe.
+pub const SURFACE_POSTLIGHT_TOE_KNEE: f64 = 0.18;
+
+/// Default exponent for the opt-in post-lighting surface toe.
+pub const SURFACE_POSTLIGHT_TOE_GAMMA: f64 = 0.80;
+
+/// Default upper bound for the opt-in post-lighting surface toe.
+pub const SURFACE_POSTLIGHT_TOE_MAX_GAIN: f64 = 1.35;
+
+/// Display-only terrain experiment applied to the already-lit, view-attenuated LAND surface
+/// contribution before atmospheric airlight and clouds are composited. It is separate
+/// from [`LandAppearanceConfig`]: this operator responds to the final surface signal,
+/// not the source albedo, and is deliberately default-off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfacePostlightToeConfig {
+    pub enabled: bool,
+    /// Linear reflectance-factor luminance at which the operator becomes identity.
+    pub knee: f64,
+    /// Toe exponent; `1.0` is identity and lower values lift dark positive signals.
+    pub gamma: f64,
+    /// Upper bound for the colour-preserving scalar lift; `1.0` is identity.
+    pub max_gain: f64,
+}
+
+impl Default for SurfacePostlightToeConfig {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl SurfacePostlightToeConfig {
+    /// Shipped/default identity path. The stored parameters remain ready for an A/B.
+    pub const fn off() -> Self {
+        Self {
+            enabled: false,
+            knee: SURFACE_POSTLIGHT_TOE_KNEE,
+            gamma: SURFACE_POSTLIGHT_TOE_GAMMA,
+            max_gain: SURFACE_POSTLIGHT_TOE_MAX_GAIN,
+        }
+    }
+
+    #[inline]
+    pub const fn is_identity(self) -> bool {
+        !self.enabled
+    }
+}
+
+/// Display-only land appearance controls. The owner-selected current preset enables
 /// both corrections; [`LandAppearanceConfig::identity`] is the explicit legacy/no-op
 /// path. They operate on the land surface signal before aerial perspective and cloud
 /// compositing. Water/glint, clouds, limb/space, thermal products, derived products,
@@ -102,7 +151,7 @@ impl Default for LandAppearanceConfig {
 }
 
 impl LandAppearanceConfig {
-    /// Owner-selected v0.1.5 finished-visible land calibration.
+    /// Owner-selected finished-visible land calibration.
     pub const fn shipped() -> Self {
         Self {
             sza_normalization: true,
@@ -489,6 +538,9 @@ pub struct FrameContext<'a> {
     pub terrain_atmosphere: bool,
     /// Optional display-only land corrections. The default is an exact no-op.
     pub land_appearance: LandAppearanceConfig,
+    /// Optional display-only post-lighting LAND surface toe. Default-off and ignored by
+    /// water/glint and raw/sensor products at the high-level API seam.
+    pub surface_postlight_toe: SurfacePostlightToeConfig,
 }
 
 /// One surface pixel's inputs for [`shade_surface`].
@@ -679,6 +731,34 @@ pub fn land_dark_toe_gain(
     surface_help_ramp(sun_elev_deg, gain)
 }
 
+/// Gain for the opt-in post-lighting surface toe. `surface_contribution` is the
+/// already-lit surface radiance after camera/view transmittance but before additive
+/// atmospheric airlight. It is converted to a solar-normalized reflectance factor and
+/// fed through the same smooth, bounded, colour-preserving toe as the established land
+/// correction. The shared daylight ramp keeps night exactly unchanged.
+#[inline]
+pub fn surface_postlight_toe_gain(
+    surface_contribution: [f64; 3],
+    sun_elev_deg: f64,
+    config: SurfacePostlightToeConfig,
+) -> f64 {
+    if config.is_identity() {
+        return 1.0;
+    }
+    let rho = [
+        std::f64::consts::PI * surface_contribution[0] / SOLAR_IRRADIANCE_RGB[0],
+        std::f64::consts::PI * surface_contribution[1] / SOLAR_IRRADIANCE_RGB[1],
+        std::f64::consts::PI * surface_contribution[2] / SOLAR_IRRADIANCE_RGB[2],
+    ];
+    land_dark_toe_gain(
+        rho,
+        sun_elev_deg,
+        config.knee,
+        config.gamma,
+        config.max_gain,
+    )
+}
+
 /// Combined land-only display gain. Each correction is independently switchable and
 /// bounded; [`LandAppearanceConfig::identity`] returns exactly `1.0` without touching
 /// the legacy path.
@@ -708,6 +788,26 @@ pub fn land_appearance_gain(
         1.0
     };
     sza * toe
+}
+
+/// Unit-preserving Lambertian surface radiance. `direct_irradiance` is the solar
+/// irradiance at the surface before projection by `N.L`; `ambient_irradiance` is the
+/// hemispheric diffuse term. With no atmosphere/ambient and an overhead sun, converting
+/// the result back through [`reflectance_from_radiance`] returns `albedo` exactly.
+#[inline]
+pub fn lambert_surface_radiance(
+    albedo: [f64; 3],
+    direct_irradiance: [f64; 3],
+    ndotl: f64,
+    ambient_irradiance: [f64; 3],
+) -> [f64; 3] {
+    let mu = ndotl.clamp(0.0, 1.0);
+    let pi = std::f64::consts::PI;
+    [
+        albedo[0] / pi * (direct_irradiance[0] * mu + ambient_irradiance[0]),
+        albedo[1] / pi * (direct_irradiance[1] * mu + ambient_irradiance[1]),
+        albedo[2] / pi * (direct_irradiance[2] * mu + ambient_irradiance[2]),
+    ]
 }
 
 /// The EFFECTIVE cloud shadow seen by the DIFFUSE direct-sun terms (land + water body):
@@ -1146,6 +1246,34 @@ pub(crate) fn combine_aerial_veil(
     ]
 }
 
+/// [`combine_aerial_veil`] with the opt-in post-lighting surface toe inserted at its
+/// precise display seam: after view transmittance, before additive airlight. The
+/// disabled path delegates to the established helper for byte-for-byte identity.
+#[inline]
+pub(crate) fn combine_aerial_veil_with_surface_toe(
+    l_surf: [f64; 3],
+    transmittance: [f64; 3],
+    inscatter: [f64; 3],
+    veil: f64,
+    sun_elev_deg: f64,
+    config: SurfacePostlightToeConfig,
+) -> [f64; 3] {
+    if config.is_identity() {
+        return combine_aerial_veil(l_surf, transmittance, inscatter, veil);
+    }
+    let surface = [
+        l_surf[0] * transmittance[0],
+        l_surf[1] * transmittance[1],
+        l_surf[2] * transmittance[2],
+    ];
+    let gain = surface_postlight_toe_gain(surface, sun_elev_deg, config);
+    [
+        surface[0] * gain + veil * inscatter[0],
+        surface[1] * gain + veil * inscatter[1],
+        surface[2] * gain + veil * inscatter[2],
+    ]
+}
+
 /// The top-of-atmosphere linear radiance of one surface (or limb) pixel, before the
 /// output transform. `None` means space beyond the atmosphere (transparent). This is
 /// the shared radiance path of [`shade_surface`] and the M4 cloud composite
@@ -1375,6 +1503,13 @@ pub fn surface_toa_radiance(
     }
 
     // Aerial perspective: raymarch the shell from atmosphere entry to the ground.
+    // The experiment targets terrain only. Dark ocean, Fresnel sky reflection, and
+    // Cox-Munk glint stay on the reviewed path exactly.
+    let postlight_toe = if px.is_water {
+        SurfacePostlightToeConfig::off()
+    } else {
+        ctx.surface_postlight_toe
+    };
     let mut l_toa = l_surf;
     if let Some((t_enter, t_ground)) = seg {
         let p_start = madd3(cam, view, t_enter);
@@ -1399,7 +1534,23 @@ pub fn surface_toa_radiance(
         } else {
             1.0
         };
-        l_toa = combine_aerial_veil(l_surf, sc.transmittance, sc.inscatter, veil);
+        l_toa = combine_aerial_veil_with_surface_toe(
+            l_surf,
+            sc.transmittance,
+            sc.inscatter,
+            veil,
+            px.sun_elev_deg as f64,
+            postlight_toe,
+        );
+    } else if !postlight_toe.is_identity() {
+        l_toa = combine_aerial_veil_with_surface_toe(
+            l_surf,
+            [1.0; 3],
+            [0.0; 3],
+            1.0,
+            px.sun_elev_deg as f64,
+            postlight_toe,
+        );
     }
     Some(l_toa)
 }
@@ -1620,6 +1771,46 @@ mod tests {
     }
 
     #[test]
+    fn analytic_lambert_round_trips_linear_reflectance_and_ndotl_units() {
+        let albedo = [0.20; 3];
+        for (ndotl, expected) in [(1.0, 0.20f32), (0.5, 0.10), (0.25, 0.05)] {
+            let radiance = lambert_surface_radiance(albedo, SOLAR_IRRADIANCE_RGB, ndotl, [0.0; 3]);
+            let rho = reflectance_from_radiance(radiance);
+            for channel in rho {
+                assert!(
+                    (channel - expected).abs() < 2.0e-7,
+                    "N.L={ndotl}: rho={channel}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_lambert_surface_and_cloud_limits_preserve_reflectance_units() {
+        let surface = lambert_surface_radiance([0.20; 3], SOLAR_IRRADIANCE_RGB, 1.0, [0.0; 3]);
+        let cloud = lambert_surface_radiance([0.60; 3], SOLAR_IRRADIANCE_RGB, 1.0, [0.0; 3]);
+        let surface_rho = reflectance_from_radiance(surface);
+        assert!(surface_rho.into_iter().all(|v| (v - 0.20).abs() < 2.0e-7));
+
+        let clear =
+            crate::topdown::composite_topdown_front_column(surface, [0.0; 3], 1.0, [0.0; 3], 1.0);
+        let opaque =
+            crate::topdown::composite_topdown_front_column(surface, cloud, 0.0, [0.0; 3], 1.0);
+        assert!(
+            reflectance_from_radiance(clear)
+                .into_iter()
+                .all(|v| (v - 0.20).abs() < 2.0e-7),
+            "clear-cloud limit must preserve the surface reflectance"
+        );
+        assert!(
+            reflectance_from_radiance(opaque)
+                .into_iter()
+                .all(|v| (v - 0.60).abs() < 2.0e-7),
+            "opaque-cloud limit must preserve cloud radiance units and hide surface"
+        );
+    }
+
+    #[test]
     fn night_is_dark_even_facing_the_sun() {
         let out = shade_pixel(&ShadeInputs {
             on_earth: true,
@@ -1743,6 +1934,7 @@ mod tests {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::identity(),
+            surface_postlight_toe: SurfacePostlightToeConfig::off(),
         };
         (ctx, sun_enu)
     }
@@ -2816,6 +3008,110 @@ mod tests {
             land_dark_toe_gain([0.02; 3], 40.0, 0.08, 1.0, 2.0),
             1.0,
             "gamma one is an explicit identity"
+        );
+    }
+
+    #[test]
+    fn surface_postlight_toe_is_default_off_bounded_and_uses_recommended_grid() {
+        let off = SurfacePostlightToeConfig::default();
+        assert!(off.is_identity());
+        assert_eq!(off.knee, 0.18);
+        assert_eq!(off.gamma, 0.80);
+        assert_eq!(off.max_gain, 1.35);
+
+        let rho = 0.035;
+        let surface = [
+            rho * SOLAR_IRRADIANCE_RGB[0] / std::f64::consts::PI,
+            rho * SOLAR_IRRADIANCE_RGB[1] / std::f64::consts::PI,
+            rho * SOLAR_IRRADIANCE_RGB[2] / std::f64::consts::PI,
+        ];
+        assert_eq!(surface_postlight_toe_gain(surface, 25.0, off), 1.0);
+        for knee in [0.15, 0.18, 0.22] {
+            for gamma in [0.75, 0.80, 0.85] {
+                for max_gain in [1.25, 1.35, 1.45] {
+                    let config = SurfacePostlightToeConfig {
+                        enabled: true,
+                        knee,
+                        gamma,
+                        max_gain,
+                    };
+                    let gain = surface_postlight_toe_gain(surface, 25.0, config);
+                    assert!(
+                        gain > 1.0 && gain <= max_gain,
+                        "grid gain {gain} outside 1..={max_gain} for {config:?}"
+                    );
+                    assert_eq!(
+                        surface_postlight_toe_gain(surface, 0.0, config),
+                        1.0,
+                        "night/horizon must remain identity"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn surface_postlight_toe_sits_after_view_transmittance_before_airlight() {
+        let config = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
+        let l_surf = [8.0, 9.0, 7.0];
+        let trans = [0.75, 0.70, 0.65];
+        let inscatter = [0.4, 0.5, 0.6];
+        let veil = 0.4;
+        let surface = [
+            l_surf[0] * trans[0],
+            l_surf[1] * trans[1],
+            l_surf[2] * trans[2],
+        ];
+        let gain = surface_postlight_toe_gain(surface, 20.0, config);
+        let adjusted =
+            combine_aerial_veil_with_surface_toe(l_surf, trans, inscatter, veil, 20.0, config);
+        for c in 0..3 {
+            assert!((adjusted[c] - (surface[c] * gain + veil * inscatter[c])).abs() < 1e-12);
+        }
+        assert_eq!(
+            combine_aerial_veil_with_surface_toe(
+                l_surf,
+                trans,
+                inscatter,
+                veil,
+                20.0,
+                SurfacePostlightToeConfig::off(),
+            ),
+            combine_aerial_veil(l_surf, trans, inscatter, veil),
+            "disabled experiment must preserve the established composite exactly"
+        );
+    }
+
+    #[test]
+    fn surface_postlight_toe_brightens_land_only_and_preserves_ocean_glint() {
+        let (mut ctx, sun) = nadir_surface_pixel(25.0);
+        let pixel = |is_water| SurfacePixel {
+            on_earth: true,
+            base_srgb: [0.08, 0.10, 0.06],
+            normal_enu: [0.0, 0.0, 1.0],
+            sun_enu: [sun[0] as f32, sun[1] as f32, sun[2] as f32],
+            sun_elev_deg: 25.0,
+            is_water,
+            view_dir: nadir_view(),
+            wind_speed: 5.0,
+            ..Default::default()
+        };
+        let sum = |v: [f64; 3]| v.into_iter().sum::<f64>();
+        let land_base = surface_toa_radiance(&ctx, &pixel(false), 1.0, 1.0).unwrap();
+        let water_base = surface_toa_radiance(&ctx, &pixel(true), 1.0, 1.0).unwrap();
+        ctx.surface_postlight_toe = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
+        let land_adjusted = surface_toa_radiance(&ctx, &pixel(false), 1.0, 1.0).unwrap();
+        let water_adjusted = surface_toa_radiance(&ctx, &pixel(true), 1.0, 1.0).unwrap();
+        assert!(sum(land_adjusted) > sum(land_base));
+        assert_eq!(
+            water_adjusted, water_base,
+            "post-light terrain recovery must not alter dark ocean or glint"
         );
     }
 

@@ -42,11 +42,15 @@ pub const RECENT_CAP: usize = 8;
 /// the owner-selected `0.15` plus the neutral ABI display/ground baseline; epoch 3
 /// keeps OD `0.15` and selects exposure `1.5`; epoch 4 promotes the owner-selected
 /// SZA normalization and dark-land toe; epoch 5 promotes exposed-domain cloud-edge
-/// feathering to the shipped visible preset.
+/// feathering to the shipped visible preset; epoch 6 promotes the owner-selected
+/// low-sun land SZA maximum gain from `1.6` to `4.0` and the reviewed
+/// deterministic two-subcolumn Recommended closure.
 /// Older settings are preserved and surfaced instead of being silently overwritten.
-pub const VISIBLE_CALIBRATION_EPOCH: u32 = 5;
+pub const VISIBLE_CALIBRATION_EPOCH: u32 = 6;
 const LAND_APPEARANCE_CALIBRATION_EPOCH: u64 = 4;
 const EXPOSED_EDGE_CALIBRATION_EPOCH: u64 = 5;
+const LAND_SZA_GAIN_CALIBRATION_EPOCH: u64 = 6;
+const LEGACY_LAND_SZA_MAX_GAIN: f32 = 1.6;
 
 /// One remembered open action: what kind of open it was + the path(s) involved
 /// (one path for a wrfout / cached run / sequence folder; several for a
@@ -133,13 +137,20 @@ pub struct StudioSettings {
     pub land_dark_toe_knee: f32,
     pub land_dark_toe_gamma: f32,
     pub land_dark_toe_max_gain: f32,
+    /// Experimental terrain-only toe over the lit, view-attenuated surface signal.
+    /// Default-off and persisted solely for explicit display A/B work.
+    pub surface_postlight_toe: bool,
+    pub surface_postlight_toe_knee: f32,
+    pub surface_postlight_toe_gamma: f32,
+    pub surface_postlight_toe_max_gain: f32,
     pub clouds_enabled: bool,
     /// Use model cloud fraction/subcolumns when the brick provides them. `true` is
     /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
     pub fractional_clouds: bool,
     /// Stable token for the CPU fractional-cloud observation operator.
-    /// `effective-od` is the shipped/default closure; deterministic 4/8/16 are
-    /// opt-in fixed-stratified references. The legacy boolean remains the master switch.
+    /// `deterministic-2` is the reviewed display default; effective OD remains the
+    /// explicit fast/sensor-compatible closure and deterministic 4/8/16 are higher-cost
+    /// fixed-stratified references. The legacy boolean remains the master switch.
     pub fractional_cloud_mode: String,
     pub multiscatter: bool,
     /// Opt-in Stage-2 Monte Carlo depth-source closure. False preserves the exact
@@ -172,6 +183,9 @@ pub struct StudioSettings {
     /// Display-only top-down pre-tonemap cloud-radiance footprint. Experimental,
     /// explicitly opt-in, and persisted for repeatable A/B review.
     pub topdown_cloud_footprint: bool,
+    /// Display-only top-down ground-shadow anti-aliasing. Default on and persisted so
+    /// the unfiltered diagnostic path remains available for exact A/B comparisons.
+    pub topdown_shadow_antialias: bool,
     pub exposure: f32,
     /// Sun-gated daytime ground-radiance lift. `1.0` is neutral.
     pub ground_gain: f32,
@@ -199,6 +213,7 @@ impl Default for StudioSettings {
     fn default() -> Self {
         // Mirrors SimSatStudioApp::new's defaults exactly (the honest baseline).
         let land = simsat::render::LandAppearanceConfig::default();
+        let postlight_toe = simsat::render::SurfacePostlightToeConfig::default();
         Self {
             visible_calibration_epoch: VISIBLE_CALIBRATION_EPOCH,
             store_root: None,
@@ -224,9 +239,13 @@ impl Default for StudioSettings {
             land_dark_toe_knee: land.dark_toe_knee as f32,
             land_dark_toe_gamma: land.dark_toe_gamma as f32,
             land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
+            surface_postlight_toe: postlight_toe.enabled,
+            surface_postlight_toe_knee: postlight_toe.knee as f32,
+            surface_postlight_toe_gamma: postlight_toe.gamma as f32,
+            surface_postlight_toe_max_gain: postlight_toe.max_gain as f32,
             clouds_enabled: true,
             fractional_clouds: true,
-            fractional_cloud_mode: fractional_cloud_mode_token(FractionalCloudMode::EffectiveOd)
+            fractional_cloud_mode: fractional_cloud_mode_token(FractionalCloudMode::Deterministic2)
                 .to_string(),
             multiscatter: true,
             delta_flux_clouds: false,
@@ -241,6 +260,7 @@ impl Default for StudioSettings {
             granulation: false,
             topdown_stratiform_regularization: false,
             topdown_cloud_footprint: false,
+            topdown_shadow_antialias: true,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             ground_gain: simsat::render::GROUND_DAY_LIFT as f32,
             cloud_softclip: simsat::render::CLOUD_SOFTCLIP_KNEE as f32,
@@ -290,6 +310,10 @@ impl StudioSettings {
         self.land_dark_toe_knee = d.land_dark_toe_knee;
         self.land_dark_toe_gamma = d.land_dark_toe_gamma;
         self.land_dark_toe_max_gain = d.land_dark_toe_max_gain;
+        self.surface_postlight_toe = d.surface_postlight_toe;
+        self.surface_postlight_toe_knee = d.surface_postlight_toe_knee;
+        self.surface_postlight_toe_gamma = d.surface_postlight_toe_gamma;
+        self.surface_postlight_toe_max_gain = d.surface_postlight_toe_max_gain;
         self.clouds_enabled = d.clouds_enabled;
         self.fractional_clouds = d.fractional_clouds;
         self.fractional_cloud_mode = d.fractional_cloud_mode;
@@ -305,6 +329,7 @@ impl StudioSettings {
         self.granulation = d.granulation;
         self.topdown_stratiform_regularization = d.topdown_stratiform_regularization;
         self.topdown_cloud_footprint = d.topdown_cloud_footprint;
+        self.topdown_shadow_antialias = d.topdown_shadow_antialias;
         self.exposure = d.exposure;
         self.ground_gain = d.ground_gain;
         self.cloud_softclip = d.cloud_softclip;
@@ -333,6 +358,24 @@ impl StudioSettings {
             1.0,
             4.0,
             d.land_dark_toe_max_gain,
+        );
+        self.surface_postlight_toe_knee = clamp_finite(
+            self.surface_postlight_toe_knee,
+            1.0e-6,
+            1.0,
+            d.surface_postlight_toe_knee,
+        );
+        self.surface_postlight_toe_gamma = clamp_finite(
+            self.surface_postlight_toe_gamma,
+            0.05,
+            1.0,
+            d.surface_postlight_toe_gamma,
+        );
+        self.surface_postlight_toe_max_gain = clamp_finite(
+            self.surface_postlight_toe_max_gain,
+            1.0,
+            4.0,
+            d.surface_postlight_toe_max_gain,
         );
         self.cloud_optical_depth_scale = clamp_finite(
             self.cloud_optical_depth_scale,
@@ -502,6 +545,7 @@ pub fn render_intent_from_token(t: &str) -> Option<RenderIntent> {
 
 pub fn enhancement_token(e: IrEnhancement) -> &'static str {
     match e {
+        IrEnhancement::Natural => "natural",
         IrEnhancement::Cimss => "cimss",
         IrEnhancement::Bd => "bd",
         IrEnhancement::Avn => "avn",
@@ -567,6 +611,7 @@ pub fn fractional_cloud_mode_from_token(t: &str) -> Option<FractionalCloudMode> 
     match t {
         "off" => Some(FractionalCloudMode::Off),
         "effective-od" | "on" => Some(FractionalCloudMode::EffectiveOd),
+        "deterministic-2" => Some(FractionalCloudMode::Deterministic2),
         "deterministic-4" => Some(FractionalCloudMode::Deterministic4),
         "deterministic-8" => Some(FractionalCloudMode::Deterministic8),
         "deterministic-16" => Some(FractionalCloudMode::Deterministic16),
@@ -615,6 +660,7 @@ pub fn load(path: &Path) -> StudioSettings {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
             let had_land_sza = value.get("land_sza_normalization").is_some();
+            let had_land_sza_max_gain = value.get("land_sza_max_gain").is_some();
             let had_land_toe = value.get("land_dark_toe").is_some();
             let had_exposed_edge = value.get("feather_exposed_domain_edges").is_some();
             let mut settings = serde_json::from_value::<StudioSettings>(value).ok()?;
@@ -634,6 +680,12 @@ pub fn load(path: &Path) -> StudioSettings {
             // margin-gated behavior; the banner offers Apply (on) versus Keep (off).
             if saved_calibration_epoch < EXPOSED_EDGE_CALIBRATION_EPOCH && !had_exposed_edge {
                 settings.feather_exposed_domain_edges = false;
+            }
+            // Epoch 6 changes only the shipped SZA bound. If an older or hand-edited
+            // settings file omitted the numeric field, preserve the former 1.6 look;
+            // the calibration banner offers 4.0 explicitly instead of silently changing it.
+            if saved_calibration_epoch < LAND_SZA_GAIN_CALIBRATION_EPOCH && !had_land_sza_max_gain {
+                settings.land_sza_max_gain = LEGACY_LAND_SZA_MAX_GAIN;
             }
             if !had_calibration_epoch {
                 // Preserve every old user-selected value. Epoch zero merely asks the UI
@@ -713,6 +765,19 @@ mod tests {
             s.land_dark_toe_max_gain,
             simsat::render::LAND_DARK_TOE_MAX_GAIN as f32
         );
+        assert!(!s.surface_postlight_toe);
+        assert_eq!(
+            s.surface_postlight_toe_knee,
+            simsat::render::SURFACE_POSTLIGHT_TOE_KNEE as f32
+        );
+        assert_eq!(
+            s.surface_postlight_toe_gamma,
+            simsat::render::SURFACE_POSTLIGHT_TOE_GAMMA as f32
+        );
+        assert_eq!(
+            s.surface_postlight_toe_max_gain,
+            simsat::render::SURFACE_POSTLIGHT_TOE_MAX_GAIN as f32
+        );
         assert_eq!(s.output_transform, "abi-reflectance");
         assert_eq!(s.render_intent, "display");
         assert_eq!(s.instrument_footprint, "off");
@@ -729,10 +794,11 @@ mod tests {
         assert_eq!(s.cloud_softclip, 0.65);
         assert_eq!(s.cloud_highlight_max, 1.25);
         assert!(s.fractional_clouds);
-        assert_eq!(s.fractional_cloud_mode, "effective-od");
+        assert_eq!(s.fractional_cloud_mode, "deterministic-2");
         assert!(!s.granulation);
         assert!(!s.topdown_stratiform_regularization);
         assert!(!s.topdown_cloud_footprint);
+        assert!(s.topdown_shadow_antialias);
     }
 
     #[test]
@@ -766,6 +832,7 @@ mod tests {
             granulation: true,
             topdown_stratiform_regularization: true,
             topdown_cloud_footprint: true,
+            topdown_shadow_antialias: false,
             exposure: 4.0,
             ground_gain: 4.0,
             cloud_softclip: 1.0,
@@ -805,6 +872,7 @@ mod tests {
             d.topdown_stratiform_regularization
         );
         assert_eq!(s.topdown_cloud_footprint, d.topdown_cloud_footprint);
+        assert_eq!(s.topdown_shadow_antialias, d.topdown_shadow_antialias);
         assert_eq!(s.exposure, d.exposure);
         assert_eq!(s.ground_gain, d.ground_gain);
         assert_eq!(s.cloud_softclip, d.cloud_softclip);
@@ -854,6 +922,7 @@ mod tests {
         for mode in [
             FractionalCloudMode::Off,
             FractionalCloudMode::EffectiveOd,
+            FractionalCloudMode::Deterministic2,
             FractionalCloudMode::Deterministic4,
             FractionalCloudMode::Deterministic8,
             FractionalCloudMode::Deterministic16,
@@ -902,8 +971,8 @@ mod tests {
         assert!(!s.land_sza_normalization);
         assert!(!s.land_dark_toe);
         assert_eq!(
-            s.land_sza_max_gain,
-            StudioSettings::default().land_sza_max_gain
+            s.land_sza_max_gain, LEGACY_LAND_SZA_MAX_GAIN,
+            "pre-epoch files that omit the field preserve the former shipped bound"
         );
         assert!(s.fractional_clouds);
         assert_eq!(
@@ -917,6 +986,10 @@ mod tests {
         assert!(!s.beer_powder);
         assert!(!s.granulation);
         assert!(!s.topdown_stratiform_regularization);
+        assert!(
+            s.topdown_shadow_antialias,
+            "older settings inherit the shipped anti-alias default"
+        );
         assert_eq!(s.ground_gain, StudioSettings::default().ground_gain);
         assert_eq!(s.cloud_softclip, StudioSettings::default().cloud_softclip);
         assert_eq!(
@@ -1031,6 +1104,7 @@ mod tests {
         let old_land_v015 = load(&land_only_v015);
         assert_eq!(old_land_v015.visible_calibration_epoch, 4);
         assert!(old_land_v015.land_sza_normalization);
+        assert_eq!(old_land_v015.land_sza_max_gain, LEGACY_LAND_SZA_MAX_GAIN);
         assert!(old_land_v015.land_dark_toe);
         assert!(!old_land_v015.feather_exposed_domain_edges);
         assert!(old_land_v015.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
@@ -1049,7 +1123,47 @@ mod tests {
         .unwrap();
         let old_missing_edge = load(&land_only_missing_edge);
         assert_eq!(old_missing_edge.visible_calibration_epoch, 4);
+        assert_eq!(old_missing_edge.land_sza_max_gain, LEGACY_LAND_SZA_MAX_GAIN);
         assert!(!old_missing_edge.feather_exposed_domain_edges);
+
+        // Epoch 5 was the v0.1.9 shipped look. Preserve its explicit 1.6 SZA bound
+        // and leave the epoch behind 6 so the Studio offers the owner-selected 4.0.
+        let v019 = dir.join("v019-calibration.json");
+        std::fs::write(
+            &v019,
+            r#"{
+                "visible_calibration_epoch": 5,
+                "land_sza_normalization": true,
+                "land_sza_max_gain": 1.6,
+                "land_dark_toe": true,
+                "feather_exposed_domain_edges": true
+            }"#,
+        )
+        .unwrap();
+        let old_v019 = load(&v019);
+        assert_eq!(old_v019.visible_calibration_epoch, 5);
+        assert_eq!(old_v019.land_sza_max_gain, LEGACY_LAND_SZA_MAX_GAIN);
+        assert!(old_v019.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // A hand-edited epoch-5 file that omitted the numeric field must also keep
+        // the former bound instead of inheriting the new serde default silently.
+        let v019_missing_gain = dir.join("v019-missing-sza-gain.json");
+        std::fs::write(
+            &v019_missing_gain,
+            r#"{
+                "visible_calibration_epoch": 5,
+                "land_sza_normalization": true,
+                "land_dark_toe": true,
+                "feather_exposed_domain_edges": true
+            }"#,
+        )
+        .unwrap();
+        let old_v019_missing_gain = load(&v019_missing_gain);
+        assert_eq!(old_v019_missing_gain.visible_calibration_epoch, 5);
+        assert_eq!(
+            old_v019_missing_gain.land_sza_max_gain,
+            LEGACY_LAND_SZA_MAX_GAIN
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1062,6 +1176,10 @@ mod tests {
             land_dark_toe_knee: 0.0,
             land_dark_toe_gamma: f32::NAN,
             land_dark_toe_max_gain: -2.0,
+            surface_postlight_toe: true,
+            surface_postlight_toe_knee: 0.0,
+            surface_postlight_toe_gamma: f32::NAN,
+            surface_postlight_toe_max_gain: 9.0,
             cloud_optical_depth_scale: 99.0,
             fractional_clouds: false,
             fractional_cloud_mode: "random-16".to_string(),
@@ -1094,8 +1212,15 @@ mod tests {
             StudioSettings::default().land_dark_toe_gamma
         );
         assert_eq!(s.land_dark_toe_max_gain, 1.0);
+        assert!(s.surface_postlight_toe);
+        assert_eq!(s.surface_postlight_toe_knee, 1.0e-6);
+        assert_eq!(
+            s.surface_postlight_toe_gamma,
+            StudioSettings::default().surface_postlight_toe_gamma
+        );
+        assert_eq!(s.surface_postlight_toe_max_gain, 4.0);
         assert_eq!(s.cloud_optical_depth_scale, 4.0);
-        assert_eq!(s.fractional_cloud_mode, "effective-od");
+        assert_eq!(s.fractional_cloud_mode, "deterministic-2");
         assert!(
             !s.fractional_clouds,
             "sanitize must preserve an explicit legacy A/B"

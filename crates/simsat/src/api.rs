@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use crate::asset_pack;
 use crate::atmosphere::{
     self, AERIAL_FROXEL_DIM, AtmosphereLuts, AtmosphereParams, CameraGeometry, OutputTransform,
-    SOLAR_IRRADIANCE_RGB, SkyShTable, sun_enu_to_ecef,
+    SOLAR_IRRADIANCE_RGB, SkyShTable,
 };
 use crate::bluemarble;
 use crate::bricks::{self, RunManifest, StorageProfile, VolumeBrick};
@@ -57,12 +57,12 @@ use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::optics::CloudOpticsMode;
 use crate::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePixel, WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow,
-    normals_from_hgt, radiance_to_rgba_softclip, reflectance_from_radiance, shade_surface,
-    snow_fraction, surface_toa_radiance,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, SurfacePostlightToeConfig, WATER_ALBEDO_SCALE,
+    apply_low_sun_illuminant, blend_snow, normals_from_hgt, radiance_to_rgba_softclip,
+    reflectance_from_radiance, shade_surface, snow_fraction, surface_toa_radiance,
 };
 use crate::sandwich;
-use crate::solar::SolarFrame;
+use crate::solar::{SolarFrame, frame_sun_ecef, sun_enu_and_elevation};
 use crate::thermal_sensor::ThermalSensor;
 use crate::topdown::{
     render_topdown_frame_reflectance, render_topdown_frame_rgba_with_cloud_footprint,
@@ -235,13 +235,16 @@ impl RenderIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderIntentAdjustment {
     CloudOpticalDepthUnscaled,
+    FractionalCloudEffectiveOd,
     ExposureNeutral,
     GroundLiftNeutral,
     LandAppearanceIdentity,
+    SurfacePostlightToeOff,
     ExposedEdgeFeatherOff,
     GranulationOff,
     TopdownStratiformRegularizationOff,
     TopdownCloudFootprintOff,
+    TopdownShadowAntialiasOff,
     AtmosphereCorrectionOff,
     HighlightShoulderIdentity,
     SyntheticGreenOff,
@@ -251,13 +254,18 @@ impl RenderIntentAdjustment {
     pub fn label(self) -> &'static str {
         match self {
             Self::CloudOpticalDepthUnscaled => "cloud optical-depth scale -> 1.0 (unscaled)",
+            Self::FractionalCloudEffectiveOd => {
+                "fractional-cloud closure -> effective OD (sensor-stable)"
+            }
             Self::ExposureNeutral => "exposure -> 1.0",
             Self::GroundLiftNeutral => "ground lift -> 1.0",
             Self::LandAppearanceIdentity => "land appearance -> identity",
+            Self::SurfacePostlightToeOff => "post-lighting surface toe -> off",
             Self::ExposedEdgeFeatherOff => "exposed-domain edge feather -> off",
             Self::GranulationOff => "granulation -> off",
             Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
             Self::TopdownCloudFootprintOff => "top-down cloud radiance footprint -> off",
+            Self::TopdownShadowAntialiasOff => "top-down ground-shadow anti-aliasing -> off",
             Self::AtmosphereCorrectionOff => {
                 "product-facing atmosphere correction -> off (retain modeled airlight)"
             }
@@ -269,8 +277,8 @@ impl RenderIntentAdjustment {
 
 /// Visible cloud-fraction observation operator.
 ///
-/// `EffectiveOd` is the established, fast homogeneous equivalent and remains the
-/// shipped default. The deterministic variants are opt-in 4/8/16-member
+/// `EffectiveOd` is the established, fast homogeneous equivalent and remains an
+/// explicit sensor/compatibility choice. The deterministic variants are 2/4/8/16-member
 /// fixed-stratified shared-`u` maximum-overlap references: each member is marched
 /// with its own internally consistent view/sun/ambient/shadow state, linear radiance
 /// is averaged, and the display transform is applied once. These are deliberately
@@ -283,6 +291,7 @@ pub enum FractionalCloudMode {
     Off,
     #[default]
     EffectiveOd,
+    Deterministic2,
     Deterministic4,
     Deterministic8,
     Deterministic16,
@@ -293,6 +302,7 @@ impl FractionalCloudMode {
         match self {
             Self::Off => "off",
             Self::EffectiveOd => "effective-od",
+            Self::Deterministic2 => "deterministic-2",
             Self::Deterministic4 => "deterministic-4",
             Self::Deterministic8 => "deterministic-8",
             Self::Deterministic16 => "deterministic-16",
@@ -303,6 +313,7 @@ impl FractionalCloudMode {
     /// closures. Keeping the bounded count on the mode prevents UI/CLI/API drift.
     pub const fn deterministic_subcolumn_count(self) -> Option<usize> {
         match self {
+            Self::Deterministic2 => Some(2),
             Self::Deterministic4 => Some(4),
             Self::Deterministic8 => Some(8),
             Self::Deterministic16 => Some(16),
@@ -336,6 +347,7 @@ pub enum GpuPreviewAdjustment {
     GranulationOff,
     TopdownStratiformRegularizationOff,
     TopdownCloudFootprintOff,
+    SurfacePostlightToeOff,
     ExposedEdgeFeatherOff,
     LegacyCloudTransport,
     ShippedHighlights,
@@ -357,6 +369,7 @@ impl GpuPreviewAdjustment {
             Self::GranulationOff => "granulation -> off",
             Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
             Self::TopdownCloudFootprintOff => "top-down cloud radiance footprint -> off",
+            Self::SurfacePostlightToeOff => "post-lighting surface toe -> off (GPU unsupported)",
             Self::ExposedEdgeFeatherOff => "exposed-edge feather -> off",
             Self::LegacyCloudTransport => "cloud transport -> legacy octaves",
             Self::ShippedHighlights => "highlight knee/ceiling -> shipped values",
@@ -455,10 +468,15 @@ pub struct RenderParams {
     /// reproduce the legacy mean-sea-level atmosphere geometry.
     pub terrain_atmosphere: bool,
     /// Display-only land corrections. Both toggles are enabled in the owner-selected
-    /// v0.1.5 preset; [`LandAppearanceConfig::identity`] is the explicit legacy path.
+    /// current preset, whose SZA bound is [`crate::render::LAND_SZA_MAX_GAIN`];
+    /// [`LandAppearanceConfig::identity`] is the explicit legacy path.
     /// Visible RGB-family products consume them while raw visible bands, thermal,
     /// derived, cloud-layer-only, ocean/glint, and cloud radiance remain unchanged.
     pub land_appearance: LandAppearanceConfig,
+    /// Display-only experiment over the lit/view-attenuated LAND surface signal.
+    /// Default-off; water/glint are unchanged and raw reflectance/Sensor Fast Gray force
+    /// the identity path.
+    pub surface_postlight_toe: SurfacePostlightToeConfig,
     /// Display exposure gain (visible only). [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
     /// M5 Wrenninge multi-scatter octaves (visible only).
@@ -485,8 +503,9 @@ pub struct RenderParams {
     /// horizontally full. Thermal and quantitative derived products are unchanged.
     pub fractional_clouds: bool,
     /// Fractional-cloud closure selected when [`Self::fractional_clouds`] is true.
-    /// `EffectiveOd` is the unchanged shipped/default behavior. The deterministic
-    /// variants perform 4/8/16 fixed shared-u CPU marches and average pre-tonemap
+    /// `Deterministic2` is the finished-display default. `EffectiveOd` remains the
+    /// explicit fast homogeneous/sensor-compatible behavior. The deterministic
+    /// variants perform 2/4/8/16 fixed shared-u CPU marches and average pre-tonemap
     /// radiance.
     /// `Off` is equivalent to the legacy full-cell path and is provided so new API
     /// callers can use one honest enum while the legacy bool remains source-compatible.
@@ -531,6 +550,11 @@ pub struct RenderParams {
     /// Geostationary, raw visible bands, thermal, derived, cloud-layer, and perspective
     /// products ignore it. Explicitly opt-in and off by default.
     pub topdown_cloud_footprint: bool,
+    /// Display-only anti-aliasing for the top-down ground cloud-shadow field. Enabled by
+    /// default to suppress fixed-grid shadow-map moire while preserving geostationary,
+    /// raw-band, thermal, derived, cloud-layer, and perspective products. Sensor Fast
+    /// Gray disables and reports this presentation filter.
+    pub topdown_shadow_antialias: bool,
     /// Optional synthetic sun override (visible only).
     pub sun_override: Option<SunOverride>,
     /// Brick cache root (read/write) + seasonal Blue Marble cache.
@@ -589,8 +613,9 @@ impl RenderParams {
     /// Shipped defaults: GOES-East, timestep 0, TOP-DOWN map (the integration default),
     /// native resolution, the owner-selected ABI display exposure (with `1.0` retained
     /// as the exact neutral override), multi-scatter + offline steps + clouds + model
-    /// cloud fraction + both land visibility corrections + exposed-domain edge feathering
-    /// on, beer-powder + granulation off, the seasonal Blue Marble (download on), no sun
+    /// cloud fraction with the deterministic two-subcolumn display closure + both land
+    /// visibility corrections + exposed-domain edge feathering on, beer-powder +
+    /// granulation off, the seasonal Blue Marble (download on), no sun
     /// override, no IR enhancement, the studio cache dir.
     pub fn new(input: PathBuf) -> Self {
         Self {
@@ -609,6 +634,7 @@ impl RenderParams {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::default(),
+            surface_postlight_toe: SurfacePostlightToeConfig::default(),
             exposure: DEFAULT_EXPOSURE,
             multiscatter: true,
             cloud_multiscatter: None,
@@ -616,7 +642,7 @@ impl RenderParams {
             steps: StepQuality::Offline,
             clouds: true,
             fractional_clouds: true,
-            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic2,
             cloud_optical_depth_scale: clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             cloud_optics: CloudOpticsMode::Fixed,
             feather_exposed_domain_edges: true,
@@ -624,6 +650,7 @@ impl RenderParams {
             // v0.1.6 candidate remains explicit opt-in until multi-case owner QA.
             topdown_stratiform_regularization: false,
             topdown_cloud_footprint: false,
+            topdown_shadow_antialias: true,
             sun_override: None,
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
@@ -1062,6 +1089,10 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
         p.cloud_optical_depth_scale = 1.0;
         changes.push(RenderIntentAdjustment::CloudOpticalDepthUnscaled);
     }
+    if p.fractional_cloud_mode != FractionalCloudMode::EffectiveOd {
+        p.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        changes.push(RenderIntentAdjustment::FractionalCloudEffectiveOd);
+    }
     if (p.exposure - 1.0).abs() > f64::EPSILON {
         p.exposure = 1.0;
         changes.push(RenderIntentAdjustment::ExposureNeutral);
@@ -1073,6 +1104,10 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
     if p.land_appearance != LandAppearanceConfig::identity() {
         p.land_appearance = LandAppearanceConfig::identity();
         changes.push(RenderIntentAdjustment::LandAppearanceIdentity);
+    }
+    if !p.surface_postlight_toe.is_identity() {
+        p.surface_postlight_toe = SurfacePostlightToeConfig::off();
+        changes.push(RenderIntentAdjustment::SurfacePostlightToeOff);
     }
     if p.feather_exposed_domain_edges {
         p.feather_exposed_domain_edges = false;
@@ -1089,6 +1124,10 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
     if p.topdown_cloud_footprint {
         p.topdown_cloud_footprint = false;
         changes.push(RenderIntentAdjustment::TopdownCloudFootprintOff);
+    }
+    if p.topdown_shadow_antialias {
+        p.topdown_shadow_antialias = false;
+        changes.push(RenderIntentAdjustment::TopdownShadowAntialiasOff);
     }
     if p.atmosphere_correction {
         p.atmosphere_correction = false;
@@ -1156,6 +1195,10 @@ pub fn plan_gpu_preview(
     if p.topdown_cloud_footprint {
         p.topdown_cloud_footprint = false;
         changes.push(GpuPreviewAdjustment::TopdownCloudFootprintOff);
+    }
+    if !p.surface_postlight_toe.is_identity() {
+        p.surface_postlight_toe = SurfacePostlightToeConfig::off();
+        changes.push(GpuPreviewAdjustment::SurfacePostlightToeOff);
     }
     if p.feather_exposed_domain_edges {
         p.feather_exposed_domain_edges = false;
@@ -1313,6 +1356,9 @@ fn render_visible_scene(
     let mut cfg = MarchConfig {
         beer_powder: params.beer_powder,
         cloud_optical_depth_scale: params.cloud_optical_depth_scale,
+        topdown_shadow_antialias: params.view == ViewMode::TopDownMap
+            && matches!(product, Product::VisibleRgb)
+            && params.topdown_shadow_antialias,
         octaves: if params.multiscatter {
             clouds::DEFAULT_OCTAVES
         } else {
@@ -1377,6 +1423,11 @@ fn render_visible_scene(
             params.land_appearance
         } else {
             LandAppearanceConfig::identity()
+        },
+        surface_postlight_toe: if matches!(product, Product::VisibleRgb) {
+            params.surface_postlight_toe
+        } else {
+            SurfacePostlightToeConfig::off()
         },
     };
 
@@ -1911,6 +1962,8 @@ fn render_gpu_visible_frame(
         cloud_optical_depth_scale: cfg.cloud_optical_depth_scale,
         edge_feather_cells: cfg.edge_feather_cells as f32,
         ground_day_lift: cfg.ground_day_lift as f32,
+        topdown_shadow_antialias: view_mode == gpu::CloudViewMode::TopDownNadir
+            && params.topdown_shadow_antialias,
     };
     let sun_od = gpu::plan_sun_od(
         georef,
@@ -2795,6 +2848,11 @@ fn render_perspective_scene(
         } else {
             params.land_appearance
         },
+        surface_postlight_toe: if cloud_layer_only {
+            SurfacePostlightToeConfig::off()
+        } else {
+            params.surface_postlight_toe
+        },
     };
     let assemble = make_assemble(
         brick,
@@ -2965,22 +3023,8 @@ fn resolve_frame_sun(
         .lat_lon_bbox()
         .map(|(la0, la1, lo0, lo1)| (((la0 + la1) * 0.5) as f64, ((lo0 + lo1) * 0.5) as f64))
         .unwrap_or((proj.cen_lat_deg, proj.cen_lon_deg));
-    let real_sun = solar.at(clat, clon);
-    let use_override = params
-        .sun_override
-        .is_some_and(|s| s.elev_deg.is_some() || s.az_deg.is_some());
-    let sun_ecef = if use_override {
-        let o = params.sun_override.unwrap_or_default();
-        let elev_deg = o.elev_deg.unwrap_or(real_sun.elevation_deg);
-        let az_deg = o.az_deg.unwrap_or(real_sun.azimuth_deg);
-        let (e, az) = (elev_deg.to_radians(), az_deg.to_radians());
-        let sun_enu = [e.cos() * az.sin(), e.cos() * az.cos(), e.sin()];
-        sun_enu_to_ecef(sun_enu, clat, clon)
-    } else {
-        sun_enu_to_ecef(real_sun.enu_direction(), clat, clon)
-    };
-    let center_elev = sun_enu_and_elev(sun_ecef, clat, clon).1;
-    (sun_ecef, center_elev)
+    let o = params.sun_override.unwrap_or_default();
+    frame_sun_ecef(solar, clat, clon, o.elev_deg, o.az_deg)
 }
 
 /// The horizontal march pitch (m): min(dx, dy), converting a `MAP_PROJ = 6` lat/lon grid's
@@ -3350,28 +3394,13 @@ fn override_light_lut(light: &mut [f32], raster: &SurfaceRaster, sun_ecef: [f64;
         if !lat.is_finite() || !lon.is_finite() {
             continue;
         }
-        let (enu, elev) = sun_enu_and_elev(sun_ecef, lat as f64, lon as f64);
+        let (enu, elev) = sun_enu_and_elevation(sun_ecef, lat as f64, lon as f64);
         let l = &mut light[idx * 4..idx * 4 + 4];
         l[0] = enu[0] as f32;
         l[1] = enu[1] as f32;
         l[2] = enu[2] as f32;
         l[3] = elev as f32;
     }
-}
-
-/// Project a global ECEF sun direction into the local ENU basis at `(lat, lon)`, returning
-/// `(sun_enu, elevation_deg)`. Inverse of `atmosphere::sun_enu_to_ecef`.
-fn sun_enu_and_elev(sun_ecef: [f64; 3], lat_deg: f64, lon_deg: f64) -> ([f64; 3], f64) {
-    let (la, lo) = (lat_deg.to_radians(), lon_deg.to_radians());
-    let (sla, cla) = la.sin_cos();
-    let (slo, clo) = lo.sin_cos();
-    let east = [-slo, clo, 0.0];
-    let north = [-sla * clo, -sla * slo, cla];
-    let up = [cla * clo, cla * slo, sla];
-    let dot = |a: [f64; 3]| a[0] * sun_ecef[0] + a[1] * sun_ecef[1] + a[2] * sun_ecef[2];
-    let (e, n, u) = (dot(east), dot(north), dot(up));
-    let elev = u.clamp(-1.0, 1.0).asin().to_degrees();
-    ([e, n, u], elev)
 }
 
 // ── source resolution (wrfout ingest-if-needed, or a cached run.json) ──────────
@@ -3664,7 +3693,12 @@ mod tests {
         assert!(p.terrain_atmosphere);
         assert_eq!(p.land_appearance, LandAppearanceConfig::shipped());
         assert!(p.land_appearance.sza_normalization);
+        assert_eq!(
+            p.land_appearance.sza_max_gain,
+            crate::render::LAND_SZA_MAX_GAIN
+        );
         assert!(p.land_appearance.dark_toe);
+        assert!(p.surface_postlight_toe.is_identity());
         assert_eq!(
             p.cloud_optical_depth_scale,
             clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
@@ -3675,11 +3709,12 @@ mod tests {
         assert!(!p.beer_powder);
         assert!(p.clouds);
         assert!(p.fractional_clouds);
-        assert_eq!(p.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
+        assert_eq!(p.fractional_cloud_mode, FractionalCloudMode::Deterministic2);
         assert!(p.feather_exposed_domain_edges);
         assert!(p.granulation.is_none());
         assert!(!p.topdown_stratiform_regularization);
         assert!(!p.topdown_cloud_footprint);
+        assert!(p.topdown_shadow_antialias);
         assert!(p.ground_gain.is_none());
         assert!(p.cloud_softclip.is_none());
         assert!(p.cloud_highlight_max.is_none());
@@ -3693,6 +3728,11 @@ mod tests {
         requested.granulation = Some(true);
         requested.topdown_stratiform_regularization = true;
         requested.topdown_cloud_footprint = true;
+        requested.surface_postlight_toe = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
+        requested.topdown_shadow_antialias = true;
         requested.synthetic_green = true;
         let before = requested.clone();
 
@@ -3704,18 +3744,28 @@ mod tests {
         assert_eq!(requested.exposure, before.exposure);
         assert_eq!(requested.ground_gain, before.ground_gain);
         assert_eq!(requested.land_appearance, before.land_appearance);
+        assert_eq!(
+            requested.surface_postlight_toe,
+            before.surface_postlight_toe
+        );
         assert_eq!(requested.granulation, before.granulation);
         assert!(requested.fractional_clouds);
+        assert_eq!(
+            requested.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
 
         assert_eq!(effective.intent, RenderIntent::SensorFastGray);
         assert_eq!(effective.cloud_optical_depth_scale, 1.0);
         assert_eq!(effective.exposure, 1.0);
         assert_eq!(effective.ground_gain, Some(1.0));
         assert_eq!(effective.land_appearance, LandAppearanceConfig::identity());
+        assert!(effective.surface_postlight_toe.is_identity());
         assert!(!effective.feather_exposed_domain_edges);
         assert_eq!(effective.granulation, Some(false));
         assert!(!effective.topdown_stratiform_regularization);
         assert!(!effective.topdown_cloud_footprint);
+        assert!(!effective.topdown_shadow_antialias);
         assert!(!effective.atmosphere_correction);
         assert_eq!(effective.cloud_softclip, Some(1.0));
         assert_eq!(effective.cloud_highlight_max, Some(1.0));
@@ -3725,16 +3775,23 @@ mod tests {
             "strict intent must retain model fractional-cloud handling"
         );
         assert_eq!(
+            effective.fractional_cloud_mode,
+            FractionalCloudMode::EffectiveOd
+        );
+        assert_eq!(
             changes,
             vec![
                 RenderIntentAdjustment::CloudOpticalDepthUnscaled,
+                RenderIntentAdjustment::FractionalCloudEffectiveOd,
                 RenderIntentAdjustment::ExposureNeutral,
                 RenderIntentAdjustment::GroundLiftNeutral,
                 RenderIntentAdjustment::LandAppearanceIdentity,
+                RenderIntentAdjustment::SurfacePostlightToeOff,
                 RenderIntentAdjustment::ExposedEdgeFeatherOff,
                 RenderIntentAdjustment::GranulationOff,
                 RenderIntentAdjustment::TopdownStratiformRegularizationOff,
                 RenderIntentAdjustment::TopdownCloudFootprintOff,
+                RenderIntentAdjustment::TopdownShadowAntialiasOff,
                 RenderIntentAdjustment::AtmosphereCorrectionOff,
                 RenderIntentAdjustment::HighlightShoulderIdentity,
                 RenderIntentAdjustment::SyntheticGreenOff,
@@ -3786,6 +3843,10 @@ mod tests {
         requested.granulation = Some(true);
         requested.topdown_stratiform_regularization = true;
         requested.topdown_cloud_footprint = true;
+        requested.surface_postlight_toe = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
         requested.cloud_softclip = Some(0.8);
         requested.synthetic_green = true;
         requested.topdown_cloud_norm = Some(0.7);
@@ -3806,6 +3867,7 @@ mod tests {
         assert_eq!(effective.granulation, Some(false));
         assert!(!effective.topdown_stratiform_regularization);
         assert!(!effective.topdown_cloud_footprint);
+        assert!(effective.surface_postlight_toe.is_identity());
         assert!(!effective.feather_exposed_domain_edges);
         assert_eq!(
             effective.cloud_multiscatter,
@@ -3819,10 +3881,11 @@ mod tests {
             GpuPreviewAdjustment::ProductVisible,
             GpuPreviewAdjustment::CloudsOn,
             GpuPreviewAdjustment::TerrainAtmosphereOff,
-            GpuPreviewAdjustment::FractionalCloudsOff,
+            GpuPreviewAdjustment::FractionalSubcolumnsOff,
             GpuPreviewAdjustment::GranulationOff,
             GpuPreviewAdjustment::TopdownStratiformRegularizationOff,
             GpuPreviewAdjustment::TopdownCloudFootprintOff,
+            GpuPreviewAdjustment::SurfacePostlightToeOff,
             GpuPreviewAdjustment::ExposedEdgeFeatherOff,
             GpuPreviewAdjustment::LegacyCloudTransport,
             GpuPreviewAdjustment::ShippedHighlights,
@@ -3987,6 +4050,50 @@ mod tests {
         p
     }
 
+    #[test]
+    fn solar_elevation_diagnostic_is_bit_exact_with_surface_light_lut() {
+        let src = synthetic_source(9, 7, 4, 3000.0);
+        let raster = build_map_raster_mode(
+            &src.georef,
+            src.brick.nx,
+            src.brick.ny,
+            3000.0,
+            3000.0,
+            ResolutionMode::Native,
+            0.0,
+        )
+        .unwrap()
+        .as_surface_raster();
+        let solar = SolarFrame::new(1974, 4, 3, 23.2);
+        let (_, mut light) = gpu::build_luts(&raster, None, src.brick.nx, src.brick.ny, &solar);
+
+        let actual =
+            crate::solar::solar_elevation_grid(&solar, &raster.lat, &raster.lon, None, None)
+                .unwrap();
+        for (idx, value) in actual.iter().enumerate() {
+            assert_eq!(value.to_bits(), light[idx * 4 + 3].to_bits(), "NOAA {idx}");
+        }
+
+        // A partial override keeps the real centre azimuth, exactly like RenderParams.
+        let mut params = RenderParams::new(PathBuf::from("<solar-grid-parity>"));
+        params.sun_override = Some(SunOverride {
+            elev_deg: Some(5.0),
+            az_deg: None,
+        });
+        let (sun_ecef, _) = resolve_frame_sun(&params, &raster, &solar, &src.params);
+        override_light_lut(&mut light, &raster, sun_ecef);
+        let overridden =
+            crate::solar::solar_elevation_grid(&solar, &raster.lat, &raster.lon, Some(5.0), None)
+                .unwrap();
+        for (idx, value) in overridden.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                light[idx * 4 + 3].to_bits(),
+                "override {idx}"
+            );
+        }
+    }
+
     fn low_stratiform_stipple_source(nx: usize, ny: usize, nz: usize) -> SceneSource {
         let mut src = synthetic_source(nx, ny, nz, 3000.0);
         let n3 = nx * ny * nz;
@@ -4140,6 +4247,43 @@ mod tests {
             "geostationary output must ignore the top-down-only footprint"
         );
         assert!(!geo_on.topdown_cloud_footprint);
+    }
+
+    #[test]
+    fn topdown_shadow_antialias_is_display_scoped_and_geo_identity() {
+        let src = low_stratiform_stipple_source(14, 14, 8);
+        let mut off = synthetic_params(ViewMode::TopDownMap);
+        off.topdown_shadow_antialias = false;
+        let mut on = off.clone();
+        on.topdown_shadow_antialias = true;
+
+        let topdown_off = render_visible_scene(&src, &off, Product::VisibleRgb).unwrap();
+        let topdown_on = render_visible_scene(&src, &on, Product::VisibleRgb).unwrap();
+        assert_ne!(
+            visible_rgba(&topdown_on),
+            visible_rgba(&topdown_off),
+            "the synthetic stipple must exercise the top-down shadow filter"
+        );
+
+        let raw_off = render_visible_scene(&src, &off, Product::RgbReflectance).unwrap();
+        let raw_on = render_visible_scene(&src, &on, Product::RgbReflectance).unwrap();
+        assert_eq!(
+            band_bits(&raw_on),
+            band_bits(&raw_off),
+            "raw visible bands must ignore the display-only shadow filter"
+        );
+
+        let mut geo_off = off;
+        geo_off.view = ViewMode::Geostationary;
+        let mut geo_on = geo_off.clone();
+        geo_on.topdown_shadow_antialias = true;
+        let geo_off = render_visible_scene(&src, &geo_off, Product::VisibleRgb).unwrap();
+        let geo_on = render_visible_scene(&src, &geo_on, Product::VisibleRgb).unwrap();
+        assert_eq!(
+            visible_rgba(&geo_on),
+            visible_rgba(&geo_off),
+            "geostationary output must be byte-identical across the top-down-only toggle"
+        );
     }
 
     #[test]

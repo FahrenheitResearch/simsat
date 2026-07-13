@@ -37,6 +37,8 @@
 //!   (eye/look/fov pinhole camera through the same marches; the angled-3D flyover
 //!   product); `cloud_layer_only=True` -> `(H x W x 4 uint8, Georef)` cloud field only.
 //!   The camera rides on `georef.camera_pose`.
+//! - [`solar_elevation_grid`] -> `H x W float32` — the exact per-pixel surface-light
+//!   elevation used for low-sun QA, including the renderer's partial-override behavior.
 //!
 //! Default `view='topdown'` (map-registered, north-up — the natural fit for a top-down
 //! Lambert map); `view='geo'` gives the from-space geostationary view.
@@ -44,7 +46,7 @@
 //! highest possible output resolution. `abi1km` / `abi2km` select 1 km / 2 km output
 //! sampling and may upsample a coarse model or downsample a fine WRF grid.
 //!
-//! Every function also takes `threads=` (cap the render worker threads; the rayon pool
+//! Every render function also takes `threads=` (cap the render worker threads; the rayon pool
 //! is GLOBAL and built once per process — the first render call's value wins, see
 //! [`apply_thread_cap`]) and returns honesty metadata on the [`Georef`]
 //! (`time_is_fallback`, `ground_source`, `ground_status`), with `UserWarning`s raised
@@ -55,7 +57,7 @@
 //! runtime with [`set_verbose`]. Honesty metadata / `UserWarning`s are unaffected.
 
 use numpy::ndarray::{Array2, Array3};
-use numpy::{IntoPyArray, PyArray2, PyArray3};
+use numpy::{IntoPyArray, PyArray2, PyArray3, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::path::PathBuf;
@@ -64,13 +66,15 @@ use simsat_engine::api::{
     self, BlueMarble, ExtentKind, FractionalCloudMode, FrameData, GroundSource, Product,
     RenderBackend, RenderIntent, RenderParams, RenderResult, SunOverride,
 };
-use simsat_engine::camera::{GeoNavigation, ResolutionMode, SatellitePreset, ViewMode};
 use simsat_engine::bricks::StorageProfile;
+use simsat_engine::camera::{GeoNavigation, ResolutionMode, SatellitePreset, ViewMode};
 use simsat_engine::clouds::{CloudMultiscatterMode, StepQuality};
 use simsat_engine::derived::DerivedField;
-use simsat_engine::ir_enhance::IrEnhancement;
 use simsat_engine::instrument_footprint::InstrumentFootprint;
+use simsat_engine::ir_enhance::IrEnhancement;
 use simsat_engine::optics::CloudOpticsMode;
+use simsat_engine::render::SurfacePostlightToeConfig;
+use simsat_engine::solar::SolarFrame;
 use simsat_engine::thermal_sensor::ThermalSensor;
 use simsat_engine::topdown::{configure_global_rayon, effective_thread_count};
 use simsat_engine::web_layer;
@@ -211,8 +215,9 @@ impl Georef {
 /// Sandwich, cloud-layer, and perspective renders: `aerosol_optical_depth` (default
 /// 0.05), `rh_aerosol_swelling` (1.5x when true), `atmosphere_correction`,
 /// `terrain_atmosphere`, `fractional_clouds` (default true),
-/// `fractional_cloud_mode` (`effective-od` default; opt-in fixed-stratified
-/// `deterministic-4`, `deterministic-8`, or `deterministic-16`), and
+/// `fractional_cloud_mode` (finished display bindings default to the reviewed
+/// `deterministic-2`; `effective-od` remains the explicit fast/sensor-compatible
+/// choice, with `deterministic-4/8/16` as higher-cost references), and
 /// `cloud_optical_depth_scale` (0..=4, shipped default 0.15 by owner cross-file visual
 /// calibration; 1.0 is unscaled model extinction), and the default-on
 /// `feather_exposed_domain_edges` finite-domain presentation control. Fractional clouds
@@ -233,13 +238,17 @@ impl Georef {
 /// low/liquid-deck reconstruction used only by the top-down finished-visible path.
 /// They also expose `topdown_cloud_footprint`, an opt-in/default-off seven-tap
 /// pre-tonemap footprint applied only to the cloud radiance residual, leaving terrain
-/// sharp. Geostationary and raw visible bands ignore both controls. Finished visible display
+/// sharp, and `topdown_shadow_antialias`, a default-on filter for top-down ground-shadow
+/// map aliasing. Geostationary and raw visible bands ignore these controls. Finished visible display
 /// products also accept `ground_gain`, `cloud_softclip`, and `cloud_highlight_max` as
 /// optional calibration overrides. The land-only controls
 /// `land_sza_normalization` / `land_sza_max_gain` and `land_dark_toe` plus its
 /// knee/gamma/max-gain parameters are independently switchable and default on in the
-/// owner-selected v0.1.5 display preset. Passing both booleans false is the exact legacy
-/// identity. Raw
+/// owner-selected current display preset. Passing both booleans false is the exact legacy
+/// identity. `surface_postlight_toe` is a separate default-off CPU display experiment
+/// over LAND after lighting and view transmittance but before atmospheric airlight/cloud
+/// compositing; its knee/gamma/max-gain defaults are 0.18/0.80/1.35. Sensor Fast Gray
+/// and GPU preview explicitly substitute it off and report the adjustment. Raw
 /// visible bands deliberately expose none of these display-only land controls.
 ///
 /// `threads` (default None = all cores, or RAYON_NUM_THREADS) caps the render worker
@@ -251,15 +260,18 @@ impl Georef {
 #[pyo3(signature = (
     input, *, storage_profile="compact-u8", backend="cpu", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=4.0,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
-    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
+    land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
+    surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
+    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
     topdown_cloud_footprint=false,
+    topdown_shadow_antialias=true,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -286,6 +298,10 @@ fn render_visible_rgb<'py>(
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -303,6 +319,7 @@ fn render_visible_rgb<'py>(
     granulation: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -331,6 +348,10 @@ fn render_visible_rgb<'py>(
         land_dark_toe_knee,
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -348,6 +369,7 @@ fn render_visible_rgb<'py>(
         granulation,
         topdown_stratiform_regularization,
         topdown_cloud_footprint,
+        topdown_shadow_antialias,
         sun_elev,
         sun_az,
         cache,
@@ -385,15 +407,18 @@ fn render_visible_rgb<'py>(
     input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
     sensor="fast-gray", instrument_footprint="off",
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=4.0,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
-    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
+    land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
+    surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
+    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
     topdown_cloud_footprint=false,
+    topdown_shadow_antialias=true,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -421,6 +446,10 @@ fn render_geocolor<'py>(
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -438,6 +467,7 @@ fn render_geocolor<'py>(
     granulation: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -466,6 +496,10 @@ fn render_geocolor<'py>(
         land_dark_toe_knee,
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -483,6 +517,7 @@ fn render_geocolor<'py>(
         granulation,
         topdown_stratiform_regularization,
         topdown_cloud_footprint,
+        topdown_shadow_antialias,
         sun_elev,
         sun_az,
         cache,
@@ -521,15 +556,18 @@ fn render_geocolor<'py>(
     input, *, storage_profile="compact-u8", intent="display", sat="goes-east", geo_navigation="model-sphere", view="topdown", timestep=0, resolution="native", margin=0.0,
     sensor="fast-gray", instrument_footprint="off",
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=4.0,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
-    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
+    land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
+    surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
+    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
-    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
+    steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
     feather_exposed_domain_edges=true, granulation=false,
     topdown_stratiform_regularization=false,
     topdown_cloud_footprint=false,
+    topdown_shadow_antialias=true,
     sun_elev=None, sun_az=None, cache=None, bluemarble=None,
     bluemarble_month=None, bluemarble_download=true, threads=None
 ))]
@@ -557,6 +595,10 @@ fn render_sandwich<'py>(
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -574,6 +616,7 @@ fn render_sandwich<'py>(
     granulation: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -602,6 +645,10 @@ fn render_sandwich<'py>(
         land_dark_toe_knee,
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -619,6 +666,7 @@ fn render_sandwich<'py>(
         granulation,
         topdown_stratiform_regularization,
         topdown_cloud_footprint,
+        topdown_shadow_antialias,
         sun_elev,
         sun_az,
         cache,
@@ -803,6 +851,10 @@ fn render_visible_bands<'py>(
         simsat_engine::render::LAND_DARK_TOE_KNEE,
         simsat_engine::render::LAND_DARK_TOE_GAMMA,
         simsat_engine::render::LAND_DARK_TOE_MAX_GAIN,
+        false,
+        simsat_engine::render::SURFACE_POSTLIGHT_TOE_KNEE,
+        simsat_engine::render::SURFACE_POSTLIGHT_TOE_GAMMA,
+        simsat_engine::render::SURFACE_POSTLIGHT_TOE_MAX_GAIN,
         None,
         None,
         None,
@@ -818,6 +870,7 @@ fn render_visible_bands<'py>(
         cloud_optics,
         false,
         granulation,
+        false,
         false,
         false,
         sun_elev,
@@ -845,9 +898,11 @@ fn render_visible_bands<'py>(
 /// Render the RAW infrared brightness temperature (ABI band 13, 10.3 um) in KELVIN.
 ///
 /// Returns `(bt, georef)` where `bt` is a numpy `H x W` float32 array in Kelvin (NaN
-/// off-domain; row 0 = north). If `enhancement` is given (one of 'cimss', 'bd', 'avn',
-/// 'funktop', 'rainbow', 'gray') the return is instead `(bt, rgb, georef)` with `rgb` a
-/// numpy `H x W x 3` uint8 colored image. `sensor='fast-gray'` preserves the historical
+/// off-domain; row 0 = north). If `enhancement` is given (one of 'natural', 'cimss',
+/// 'bd', 'avn', 'funktop', 'rainbow', 'gray') the return is instead
+/// `(bt, rgb, georef)` with `rgb` a numpy `H x W x 3` uint8 colored image. 'natural'
+/// is the recommended continuous NOAA heritage Band-13 grayscale. `sensor='fast-gray'`
+/// preserves the historical
 /// center-wavelength response; `sensor='goes-r-abi-band13-fm4'` applies NOAA's official
 /// FM4/GOES-19 Band 13 SRF and emits a warning that absorption remains gray.
 #[pyfunction]
@@ -923,8 +978,8 @@ fn render_ir<'py>(
 ///
 /// `band` selects the level: '6.2' (upper), '6.9' (mid), or '7.3' (lower). Returns
 /// `(bt, georef)` where `bt` is a numpy `H x W` float32 array in Kelvin (NaN off-domain;
-/// row 0 = north). With `enhancement` given (one of 'cimss', 'bd', 'avn', 'funktop',
-/// 'rainbow', 'gray') the return is instead `(bt, rgb, georef)` with `rgb` a numpy
+/// row 0 = north). With `enhancement` given (one of 'natural', 'cimss', 'bd', 'avn',
+/// 'funktop', 'rainbow', 'gray') the return is instead `(bt, rgb, georef)` with `rgb` a numpy
 /// `H x W x 3` uint8 colored image — for WV, 'cimss' is the classic WV moisture palette
 /// and 'gray' is a WV-scaled grayscale (cold/moist white). Thermal — works day AND night.
 #[pyfunction]
@@ -1285,9 +1340,11 @@ fn render_cloud_layer<'py>(
 #[pyo3(signature = (
     input, *, eye, look, storage_profile="compact-u8", intent="display", fov=40.0, size=(1280, 720), timestep=0,
     aerosol_optical_depth=0.05, rh_aerosol_swelling=false, atmosphere_correction=true,
-    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=1.6,
+    terrain_atmosphere=true, land_sza_normalization=true, land_sza_max_gain=4.0,
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
-    land_dark_toe_max_gain=1.5, exposure=None, ground_gain=None, cloud_softclip=None,
+    land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
+    surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
+    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
@@ -1316,6 +1373,10 @@ fn render_perspective<'py>(
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -1373,6 +1434,13 @@ fn render_perspective<'py>(
         land_dark_toe_knee,
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
+    )?;
+    apply_surface_postlight_toe_controls(
+        &mut params,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
     )?;
     params.multiscatter = multiscatter;
     params.cloud_multiscatter = cloud_multiscatter
@@ -1447,6 +1515,99 @@ fn render_perspective<'py>(
 #[pyfunction]
 fn set_verbose(enabled: bool) {
     simsat_engine::log::set_enabled(enabled);
+}
+
+/// Return the renderer's frame-sun elevation at every latitude/longitude pixel.
+///
+/// `lat` and `lon` must be same-shaped two-dimensional `float32` numpy arrays. The
+/// calculation deliberately matches the surface-light LUT that drives terrain and
+/// cloud compositing: per-pixel NOAA elevation normally; with an override, NOAA at the
+/// finite-coordinate bounding-box centre is partially overridden, converted once to
+/// ECEF, then projected into each pixel's local ENU frame. An omitted override component
+/// keeps its real centre value. Invalid/off-earth coordinate pairs return `NaN`. The
+/// atmosphere/cloud frame sun is a separate single ECEF vector.
+#[pyfunction]
+#[pyo3(signature = (time_iso, lat, lon, sun_elev=None, sun_az=None))]
+fn solar_elevation_grid<'py>(
+    py: Python<'py>,
+    time_iso: &str,
+    lat: PyReadonlyArray2<'py, f32>,
+    lon: PyReadonlyArray2<'py, f32>,
+    sun_elev: Option<f64>,
+    sun_az: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let lat_view = lat.as_array();
+    let lon_view = lon.as_array();
+    if lat_view.shape() != lon_view.shape() {
+        return Err(value_err(format!(
+            "lat and lon must have the same shape (got {:?} and {:?})",
+            lat_view.shape(),
+            lon_view.shape()
+        )));
+    }
+    let shape = (lat_view.shape()[0], lat_view.shape()[1]);
+    if shape.0 == 0 || shape.1 == 0 {
+        return Err(value_err(
+            "lat and lon grids must have non-zero height and width".to_string(),
+        ));
+    }
+
+    let (year, month, day, ut) = parse_valid_utc(time_iso).ok_or_else(|| {
+        value_err(format!(
+            "time_iso must be a valid UTC timestamp like 1974-04-03T23:12:00Z; got '{time_iso}'"
+        ))
+    })?;
+    let solar = SolarFrame::new(year, month, day, ut);
+    let lat_values: Vec<f32> = lat_view.iter().copied().collect();
+    let lon_values: Vec<f32> = lon_view.iter().copied().collect();
+    let values = simsat_engine::solar::solar_elevation_grid(
+        &solar,
+        &lat_values,
+        &lon_values,
+        sun_elev,
+        sun_az,
+    )
+    .map_err(value_err)?;
+    Ok(Array2::from_shape_vec(shape, values)
+        .map_err(|e| runtime_err(&format!("solar elevation reshape: {e}")))?
+        .into_pyarray(py))
+}
+
+fn parse_valid_utc(value: &str) -> Option<(i32, u32, u32, f64)> {
+    let value = value.trim();
+    let value = value.strip_suffix('Z').unwrap_or(value);
+    let (date, time) = value.split_once(['T', '_'])?;
+    let date: Vec<_> = date.split('-').collect();
+    let clock: Vec<_> = time.split(':').collect();
+    if date.len() != 3 || !(2..=3).contains(&clock.len()) {
+        return None;
+    }
+    let year: i32 = date[0].parse().ok()?;
+    let month: u32 = date[1].parse().ok()?;
+    let day: u32 = date[2].parse().ok()?;
+    let hour: u32 = clock[0].parse().ok()?;
+    let minute: u32 = clock[1].parse().ok()?;
+    let second: f64 = clock.get(2).map_or(Some(0.0), |v| v.parse().ok())?;
+    if hour >= 24 || minute >= 60 || !second.is_finite() || !(0.0..60.0).contains(&second) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days).contains(&day) {
+        return None;
+    }
+    Some((
+        year,
+        month,
+        day,
+        hour as f64 + minute as f64 / 60.0 + second / 3600.0,
+    ))
 }
 
 /// `SIMSAT_LOG` truthiness: `1` or `true` (case-insensitive) opts the process into the
@@ -1548,6 +1709,10 @@ fn build_visible_params(
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -1565,6 +1730,7 @@ fn build_visible_params(
     granulation: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     sun_elev: Option<f64>,
     sun_az: Option<f64>,
     cache: Option<String>,
@@ -1611,6 +1777,13 @@ fn build_visible_params(
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
     )?;
+    apply_surface_postlight_toe_controls(
+        &mut params,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
+    )?;
     params.multiscatter = multiscatter;
     params.cloud_multiscatter = cloud_multiscatter
         .map(parse_cloud_multiscatter)
@@ -1619,6 +1792,7 @@ fn build_visible_params(
     params.clouds = clouds;
     params.topdown_stratiform_regularization = topdown_stratiform_regularization;
     params.topdown_cloud_footprint = topdown_cloud_footprint;
+    params.topdown_shadow_antialias = topdown_shadow_antialias;
     params.sun_override = if sun_elev.is_some() || sun_az.is_some() {
         Some(SunOverride {
             elev_deg: sun_elev,
@@ -1743,6 +1917,32 @@ fn apply_land_appearance_controls(
     Ok(())
 }
 
+/// Validate and apply the default-off display-only terrain signal experiment. Bounds
+/// match the CLI and Studio; disabled still validates its persisted/ready A/B values.
+fn apply_surface_postlight_toe_controls(
+    params: &mut RenderParams,
+    enabled: bool,
+    knee: f64,
+    gamma: f64,
+    max_gain: f64,
+) -> PyResult<()> {
+    let bounded = |name: &str, value: f64, lo: f64, hi: f64| -> PyResult<f64> {
+        if !value.is_finite() || !(lo..=hi).contains(&value) {
+            return Err(value_err(format!(
+                "{name} must be finite and in {lo}..={hi}, got {value}"
+            )));
+        }
+        Ok(value)
+    };
+    params.surface_postlight_toe = SurfacePostlightToeConfig {
+        enabled,
+        knee: bounded("surface_postlight_toe_knee", knee, 1.0e-6, 1.0)?,
+        gamma: bounded("surface_postlight_toe_gamma", gamma, 0.05, 1.0)?,
+        max_gain: bounded("surface_postlight_toe_max_gain", max_gain, 1.0, 4.0)?,
+    };
+    Ok(())
+}
+
 /// Build the Python [`Georef`] from a render result: scalars + the projection dict + the
 /// lat/lon numpy mesh.
 fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
@@ -1785,10 +1985,7 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
         Some(nav) => {
             let d = PyDict::new(py);
             d.set_item("navigation", nav.navigation.slug())?;
-            d.set_item(
-                "perspective_point_height_m",
-                nav.perspective_point_height_m,
-            )?;
+            d.set_item("perspective_point_height_m", nav.perspective_point_height_m)?;
             d.set_item("semi_major_axis_m", nav.semi_major_axis_m)?;
             d.set_item("semi_minor_axis_m", nav.semi_minor_axis_m)?;
             d.set_item("fixed_grid_origin_lon_deg", nav.sub_lon_deg)?;
@@ -1799,8 +1996,7 @@ fn build_georef(py: Python<'_>, result: &RenderResult) -> PyResult<Georef> {
         None => None,
     };
     let footprint_meta = result.instrument_footprint.metadata();
-    let instrument_footprint_metadata = if result.instrument_footprint == InstrumentFootprint::Off
-    {
+    let instrument_footprint_metadata = if result.instrument_footprint == InstrumentFootprint::Off {
         None
     } else {
         let d = PyDict::new(py);
@@ -2052,9 +2248,7 @@ fn parse_view(v: &str) -> PyResult<ViewMode> {
 fn parse_geo_navigation(v: &str) -> PyResult<GeoNavigation> {
     match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
         "model-sphere" | "sphere" | "model" | "default" => Ok(GeoNavigation::ModelSphere),
-        "goes-r-abi" | "goes-r" | "abi" | "ellipsoid" => {
-            Ok(GeoNavigation::GoesRAbiFixedGrid)
-        }
+        "goes-r-abi" | "goes-r" | "abi" | "ellipsoid" => Ok(GeoNavigation::GoesRAbiFixedGrid),
         _ => Err(value_err(format!(
             "unknown geo_navigation '{v}' (expected 'model-sphere' or 'goes-r-abi')"
         ))),
@@ -2097,18 +2291,17 @@ fn parse_steps(v: &str) -> PyResult<StepQuality> {
 fn parse_fractional_cloud_mode(v: &str) -> PyResult<FractionalCloudMode> {
     match v.to_ascii_lowercase().replace('_', "-").as_str() {
         "on" | "true" | "effective" | "effective-od" => Ok(FractionalCloudMode::EffectiveOd),
+        "deterministic-2" | "deterministic2" | "ica-2" | "mcica-2" => {
+            Ok(FractionalCloudMode::Deterministic2)
+        }
         "deterministic-4" | "deterministic4" | "ica-4" | "mcica-4" => {
             Ok(FractionalCloudMode::Deterministic4)
         }
-        "deterministic-8" | "deterministic8" => {
-            Ok(FractionalCloudMode::Deterministic8)
-        }
-        "deterministic-16" | "deterministic16" => {
-            Ok(FractionalCloudMode::Deterministic16)
-        }
+        "deterministic-8" | "deterministic8" => Ok(FractionalCloudMode::Deterministic8),
+        "deterministic-16" | "deterministic16" => Ok(FractionalCloudMode::Deterministic16),
         "off" | "false" | "legacy" => Ok(FractionalCloudMode::Off),
         _ => Err(value_err(format!(
-            "unknown fractional_cloud_mode '{v}' (off|effective-od|deterministic-4|deterministic-8|deterministic-16)"
+            "unknown fractional_cloud_mode '{v}' (off|effective-od|deterministic-2|deterministic-4|deterministic-8|deterministic-16)"
         ))),
     }
 }
@@ -2154,16 +2347,13 @@ fn parse_instrument_footprint(v: &str) -> PyResult<InstrumentFootprint> {
 }
 
 fn parse_enhancement(v: &str) -> PyResult<IrEnhancement> {
-    // `IrEnhancement::parse` is total (falls back to a default); reject an unknown token
-    // explicitly so a typo surfaces rather than silently picking grayscale.
-    match v.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
-        "cimss" | "bd" | "avn" | "funktop" | "rainbow" | "gray" | "grayscale" | "grey" => {
-            Ok(IrEnhancement::parse(v))
-        }
-        _ => Err(value_err(format!(
-            "unknown enhancement '{v}' (cimss|bd|avn|funktop|rainbow|gray)"
-        ))),
-    }
+    IrEnhancement::parse_strict(v).ok_or_else(|| {
+        value_err(format!(
+            "unknown enhancement '{v}' \
+             (natural|cimss|bd|avn|funktop|rainbow|gray; \
+             noaa/heritage accepted for natural; grayscale/greyscale accepted for gray)"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -2216,13 +2406,19 @@ mod tests {
         assert!(parse_intent("abi-band-2").is_err());
 
         let mut params = RenderParams::new(PathBuf::from("input"));
+        assert!(params.topdown_shadow_antialias);
         params.intent = parse_intent("sensor").unwrap();
         params.granulation = Some(true);
         let (effective, changes) = api::plan_render_intent(&params);
         assert_eq!(effective.cloud_optical_depth_scale, 1.0);
         assert!(effective.fractional_clouds);
         assert_eq!(effective.granulation, Some(false));
+        assert!(!effective.topdown_shadow_antialias);
         assert!(changes.contains(&simsat_engine::api::RenderIntentAdjustment::GranulationOff));
+        assert!(
+            changes
+                .contains(&simsat_engine::api::RenderIntentAdjustment::TopdownShadowAntialiasOff)
+        );
     }
 
     #[test]
@@ -2233,6 +2429,10 @@ mod tests {
                 FractionalCloudMode::EffectiveOd
             );
         }
+        assert_eq!(
+            parse_fractional_cloud_mode("deterministic-2").unwrap(),
+            FractionalCloudMode::Deterministic2
+        );
         assert_eq!(
             parse_fractional_cloud_mode("deterministic-4").unwrap(),
             FractionalCloudMode::Deterministic4
@@ -2281,6 +2481,30 @@ mod tests {
             InstrumentFootprint::GoesRAbiBand13Mtf
         );
         assert!(parse_instrument_footprint("generic-blur").is_err());
+    }
+
+    #[test]
+    fn enhancement_parser_exposes_natural_and_preserves_legacy_tokens() {
+        assert_eq!(
+            parse_enhancement("natural").unwrap(),
+            IrEnhancement::Natural
+        );
+        assert_eq!(
+            parse_enhancement("NOAA heritage").unwrap(),
+            IrEnhancement::Natural
+        );
+        for (token, expected) in [
+            ("cimss", IrEnhancement::Cimss),
+            ("bd", IrEnhancement::Bd),
+            ("avn", IrEnhancement::Avn),
+            ("funktop", IrEnhancement::Funktop),
+            ("rainbow", IrEnhancement::Rainbow),
+            ("gray", IrEnhancement::Grayscale),
+            ("greyscale", IrEnhancement::Grayscale),
+        ] {
+            assert_eq!(parse_enhancement(token).unwrap(), expected, "{token}");
+        }
+        assert!(parse_enhancement("smooth-rainbow").is_err());
     }
 
     #[test]
@@ -2382,7 +2606,16 @@ mod tests {
             params.land_appearance,
             simsat_engine::render::LandAppearanceConfig::shipped()
         );
-        apply_land_appearance_controls(&mut params, false, 1.6, false, 0.08, 0.65, 1.5).unwrap();
+        apply_land_appearance_controls(
+            &mut params,
+            false,
+            simsat_engine::render::LAND_SZA_MAX_GAIN,
+            false,
+            0.08,
+            0.65,
+            1.5,
+        )
+        .unwrap();
         assert_eq!(
             params.land_appearance,
             simsat_engine::render::LandAppearanceConfig::identity()
@@ -2413,6 +2646,35 @@ mod tests {
             let mut params = RenderParams::new(PathBuf::from("input"));
             assert!(
                 apply_land_appearance_controls(&mut params, true, sza, true, knee, gamma, toe_max,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn surface_postlight_toe_helper_is_default_off_and_assigns_bounded_controls() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        assert!(params.surface_postlight_toe.is_identity());
+        apply_surface_postlight_toe_controls(&mut params, true, 0.18, 0.80, 1.35).unwrap();
+        assert_eq!(
+            params.surface_postlight_toe,
+            SurfacePostlightToeConfig {
+                enabled: true,
+                knee: 0.18,
+                gamma: 0.80,
+                max_gain: 1.35,
+            }
+        );
+    }
+
+    #[test]
+    fn surface_postlight_toe_helper_rejects_invalid_values() {
+        for (knee, gamma, max_gain) in
+            [(0.0, 0.80, 1.35), (0.18, 1.1, 1.35), (0.18, 0.80, f64::NAN)]
+        {
+            let mut params = RenderParams::new(PathBuf::from("input"));
+            assert!(
+                apply_surface_postlight_toe_controls(&mut params, true, knee, gamma, max_gain,)
                     .is_err()
             );
         }
@@ -2491,6 +2753,7 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_cloud_optical_depth, m)?)?;
     m.add_function(wrap_pyfunction!(render_cloud_layer, m)?)?;
     m.add_function(wrap_pyfunction!(render_perspective, m)?)?;
+    m.add_function(wrap_pyfunction!(solar_elevation_grid, m)?)?;
     m.add_function(wrap_pyfunction!(set_verbose, m)?)?;
     m.add_class::<Georef>()?;
     Ok(())

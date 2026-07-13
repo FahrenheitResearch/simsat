@@ -1400,7 +1400,7 @@ pub fn plan_sun_od(
     let margin = pitch * 4.0;
     let s_start = s_max + margin;
     let s_len = (s_max - s_min) + 2.0 * margin;
-    let n_steps = ((s_len / pitch).ceil() as usize).clamp(1, 1024);
+    let n_steps = ((s_len / pitch).ceil() as usize).clamp(1, 4096);
     let ds = s_len / n_steps as f64;
     SunOdPlan {
         center,
@@ -1441,6 +1441,8 @@ pub struct CloudMarchParams {
     pub edge_feather_cells: f32,
     /// The sun-gated whole-surface daytime lift (`render::GROUND_DAY_LIFT` default).
     pub ground_day_lift: f32,
+    /// Top-down-only 5x5 transmittance antialias for ground cloud shadows.
+    pub topdown_shadow_antialias: bool,
 }
 
 /// The CPU-side inputs of one GPU cloud-composited render: the surface-pass inputs
@@ -1557,11 +1559,11 @@ pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 28] {
         // preserve every historical cloud-uniform offset above.
         s[9],
         s[10],
-        // ray0: view-mode tag, Top-down synthetic camera radius, reserved.
+        // ray0: view-mode tag, Top-down synthetic camera radius, shadow-AA flag, reserved.
         [
             inputs.view_mode.shader_tag(),
             (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32,
-            0.0,
+            if m.topdown_shadow_antialias { 1.0 } else { 0.0 },
             0.0,
         ],
     ]
@@ -2484,6 +2486,60 @@ mod tests {
     }
 
     #[test]
+    fn topdown_front_column_wgsl_matches_cpu_formula_and_validates() {
+        assert!(
+            CLOUDS_WGSL.contains("ap = topdown_front_column(cam, view, sun_ecef, m.mean_t);"),
+            "top-down GPU path must march its camera-to-cloud atmosphere"
+        );
+        assert!(
+            CLOUDS_WGSL.contains("let l_final = composite_front_column("),
+            "GPU final composite must use the reviewed front-column helper"
+        );
+        assert!(
+            CLOUDS_WGSL.contains(
+                "return l_toa * t_cloud\n        + t_ac * l_cloud\n        + i_ac * (1.0 - t_cloud);"
+            ),
+            "GPU front-column algebra drifted from the CPU contract"
+        );
+
+        // Evaluate the WGSL's f32 algebra independently and compare it with the Rust
+        // CPU helper at clear, partial, and opaque transmittance.
+        let l_toa = [0.08f32, 0.12, 0.18];
+        let l_cloud = [0.31f32, 0.29, 0.27];
+        let i_ac = [0.011f32, 0.017, 0.026];
+        let t_ac = 0.83f32;
+        for t_cloud in [0.0f32, 0.37, 1.0] {
+            let gpu = [
+                l_toa[0] * t_cloud + t_ac * l_cloud[0] + i_ac[0] * (1.0 - t_cloud),
+                l_toa[1] * t_cloud + t_ac * l_cloud[1] + i_ac[1] * (1.0 - t_cloud),
+                l_toa[2] * t_cloud + t_ac * l_cloud[2] + i_ac[2] * (1.0 - t_cloud),
+            ];
+            let cpu = crate::topdown::composite_topdown_front_column(
+                l_toa.map(f64::from),
+                l_cloud.map(f64::from),
+                f64::from(t_cloud),
+                i_ac.map(f64::from),
+                f64::from(t_ac),
+            );
+            for band in 0..3 {
+                assert!(
+                    (f64::from(gpu[band]) - cpu[band]).abs() < 5.0e-8,
+                    "band {band} T_cloud={t_cloud}: GPU {} CPU {}",
+                    gpu[band],
+                    cpu[band]
+                );
+            }
+        }
+
+        let module = naga::front::wgsl::parse_str(CLOUDS_WGSL).expect("clouds.wgsl parses");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.validate(&module).expect("clouds.wgsl validates");
+    }
+
+    #[test]
     fn every_shader_validates() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu/shaders");
         let mut count = 0;
@@ -2681,6 +2737,7 @@ mod tests {
                 cloud_optical_depth_scale: 1.0,
                 edge_feather_cells: 0.0,
                 ground_day_lift: 1.0,
+                topdown_shadow_antialias: true,
             },
             sun_od,
             froxel_dim: 1,
@@ -2801,6 +2858,7 @@ mod tests {
                 cloud_optical_depth_scale: 0.75,
                 edge_feather_cells: 3.2,
                 ground_day_lift: 2.0,
+                topdown_shadow_antialias: false,
             },
             sun_od: SunOdPlan {
                 center: [6.37e6, 1000.0, 2000.0],
@@ -2846,7 +2904,7 @@ mod tests {
         // frx2: froxel dim, edge feather, ground lift, visible cloud OD scale.
         assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
         // Appended land controls preserve every historical cloud offset above.
-        assert_eq!(quads[25], [0.0, 1.6, 0.0, 0.08]);
+        assert_eq!(quads[25], [0.0, 4.0, 0.0, 0.08]);
         assert_eq!(quads[26], [0.65, 1.5, 0.0, 0.0]);
         assert_eq!(
             quads[27],
@@ -2857,6 +2915,9 @@ mod tests {
                 0.0
             ]
         );
+        let mut aa = test_cloud_inputs(test_surface_uniforms());
+        aa.march.topdown_shadow_antialias = true;
+        assert_eq!(cloud_uniform_quads(&aa)[27][2], 1.0);
         let mut invalid = test_cloud_inputs(test_surface_uniforms());
         invalid.march.cloud_optical_depth_scale = f32::NAN;
         assert_eq!(
@@ -2878,6 +2939,48 @@ mod tests {
     fn wgsl_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
         let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
+    }
+
+    fn wgsl_lambert_surface_radiance(
+        albedo: [f32; 3],
+        direct_irradiance: [f32; 3],
+        ndotl: f32,
+        ambient_irradiance: [f32; 3],
+    ) -> [f32; 3] {
+        let mu = ndotl.clamp(0.0, 1.0);
+        [
+            albedo[0] / std::f32::consts::PI * (direct_irradiance[0] * mu + ambient_irradiance[0]),
+            albedo[1] / std::f32::consts::PI * (direct_irradiance[1] * mu + ambient_irradiance[1]),
+            albedo[2] / std::f32::consts::PI * (direct_irradiance[2] * mu + ambient_irradiance[2]),
+        ]
+    }
+
+    #[test]
+    fn wgsl_lambert_formula_tracks_cpu_units() {
+        let direct_f64 = crate::atmosphere::SOLAR_IRRADIANCE_RGB;
+        let direct_f32 = [
+            direct_f64[0] as f32,
+            direct_f64[1] as f32,
+            direct_f64[2] as f32,
+        ];
+        for ndotl in [1.0f32, 0.5, 0.25] {
+            let gpu = wgsl_lambert_surface_radiance([0.20; 3], direct_f32, ndotl, [0.0; 3]);
+            let cpu = crate::render::lambert_surface_radiance(
+                [0.20; 3],
+                direct_f64,
+                ndotl as f64,
+                [0.0; 3],
+            );
+            for c in 0..3 {
+                assert!(
+                    (gpu[c] as f64 - cpu[c]).abs() <= 2.0e-6 * cpu[c].abs().max(1.0),
+                    "channel {c} N.L={ndotl}: gpu={} cpu={}",
+                    gpu[c],
+                    cpu[c]
+                );
+            }
+        }
+        assert!(SURFACE_WGSL.contains("albedo / PI * (e_direct + e_ambient)"));
     }
 
     /// Executable f32 transcription of the marked WGSL helper. The exhaustive property
@@ -2936,10 +3039,10 @@ mod tests {
     #[test]
     fn land_appearance_uniforms_match_cpu_sanitization_and_identity() {
         let identity = land_appearance_uniform_quads(LandAppearanceConfig::identity());
-        assert_eq!(identity[0], [0.0, 1.6, 0.0, 0.08]);
+        assert_eq!(identity[0], [0.0, 4.0, 0.0, 0.08]);
         assert_eq!(identity[1], [0.65, 1.5, 0.0, 0.0]);
         let shipped = land_appearance_uniform_quads(LandAppearanceConfig::default());
-        assert_eq!(shipped[0], [1.0, 1.6, 1.0, 0.08]);
+        assert_eq!(shipped[0], [1.0, 4.0, 1.0, 0.08]);
         assert_eq!(shipped[1], [0.65, 1.5, 0.0, 0.0]);
 
         let invalid = land_appearance_uniform_quads(LandAppearanceConfig {
@@ -2950,7 +3053,7 @@ mod tests {
             dark_toe_gamma: -9.0,
             dark_toe_max_gain: 99.0,
         });
-        assert_eq!(invalid[0], [1.0, 1.6, 1.0, 0.08]);
+        assert_eq!(invalid[0], [1.0, 4.0, 1.0, 0.08]);
         assert_eq!(invalid[1], [0.05, 4.0, 0.0, 0.0]);
 
         for elev in [-90.0, 0.0, 20.0, 25.0, 30.0, 60.0, 90.0] {
@@ -3105,6 +3208,14 @@ mod tests {
         assert!(
             CLOUDS_WGSL.contains("const SUN_ANG_RADIUS_TAN: f32 = 0.00465003;"),
             "clouds WGSL penumbra half-angle drifted from Rust"
+        );
+        assert!(
+            CLOUDS_WGSL.contains("array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0)"),
+            "clouds WGSL top-down shadow kernel drifted from Rust [1,4,6,4,1]"
+        );
+        assert!(
+            CLOUDS_WGSL.contains("return sum * (1.0 / 256.0);"),
+            "clouds WGSL top-down shadow normalization drifted from Rust 1/256"
         );
     }
 
@@ -3367,6 +3478,6 @@ mod tests {
         // Trailing word is the product-facing atmosphere-correction flag.
         assert_eq!(f32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1.0);
         assert_eq!(f32::from_le_bytes(bytes[144..148].try_into().unwrap()), 0.0);
-        assert_eq!(f32::from_le_bytes(bytes[148..152].try_into().unwrap()), 1.6);
+        assert_eq!(f32::from_le_bytes(bytes[148..152].try_into().unwrap()), 4.0);
     }
 }

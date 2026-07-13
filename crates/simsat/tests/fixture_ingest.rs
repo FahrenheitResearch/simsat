@@ -350,6 +350,7 @@ fn optional_wrf_fixture_ingests_and_ratchets() {
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
                 land_appearance: simsat::render::LandAppearanceConfig::identity(),
+                surface_postlight_toe: simsat::render::SurfacePostlightToeConfig::off(),
             };
             let sun_enu = [0.0f32, e.cos() as f32, e.sin() as f32];
             let rnx = native.nx;

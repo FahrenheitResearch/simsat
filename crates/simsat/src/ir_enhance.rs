@@ -8,12 +8,14 @@
 //! same frame live with the same curves.
 //!
 //! ---
-//! ATTRIBUTION. The `IrEnhancement` enum and every anchor table below are PORTED
-//! VERBATIM (values unchanged; comments condensed) from BowEcho
+//! ATTRIBUTION. The legacy enhancement variants and their anchor tables below are
+//! PORTED VERBATIM (values unchanged; comments condensed) from BowEcho
 //! (`crates/app_ui/src/sat_worker.rs` in the sibling rusty-weather app, the
 //! rev pinned in Cargo.toml): `IrEnhancement`, `ir_enhancement_anchors`,
 //! `enhanced_anchors_for_band`, and the `ENHANCED_IR` / `BD_CURVE` / `AVN_IR` /
-//! `FUNKTOP_IR` / `RAINBOW_IR` / `GRAYSCALE_IR` anchor constants. The colour
+//! `FUNKTOP_IR` / `RAINBOW_IR` / `GRAYSCALE_IR` anchor constants. `NATURAL_IR`
+//! separately implements NOAA/NESDIS's published heritage longwave-IR display
+//! transfer function and cites the primary ATBD at its definition. The colour
 //! interpolation itself is the pinned `rw_sat::palette::anchor_color` (called
 //! directly — `rw-sat` is a workspace dependency), and the CIMSS/`Cimss` per-band
 //! fallback uses the pinned `rw_sat::palette::band_anchors`. The anchor SCIENCE
@@ -39,14 +41,18 @@
 use rw_sat::palette::{Anchors, anchor_color, band_anchors};
 
 /// User-selectable IR enhancement for Kelvin brightness-temperature bands (ABI /
-/// AHI bands 7-16). `Cimss` keeps the per-band production behaviour ([`ENHANCED_IR`]
-/// on the longwave window 13-15, production palettes elsewhere); the others are the
-/// classic NOAA absolute-temperature enhancement curves applied to every IR band.
-/// Ported from `sat_worker::IrEnhancement`.
+/// AHI bands 7-16). [`Natural`](Self::Natural) is the recommended longwave-window
+/// display: NOAA's continuous heritage 8-bit bi-linear grayscale. `Cimss` keeps the
+/// legacy per-band production behaviour ([`ENHANCED_IR`] on the longwave window
+/// 13-15, production palettes elsewhere); the other legacy choices are analysis
+/// palettes whose temperature bands or hard thresholds are intentional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IrEnhancement {
-    /// CIMSS-style rainbow on 13-15, production palettes elsewhere (default).
+    /// NOAA heritage continuous bi-linear longwave-IR grayscale (recommended).
+    /// Water-vapor bands retain their existing band-scaled grayscale ranges.
     #[default]
+    Natural,
+    /// CIMSS-style false colour on 13-15, production palettes elsewhere.
     Cimss,
     /// NESDIS BD curve — the stepped Dvorak tropical-cyclone enhancement.
     Bd,
@@ -64,7 +70,8 @@ pub enum IrEnhancement {
 
 impl IrEnhancement {
     /// All enhancements in UI order.
-    pub const ALL: [IrEnhancement; 6] = [
+    pub const ALL: [IrEnhancement; 7] = [
+        Self::Natural,
         Self::Cimss,
         Self::Bd,
         Self::Avn,
@@ -76,6 +83,7 @@ impl IrEnhancement {
     /// Stable slug (the same keys BowEcho persists, for cross-tool consistency).
     pub fn slug(self) -> &'static str {
         match self {
+            Self::Natural => "natural",
             Self::Cimss => "cimss",
             Self::Bd => "bd",
             Self::Avn => "avn",
@@ -88,12 +96,13 @@ impl IrEnhancement {
     /// Human-readable label for the picker.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Cimss => "CIMSS ramp (default)",
-            Self::Bd => "BD curve (Dvorak)",
-            Self::Avn => "AVN",
-            Self::Funktop => "Funktop",
-            Self::Rainbow => "Rainbow",
-            Self::Grayscale => "Grayscale",
+            Self::Natural => "Natural (NOAA heritage) — Recommended",
+            Self::Cimss => "CIMSS-style false color (isotherm bands)",
+            Self::Bd => "BD stepped thresholds (Dvorak)",
+            Self::Avn => "AVN stepped analysis palette",
+            Self::Funktop => "Funktop stepped analysis palette",
+            Self::Rainbow => "Rainbow analysis palette",
+            Self::Grayscale => "Legacy linear grayscale",
         }
     }
 
@@ -119,6 +128,7 @@ impl IrEnhancement {
             .replace(['-', '_', ' '], "")
             .as_str()
         {
+            "natural" | "noaa" | "noaaheritage" | "heritage" => Some(Self::Natural),
             "cimss" => Some(Self::Cimss),
             "bd" | "bdcurve" => Some(Self::Bd),
             "avn" => Some(Self::Avn),
@@ -256,6 +266,24 @@ pub const GRAYSCALE_IR: Anchors = &[
     (330.0, [0, 0, 0]),        //  +57 C
 ];
 
+/// NOAA/NESDIS heritage 8-bit longwave-IR display mapping.
+///
+/// The GOES-R Cloud and Moisture Imagery ATBD defines the continuous bi-linear
+/// conversion from brightness temperature to display value as `418 - BT` below
+/// 242 K and `660 - 2*BT` at and above 242 K, clamped to 0..255. Those equations
+/// meet at value 176 at 242 K. These three anchors are exactly the same piecewise
+/// linear transfer function; keeping them as anchors also preserves the common
+/// palette API. This is a display enhancement only — the canonical BT plane stays
+/// floating-point Kelvin.
+///
+/// Source: NOAA/NESDIS GOES-R ABI Cloud and Moisture Imagery Product ATBD v4,
+/// section 3.4.2.1, <https://www.star.nesdis.noaa.gov/goesr/documents/ATBDs/Enterprise/ATBD_Enterprise_Cloud_and_Moisture_Imagery_Product_v4_2021-01-13.pdf>.
+pub const NATURAL_IR: Anchors = &[
+    (163.0, [255, 255, 255]), // clamp(418 - 163) = 255
+    (242.0, [176, 176, 176]), // both branches meet continuously
+    (330.0, [0, 0, 0]),       // clamp(660 - 2*330) = 0
+];
+
 /// WV-scaled inverted grayscale for the 6.2 um band (8): cold/moist WHITE at 184 K ->
 /// warm/dry BLACK at 268 K, over band 8's WV BT range (matches `UPPER_WATER_VAPOR`).
 pub const WV_GRAYSCALE_C08: Anchors = &[(184.0, [255, 255, 255]), (268.0, [0, 0, 0])];
@@ -277,11 +305,16 @@ pub fn wv_grayscale_for_band(band: u8) -> Option<Anchors> {
 }
 
 /// The anchor table an IR band renders through for the given enhancement. `Cimss`
-/// preserves the per-band production behaviour; every other curve is an absolute-
-/// Kelvin table shared by all IR bands. Ported from
-/// `sat_worker::ir_enhancement_anchors`.
+/// preserves the per-band production behaviour. `Natural` and `Grayscale` retain
+/// the existing WV-scaled grayscale on bands 8/9/10; their window-band mappings and
+/// the analysis curves are absolute-Kelvin tables. The legacy branches are ported
+/// from `sat_worker::ir_enhancement_anchors`.
 pub fn ir_enhancement_anchors(band: u8, enhancement: IrEnhancement) -> Anchors {
     match enhancement {
+        // NOAA's heritage mapping is a longwave-window display. For WV 8/9/10,
+        // retain the existing band-scaled grayscale so their narrower BT ranges
+        // remain readable instead of forcing the Band-13 242 K breakpoint.
+        IrEnhancement::Natural => wv_grayscale_for_band(band).unwrap_or(NATURAL_IR),
         IrEnhancement::Cimss => {
             enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band))
         }
@@ -319,13 +352,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enhancement_slugs_round_trip_and_default_is_cimss() {
+    fn enhancement_slugs_round_trip_and_default_is_natural() {
         for e in IrEnhancement::ALL {
             assert_eq!(IrEnhancement::parse(e.slug()), e, "slug {} lost", e.slug());
         }
-        assert_eq!(IrEnhancement::default(), IrEnhancement::Cimss);
+        assert_eq!(IrEnhancement::default(), IrEnhancement::Natural);
         // The LENIENT parse keeps its pinned total behavior (simsat_py wraps it).
-        assert_eq!(IrEnhancement::parse("nonsense"), IrEnhancement::Cimss);
+        assert_eq!(IrEnhancement::parse("nonsense"), IrEnhancement::Natural);
     }
 
     #[test]
@@ -351,8 +384,88 @@ mod tests {
             IrEnhancement::parse_strict("rb"),
             Some(IrEnhancement::Rainbow)
         );
+        for alias in ["noaa", "NOAA heritage", "heritage"] {
+            assert_eq!(
+                IrEnhancement::parse_strict(alias),
+                Some(IrEnhancement::Natural)
+            );
+        }
         assert_eq!(IrEnhancement::parse_strict("nonsense"), None);
         assert_eq!(IrEnhancement::parse_strict(""), None);
+    }
+
+    fn expected_natural_gray(bt_k: f32) -> u8 {
+        let value = if bt_k < 242.0 {
+            418.0 - bt_k
+        } else {
+            660.0 - 2.0 * bt_k
+        };
+        value.clamp(0.0, 255.0).round() as u8
+    }
+
+    #[test]
+    fn natural_noaa_mapping_is_continuous_at_242_k_and_monotone() {
+        assert_eq!(expected_natural_gray(242.0), 176);
+        let below = bt_to_rgba(242.0 - 0.001, 13, IrEnhancement::Natural);
+        let at = bt_to_rgba(242.0, 13, IrEnhancement::Natural);
+        let above = bt_to_rgba(242.0 + 0.001, 13, IrEnhancement::Natural);
+        assert_eq!(&below[..3], &[176, 176, 176]);
+        assert_eq!(&at[..3], &[176, 176, 176]);
+        assert_eq!(&above[..3], &[176, 176, 176]);
+
+        let mut previous = 255;
+        for step in 0..=1600 {
+            let bt = 150.0 + step as f32 * 0.125;
+            let pixel = bt_to_rgba(bt, 13, IrEnhancement::Natural);
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+            assert!(
+                pixel[0] <= previous,
+                "natural mapping increased at {bt} K: {} > {previous}",
+                pixel[0]
+            );
+            previous = pixel[0];
+        }
+    }
+
+    #[test]
+    fn natural_linear_ramp_matches_the_noaa_equations() {
+        let bt: Vec<f32> = (150..=350).map(|k| k as f32).collect();
+        let rgba = render_ir_rgba(&bt, 13, IrEnhancement::Natural);
+        for (i, &temperature) in bt.iter().enumerate() {
+            let expected = expected_natural_gray(temperature);
+            assert_eq!(
+                &rgba[i * 4..i * 4 + 4],
+                &[expected, expected, expected, 255],
+                "linear-ramp mismatch at {temperature} K"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_radial_ramp_stays_grayscale_and_matches_the_transfer() {
+        const SIDE: usize = 33;
+        let center = (SIDE / 2) as f32;
+        let mut bt = Vec::with_capacity(SIDE * SIDE);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+                bt.push(180.0 + (dx * dx + dy * dy).sqrt() * 6.0);
+            }
+        }
+        let rgba = render_ir_rgba(&bt, 13, IrEnhancement::Natural);
+        for (i, &temperature) in bt.iter().enumerate() {
+            let expected = expected_natural_gray(temperature);
+            assert_eq!(
+                &rgba[i * 4..i * 4 + 4],
+                &[expected, expected, expected, 255],
+                "radial-ramp mismatch at pixel {i}, {temperature} K"
+            );
+        }
+        let center_gray = rgba[(SIDE / 2 * SIDE + SIDE / 2) * 4];
+        let edge_gray = rgba[(SIDE / 2 * SIDE) * 4];
+        assert!(center_gray > edge_gray, "warmward radial ramp must darken");
     }
 
     #[test]
@@ -383,6 +496,7 @@ mod tests {
         // (anchor_color clamps to the ends). This is the "cold BT gets the cold-end
         // colour, warm BT the warm end" check (design section 7 test 5).
         for e in [
+            IrEnhancement::Natural,
             IrEnhancement::Bd,
             IrEnhancement::Avn,
             IrEnhancement::Funktop,
@@ -478,6 +592,21 @@ mod tests {
         assert_eq!(
             ir_enhancement_anchors(13, IrEnhancement::Grayscale),
             GRAYSCALE_IR
+        );
+    }
+
+    #[test]
+    fn natural_keeps_water_vapor_band_scaled_and_wv_default_is_cimss() {
+        for (band, table) in [
+            (8u8, WV_GRAYSCALE_C08),
+            (9, WV_GRAYSCALE_C09),
+            (10, WV_GRAYSCALE_C10),
+        ] {
+            assert_eq!(ir_enhancement_anchors(band, IrEnhancement::Natural), table);
+        }
+        assert_eq!(
+            crate::wv::WvBand::Upper.default_enhancement(),
+            IrEnhancement::Cimss
         );
     }
 

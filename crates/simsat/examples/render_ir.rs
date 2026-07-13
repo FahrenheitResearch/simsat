@@ -20,8 +20,8 @@
 //!   resolution=<mode>   native | abi1km | abi2km            (default native)
 //!                       native = one output pixel per source grid cell. ABI 1/2 km are
 //!                       output sampling choices and may upsample coarse or downsample fine data.
-//!   enhancement=<name>  cimss | bd | avn | funktop | rainbow | gray  (default gray;
-//!                       cimss for a WV band)
+//!   enhancement=<name>  natural | cimss | bd | avn | funktop | rainbow | gray
+//!                       (default natural for Band 13; cimss for a WV band)
 //!   wv=<band>           6.2 | 6.9 | 7.3  — render a WATER-VAPOR band instead of the
 //!                       10.3 um window (band 13). Thermal either way.
 //!   derived=<field>     pw | ctt | cod  — render a DERIVED scalar-field MAP (precipitable
@@ -346,7 +346,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
     let mut margin = 0.0f64;
-    let mut enhancement = IrEnhancement::Grayscale;
+    let mut enhancement = IrEnhancement::Natural;
     let mut cache = simsat::ingest::default_cache_dir();
     let mut view = ViewMode::Geostationary;
     let mut canvas: Option<(usize, usize)> = None;
@@ -382,8 +382,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 // fall-back to the default (a `grayscale` typo used to render CIMSS).
                 enhancement = IrEnhancement::parse_strict(v).ok_or_else(|| {
                     format!(
-                        "unknown enhancement '{v}' (cimss|bd|avn|funktop|rainbow|gray; \
-                         grayscale/greyscale accepted for gray)"
+                        "unknown enhancement '{v}' (natural|cimss|bd|avn|funktop|rainbow|gray; \
+                         noaa/heritage accepted for natural; grayscale/greyscale accepted for gray)"
                     )
                 })?;
                 enhancement_explicit = true;
@@ -422,8 +422,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             other => return Err(format!("unknown key '{other}'")),
         }
     }
-    // For a WV band the natural default look is CIMSS (the classic WV moisture palette);
-    // the 10.3 um window keeps its Grayscale default. An explicit enhancement= wins either way.
+    // For a WV band the default remains CIMSS (the classic WV moisture palette); the
+    // 10.3 um window uses the NOAA heritage Natural grayscale. An explicit enhancement=
+    // wins either way.
     if wv.is_some() && !enhancement_explicit {
         enhancement = IrEnhancement::Cimss;
     }
@@ -529,7 +530,8 @@ fn print_usage() {
          \x20                     native = one pixel per source-grid cell; ABI 1/2 km may\n\
          \x20                     upsample coarse or downsample fine model grids\n\
          \x20 margin=<frac>       zoom-out margin fraction on each side (default 0.0; thermal margin = no-data)\n\
-         \x20 enhancement=<name>  cimss|bd|avn|funktop|rainbow|gray  (default gray; cimss for WV)\n\
+         \x20 enhancement=<name>  natural|cimss|bd|avn|funktop|rainbow|gray\n\
+         \x20                     (default natural for Band 13; cimss for WV)\n\
          \x20 sensor=<response>   fast-gray (default) | goes-r-abi-band13-fm4 (official NOAA SRF)\n\
          \x20 instrument-footprint=<mode> off (default) | goes-r-abi-band13-mtf-prototype; exact global 56-urad lattice (requires FM4 + GOES-R exact nav + geo ABI2km)\n\
          \x20 wv=<band>           6.2|6.9|7.3  render a water-vapor band (else band 13)\n\
@@ -557,6 +559,26 @@ mod tests {
         assert_eq!(
             parse_opts(&science).unwrap().storage_profile,
             StorageProfile::ScienceCloudF16
+        );
+    }
+
+    #[test]
+    fn band13_defaults_natural_while_water_vapor_stays_cimss() {
+        let base = vec!["input=input".to_string(), "out=out.png".to_string()];
+        assert_eq!(
+            parse_opts(&base).unwrap().enhancement,
+            IrEnhancement::Natural
+        );
+
+        let mut wv = base.clone();
+        wv.push("wv=6.2".to_string());
+        assert_eq!(parse_opts(&wv).unwrap().enhancement, IrEnhancement::Cimss);
+
+        let mut explicit = wv;
+        explicit.push("enhancement=natural".to_string());
+        assert_eq!(
+            parse_opts(&explicit).unwrap().enhancement,
+            IrEnhancement::Natural
         );
     }
 }

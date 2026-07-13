@@ -15,6 +15,8 @@
 
 use std::f64::consts::PI;
 
+use crate::atmosphere::sun_enu_to_ecef;
+
 const DEG2RAD: f64 = PI / 180.0;
 const RAD2DEG: f64 = 180.0 / PI;
 
@@ -220,6 +222,150 @@ pub fn parse_iso_utc(s: &str) -> Option<(i32, u32, u32, f64)> {
     Some((year, month, day, hh + mm / 60.0 + ss / 3600.0))
 }
 
+/// Project a global ECEF sun direction into the local ENU basis at `(lat, lon)`.
+///
+/// This is the inverse of [`sun_enu_to_ecef`]. The renderer uses the returned
+/// elevation for a synthetic sun override after placing that override over the
+/// raster bounding-box centre.
+pub fn sun_enu_and_elevation(sun_ecef: [f64; 3], lat_deg: f64, lon_deg: f64) -> ([f64; 3], f64) {
+    let (la, lo) = (lat_deg.to_radians(), lon_deg.to_radians());
+    let (sla, cla) = la.sin_cos();
+    let (slo, clo) = lo.sin_cos();
+    let east = [-slo, clo, 0.0];
+    let north = [-sla * clo, -sla * slo, cla];
+    let up = [cla * clo, cla * slo, sla];
+    let dot = |a: [f64; 3]| a[0] * sun_ecef[0] + a[1] * sun_ecef[1] + a[2] * sun_ecef[2];
+    let (e, n, u) = (dot(east), dot(north), dot(up));
+    let elev = u.clamp(-1.0, 1.0).asin().to_degrees();
+    ([e, n, u], elev)
+}
+
+/// Resolve the renderer's single sun-at-infinity ECEF vector at a raster centre.
+///
+/// An unset override component keeps the NOAA value at the centre, matching
+/// [`crate::api::SunOverride`]. The returned elevation is projected back from the
+/// ECEF vector rather than copied from the input so this helper and every per-pixel
+/// diagnostic follow the same ENU -> ECEF -> ENU path.
+pub fn frame_sun_ecef(
+    solar: &SolarFrame,
+    center_lat_deg: f64,
+    center_lon_deg: f64,
+    elevation_override_deg: Option<f64>,
+    azimuth_override_deg: Option<f64>,
+) -> ([f64; 3], f64) {
+    let real_sun = solar.at(center_lat_deg, center_lon_deg);
+    let use_override = elevation_override_deg.is_some() || azimuth_override_deg.is_some();
+    let sun_ecef = if use_override {
+        let elev_deg = elevation_override_deg.unwrap_or(real_sun.elevation_deg);
+        let az_deg = azimuth_override_deg.unwrap_or(real_sun.azimuth_deg);
+        let (elev, az) = (elev_deg.to_radians(), az_deg.to_radians());
+        let sun_enu = [elev.cos() * az.sin(), elev.cos() * az.cos(), elev.sin()];
+        sun_enu_to_ecef(sun_enu, center_lat_deg, center_lon_deg)
+    } else {
+        sun_enu_to_ecef(real_sun.enu_direction(), center_lat_deg, center_lon_deg)
+    };
+    let center_elev = sun_enu_and_elevation(sun_ecef, center_lat_deg, center_lon_deg).1;
+    (sun_ecef, center_elev)
+}
+
+/// Compute the finite-pair latitude/longitude bounding box used by a surface raster.
+///
+/// Coordinates are kept as `f32` through the extrema and centre calculation because
+/// that is the renderer's raster representation. A pixel is valid only when both its
+/// latitude and longitude are finite.
+pub fn lat_lon_bbox(lat: &[f32], lon: &[f32]) -> Option<(f32, f32, f32, f32)> {
+    if lat.len() != lon.len() {
+        return None;
+    }
+    let mut pairs = lat
+        .iter()
+        .zip(lon.iter())
+        .filter(|(la, lo)| la.is_finite() && lo.is_finite());
+    let (&la0, &lo0) = pairs.next()?;
+    let (mut la_min, mut la_max, mut lo_min, mut lo_max) = (la0, la0, lo0, lo0);
+    for (&la, &lo) in pairs {
+        la_min = la_min.min(la);
+        la_max = la_max.max(la);
+        lo_min = lo_min.min(lo);
+        lo_max = lo_max.max(lo);
+    }
+    Some((la_min, la_max, lo_min, lo_max))
+}
+
+/// Exact per-pixel elevation diagnostic for the renderer's surface-light LUT.
+///
+/// Without an override, [`crate::gpu::build_luts`] evaluates NOAA independently at
+/// every valid pixel. With either override component set, the renderer instead places
+/// that partially-overridden sun over the finite-pair bounding-box centre, converts it
+/// once to ECEF, then projects that vector into every pixel's local ENU frame. This
+/// diagnostic mirrors that conditional behavior exactly. The frame-wide atmosphere and
+/// cloud sun remains a separate single ECEF vector. Invalid pairs produce `NaN`.
+pub fn solar_elevation_grid(
+    solar: &SolarFrame,
+    lat: &[f32],
+    lon: &[f32],
+    elevation_override_deg: Option<f64>,
+    azimuth_override_deg: Option<f64>,
+) -> Result<Vec<f32>, String> {
+    if lat.len() != lon.len() {
+        return Err(format!(
+            "latitude and longitude lengths differ ({} != {})",
+            lat.len(),
+            lon.len()
+        ));
+    }
+    if lat.is_empty() {
+        return Err("latitude and longitude grids must not be empty".to_string());
+    }
+    for (name, value) in [
+        ("sun_elev", elevation_override_deg),
+        ("sun_az", azimuth_override_deg),
+    ] {
+        if value.is_some_and(|v| !v.is_finite()) {
+            return Err(format!("{name} must be finite when provided"));
+        }
+    }
+    let bbox = lat_lon_bbox(lat, lon)
+        .ok_or_else(|| "latitude/longitude grids contain no finite coordinate pair".to_string())?;
+    let use_override = elevation_override_deg.is_some() || azimuth_override_deg.is_some();
+    if !use_override {
+        return Ok(lat
+            .iter()
+            .zip(lon.iter())
+            .map(|(&la, &lo)| {
+                if la.is_finite() && lo.is_finite() {
+                    solar.at(la as f64, lo as f64).elevation_deg as f32
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect());
+    }
+
+    let (la_min, la_max, lo_min, lo_max) = bbox;
+    // Preserve the renderer's f32 bbox-centre arithmetic before widening to f64.
+    let center_lat = ((la_min + la_max) * 0.5) as f64;
+    let center_lon = ((lo_min + lo_max) * 0.5) as f64;
+    let (sun_ecef, _) = frame_sun_ecef(
+        solar,
+        center_lat,
+        center_lon,
+        elevation_override_deg,
+        azimuth_override_deg,
+    );
+    Ok(lat
+        .iter()
+        .zip(lon.iter())
+        .map(|(&la, &lo)| {
+            if la.is_finite() && lo.is_finite() {
+                sun_enu_and_elevation(sun_ecef, la as f64, lo as f64).1 as f32
+            } else {
+                f32::NAN
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +482,93 @@ mod tests {
             Some((2018, 10, 10, 12.0))
         );
         assert_eq!(parse_iso_utc("garbage"), None);
+    }
+
+    #[test]
+    fn elevation_grid_matches_surface_light_lut_noaa_at_center_and_corners() {
+        let solar = SolarFrame::new(1974, 4, 3, 23.2);
+        let lat = [35.0, 35.0, 35.0, 37.5, 37.5, 37.5, 40.0, 40.0, 40.0];
+        let lon = [
+            -95.0, -92.5, -90.0, -95.0, -92.5, -90.0, -95.0, -92.5, -90.0,
+        ];
+        let got = solar_elevation_grid(&solar, &lat, &lon, None, None).unwrap();
+
+        for idx in 0..lat.len() {
+            let expected = solar.at(lat[idx] as f64, lon[idx] as f64).elevation_deg as f32;
+            assert_eq!(got[idx], expected, "pixel {idx}");
+        }
+    }
+
+    #[test]
+    fn elevation_grid_honors_full_and_partial_overrides() {
+        let solar = SolarFrame::new(1974, 4, 3, 23.2);
+        let lat = [36.0, 36.0, 37.5, 37.5, 39.0, 39.0];
+        let lon = [-94.0, -91.0, -94.0, -91.0, -94.0, -91.0];
+
+        let full = solar_elevation_grid(&solar, &lat, &lon, Some(12.5), Some(210.0)).unwrap();
+        let elev = 12.5_f64.to_radians();
+        let az = 210.0_f64.to_radians();
+        let sun_ecef = sun_enu_to_ecef(
+            [elev.cos() * az.sin(), elev.cos() * az.cos(), elev.sin()],
+            37.5,
+            -92.5,
+        );
+        for idx in 0..lat.len() {
+            let expected =
+                sun_enu_and_elevation(sun_ecef, lat[idx] as f64, lon[idx] as f64).1 as f32;
+            assert_eq!(full[idx], expected, "override pixel {idx}");
+        }
+        // Add the bbox centre explicitly: an override is defined at that centre and
+        // must round-trip to its requested elevation through ECEF.
+        let center = solar_elevation_grid(
+            &solar,
+            &[36.0, 37.5, 39.0],
+            &[-94.0, -92.5, -91.0],
+            Some(12.5),
+            Some(210.0),
+        )
+        .unwrap();
+        assert!((center[1] - 12.5).abs() <= 1.0e-5);
+        assert!(full.iter().all(|v| v.is_finite()));
+
+        let partial = solar_elevation_grid(
+            &solar,
+            &[36.0, 37.5, 39.0],
+            &[-94.0, -92.5, -91.0],
+            Some(5.0),
+            None,
+        )
+        .unwrap();
+        assert!((partial[1] - 5.0).abs() <= 1.0e-5);
+    }
+
+    #[test]
+    fn elevation_grid_validates_lengths_and_finite_coordinates() {
+        let solar = SolarFrame::new(2025, 1, 15, 12.0);
+        assert!(
+            solar_elevation_grid(&solar, &[35.0], &[90.0, 91.0], None, None)
+                .unwrap_err()
+                .contains("lengths differ")
+        );
+        assert!(
+            solar_elevation_grid(&solar, &[], &[], None, None)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
+        assert!(
+            solar_elevation_grid(&solar, &[f32::NAN], &[f32::NAN], None, None)
+                .unwrap_err()
+                .contains("no finite coordinate pair")
+        );
+        assert!(
+            solar_elevation_grid(&solar, &[35.0], &[90.0], Some(f64::NAN), None)
+                .unwrap_err()
+                .contains("sun_elev")
+        );
+
+        let with_space =
+            solar_elevation_grid(&solar, &[35.0, f32::NAN], &[90.0, 91.0], None, None).unwrap();
+        assert!(with_space[0].is_finite());
+        assert!(with_space[1].is_nan());
     }
 }

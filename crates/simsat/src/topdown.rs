@@ -18,14 +18,14 @@
 //! north-up flat map of the domain that registers with other top-down Lambert WRF
 //! field plots (same spherical R = 6.37e6, same projection).
 //!
-//! AERIAL-PERSPECTIVE NOTE (a documented near-nadir simplification): the geostationary
-//! composite adds the froxel camera->cloud front airlight. For the top-down view the
-//! camera sits just above the atmosphere looking straight DOWN, so the camera->cloud air
-//! column is a thin near-vertical slab through the tenuous upper atmosphere — its in-
-//! scatter is negligible next to the geostationary slant path. The top-down composite
-//! therefore omits that front-airlight term; the surface's OWN full-column camera->ground
-//! aerial perspective (integrated inside [`crate::render::surface_toa_radiance`]) is
-//! retained. This is the only physics difference from the geostationary composite.
+//! AERIAL-PERSPECTIVE NOTE: the geostationary composite samples a scan-space froxel for
+//! the camera->cloud atmosphere. A top-down pixel has its own local nadir camera, so that
+//! shared froxel cannot describe it. Instead, the top-down composite directly marches the
+//! near-vertical atmosphere from shell entry to the cloud's optical centroid and uses the
+//! same complete front-column form as GEO:
+//! `L = L_toa*T_cloud + T_ac*L_cloud + I_ac*(1-T_cloud)`. The weighting preserves the
+//! exact clear-surface limit while retaining all camera-side airlight in front of an
+//! opaque cloud.
 //!
 //! Also holds the two integration OUTPUT helpers used by the headless CLI: the canvas
 //! [`letterbox_rgb`] (pad a rendered frame into a fixed figure size, e.g. his uniform
@@ -35,7 +35,7 @@
 
 use rayon::prelude::*;
 
-use crate::atmosphere::OutputTransform;
+use crate::atmosphere::{self, OutputTransform, SOLAR_IRRADIANCE_RGB};
 use crate::camera::topdown_nadir_ray;
 use crate::clouds::{CloudScene, ground_cloud_shadow, march_cloud};
 use crate::ir::{IrScene, march_ir_bt};
@@ -99,7 +99,108 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         atmosphere_correction: base.atmosphere_correction,
         terrain_atmosphere: base.terrain_atmosphere,
         land_appearance: base.land_appearance,
+        surface_postlight_toe: base.surface_postlight_toe,
     }
+}
+
+/// The in-atmosphere camera->cloud segment for a top-down ray. `cloud_mean_t_m` is
+/// the cloud march's absolute optical-centroid distance from `cam`. Clamping to the
+/// atmosphere segment makes the entry and ground limits exact even for a centroid
+/// perturbed a few metres outside the shell by finite-step integration.
+fn topdown_front_segment(
+    cam: [f64; 3],
+    view: [f64; 3],
+    cloud_mean_t_m: f64,
+) -> Option<([f64; 3], f64)> {
+    if !cloud_mean_t_m.is_finite() {
+        return None;
+    }
+    let (t_enter, t_exit) = atmosphere::ray_atmosphere_segment(cam, view)?;
+    let t_cloud = cloud_mean_t_m.clamp(t_enter, t_exit);
+    let length_m = (t_cloud - t_enter).max(0.0);
+    let p_start = [
+        cam[0] + view[0] * t_enter,
+        cam[1] + view[1] * t_enter,
+        cam[2] + view[2] * t_enter,
+    ];
+    Some((p_start, length_m))
+}
+
+/// Directly integrate the top-down camera->cloud atmosphere. GEO samples the same
+/// quantities from its scan-space froxel; top-down has one local camera per pixel,
+/// so a short direct march is the physically matching construction. The scalar
+/// transmittance is the same RGB mean stored in the GEO froxel's alpha channel.
+fn topdown_front_column(
+    ctx: &FrameContext,
+    cam: [f64; 3],
+    view: [f64; 3],
+    cloud_mean_t_m: f64,
+) -> ([f64; 3], f64) {
+    let Some((p_start, length_m)) = topdown_front_segment(cam, view, cloud_mean_t_m) else {
+        return ([0.0; 3], 1.0);
+    };
+    if length_m <= 0.0 {
+        return ([0.0; 3], 1.0);
+    }
+    let sc = atmosphere::integrate_scattered_luminance(
+        ctx.luts,
+        ctx.params,
+        p_start,
+        view,
+        ctx.sun_ecef,
+        SOLAR_IRRADIANCE_RGB,
+        length_m,
+        ctx.raymarch_steps,
+        true,
+    );
+    let t_ac = (sc.transmittance[0] + sc.transmittance[1] + sc.transmittance[2]) / 3.0;
+    (sc.inscatter, t_ac.clamp(0.0, 1.0))
+}
+
+/// Complete front-column cloud composite, shared by the regular and footprint
+/// top-down CPU paths and mirrored by `gpu/shaders/clouds.wgsl`.
+///
+/// `i_ac` is already passed through the product-facing aerial-veil scale. Keeping
+/// that concern outside this pure algebra makes its two physical limits explicit:
+/// clear (`T_cloud=1`, `L_cloud=0`) is exactly `L_toa`; opaque (`T_cloud=0`) is
+/// exactly `T_ac*L_cloud + I_ac`, independent of the hidden surface.
+#[inline]
+pub(crate) fn composite_topdown_front_column(
+    l_toa: [f64; 3],
+    l_cloud: [f64; 3],
+    t_cloud: f64,
+    i_ac: [f64; 3],
+    t_ac: f64,
+) -> [f64; 3] {
+    let mut out = [0.0; 3];
+    for c in 0..3 {
+        out[c] = l_toa[c] * t_cloud + t_ac * l_cloud[c] + i_ac[c] * (1.0 - t_cloud);
+    }
+    out
+}
+
+/// Apply the physical front atmosphere to one already-marched top-down cloud.
+#[allow(clippy::too_many_arguments)]
+fn composite_topdown_cloud_radiance(
+    ctx: &FrameContext,
+    pixel: &SurfacePixel,
+    cam: [f64; 3],
+    view: [f64; 3],
+    l_toa: [f64; 3],
+    l_cloud: [f64; 3],
+    t_cloud: f64,
+    cloud_mean_t_m: f64,
+) -> [f64; 3] {
+    let (mut i_ac, t_ac) = topdown_front_column(ctx, cam, view, cloud_mean_t_m);
+    let front_veil = if ctx.atmosphere_correction {
+        crate::render::aerial_veil_scale(pixel.sun_elev_deg as f64)
+    } else {
+        1.0
+    };
+    for band in &mut i_ac {
+        *band *= front_veil;
+    }
+    composite_topdown_front_column(l_toa, l_cloud, t_cloud, i_ac, t_ac)
 }
 
 /// Render a full TOP-DOWN VISIBLE frame to row-major `Rgba8` bytes (row 0 = north;
@@ -112,7 +213,7 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
 ///
 /// Per pixel: a nadir ray ([`topdown_nadir_ray`]) into
 /// [`surface_toa_radiance`] (surface + atmosphere) and [`march_cloud`] (cloud), composited
-/// `L = L_toa * T_cloud + L_cloud` (no front airlight — see the module note) and put
+/// `L = L_toa*T_cloud + T_ac*L_cloud + I_ac*(1-T_cloud)` (see the module note) and put
 /// through the shared [`radiance_to_rgba_softclip`] tonemap. Rows in parallel (rayon).
 #[allow(clippy::too_many_arguments)]
 pub fn render_topdown_frame_rgba(
@@ -366,11 +467,21 @@ fn topdown_pixel_radiance_components(
         shadowed_surface
     } else {
         let norm = topdown_cloud_norm(pixel.sun_elev_deg as f64, cloud_norm_target);
-        [
-            shadowed_surface[0] * marched.transmittance + norm * marched.inscatter[0],
-            shadowed_surface[1] * marched.transmittance + norm * marched.inscatter[1],
-            shadowed_surface[2] * marched.transmittance + norm * marched.inscatter[2],
-        ]
+        let l_cloud = [
+            norm * marched.inscatter[0],
+            norm * marched.inscatter[1],
+            norm * marched.inscatter[2],
+        ];
+        composite_topdown_cloud_radiance(
+            &ctx,
+            &pixel,
+            cam,
+            view,
+            shadowed_surface,
+            l_cloud,
+            marched.transmittance,
+            marched.mean_t_m,
+        )
     };
     Some(TopdownRadianceComponents {
         base,
@@ -558,7 +669,7 @@ pub fn render_topdown_frame_linear_radiance(
 }
 
 /// The composited top-of-atmosphere LINEAR RADIANCE of one top-down map pixel (surface +
-/// cloud, no front airlight — see the module note), before any tonemap/exposure, PLUS the
+/// cloud + camera-to-cloud atmosphere — see the module note), before any tonemap/exposure, PLUS the
 /// pixel's sun elevation (deg — the low-sun illuminant correction's per-pixel input at
 /// the RGB display seam). `None` for a non-finite/padding pixel or a ray that misses the
 /// shell. The shared numerator of BOTH the top-down RGB product (->
@@ -608,10 +719,21 @@ fn topdown_pixel_radiance(
                 // At the neutral `cloud_norm_target = 1.0` (the raw-bands path) or at
                 // twilight the factor is 1.0 -> byte-identical to the un-normalized cloud.
                 let norm = topdown_cloud_norm(elev as f64, cloud_norm_target);
-                let mut lf = [0.0f64; 3];
-                for (c, out) in lf.iter_mut().enumerate() {
-                    *out = l_toa[c] * m.transmittance + norm * m.inscatter[c];
-                }
+                let l_cloud = [
+                    norm * m.inscatter[0],
+                    norm * m.inscatter[1],
+                    norm * m.inscatter[2],
+                ];
+                let lf = composite_topdown_cloud_radiance(
+                    &ctx,
+                    &pixel,
+                    cam,
+                    view,
+                    l_toa,
+                    l_cloud,
+                    m.transmittance,
+                    m.mean_t_m,
+                );
                 Some((lf, elev))
             }
         }
@@ -802,9 +924,10 @@ pub fn render_cloud_layer_frame(
 /// space, alpha 0). Near-horizon sky rays can still cross the CLOUD shell — the
 /// cloud march runs for every ray, so elevated cloud rises honestly above the limb.
 ///
-/// DOCUMENTED DIVERGENCE (the top-down precedent): the froxel camera->cloud front
-/// airlight is omitted — the aerial-perspective froxel is built for the geostationary
-/// scan camera and does not describe a free eye. The surface term keeps its FULL
+/// DOCUMENTED PERSPECTIVE LIMITATION: the froxel camera->cloud front airlight is
+/// omitted — the aerial-perspective froxel is built for the geostationary scan camera
+/// and does not describe a free eye. Unlike the constrained nadir construction above,
+/// the arbitrary-eye perspective path has not adopted a direct front march. The surface term keeps its FULL
 /// per-ray eye->ground aerial perspective (integrated inside `surface_toa_radiance`
 /// along the actual slant ray), so the ground haze is honest; only the extra airlight
 /// IN FRONT OF the cloud body is dropped: `L = L_toa * T_cloud + L_cloud`.
@@ -1199,7 +1322,90 @@ mod tests {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
+            surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
         }
+    }
+
+    // ── top-down camera->cloud atmospheric column ────────────────────────────
+
+    #[test]
+    fn topdown_front_segment_shortens_monotonically_with_cloud_altitude() {
+        let (cam, view) = topdown_nadir_ray(0.0, 0.0);
+        let mut previous = f64::INFINITY;
+        for altitude_m in [1_000.0, 5_000.0, 12_000.0] {
+            // Along a nadir ray the camera->cloud distance is simply camera altitude
+            // minus cloud altitude; Earth radius cancels exactly.
+            let cloud_t = crate::camera::TOPDOWN_CAMERA_ALTITUDE_M - altitude_m;
+            let (_, length_m) = topdown_front_segment(cam, view, cloud_t).unwrap();
+            assert!(
+                length_m < previous,
+                "front column did not shorten at {altitude_m} m: {length_m} >= {previous}"
+            );
+            previous = length_m;
+        }
+
+        // A cloud exactly at atmosphere entry has the neutral zero-length column.
+        let (t_enter, _) = atmosphere::ray_atmosphere_segment(cam, view).unwrap();
+        let (_, length_m) = topdown_front_segment(cam, view, t_enter).unwrap();
+        assert_eq!(length_m, 0.0);
+    }
+
+    #[test]
+    fn topdown_front_column_low_mid_high_has_ordered_airlight_and_transmittance() {
+        let params = AtmosphereParams::default();
+        let luts = AtmosphereLuts::build(&params);
+        let sky_sh = SkyShTable::build(&luts, &params, 4);
+        let (cam, view) = topdown_nadir_ray(0.0, 0.0);
+        let sun_ecef = [-view[0], -view[1], -view[2]];
+        let surf = overhead_surf(&luts, &params, &sky_sh, sun_ecef);
+
+        let mut samples = Vec::new();
+        for altitude_m in [1_000.0, 5_000.0, 12_000.0] {
+            let cloud_t = crate::camera::TOPDOWN_CAMERA_ALTITUDE_M - altitude_m;
+            let (inscatter, transmittance) = topdown_front_column(&surf, cam, view, cloud_t);
+            assert!(inscatter.iter().all(|v| v.is_finite() && *v > 0.0));
+            assert!(transmittance.is_finite() && (0.0..=1.0).contains(&transmittance));
+            samples.push((inscatter.iter().sum::<f64>(), transmittance));
+        }
+
+        // A low cloud has more camera-side atmosphere than a mid/high cloud: more
+        // airlight reaches the camera and less of its own radiance is transmitted.
+        assert!(
+            samples[0].0 > samples[1].0 && samples[1].0 > samples[2].0,
+            "{samples:?}"
+        );
+        assert!(
+            samples[0].1 < samples[1].1 && samples[1].1 < samples[2].1,
+            "{samples:?}"
+        );
+    }
+
+    #[test]
+    fn topdown_front_column_composite_preserves_clear_and_opaque_limits() {
+        let surface = [0.08, 0.12, 0.18];
+        let cloud = [0.31, 0.29, 0.27];
+        let airlight = [0.011, 0.017, 0.026];
+        let t_ac = 0.83;
+
+        let clear = composite_topdown_front_column(surface, [0.0; 3], 1.0, airlight, t_ac);
+        assert_eq!(
+            clear, surface,
+            "clear cloud must be the exact surface result"
+        );
+
+        let opaque = composite_topdown_front_column(surface, cloud, 0.0, airlight, t_ac);
+        let opaque_other_surface =
+            composite_topdown_front_column([9.0, 8.0, 7.0], cloud, 0.0, airlight, t_ac);
+        let expected = [
+            t_ac * cloud[0] + airlight[0],
+            t_ac * cloud[1] + airlight[1],
+            t_ac * cloud[2] + airlight[2],
+        ];
+        assert_eq!(opaque, expected);
+        assert_eq!(
+            opaque_other_surface, expected,
+            "opaque cloud must hide the surface"
+        );
     }
 
     // ── top-down cloud normalization (sun-gated appearance pass) ──────────────

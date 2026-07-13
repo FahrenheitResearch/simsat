@@ -31,7 +31,9 @@ supercell case and Hurricane Michael), thumbnailed for the README.
   Cox-Munk glint, snow blend, ABI-style display transform.
 - **Infrared band 13 (10.3 um)** — a real radiative-transfer march (gray-body
   Planck emission per voxel + surface term) inverted to true-Kelvin brightness
-  temperature; enhancements: Grayscale, BD, Rainbow, CIMSS, AVN, Funktop.
+  temperature. The default/recommended display is NOAA's continuous heritage
+  bi-linear grayscale (`natural`); legacy linear grayscale and the BD, Rainbow,
+  CIMSS, AVN, and Funktop analysis palettes remain available unchanged.
 - **Water vapor 6.2 / 6.9 / 7.3 um (bands 8/9/10)** — the same thermal march
   with water vapor as the dominant emitter; upper/mid/lower-level moisture.
 - **GeoColor Style / SimSat Day-Night Color** — broad-RGB visible by day, IR by night,
@@ -162,7 +164,7 @@ simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
     atmosphere-correction=on terrain-atmosphere=on fractional-clouds=on cloud-od-scale=0.15 \
     multiscatter=on beer-powder=off granulation=off feather-exposed-domain-edges=on clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
-    bt-out=ir-band13-kelvin.bin enhancement=rainbow sensor=goes-r-abi-band13-fm4
+    bt-out=ir-band13-kelvin.bin enhancement=natural sensor=goes-r-abi-band13-fm4
 ```
 
 `simsat-render-frame` renders visible, GeoColor Style/SimSat Day-Night Color, and Sandwich;
@@ -194,9 +196,10 @@ calibration, not a claimed physical optimum. Finished RGB products also expose
 omitting them keeps the shipped `1.5` exposure, neutral `1.0` ground gain, `0.65`
 highlight knee, and `1.25` highlight ceiling.
 `fractional-clouds=off` restores legacy horizontally-full cloudy cells; `on` remains
-the alias for the unchanged `effective-od` default. The opt-in
-`fractional-clouds=deterministic-4`, `deterministic-8`, and `deterministic-16` CPU
-references march the selected number of fixed-stratified shared-u maximum-overlap
+the compatibility alias for `effective-od`. Finished display renders now default to
+the reviewed `fractional-clouds=deterministic-2` closure. The explicit
+`deterministic-2`, `deterministic-4`, `deterministic-8`, and `deterministic-16` CPU
+modes march the selected number of fixed-stratified shared-u maximum-overlap
 subcolumns and average linear radiance before one tonemap. These are deterministic
 convergence references, not full max-random/Sobol McICA; cost grows with member count.
 The scale
@@ -238,10 +241,15 @@ rgb, geo = simsat.render_visible_rgb(
     rh_aerosol_swelling=False,
     atmosphere_correction=True,
     terrain_atmosphere=True,
-    land_sza_normalization=True,   # owner-selected v0.1.5 display default
+    land_sza_normalization=True,   # owner-selected display default
+    land_sza_max_gain=4.0,         # bounded low-sun terrain recovery; 1.0 is identity
     land_dark_toe=True,            # independently switchable; both false = legacy identity
+    surface_postlight_toe=False,   # opt-in CPU terrain recovery after lighting/view attenuation
+    surface_postlight_toe_knee=0.18,
+    surface_postlight_toe_gamma=0.80,
+    surface_postlight_toe_max_gain=1.35,
     fractional_clouds=True,
-    fractional_cloud_mode="effective-od",  # or deterministic-4/-8/-16 CPU QA reference
+    fractional_cloud_mode="deterministic-2",  # Recommended; effective-od remains explicit
     cloud_optical_depth_scale=0.15,
     beer_powder=False,
     granulation=False,

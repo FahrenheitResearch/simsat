@@ -1696,7 +1696,7 @@ impl DecodedVolume {
         )
     }
 
-    /// Materialize one member of a selectable 4/8/16 fixed-stratified ensemble.
+    /// Materialize one member of a selectable 2/4/8/16 fixed-stratified ensemble.
     ///
     /// This is the counted form of [`Self::apply_deterministic_fractional_subcolumn`].
     /// The sampled `u` remains shared through every vertical layer. The caller must
@@ -1710,7 +1710,7 @@ impl DecodedVolume {
         let u = deterministic_subcolumn_u_for_count(subcolumn_index, subcolumn_count).ok_or_else(
             || {
                 format!(
-                    "deterministic fractional subcolumn index {subcolumn_index} is outside 0..{subcolumn_count}, or count is not one of 4/8/16"
+                    "deterministic fractional subcolumn index {subcolumn_index} is outside 0..{subcolumn_count}, or count is not one of 2/4/8/16"
                 )
             },
         )?;
@@ -2622,11 +2622,13 @@ pub fn accumulate_sun_od_granulated(
     let s_len = (s_max - s_min) + 2.0 * margin;
     // Target one sample per voxel pitch along the sun ray so a thin (1-2 voxel) layer
     // is not stepped over. On a wide domain at a low sun the along-sun span is huge and
-    // hits the cap; the cap is 1024 (raised from 512 — M4 review FINDING 3) so the
-    // worst-case ds roughly halves. The map now feeds ONLY the ground cloud-shadow
+    // hits the cap; the cap is 4096 so CONUS-scale 250 m vertical grids do not
+    // periodically skip whole cloudy layers (the former 1024 cap produced coherent
+    // dash/ring shadows). Smaller domains naturally use fewer steps. The map now feeds
+    // ONLY the ground cloud-shadow
     // (the in-cloud sun term uses the secondary light march, FINDING 1), so this
     // resolution governs ground-shadow fidelity of thin cirrus, not cloud lighting.
-    let n_steps = ((s_len / pitch).ceil() as usize).clamp(1, 1024);
+    let n_steps = ((s_len / pitch).ceil() as usize).clamp(1, 4096);
     let ds = s_len / n_steps as f64;
 
     // Rows in parallel (embarrassingly parallel over texels; on the below-normal
@@ -2711,6 +2713,43 @@ pub fn accumulate_sun_od_granulated(
 }
 
 impl SunOdMap {
+    /// Transmittance-space ground-shadow filter. This is deliberately evaluated only
+    /// by the ground-shadow consumer: the raw sun-OD field remains unchanged for the
+    /// thin-cloud support term used by the volume march. The compact binomial kernel
+    /// approximates integrating one model-grid footprint and avoids averaging optical
+    /// depth before Beer conversion (which would over-darken mixed clear/cloudy cells).
+    fn filtered_ground_shadow(
+        &self,
+        u: f64,
+        v: f64,
+        optical_depth_scale: f64,
+        antialias: bool,
+    ) -> f64 {
+        if !antialias {
+            return beer(optical_depth_scale * self.sample_uv(&self.od, u, v));
+        }
+
+        // Separable Pascal-row/binomial kernel [1 4 6 4 1] x itself. The weights
+        // sum to 16 per axis and 256 in 2-D, so constant transmittance is preserved.
+        // Fixed storage is intentional: this path runs once per ground pixel and must
+        // not allocate. Filtering is in TRANSMITTANCE space, never optical-depth space.
+        const WEIGHTS: [f64; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
+        const NORMALIZATION: f64 = 1.0 / 256.0;
+        let texel_u = (self.u_max - self.u_min) / self.width.max(1) as f64;
+        let texel_v = (self.v_max - self.v_min) / self.height.max(1) as f64;
+        let mut sum = 0.0f64;
+        for (yi, &wy) in WEIGHTS.iter().enumerate() {
+            for (xi, &wx) in WEIGHTS.iter().enumerate() {
+                let du = (xi as isize - 2) as f64 * texel_u;
+                let dv = (yi as isize - 2) as f64 * texel_v;
+                let weight = wx * wy;
+                sum +=
+                    weight * beer(optical_depth_scale * self.sample_uv(&self.od, u + du, v + dv));
+            }
+        }
+        sum * NORMALIZATION
+    }
+
     /// Bilinear sample of a channel at sun-plane coordinates `(u, v)` in metres.
     ///
     /// OUT-OF-EXTENT CONTRACT (WS1 march-physics pass): a point outside
@@ -2791,6 +2830,17 @@ impl SunOdMap {
     /// Beer exponent is scaled only at this visible-render consumer. The occluder
     /// distance is an extinction-weighted mean and therefore does not change.
     pub fn penumbral_shadow_scaled(&self, p: [f64; 3], optical_depth_scale: f32) -> f64 {
+        self.penumbral_shadow_scaled_antialiased(p, optical_depth_scale, false)
+    }
+
+    /// Ground shadow with the reviewed top-down 5x5 transmittance antialias filter.
+    /// `false` is operation-for-operation identical to [`Self::penumbral_shadow_scaled`].
+    pub fn penumbral_shadow_scaled_antialiased(
+        &self,
+        p: [f64; 3],
+        optical_depth_scale: f32,
+        antialias: bool,
+    ) -> f64 {
         let od_scale = validated_cloud_optical_depth_scale(optical_depth_scale) as f64;
         let (u, v) = self.plane_uv(p);
         let occ_dist = self.sample_uv(&self.occ_dist, u, v);
@@ -2799,12 +2849,15 @@ impl SunOdMap {
         let texel = ((self.u_max - self.u_min).abs() / self.width.max(1) as f64)
             .max((self.v_max - self.v_min).abs() / self.height.max(1) as f64);
         if radius <= 0.5 * texel {
-            return beer(od_scale * self.sample_uv(&self.od, u, v));
+            return self.filtered_ground_shadow(u, v, od_scale, antialias);
         }
         // A centre tap + two rings of taps over the blur disk, transmittance-averaged
         // (the penumbra is a partial occlusion of the sun DISK, so it softens in
         // transmittance, not optical-depth, space).
         const RING: usize = 8;
+        // A physically resolved solar-disk penumbra already supplies its own 17-tap
+        // integration. Keep that historical path unchanged (and bounded) rather than
+        // nesting the 25-tap top-down footprint inside every disk tap.
         let mut sum = beer(od_scale * self.sample_uv(&self.od, u, v));
         let mut wsum = 1.0f64;
         for (ri, &rr) in [0.5, 1.0].iter().enumerate() {
@@ -2947,6 +3000,10 @@ pub struct MarchConfig {
     /// model-extinction value. Validated to
     /// [`CLOUD_OPTICAL_DEPTH_SCALE_MIN`]..=[`CLOUD_OPTICAL_DEPTH_SCALE_MAX`].
     pub cloud_optical_depth_scale: f32,
+    /// Apply the reviewed 5x5 binomial transmittance filter to the ground cloud-shadow
+    /// field. The render assembly enables this only for top-down display products;
+    /// geostationary/perspective and Sensor Fast Gray keep the exact unfiltered path.
+    pub topdown_shadow_antialias: bool,
     /// GROUND LIFT (top-down/basemap appearance pass, [`crate::render::GROUND_DAY_LIFT`]):
     /// the sun-gated daytime surface-brightness lift passed to
     /// [`crate::render::surface_toa_radiance`] by the cloud/top-down composite. Default =
@@ -3017,6 +3074,7 @@ impl MarchConfig {
             ground_albedo: GROUND_ALBEDO,
             transmittance_floor: 0.003,
             cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            topdown_shadow_antialias: false,
             // Appearance-pass baked defaults (the studio's `..MarchConfig::new()` inherits
             // these; the render_frame CLI knobs override them). Edge feather off by default
             // (activated only by a zoom-out margin, via `edge_feather_cells_for_margin`).
@@ -3504,9 +3562,11 @@ pub fn ground_cloud_shadow(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) ->
     match ray_sphere(cam, view, scene.vol.r_bottom()) {
         Some((t0, _)) if t0 > 0.0 => {
             let pg = madd3(cam, view, t0);
-            scene
-                .sun_od
-                .penumbral_shadow_scaled(pg, scene.cfg.cloud_optical_depth_scale)
+            scene.sun_od.penumbral_shadow_scaled_antialiased(
+                pg,
+                scene.cfg.cloud_optical_depth_scale,
+                scene.cfg.topdown_shadow_antialias,
+            )
         }
         _ => 1.0,
     }
@@ -4375,7 +4435,7 @@ mod tests {
     fn selectable_fixed_stratified_counts_are_deterministic_and_converge_in_coverage() {
         let mut source = build_volume(1, 1, 1, 100.0, 500.0, |_, _, _| (0.02, 0.0, 0.0));
         source.has_cloud_fraction = true;
-        source.cloud_fraction.fill(77); // f ~= 0.302; deliberately not aligned to 4/8/16.
+        source.cloud_fraction.fill(77); // f ~= 0.302; deliberately not aligned to 2/4/8/16.
         let encoded_fraction = 77.0 / 255.0;
 
         let mut previous_error = f64::INFINITY;
@@ -5433,6 +5493,7 @@ mod tests {
             atmosphere_correction: true,
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
+            surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
         };
         let rnx = raster.nx;
         let lat = raster.lat.clone();
@@ -5548,6 +5609,7 @@ mod tests {
                 atmosphere_correction: true,
                 terrain_atmosphere: true,
                 land_appearance: crate::render::LandAppearanceConfig::identity(),
+                surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
             };
             render_cloud_frame_rgba(&scene, &surf, &froxel, &raster, &assemble)
         };
@@ -6089,6 +6151,53 @@ mod tests {
     }
 
     // ── edge feather (zoom-out / margin appearance pass) ──────────────────────
+
+    #[test]
+    fn topdown_shadow_antialias_off_is_exact_and_binomial_mean_is_normalized() {
+        let mut od = vec![0.0f32; 25];
+        od[12] = 4.0;
+        let map = SunOdMap {
+            width: 5,
+            height: 5,
+            od,
+            occ_dist: vec![0.0; 25],
+            gran_coherence: None,
+            center: [R_GROUND_M, 0.0, 0.0],
+            au: [0.0, 1.0, 0.0],
+            av: [0.0, 0.0, 1.0],
+            u_min: -2.5,
+            u_max: 2.5,
+            v_min: -2.5,
+            v_max: 2.5,
+        };
+        let point = map.center;
+        let scale = 0.225f32;
+        let raw = beer(scale as f64 * map.sample(point));
+        let off = map.penumbral_shadow_scaled_antialiased(point, scale, false);
+        assert_eq!(
+            off.to_bits(),
+            raw.to_bits(),
+            "disabled antialias must retain the historical single Beer sample exactly"
+        );
+
+        // Only the centre tap is cloudy. Its 2-D binomial weight is 6*6=36;
+        // the remaining 220/256 weight stays clear.
+        let want = (220.0 + 36.0 * beer(scale as f64 * 4.0)) / 256.0;
+        let got = map.penumbral_shadow_scaled_antialiased(point, scale, true);
+        assert!(
+            (got - want).abs() < 1.0e-12,
+            "filtered {got}, expected {want}"
+        );
+
+        let mut uniform = map.clone();
+        uniform.od.fill(2.0);
+        let got_uniform = uniform.penumbral_shadow_scaled_antialiased(point, scale, true);
+        let want_uniform = beer(scale as f64 * 2.0);
+        assert!(
+            (got_uniform - want_uniform).abs() < 1.0e-12,
+            "normalized kernel must preserve a constant transmittance"
+        );
+    }
 
     #[test]
     fn edge_feather_cells_for_margin_is_gated_on_margin() {

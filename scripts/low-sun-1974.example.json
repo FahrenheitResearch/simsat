@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "id": "v020-low-sun-1974",
+  "title": "1974 low-sun terrain and cloud timeline",
+  "reference_case": "time-2130",
+  "minimum_samples": 512,
+  "temporal_region": "inland-terrain",
+  "max_temporal_surface_step_per_10min": 0.08,
+  "surface_ratio_minimum": {
+    "sun-5-8": 0.35,
+    "sun-8-12": 0.45,
+    "sun-12-16": 0.55,
+    "sun-16-20": 0.65
+  },
+  "settings": {
+    "storage_profile": "compact-u8",
+    "backend": "cpu",
+    "intent": "display",
+    "sat": "goes-east",
+    "geo_navigation": "model-sphere",
+    "view": "topdown",
+    "timestep": 0,
+    "resolution": "native",
+    "margin": 0.0,
+    "aerosol_optical_depth": 0.05,
+    "rh_aerosol_swelling": false,
+    "atmosphere_correction": true,
+    "terrain_atmosphere": true,
+    "land_sza_normalization": true,
+    "land_sza_max_gain": 4.0,
+    "land_dark_toe": true,
+    "land_dark_toe_knee": 0.08,
+    "land_dark_toe_gamma": 0.65,
+    "land_dark_toe_max_gain": 1.5,
+    "ground_gain": 1.0,
+    "cloud_softclip": 0.65,
+    "cloud_highlight_max": 1.25,
+    "multiscatter": true,
+    "cloud_multiscatter": "legacy-octaves",
+    "beer_powder": false,
+    "steps": "offline",
+    "fractional_clouds": true,
+    "fractional_cloud_mode": "effective-od",
+    "cloud_optical_depth_scale": 0.15,
+    "cloud_optics": "fixed",
+    "feather_exposed_domain_edges": true,
+    "granulation": false,
+    "topdown_stratiform_regularization": false,
+    "topdown_cloud_footprint": false,
+    "bluemarble_download": false,
+    "cache": "%LOCALAPPDATA%\\SimSatStudio\\cache"
+  },
+  "variants": [
+    {
+      "id": "exposure-1p3",
+      "label": "Exposure 1.3 (darker control)",
+      "role": "darker-control",
+      "exposure": 1.3
+    },
+    {
+      "id": "exposure-1p5",
+      "label": "Recommended Display (v0.1.9 default)",
+      "role": "current-default",
+      "exposure": 1.5
+    },
+    {
+      "id": "high-quality",
+      "label": "High Quality Display",
+      "role": "hq-control",
+      "exposure": 1.5,
+      "settings": {
+        "fractional_cloud_mode": "deterministic-4",
+        "cloud_softclip": 0.45
+      }
+    }
+  ],
+  "regions": {
+    "feedback-crop": {
+      "label": "Reported Louisiana to Alabama crop",
+      "crop": {"x": 0.324, "y": 0.792, "width": 0.273, "height": 0.195}
+    },
+    "inland-terrain": {
+      "label": "Central inland terrain guard",
+      "crop": {"x": 0.08, "y": 0.28, "width": 0.36, "height": 0.58}
+    }
+  },
+  "cases": [
+    {
+      "id": "time-2130",
+      "label": "21:30Z high-sun guardrail",
+      "valid_time": "1974-04-03T21:30:00Z",
+      "input": "%LOCALAPPDATA%\\SimSatStudio\\cache\\wrfout_d02_1974_04_03_21_30_00\\run.json"
+    },
+    {
+      "id": "time-2303",
+      "label": "23:03Z",
+      "valid_time": "1974-04-03T23:03:00Z",
+      "input": "%LOCALAPPDATA%\\SimSatStudio\\cache\\wrfout_d02_1974_04_03_23_03_00\\run.json"
+    },
+    {
+      "id": "time-2312",
+      "label": "23:12Z reported failure",
+      "valid_time": "1974-04-03T23:12:00Z",
+      "artifact_analysis": true,
+      "input": "%LOCALAPPDATA%\\SimSatStudio\\cache\\wrfout_d02_1974_04_03_23_12_00\\run.json"
+    },
+    {
+      "id": "time-2320",
+      "label": "23:20Z",
+      "valid_time": "1974-04-03T23:20:00Z",
+      "input": "%LOCALAPPDATA%\\SimSatStudio\\cache\\wrfout_d02_1974_04_03_23_20_00\\run.json"
+    },
+    {
+      "id": "time-0000",
+      "label": "00:00Z near-terminator guard",
+      "valid_time": "1974-04-04T00:00:00Z",
+      "input": "%LOCALAPPDATA%\\SimSatStudio\\cache\\wrfout_d02_1974_04_04_00_00_00\\run.json"
+    }
+  ]
+}

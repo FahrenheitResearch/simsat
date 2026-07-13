@@ -42,9 +42,9 @@
 //!   multiscatter=<b>   on | off  — M5 Wrenninge octaves   (default on).
 //!   beer-powder=<b>    on | off  — Schneider direct-sun shaping (default off).
 //!   clouds=<b>         on | off  — off = surface only (QA terrain/glint)  (default on).
-//!   fractional-clouds=<mode> off | on | effective-od | deterministic-4 | deterministic-8 | deterministic-16.
-//!                      `on` remains the backward-compatible alias of effective-od
-//!                      (default); deterministic modes are fixed-stratified CPU references.
+//!   fractional-clouds=<mode> off | on | effective-od | deterministic-2 | deterministic-4 | deterministic-8 | deterministic-16.
+//!                      Default is deterministic-2; `on` remains the backward-compatible
+//!                      alias of effective-od. Deterministic modes are fixed-stratified CPU references.
 //!   cloud-optical-depth-scale=<f>  cloud OD calibration, 0.0..=4.0 (shipped default 0.15;
 //!                      1.0 = unscaled model extinction).
 //!   cloud-optics=<mode> fixed | nssl-native | hrrr-thompson-native (default fixed). Native modes are explicit
@@ -52,18 +52,24 @@
 //!   feather-exposed-domain-edges=<b> on | off — fade finished clouds at camera-exposed
 //!                      finite WRF boundaries (owner-selected v0.1.5 default on).
 //!   granulation=<b>    on | off  — sub-grid cloud edge erosion (default off).
+//!   topdown-shadow-antialias=<b> on | off - ground-shadow map filter (default on).
 //!   steps=<quality>    offline | interactive              (default offline).
 //!   sun-elev=<deg>     OPTIONAL sun-elevation override (else true solar geometry).
 //!   sun-az=<deg>       OPTIONAL sun-azimuth override (deg from north).
 //!   exposure=<f>       Display gain before the ABI stretch (default DEFAULT_EXPOSURE).
 //!   land-sza-normalization=<b> on | off - bounded land-only solar-zenith display
 //!                              normalization (owner-selected default on).
-//!   land-sza-max-gain=<f>      upper bound for that normalization (default 1.6).
+//!   land-sza-max-gain=<f>      upper bound for that normalization (default 4.0).
 //!   land-dark-toe=<b>          on | off - bounded dark-land reflectance lift
 //!                              (owner-selected default on).
 //!   land-dark-toe-knee=<f>     linear-reflectance identity knee (default 0.08).
 //!   land-dark-toe-gamma=<f>    toe exponent, 0.05..=1 (default 0.65; 1 = identity).
 //!   land-dark-toe-max-gain=<f> upper bound for the toe lift (default 1.5).
+//!   surface-postlight-toe=<b>  on | off - experimental toe over the lit,
+//!                              view-attenuated surface before airlight (default off).
+//!   surface-postlight-toe-knee=<f> reflectance-factor knee (default 0.18).
+//!   surface-postlight-toe-gamma=<f> exponent, 0.05..=1 (default 0.80).
+//!   surface-postlight-toe-max-gain=<f> bounded gain, 1..=4 (default 1.35).
 //!   cache=<dir>        Brick cache root + seasonal Blue Marble cache.
 //!   bluemarble=<path>  OPTIONAL single-file Blue Marble override (default seasonal pack).
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
@@ -152,7 +158,8 @@ use simsat::instrument_footprint::InstrumentFootprint;
 use simsat::optics::CloudOpticsMode;
 use simsat::render::{
     DEFAULT_EXPOSURE, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
-    LAND_SZA_MAX_GAIN, LandAppearanceConfig,
+    LAND_SZA_MAX_GAIN, LandAppearanceConfig, SURFACE_POSTLIGHT_TOE_GAMMA,
+    SURFACE_POSTLIGHT_TOE_KNEE, SURFACE_POSTLIGHT_TOE_MAX_GAIN, SurfacePostlightToeConfig,
 };
 use simsat::store_out::{self, VisibleFrame};
 use simsat::thermal_sensor::ThermalSensor;
@@ -191,6 +198,10 @@ struct Opts {
     land_dark_toe_knee: f64,
     land_dark_toe_gamma: f64,
     land_dark_toe_max_gain: f64,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f64,
+    surface_postlight_toe_gamma: f64,
+    surface_postlight_toe_max_gain: f64,
     multiscatter: bool,
     cloud_multiscatter: Option<CloudMultiscatterMode>,
     beer_powder: bool,
@@ -206,6 +217,7 @@ struct Opts {
     granulation: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     exposure: f64,
     cache: PathBuf,
     bluemarble: Option<PathBuf>,
@@ -269,9 +281,10 @@ fn run(args: &[String]) -> Result<(), String> {
         "render_frame: input={} product={} view={} sat={} geo-navigation={} ts={} res={} margin={:.2} \
          aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
          land-sza={}({:.2}) land-dark-toe={}({:.3}/{:.2}/{:.2}) \
+         surface-postlight-toe={}({:.3}/{:.2}/{:.2}) \
          cloud-multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
          cloud-od-scale={:.3} feather-exposed-edges={} granulation={} \
-         topdown-stratiform-regularization={} topdown-cloud-footprint={} \
+         topdown-stratiform-regularization={} topdown-cloud-footprint={} topdown-shadow-antialias={} \
          steps={} sun-elev={} \
          exposure={:.3} intent={} backend={} storage-profile={} canvas={} threads={}",
         opts.input.display(),
@@ -292,6 +305,10 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.land_dark_toe_knee,
         opts.land_dark_toe_gamma,
         opts.land_dark_toe_max_gain,
+        opts.surface_postlight_toe,
+        opts.surface_postlight_toe_knee,
+        opts.surface_postlight_toe_gamma,
+        opts.surface_postlight_toe_max_gain,
         resolved_cloud_multiscatter(&opts).slug(),
         opts.beer_powder,
         opts.clouds,
@@ -305,6 +322,7 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.granulation,
         opts.topdown_stratiform_regularization,
         opts.topdown_cloud_footprint,
+        opts.topdown_shadow_antialias,
         if opts.steps == StepQuality::Offline {
             "offline"
         } else {
@@ -859,6 +877,12 @@ fn render_params(opts: &Opts) -> RenderParams {
             dark_toe_gamma: opts.land_dark_toe_gamma,
             dark_toe_max_gain: opts.land_dark_toe_max_gain,
         },
+        surface_postlight_toe: SurfacePostlightToeConfig {
+            enabled: opts.surface_postlight_toe,
+            knee: opts.surface_postlight_toe_knee,
+            gamma: opts.surface_postlight_toe_gamma,
+            max_gain: opts.surface_postlight_toe_max_gain,
+        },
         exposure: opts.exposure,
         multiscatter: opts.multiscatter,
         cloud_multiscatter: opts.cloud_multiscatter,
@@ -873,6 +897,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         granulation: Some(opts.granulation),
         topdown_stratiform_regularization: opts.topdown_stratiform_regularization,
         topdown_cloud_footprint: opts.topdown_cloud_footprint,
+        topdown_shadow_antialias: opts.topdown_shadow_antialias,
         sun_override,
         cache: opts.cache.clone(),
         bluemarble,
@@ -1014,18 +1039,24 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut land_dark_toe_knee = LAND_DARK_TOE_KNEE;
     let mut land_dark_toe_gamma = LAND_DARK_TOE_GAMMA;
     let mut land_dark_toe_max_gain = LAND_DARK_TOE_MAX_GAIN;
+    let postlight_defaults = SurfacePostlightToeConfig::default();
+    let mut surface_postlight_toe = postlight_defaults.enabled;
+    let mut surface_postlight_toe_knee = SURFACE_POSTLIGHT_TOE_KNEE;
+    let mut surface_postlight_toe_gamma = SURFACE_POSTLIGHT_TOE_GAMMA;
+    let mut surface_postlight_toe_max_gain = SURFACE_POSTLIGHT_TOE_MAX_GAIN;
     let mut multiscatter = true;
     let mut cloud_multiscatter = None;
     let mut beer_powder = false;
     let mut clouds = true;
     let mut fractional_clouds = true;
-    let mut fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+    let mut fractional_cloud_mode = FractionalCloudMode::Deterministic2;
     let mut cloud_optical_depth_scale = DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
     let mut cloud_optics = CloudOpticsMode::Fixed;
     let mut feather_exposed_domain_edges = true;
     let mut granulation = false;
     let mut topdown_stratiform_regularization = false;
     let mut topdown_cloud_footprint = false;
+    let mut topdown_shadow_antialias = true;
     let mut steps = StepQuality::Offline;
     let mut sun_elev_override: Option<f64> = None;
     let mut sun_az_override: Option<f64> = None;
@@ -1153,6 +1184,48 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     ));
                 }
             }
+            "surface-postlight-toe" | "surface_postlight_toe" | "postlight-surface-toe" => {
+                surface_postlight_toe = parse_bool(v)?
+            }
+            "surface-postlight-toe-knee" | "surface_postlight_toe_knee" => {
+                surface_postlight_toe_knee = v
+                    .parse()
+                    .map_err(|_| format!("bad surface-postlight-toe-knee '{v}'"))?;
+                if !surface_postlight_toe_knee.is_finite()
+                    || !(1.0e-6..=1.0).contains(&surface_postlight_toe_knee)
+                {
+                    return Err(format!(
+                        "surface-postlight-toe-knee must be finite and in 1e-6..=1.0, got \
+                         {surface_postlight_toe_knee}"
+                    ));
+                }
+            }
+            "surface-postlight-toe-gamma" | "surface_postlight_toe_gamma" => {
+                surface_postlight_toe_gamma = v
+                    .parse()
+                    .map_err(|_| format!("bad surface-postlight-toe-gamma '{v}'"))?;
+                if !surface_postlight_toe_gamma.is_finite()
+                    || !(0.05..=1.0).contains(&surface_postlight_toe_gamma)
+                {
+                    return Err(format!(
+                        "surface-postlight-toe-gamma must be finite and in 0.05..=1.0, got \
+                         {surface_postlight_toe_gamma}"
+                    ));
+                }
+            }
+            "surface-postlight-toe-max-gain" | "surface_postlight_toe_max_gain" => {
+                surface_postlight_toe_max_gain = v
+                    .parse()
+                    .map_err(|_| format!("bad surface-postlight-toe-max-gain '{v}'"))?;
+                if !surface_postlight_toe_max_gain.is_finite()
+                    || !(1.0..=4.0).contains(&surface_postlight_toe_max_gain)
+                {
+                    return Err(format!(
+                        "surface-postlight-toe-max-gain must be finite and in 1.0..=4.0, got \
+                         {surface_postlight_toe_max_gain}"
+                    ));
+                }
+            }
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
             "cloud-multiscatter" | "cloud_multiscatter" | "cloud-ms" => {
                 cloud_multiscatter = Some(parse_cloud_multiscatter(v)?)
@@ -1196,6 +1269,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             | "topdown-cloud-regularization" => topdown_stratiform_regularization = parse_bool(v)?,
             "topdown-cloud-footprint" | "topdown_cloud_footprint" | "cloud-footprint" => {
                 topdown_cloud_footprint = parse_bool(v)?
+            }
+            "topdown-shadow-antialias" | "topdown_shadow_antialias" | "shadow-antialias" => {
+                topdown_shadow_antialias = parse_bool(v)?
             }
             "steps" | "quality" => steps = parse_steps(v)?,
             "sun-elev" | "sun_elev" | "sunelev" => {
@@ -1321,6 +1397,10 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         land_dark_toe_knee,
         land_dark_toe_gamma,
         land_dark_toe_max_gain,
+        surface_postlight_toe,
+        surface_postlight_toe_knee,
+        surface_postlight_toe_gamma,
+        surface_postlight_toe_max_gain,
         multiscatter,
         cloud_multiscatter,
         beer_powder,
@@ -1336,6 +1416,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         granulation,
         topdown_stratiform_regularization,
         topdown_cloud_footprint,
+        topdown_shadow_antialias,
         exposure,
         cache,
         bluemarble,
@@ -1477,6 +1558,9 @@ fn parse_fractional_cloud_mode(v: &str) -> Result<(bool, FractionalCloudMode), S
         "on" | "true" | "1" | "yes" | "effective" | "effective-od" => {
             Ok((true, FractionalCloudMode::EffectiveOd))
         }
+        "deterministic-2" | "deterministic2" | "ica-2" | "mcica-2" => {
+            Ok((true, FractionalCloudMode::Deterministic2))
+        }
         "deterministic-4" | "deterministic4" | "ica-4" | "mcica-4" => {
             Ok((true, FractionalCloudMode::Deterministic4))
         }
@@ -1484,7 +1568,7 @@ fn parse_fractional_cloud_mode(v: &str) -> Result<(bool, FractionalCloudMode), S
         "deterministic-16" | "deterministic16" => Ok((true, FractionalCloudMode::Deterministic16)),
         "off" | "false" | "0" | "no" | "legacy" => Ok((false, FractionalCloudMode::Off)),
         _ => Err(format!(
-            "unknown fractional-clouds mode '{v}' (off|on|effective-od|deterministic-4|deterministic-8|deterministic-16)"
+            "unknown fractional-clouds mode '{v}' (off|on|effective-od|deterministic-2|deterministic-4|deterministic-8|deterministic-16)"
         )),
     }
 }
@@ -1538,17 +1622,22 @@ fn print_usage() {
          \x20 land-dark-toe-knee=<f>     toe identity knee (default {LAND_DARK_TOE_KNEE})\n\
          \x20 land-dark-toe-gamma=<f>    toe exponent (default {LAND_DARK_TOE_GAMMA})\n\
          \x20 land-dark-toe-max-gain=<f> toe gain bound (default {LAND_DARK_TOE_MAX_GAIN})\n\
+         \x20 surface-postlight-toe=<b>  on|off experimental post-lighting surface toe (default off)\n\
+         \x20 surface-postlight-toe-knee=<f> reflectance-factor knee (default {SURFACE_POSTLIGHT_TOE_KNEE})\n\
+         \x20 surface-postlight-toe-gamma=<f> toe exponent (default {SURFACE_POSTLIGHT_TOE_GAMMA})\n\
+         \x20 surface-postlight-toe-max-gain=<f> gain bound (default {SURFACE_POSTLIGHT_TOE_MAX_GAIN})\n\
          \x20 multiscatter=<b>   on | off  legacy compatibility toggle (default on)\n\
          \x20 cloud-multiscatter=<mode> legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b|delta-flux-v3-memory (opt-in)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
-         \x20 fractional-clouds=<mode> off|on|effective-od|deterministic-4|deterministic-8|deterministic-16 (default on=effective-od)\n\
+         \x20 fractional-clouds=<mode> off|on|effective-od|deterministic-2|deterministic-4|deterministic-8|deterministic-16 (default deterministic-2; on=effective-od alias)\n\
          \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default {DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE}; 1.0 = unscaled)\n\
          \x20 cloud-optics=<mode> fixed|nssl-native|hrrr-thompson-native source-specific particle optics (default fixed; visible only)\n\
          \x20 feather-exposed-domain-edges=<b> on|off fade finished clouds at visible WRF boundaries (default on)\n\
          \x20 granulation=<b>    on | off  sub-grid cloud detail    (default off)\n\
          \x20 topdown-stratiform-regularization=<b> on|off low-deck source reconstruction (default off)\n\
          \x20 topdown-cloud-footprint=<b> on|off display-only pre-tonemap cloud footprint (default off)\n\
+         \x20 topdown-shadow-antialias=<b> on|off top-down ground-shadow anti-aliasing (default on)\n\
          \x20 steps=<quality>    offline | interactive              (default offline)\n\
          \x20 sun-elev=<deg>     OPTIONAL sun elevation override (else true solar)\n\
          \x20 sun-az=<deg>       OPTIONAL sun azimuth override, deg from north\n\
@@ -1610,8 +1699,12 @@ mod tests {
         );
         assert!(!opts.topdown_stratiform_regularization);
         assert!(!opts.topdown_cloud_footprint);
+        assert!(opts.topdown_shadow_antialias);
         assert!(opts.fractional_clouds);
-        assert_eq!(opts.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
+        assert_eq!(
+            opts.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
         assert!(opts.feather_exposed_domain_edges);
         assert_eq!(
             opts.cloud_optical_depth_scale,
@@ -1624,6 +1717,16 @@ mod tests {
         assert_eq!(opts.land_dark_toe_knee, LAND_DARK_TOE_KNEE);
         assert_eq!(opts.land_dark_toe_gamma, LAND_DARK_TOE_GAMMA);
         assert_eq!(opts.land_dark_toe_max_gain, LAND_DARK_TOE_MAX_GAIN);
+        assert!(!opts.surface_postlight_toe);
+        assert_eq!(opts.surface_postlight_toe_knee, SURFACE_POSTLIGHT_TOE_KNEE);
+        assert_eq!(
+            opts.surface_postlight_toe_gamma,
+            SURFACE_POSTLIGHT_TOE_GAMMA
+        );
+        assert_eq!(
+            opts.surface_postlight_toe_max_gain,
+            SURFACE_POSTLIGHT_TOE_MAX_GAIN
+        );
         assert!(opts.ground_gain.is_none());
         assert!(opts.cloud_softclip.is_none());
         assert!(opts.cloud_highlight_max.is_none());
@@ -1636,10 +1739,11 @@ mod tests {
         assert_eq!(params.granulation, Some(false));
         assert!(!params.topdown_stratiform_regularization);
         assert!(!params.topdown_cloud_footprint);
+        assert!(params.topdown_shadow_antialias);
         assert!(params.fractional_clouds);
         assert_eq!(
             params.fractional_cloud_mode,
-            FractionalCloudMode::EffectiveOd
+            FractionalCloudMode::Deterministic2
         );
         assert!(params.feather_exposed_domain_edges);
         assert_eq!(
@@ -1680,11 +1784,14 @@ mod tests {
         let params = render_params(&opts);
         assert_eq!(params.intent, RenderIntent::SensorFastGray);
         assert!(params.synthetic_green);
+        assert!(params.topdown_shadow_antialias);
         assert!(params.fractional_clouds);
         let (effective, changes) = api::plan_render_intent(&params);
         assert!(!effective.synthetic_green);
+        assert!(!effective.topdown_shadow_antialias);
         assert!(effective.fractional_clouds);
         assert!(changes.contains(&api::RenderIntentAdjustment::SyntheticGreenOff));
+        assert!(changes.contains(&api::RenderIntentAdjustment::TopdownShadowAntialiasOff));
 
         let args = vec![
             "input=input".to_string(),
@@ -1764,6 +1871,7 @@ mod tests {
             "feather-exposed-domain-edges=off",
             "topdown-stratiform-regularization=on",
             "topdown-cloud-footprint=on",
+            "topdown-shadow-antialias=off",
         ]);
         assert!(opts.beer_powder);
         assert!(opts.granulation);
@@ -1772,6 +1880,7 @@ mod tests {
         assert!(!opts.feather_exposed_domain_edges);
         assert!(opts.topdown_stratiform_regularization);
         assert!(opts.topdown_cloud_footprint);
+        assert!(!opts.topdown_shadow_antialias);
         let params = render_params(&opts);
         assert!(params.beer_powder);
         assert_eq!(params.granulation, Some(true));
@@ -1780,6 +1889,7 @@ mod tests {
         assert!(!params.feather_exposed_domain_edges);
         assert!(params.topdown_stratiform_regularization);
         assert!(params.topdown_cloud_footprint);
+        assert!(!params.topdown_shadow_antialias);
     }
 
     #[test]
@@ -1801,6 +1911,7 @@ mod tests {
             FractionalCloudMode::Deterministic4
         );
         for (token, mode, count) in [
+            ("deterministic-2", FractionalCloudMode::Deterministic2, 2),
             ("deterministic-4", FractionalCloudMode::Deterministic4, 4),
             ("deterministic-8", FractionalCloudMode::Deterministic8, 8),
             ("deterministic-16", FractionalCloudMode::Deterministic16, 16),
@@ -1831,6 +1942,10 @@ mod tests {
             "land-dark-toe-knee=0.07",
             "land-dark-toe-gamma=0.6",
             "land-dark-toe-max-gain=1.4",
+            "surface-postlight-toe=on",
+            "surface-postlight-toe-knee=0.18",
+            "surface-postlight-toe-gamma=0.8",
+            "surface-postlight-toe-max-gain=1.35",
         ]);
         assert_eq!(opts.ground_gain, Some(1.6));
         assert_eq!(opts.cloud_softclip, Some(0.65));
@@ -1841,6 +1956,7 @@ mod tests {
         assert_eq!(opts.land_dark_toe_knee, 0.07);
         assert_eq!(opts.land_dark_toe_gamma, 0.6);
         assert_eq!(opts.land_dark_toe_max_gain, 1.4);
+        assert!(opts.surface_postlight_toe);
 
         let params = render_params(&opts);
         assert_eq!(params.ground_gain, Some(1.6));
@@ -1855,6 +1971,15 @@ mod tests {
                 dark_toe_knee: 0.07,
                 dark_toe_gamma: 0.6,
                 dark_toe_max_gain: 1.4,
+            }
+        );
+        assert_eq!(
+            params.surface_postlight_toe,
+            SurfacePostlightToeConfig {
+                enabled: true,
+                knee: 0.18,
+                gamma: 0.8,
+                max_gain: 1.35,
             }
         );
     }
@@ -1877,6 +2002,9 @@ mod tests {
             "land-dark-toe-knee=0",
             "land-dark-toe-gamma=1.1",
             "land-dark-toe-max-gain=nan",
+            "surface-postlight-toe-knee=0",
+            "surface-postlight-toe-gamma=1.1",
+            "surface-postlight-toe-max-gain=nan",
         ] {
             let args = vec![
                 "input=input".to_string(),

@@ -52,9 +52,12 @@ impl StudioPreset {
     pub(crate) const fn description(self) -> &'static str {
         match self {
             Self::RecommendedDisplay => {
-                "Owner-reviewed visible defaults: CPU Offline, Native resolution, OD 0.15, \
-                 exposure 1.5, AOD 0.05, fixed optics, Effective OD, corrections and edge \
-                 feathering on, experimental storage/footprint and appearance experiments off."
+                "For Visible/GeoColor/Sandwich: owner-reviewed CPU Offline defaults, Native \
+                 resolution, OD 0.15, exposure 1.5, AOD 0.05, fixed optics, deterministic \
+                 2-subcolumn closure, corrections, edge feathering, and top-down shadow \
+                 anti-aliasing on. For IR Band 13: selects only the recommended continuous \
+                 NOAA heritage Natural grayscale; saved legacy palette choices are not \
+                 silently migrated."
             }
             Self::HighQualityVisible => {
                 "Recommended Display plus the owner-selected deterministic 4-subcolumn \
@@ -64,7 +67,8 @@ impl StudioPreset {
             Self::SensorQa => {
                 "CPU Offline sensor comparison: GOES-R ABI fixed-grid navigation, sensor \
                  sampling, neutral visible transforms, and official GOES-19 FM4 Band 13 for \
-                 a compatible GOES-East IR product. Experimental storage and footprint remain off."
+                 a compatible GOES-East IR product. Top-down shadow anti-aliasing and other \
+                 display-only experiments remain off."
             }
         }
     }
@@ -139,13 +143,25 @@ pub(crate) fn plan(
     validate_scope(preset, mode, view, satellite)?;
 
     let mut desired = current.clone();
-    let desired_runtime = PresetRuntime {
-        gpu_clouds: false,
-        parity_pending: false,
+    // Recommended IR is deliberately palette-only. Session-only visible/GPU state is
+    // unrelated to thermal recoloring and must not change when the user picks it.
+    let desired_runtime = if preset == StudioPreset::RecommendedDisplay && mode == RenderMode::Ir {
+        runtime
+    } else {
+        PresetRuntime {
+            gpu_clouds: false,
+            parity_pending: false,
+        }
     };
 
     match preset {
-        StudioPreset::RecommendedDisplay => apply_display_baseline(&mut desired),
+        StudioPreset::RecommendedDisplay => {
+            if mode == RenderMode::Ir {
+                apply_ir_display_baseline(&mut desired);
+            } else {
+                apply_display_baseline(&mut desired);
+            }
+        }
         StudioPreset::HighQualityVisible => {
             apply_display_baseline(&mut desired);
             desired.fractional_cloud_mode = "deterministic-4".to_string();
@@ -181,10 +197,10 @@ fn validate_scope(
 ) -> Result<(), PresetUnavailable> {
     match preset {
         StudioPreset::RecommendedDisplay => {
-            if !mode.uses_visible_controls() {
+            if !mode.uses_visible_controls() && mode != RenderMode::Ir {
                 return Err(PresetUnavailable(format!(
-                    "{} does not use the visible display path. This preset never changes Mode; \
-                     select Visible, GeoColor Style, or Sandwich first.",
+                    "{} has no reviewed Recommended Display path. This preset never changes \
+                     Mode; select Visible, IR Band 13, GeoColor Style, or Sandwich first.",
                     mode.label()
                 )));
             }
@@ -257,7 +273,7 @@ fn apply_display_baseline(s: &mut StudioSettings) {
     s.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
     s.clouds_enabled = true;
     s.fractional_clouds = true;
-    s.fractional_cloud_mode = "effective-od".to_string();
+    s.fractional_cloud_mode = "deterministic-2".to_string();
     s.multiscatter = true;
     s.delta_flux_clouds = false;
     s.delta_flux_v2_clouds = false;
@@ -271,10 +287,18 @@ fn apply_display_baseline(s: &mut StudioSettings) {
     s.granulation = false;
     s.topdown_stratiform_regularization = false;
     s.topdown_cloud_footprint = false;
+    s.topdown_shadow_antialias = true;
     s.exposure = 1.5;
     s.ground_gain = 1.0;
     s.cloud_softclip = 0.65;
     s.cloud_highlight_max = 1.25;
+}
+
+/// One-click Band-13 display recommendation. It changes only the palette, leaving
+/// the user's sensor, navigation, sampling, camera, raw BT, and visible settings intact.
+fn apply_ir_display_baseline(s: &mut StudioSettings) {
+    s.ir_enhancement =
+        settings::enhancement_token(simsat::ir_enhance::IrEnhancement::Natural).to_string();
 }
 
 fn apply_sensor_qa(s: &mut StudioSettings, mode: RenderMode) {
@@ -318,6 +342,7 @@ fn apply_sensor_qa(s: &mut StudioSettings, mode: RenderMode) {
             s.granulation = false;
             s.topdown_stratiform_regularization = false;
             s.topdown_cloud_footprint = false;
+            s.topdown_shadow_antialias = false;
             s.exposure = 1.0;
             s.ground_gain = 1.0;
             s.cloud_softclip = 1.0;
@@ -327,9 +352,9 @@ fn apply_sensor_qa(s: &mut StudioSettings, mode: RenderMode) {
             s.resolution = settings::resolution_token(ResolutionMode::Abi2km).to_string();
             s.thermal_sensor =
                 settings::thermal_sensor_token(ThermalSensor::GoesRAbiBand13Fm4).to_string();
-            // The Studio must display RGB, so grayscale is its least-shaped preview;
-            // the rendered Kelvin plane remains the quantitative sensor result.
-            s.ir_enhancement = "grayscale".to_string();
+            // The Studio must display RGB, so use NOAA's continuous heritage Band-13
+            // grayscale. The rendered Kelvin plane remains the quantitative sensor result.
+            s.ir_enhancement = "natural".to_string();
         }
         _ => unreachable!("validate_scope admits only Visible or IR"),
     }
@@ -396,6 +421,7 @@ fn collect_changes(
         "Top-down stratiform reconstruction"
     );
     record!(topdown_cloud_footprint, "Top-down cloud footprint");
+    record!(topdown_shadow_antialias, "Top-down shadow anti-aliasing");
     record!(exposure, "Exposure");
     record!(ground_gain, "Ground gain");
     record!(cloud_softclip, "Cloud highlight knee");
@@ -494,6 +520,7 @@ mod tests {
             granulation: true,
             topdown_stratiform_regularization: true,
             topdown_cloud_footprint: true,
+            topdown_shadow_antialias: false,
             exposure: 4.0,
             ground_gain: 4.0,
             cloud_softclip: 1.0,
@@ -518,7 +545,7 @@ mod tests {
         assert!(s.atmosphere_correction);
         assert!(s.terrain_atmosphere);
         assert!(s.land_sza_normalization);
-        assert_eq!(s.land_sza_max_gain, 1.6);
+        assert_eq!(s.land_sza_max_gain, 4.0);
         assert!(s.land_dark_toe);
         assert_eq!(s.land_dark_toe_knee, 0.08);
         assert_eq!(s.land_dark_toe_gamma, 0.65);
@@ -539,6 +566,7 @@ mod tests {
         assert!(!s.granulation);
         assert!(!s.topdown_stratiform_regularization);
         assert!(!s.topdown_cloud_footprint);
+        assert!(s.topdown_shadow_antialias);
         assert_eq!(s.exposure, 1.5);
         assert_eq!(s.ground_gain, 1.0);
         assert_eq!(s.cloud_softclip, cloud_softclip);
@@ -550,7 +578,7 @@ mod tests {
         let before = scrambled_visible();
         let plan = plan(StudioPreset::RecommendedDisplay, &before, runtime_on()).unwrap();
         assert_diff_is_exhaustive(&before, runtime_on(), &plan);
-        assert_display_settings(&plan.settings, "effective-od", 0.65);
+        assert_display_settings(&plan.settings, "deterministic-2", 0.65);
         assert_eq!(plan.settings.mode, before.mode, "product never changes");
         assert_eq!(plan.settings.sat, before.sat, "satellite never changes");
         assert_eq!(plan.settings.view, before.view, "camera never changes");
@@ -579,6 +607,38 @@ mod tests {
                 .iter()
                 .any(|c| c.field == "Pending GPU parity pass")
         );
+    }
+
+    #[test]
+    fn recommended_ir_is_palette_only_and_does_not_silently_migrate_saved_cimss() {
+        let mut before = StudioSettings {
+            mode: "ir-band13".to_string(),
+            ir_enhancement: "cimss".to_string(),
+            sat: "goes-west".to_string(),
+            view: "topdown".to_string(),
+            resolution: "native".to_string(),
+            exposure: 2.75,
+            cloud_optical_depth_scale: 0.37,
+            ..Default::default()
+        };
+        before.sanitize();
+        assert_eq!(
+            before.ir_enhancement, "cimss",
+            "loading/sanitizing an existing setting must preserve its explicit legacy token"
+        );
+
+        let runtime = runtime_on();
+        let plan = plan(StudioPreset::RecommendedDisplay, &before, runtime).unwrap();
+        assert_diff_is_exhaustive(&before, runtime, &plan);
+        let mut expected = before.clone();
+        expected.ir_enhancement = "natural".to_string();
+        assert_eq!(plan.settings, expected);
+        assert_eq!(
+            plan.runtime, runtime,
+            "thermal recoloring must not alter GPU state"
+        );
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].field, "IR enhancement");
     }
 
     #[test]
@@ -617,7 +677,7 @@ mod tests {
         assert!(!s.atmosphere_correction);
         assert!(s.terrain_atmosphere);
         assert!(!s.land_sza_normalization);
-        assert_eq!(s.land_sza_max_gain, 1.6);
+        assert_eq!(s.land_sza_max_gain, 4.0);
         assert!(!s.land_dark_toe);
         assert_eq!(s.land_dark_toe_knee, 0.08);
         assert_eq!(s.land_dark_toe_gamma, 0.65);
@@ -638,6 +698,7 @@ mod tests {
         assert!(!s.granulation);
         assert!(!s.topdown_stratiform_regularization);
         assert!(!s.topdown_cloud_footprint);
+        assert!(!s.topdown_shadow_antialias);
         assert_eq!(s.exposure, 1.0);
         assert_eq!(s.ground_gain, 1.0);
         assert_eq!(s.cloud_softclip, 1.0);
@@ -649,8 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn sensor_ir_uses_goes19_fm4_two_kilometre_grayscale_without_touching_hidden_visible_controls()
-    {
+    fn sensor_ir_uses_goes19_fm4_two_kilometre_natural_without_touching_hidden_visible_controls() {
         let before = StudioSettings {
             mode: "ir-band13".to_string(),
             sat: "goes-east".to_string(),
@@ -679,7 +739,7 @@ mod tests {
         assert_eq!(s.render_intent, "sensor-fast-gray");
         assert_eq!(s.thermal_sensor, "goes-r-abi-band13-fm4");
         assert_eq!(s.instrument_footprint, "off");
-        assert_eq!(s.ir_enhancement, "grayscale");
+        assert_eq!(s.ir_enhancement, "natural");
         assert_eq!(s.step_quality, "offline");
         assert!(!s.science_cloud_f16);
         assert_eq!(s.exposure, original_exposure);
