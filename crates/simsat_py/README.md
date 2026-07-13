@@ -54,11 +54,12 @@ reconstruction/synthetic green. Model fractional clouds are retained. Exact
 substitutions and limitations ride on `geo.intent`,
 `geo.observation_operator`, `geo.intent_adjustments`, and
 `geo.intent_limitations` and are also raised as `UserWarning`s. It is not yet an
-instrument-SRF-integrated ABI/AHI channel; use `render_rgb_reflectance` for the
+instrument-SRF-integrated ABI/AHI/FCI channel; use `render_rgb_reflectance` for the
 pre-tonemap broad-RGB reflectance output. Sensor Fast Gray currently requires
 `backend="cpu"` because GPU preview cannot preserve this strict contract.
 
-Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`
+Common keyword args (all optional): `sat`
+(`goes-east`/`goes-west`/`himawari`/`mtg-i1`), `view`
 (`topdown` default / `geo`), `timestep=0`, `resolution` (`native` default: one output
 pixel per source-model grid cell, not necessarily the highest output resolution;
 `abi1km` / `abi2km` request 1 km / 2 km sampling and may upsample a coarse model or
@@ -81,6 +82,12 @@ sensor-compatible default),
 bands; `natural` remains NOAA's continuous heritage bi-linear grayscale. For water
 vapor, `cimss` remains the classic moisture palette;
 the derived-field functions take `colormap=`.
+
+`sat="mtg-i1"` selects the operational MTG-I1 / Meteosat-12 camera at 0°;
+`mtg`, `meteosat-12`, and `meteosat12` are accepted aliases and the canonical
+provenance slug is `mtgi1`. This is camera geometry, not full FCI simulation: visible,
+IR, and water-vapor products retain SimSat's existing generic physics, with no FCI
+spectral-response or point-spread-function model.
 
 The visible-family functions (including raw RGB reflectance, cloud layer, and perspective)
 also expose the atmosphere/cloud QA controls directly:

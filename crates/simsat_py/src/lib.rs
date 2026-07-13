@@ -5,6 +5,11 @@
 //! CPU-heavy march), and marshals the returned owned Rust arrays into numpy. NO render
 //! logic lives here — the physics + the tests are in the `simsat` crate.
 //!
+//! Render functions with a `sat=` keyword accept the MTG-I1 / Meteosat-12 0°
+//! camera as `mtg`, `mtg-i1`, `meteosat-12`, or `meteosat12` (canonical slug
+//! `mtgi1`). This selects geometry only: the binding continues to use SimSat's generic
+//! visible, thermal, and water-vapor physics and does not claim an FCI SRF or PSF.
+//!
 //! The functions each return `(numpy_array, georef)` so a meteorologist can plot the
 //! result on a cartopy map:
 //! - [`render_visible_rgb`]  -> `(H x W x 3 uint8, Georef)`  the finished true-color RGB.
@@ -2300,8 +2305,9 @@ fn parse_sat(v: &str) -> PyResult<SatellitePreset> {
         "goeseast" | "goese" | "east" => Ok(SatellitePreset::GoesEast),
         "goeswest" | "goesw" | "west" => Ok(SatellitePreset::GoesWest),
         "himawari" | "ahi" => Ok(SatellitePreset::Himawari),
+        "mtg" | "mtgi1" | "meteosat12" => Ok(SatellitePreset::MtgI1),
         _ => Err(value_err(format!(
-            "unknown sat '{v}' (goes-east|goes-west|himawari)"
+            "unknown sat '{v}' (goes-east|goes-west|himawari|mtg-i1)"
         ))),
     }
 }
@@ -2458,6 +2464,16 @@ fn parse_enhancement(v: &str) -> PyResult<IrEnhancement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn satellite_parser_accepts_mtg_camera_aliases_with_canonical_slug() {
+        for token in ["mtg", "mtg-i1", "meteosat-12", "meteosat12"] {
+            let satellite = parse_sat(token).unwrap();
+            assert_eq!(satellite, SatellitePreset::MtgI1, "{token}");
+            assert_eq!(satellite.slug(), "mtgi1", "{token}");
+        }
+        assert!(parse_sat("fci-full-physics").is_err());
+    }
 
     #[test]
     fn backend_parser_defaults_and_tokens_match_rust_api() {
@@ -2886,7 +2902,9 @@ fn simsat(m: &Bound<'_, PyModule>) -> PyResult<()> {
          render_cloud_layer returns the web-map cloud + shadow layer pair on a Web-Mercator \
          grid (georef.mercator_corners = the Mapbox ImageSource corner lon/lats). \
          render_perspective renders a free eye/look/fov pinhole camera (full composite, or \
-         cloud_layer_only=True for the cloud field alone; georef.camera_pose = the camera).",
+         cloud_layer_only=True for the cloud field alone; georef.camera_pose = the camera). \
+         sat='mtg-i1' (also mtg/meteosat-12/meteosat12) selects the MTG-I1 / Meteosat-12 \
+         0° camera only; channels remain generic and do not model an FCI SRF or PSF.",
     )?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(render_visible_rgb, m)?)?;
