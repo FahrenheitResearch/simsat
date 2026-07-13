@@ -44,13 +44,18 @@ pub const RECENT_CAP: usize = 8;
 /// SZA normalization and dark-land toe; epoch 5 promotes exposed-domain cloud-edge
 /// feathering to the shipped visible preset; epoch 6 promotes the owner-selected
 /// low-sun land SZA maximum gain from `1.6` to `4.0` and the reviewed
-/// deterministic two-subcolumn Recommended closure.
+/// deterministic two-subcolumn Recommended closure; epoch 7 promotes the owner-selected
+/// tightly gated twilight surface recovery (`0.30 / 0.50 / 4.0`) for visible displays;
+/// epoch 8 promotes the reviewed, sun-gated surface-only ground lift from `1.0` to `1.10`.
 /// Older settings are preserved and surfaced instead of being silently overwritten.
-pub const VISIBLE_CALIBRATION_EPOCH: u32 = 6;
+pub const VISIBLE_CALIBRATION_EPOCH: u32 = 8;
 const LAND_APPEARANCE_CALIBRATION_EPOCH: u64 = 4;
 const EXPOSED_EDGE_CALIBRATION_EPOCH: u64 = 5;
 const LAND_SZA_GAIN_CALIBRATION_EPOCH: u64 = 6;
+const TWILIGHT_SURFACE_RECOVERY_CALIBRATION_EPOCH: u64 = 7;
+const GROUND_LIFT_CALIBRATION_EPOCH: u64 = 8;
 const LEGACY_LAND_SZA_MAX_GAIN: f32 = 1.6;
+const LEGACY_GROUND_DAY_LIFT: f32 = 1.0;
 
 /// One remembered open action: what kind of open it was + the path(s) involved
 /// (one path for a wrfout / cached run / sequence folder; several for a
@@ -143,6 +148,11 @@ pub struct StudioSettings {
     pub surface_postlight_toe_knee: f32,
     pub surface_postlight_toe_gamma: f32,
     pub surface_postlight_toe_max_gain: f32,
+    /// Separate tightly gated low-sun recovery; shipped on for finished visible displays.
+    pub twilight_surface_recovery: bool,
+    pub twilight_surface_recovery_knee: f32,
+    pub twilight_surface_recovery_gamma: f32,
+    pub twilight_surface_recovery_max_gain: f32,
     pub clouds_enabled: bool,
     /// Use model cloud fraction/subcolumns when the brick provides them. `true` is
     /// the physical default; `false` preserves legacy horizontally-full cloudy cells.
@@ -213,7 +223,8 @@ impl Default for StudioSettings {
     fn default() -> Self {
         // Mirrors SimSatStudioApp::new's defaults exactly (the honest baseline).
         let land = simsat::render::LandAppearanceConfig::default();
-        let postlight_toe = simsat::render::SurfacePostlightToeConfig::default();
+        let postlight_toe = simsat::render::SurfacePostlightToeConfig::off();
+        let twilight_recovery = simsat::render::TwilightSurfaceRecoveryConfig::shipped();
         Self {
             visible_calibration_epoch: VISIBLE_CALIBRATION_EPOCH,
             store_root: None,
@@ -243,6 +254,10 @@ impl Default for StudioSettings {
             surface_postlight_toe_knee: postlight_toe.knee as f32,
             surface_postlight_toe_gamma: postlight_toe.gamma as f32,
             surface_postlight_toe_max_gain: postlight_toe.max_gain as f32,
+            twilight_surface_recovery: twilight_recovery.enabled,
+            twilight_surface_recovery_knee: twilight_recovery.knee as f32,
+            twilight_surface_recovery_gamma: twilight_recovery.gamma as f32,
+            twilight_surface_recovery_max_gain: twilight_recovery.max_gain as f32,
             clouds_enabled: true,
             fractional_clouds: true,
             fractional_cloud_mode: fractional_cloud_mode_token(FractionalCloudMode::Deterministic2)
@@ -314,6 +329,10 @@ impl StudioSettings {
         self.surface_postlight_toe_knee = d.surface_postlight_toe_knee;
         self.surface_postlight_toe_gamma = d.surface_postlight_toe_gamma;
         self.surface_postlight_toe_max_gain = d.surface_postlight_toe_max_gain;
+        self.twilight_surface_recovery = d.twilight_surface_recovery;
+        self.twilight_surface_recovery_knee = d.twilight_surface_recovery_knee;
+        self.twilight_surface_recovery_gamma = d.twilight_surface_recovery_gamma;
+        self.twilight_surface_recovery_max_gain = d.twilight_surface_recovery_max_gain;
         self.clouds_enabled = d.clouds_enabled;
         self.fractional_clouds = d.fractional_clouds;
         self.fractional_cloud_mode = d.fractional_cloud_mode;
@@ -376,6 +395,24 @@ impl StudioSettings {
             1.0,
             4.0,
             d.surface_postlight_toe_max_gain,
+        );
+        self.twilight_surface_recovery_knee = clamp_finite(
+            self.twilight_surface_recovery_knee,
+            1.0e-6,
+            1.0,
+            d.twilight_surface_recovery_knee,
+        );
+        self.twilight_surface_recovery_gamma = clamp_finite(
+            self.twilight_surface_recovery_gamma,
+            0.05,
+            1.0,
+            d.twilight_surface_recovery_gamma,
+        );
+        self.twilight_surface_recovery_max_gain = clamp_finite(
+            self.twilight_surface_recovery_max_gain,
+            1.0,
+            4.0,
+            d.twilight_surface_recovery_max_gain,
         );
         self.cloud_optical_depth_scale = clamp_finite(
             self.cloud_optical_depth_scale,
@@ -663,6 +700,8 @@ pub fn load(path: &Path) -> StudioSettings {
             let had_land_sza_max_gain = value.get("land_sza_max_gain").is_some();
             let had_land_toe = value.get("land_dark_toe").is_some();
             let had_exposed_edge = value.get("feather_exposed_domain_edges").is_some();
+            let had_twilight_surface_recovery = value.get("twilight_surface_recovery").is_some();
+            let had_ground_gain = value.get("ground_gain").is_some();
             let mut settings = serde_json::from_value::<StudioSettings>(value).ok()?;
             // Files from before epoch 4 either persisted these switches as off or did
             // not know about them. Missing legacy fields therefore mean identity, not
@@ -686,6 +725,20 @@ pub fn load(path: &Path) -> StudioSettings {
             // the calibration banner offers 4.0 explicitly instead of silently changing it.
             if saved_calibration_epoch < LAND_SZA_GAIN_CALIBRATION_EPOCH && !had_land_sza_max_gain {
                 settings.land_sza_max_gain = LEGACY_LAND_SZA_MAX_GAIN;
+            }
+            // Epoch 7 promotes this display correction for new installs and reviewed visible
+            // presets only. Older settings that predate the field retain exact identity and
+            // surface the Apply/Keep banner instead of inheriting the new serde default.
+            if saved_calibration_epoch < TWILIGHT_SURFACE_RECOVERY_CALIBRATION_EPOCH
+                && !had_twilight_surface_recovery
+            {
+                settings.twilight_surface_recovery = false;
+            }
+            // Epoch 8 changes the shipped display ground lift. Preserve an older or
+            // hand-edited file that omitted the numeric field at the previous neutral
+            // value; the calibration banner offers the reviewed 1.10 explicitly.
+            if saved_calibration_epoch < GROUND_LIFT_CALIBRATION_EPOCH && !had_ground_gain {
+                settings.ground_gain = LEGACY_GROUND_DAY_LIFT;
             }
             if !had_calibration_epoch {
                 // Preserve every old user-selected value. Epoch zero merely asks the UI
@@ -778,8 +831,22 @@ mod tests {
             s.surface_postlight_toe_max_gain,
             simsat::render::SURFACE_POSTLIGHT_TOE_MAX_GAIN as f32
         );
+        assert!(s.twilight_surface_recovery);
+        assert_eq!(
+            s.twilight_surface_recovery_knee,
+            simsat::render::TWILIGHT_SURFACE_RECOVERY_KNEE as f32
+        );
+        assert_eq!(
+            s.twilight_surface_recovery_gamma,
+            simsat::render::TWILIGHT_SURFACE_RECOVERY_GAMMA as f32
+        );
+        assert_eq!(
+            s.twilight_surface_recovery_max_gain,
+            simsat::render::TWILIGHT_SURFACE_RECOVERY_MAX_GAIN as f32
+        );
         assert_eq!(s.output_transform, "abi-reflectance");
         assert_eq!(s.render_intent, "display");
+        assert_eq!(s.ir_enhancement, "cimss");
         assert_eq!(s.instrument_footprint, "off");
         assert!(s.clouds_enabled);
         assert!(s.multiscatter);
@@ -790,7 +857,7 @@ mod tests {
         assert_eq!(s.cloud_optical_depth_scale, 0.15);
         assert!(s.feather_exposed_domain_edges);
         assert_eq!(s.exposure, simsat::render::DEFAULT_EXPOSURE as f32);
-        assert_eq!(s.ground_gain, 1.0);
+        assert_eq!(s.ground_gain, simsat::render::GROUND_DAY_LIFT as f32);
         assert_eq!(s.cloud_softclip, 0.65);
         assert_eq!(s.cloud_highlight_max, 1.25);
         assert!(s.fractional_clouds);
@@ -853,6 +920,8 @@ mod tests {
         assert_eq!(s.land_dark_toe_knee, d.land_dark_toe_knee);
         assert_eq!(s.land_dark_toe_gamma, d.land_dark_toe_gamma);
         assert_eq!(s.land_dark_toe_max_gain, d.land_dark_toe_max_gain);
+        assert_eq!(s.surface_postlight_toe, d.surface_postlight_toe);
+        assert_eq!(s.twilight_surface_recovery, d.twilight_surface_recovery);
         assert_eq!(s.clouds_enabled, d.clouds_enabled);
         assert_eq!(s.fractional_clouds, d.fractional_clouds);
         assert_eq!(s.fractional_cloud_mode, d.fractional_cloud_mode);
@@ -970,6 +1039,7 @@ mod tests {
         assert!(s.terrain_atmosphere);
         assert!(!s.land_sza_normalization);
         assert!(!s.land_dark_toe);
+        assert!(!s.twilight_surface_recovery);
         assert_eq!(
             s.land_sza_max_gain, LEGACY_LAND_SZA_MAX_GAIN,
             "pre-epoch files that omit the field preserve the former shipped bound"
@@ -990,11 +1060,36 @@ mod tests {
             s.topdown_shadow_antialias,
             "older settings inherit the shipped anti-alias default"
         );
-        assert_eq!(s.ground_gain, StudioSettings::default().ground_gain);
+        assert_eq!(
+            s.ground_gain, LEGACY_GROUND_DAY_LIFT,
+            "pre-epoch files that omit ground gain keep the former neutral display"
+        );
         assert_eq!(s.cloud_softclip, StudioSettings::default().cloud_softclip);
         assert_eq!(
             s.cloud_highlight_max,
             StudioSettings::default().cloud_highlight_max
+        );
+        // IR palette selection is independently persisted. Changing the shipped
+        // default must not rewrite an explicit Natural choice or require a visible-
+        // calibration epoch bump.
+        let explicit_natural = dir.join("explicit-natural-ir.json");
+        std::fs::write(
+            &explicit_natural,
+            format!(
+                r#"{{
+                    "visible_calibration_epoch": {},
+                    "mode": "ir-band13",
+                    "ir_enhancement": "natural"
+                }}"#,
+                VISIBLE_CALIBRATION_EPOCH
+            ),
+        )
+        .unwrap();
+        let saved_natural = load(&explicit_natural);
+        assert_eq!(saved_natural.ir_enhancement, "natural");
+        assert_eq!(
+            saved_natural.visible_calibration_epoch,
+            VISIBLE_CALIBRATION_EPOCH
         );
         // A pre-epoch file's explicit calibration is never silently rewritten. The
         // Studio uses epoch zero to show its apply/keep banner.
@@ -1062,6 +1157,34 @@ mod tests {
         assert_eq!(old_v014.exposure, 1.0);
         assert_eq!(old_v014.ground_gain, 1.0);
         assert!(old_v014.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        // Epoch 7 was the v0.2.1 RC1 calibration immediately before the reviewed
+        // 1.10 ground lift. Loading RC1 settings must preserve either its former
+        // neutral default or any explicit owner customization and offer the epoch-8
+        // Apply/Keep choice instead of silently changing the image.
+        for (name, json, expected_ground) in [
+            (
+                "epoch7-missing-ground.json",
+                r#"{ "visible_calibration_epoch": 7 }"#,
+                LEGACY_GROUND_DAY_LIFT,
+            ),
+            (
+                "epoch7-neutral-ground.json",
+                r#"{ "visible_calibration_epoch": 7, "ground_gain": 1.0 }"#,
+                1.0,
+            ),
+            (
+                "epoch7-custom-ground.json",
+                r#"{ "visible_calibration_epoch": 7, "ground_gain": 1.27 }"#,
+                1.27,
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, json).unwrap();
+            let saved = load(&path);
+            assert_eq!(saved.visible_calibration_epoch, 7, "{name}");
+            assert_eq!(saved.ground_gain, expected_ground, "{name}");
+        }
 
         // Epoch 3 selected exposure 1.5 while the two land operators were still off.
         // Preserve that exact saved look and leave the epoch behind 4 so the Studio
@@ -1164,6 +1287,43 @@ mod tests {
             old_v019_missing_gain.land_sza_max_gain,
             LEGACY_LAND_SZA_MAX_GAIN
         );
+
+        // Epoch 6 predates the shipped twilight recovery. A missing field must preserve
+        // identity and leave the migration banner active; an explicit saved choice is kept.
+        let v020_missing_twilight = dir.join("v020-missing-twilight-recovery.json");
+        std::fs::write(
+            &v020_missing_twilight,
+            r#"{
+                "visible_calibration_epoch": 6,
+                "land_sza_normalization": true,
+                "land_sza_max_gain": 4.0,
+                "land_dark_toe": true,
+                "feather_exposed_domain_edges": true
+            }"#,
+        )
+        .unwrap();
+        let old_v020_missing = load(&v020_missing_twilight);
+        assert_eq!(old_v020_missing.visible_calibration_epoch, 6);
+        assert!(!old_v020_missing.twilight_surface_recovery);
+        assert!(old_v020_missing.visible_calibration_epoch < VISIBLE_CALIBRATION_EPOCH);
+
+        let v020_explicit_twilight = dir.join("v020-explicit-twilight-recovery.json");
+        std::fs::write(
+            &v020_explicit_twilight,
+            r#"{
+                "visible_calibration_epoch": 6,
+                "twilight_surface_recovery": true,
+                "twilight_surface_recovery_knee": 0.25,
+                "twilight_surface_recovery_gamma": 0.60,
+                "twilight_surface_recovery_max_gain": 3.0
+            }"#,
+        )
+        .unwrap();
+        let old_v020_explicit = load(&v020_explicit_twilight);
+        assert!(old_v020_explicit.twilight_surface_recovery);
+        assert_eq!(old_v020_explicit.twilight_surface_recovery_knee, 0.25);
+        assert_eq!(old_v020_explicit.twilight_surface_recovery_gamma, 0.60);
+        assert_eq!(old_v020_explicit.twilight_surface_recovery_max_gain, 3.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

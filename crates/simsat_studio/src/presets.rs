@@ -10,7 +10,9 @@ use std::fmt;
 
 use simsat::camera::{GeoNavigation, ResolutionMode, SatellitePreset};
 use simsat::instrument_footprint::InstrumentFootprint;
-use simsat::render::LandAppearanceConfig;
+use simsat::render::{
+    GROUND_DAY_LIFT, LandAppearanceConfig, SurfacePostlightToeConfig, TwilightSurfaceRecoveryConfig,
+};
 use simsat::thermal_sensor::ThermalSensor;
 
 use crate::settings::{self, StudioSettings};
@@ -54,10 +56,10 @@ impl StudioPreset {
             Self::RecommendedDisplay => {
                 "For Visible/GeoColor/Sandwich: owner-reviewed CPU Offline defaults, Native \
                  resolution, OD 0.15, exposure 1.5, AOD 0.05, fixed optics, deterministic \
-                 2-subcolumn closure, corrections, edge feathering, and top-down shadow \
-                 anti-aliasing on. For IR Band 13: selects only the recommended continuous \
-                 NOAA heritage Natural grayscale; saved legacy palette choices are not \
-                 silently migrated."
+                 2-subcolumn closure, corrections, tightly gated twilight terrain recovery, \
+                 edge feathering, and top-down shadow anti-aliasing on. For IR Band 13: selects \
+                 only the recommended CIMSS Style false-color isotherm display; saved palette \
+                 choices are not silently migrated."
             }
             Self::HighQualityVisible => {
                 "Recommended Display plus the owner-selected deterministic 4-subcolumn \
@@ -271,6 +273,16 @@ fn apply_display_baseline(s: &mut StudioSettings) {
     s.land_dark_toe_knee = land.dark_toe_knee as f32;
     s.land_dark_toe_gamma = land.dark_toe_gamma as f32;
     s.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+    let legacy_postlight = SurfacePostlightToeConfig::off();
+    s.surface_postlight_toe = legacy_postlight.enabled;
+    s.surface_postlight_toe_knee = legacy_postlight.knee as f32;
+    s.surface_postlight_toe_gamma = legacy_postlight.gamma as f32;
+    s.surface_postlight_toe_max_gain = legacy_postlight.max_gain as f32;
+    let twilight = TwilightSurfaceRecoveryConfig::shipped();
+    s.twilight_surface_recovery = twilight.enabled;
+    s.twilight_surface_recovery_knee = twilight.knee as f32;
+    s.twilight_surface_recovery_gamma = twilight.gamma as f32;
+    s.twilight_surface_recovery_max_gain = twilight.max_gain as f32;
     s.clouds_enabled = true;
     s.fractional_clouds = true;
     s.fractional_cloud_mode = "deterministic-2".to_string();
@@ -289,7 +301,7 @@ fn apply_display_baseline(s: &mut StudioSettings) {
     s.topdown_cloud_footprint = false;
     s.topdown_shadow_antialias = true;
     s.exposure = 1.5;
-    s.ground_gain = 1.0;
+    s.ground_gain = GROUND_DAY_LIFT as f32;
     s.cloud_softclip = 0.65;
     s.cloud_highlight_max = 1.25;
 }
@@ -298,7 +310,7 @@ fn apply_display_baseline(s: &mut StudioSettings) {
 /// the user's sensor, navigation, sampling, camera, raw BT, and visible settings intact.
 fn apply_ir_display_baseline(s: &mut StudioSettings) {
     s.ir_enhancement =
-        settings::enhancement_token(simsat::ir_enhance::IrEnhancement::Natural).to_string();
+        settings::enhancement_token(simsat::ir_enhance::IrEnhancement::Cimss).to_string();
 }
 
 fn apply_sensor_qa(s: &mut StudioSettings, mode: RenderMode) {
@@ -309,6 +321,17 @@ fn apply_sensor_qa(s: &mut StudioSettings, mode: RenderMode) {
     s.geo_navigation = settings::geo_navigation_token(GeoNavigation::GoesRAbiFixedGrid).to_string();
     s.render_intent = "sensor-fast-gray".to_string();
     s.step_quality = "offline".to_string();
+    // Sensor QA is an observation-operator path, never a display terrain correction.
+    let legacy_postlight = SurfacePostlightToeConfig::off();
+    s.surface_postlight_toe = legacy_postlight.enabled;
+    s.surface_postlight_toe_knee = legacy_postlight.knee as f32;
+    s.surface_postlight_toe_gamma = legacy_postlight.gamma as f32;
+    s.surface_postlight_toe_max_gain = legacy_postlight.max_gain as f32;
+    let twilight = TwilightSurfaceRecoveryConfig::off();
+    s.twilight_surface_recovery = twilight.enabled;
+    s.twilight_surface_recovery_knee = twilight.knee as f32;
+    s.twilight_surface_recovery_gamma = twilight.gamma as f32;
+    s.twilight_surface_recovery_max_gain = twilight.max_gain as f32;
 
     match mode {
         RenderMode::Visible => {
@@ -399,6 +422,20 @@ fn collect_changes(
     record!(land_dark_toe_knee, "Land dark-toe knee");
     record!(land_dark_toe_gamma, "Land dark-toe gamma");
     record!(land_dark_toe_max_gain, "Land dark-toe max gain");
+    record!(surface_postlight_toe, "Legacy post-light surface toe");
+    record!(surface_postlight_toe_knee, "Legacy post-light toe knee");
+    record!(surface_postlight_toe_gamma, "Legacy post-light toe gamma");
+    record!(
+        surface_postlight_toe_max_gain,
+        "Legacy post-light toe max gain"
+    );
+    record!(twilight_surface_recovery, "Twilight surface recovery");
+    record!(twilight_surface_recovery_knee, "Twilight recovery knee");
+    record!(twilight_surface_recovery_gamma, "Twilight recovery gamma");
+    record!(
+        twilight_surface_recovery_max_gain,
+        "Twilight recovery max gain"
+    );
     record!(clouds_enabled, "Clouds");
     record!(fractional_clouds, "Fractional clouds");
     record!(fractional_cloud_mode, "Fractional-cloud mode");
@@ -504,6 +541,14 @@ mod tests {
             land_dark_toe_knee: 0.2,
             land_dark_toe_gamma: 0.2,
             land_dark_toe_max_gain: 3.0,
+            surface_postlight_toe: true,
+            surface_postlight_toe_knee: 0.22,
+            surface_postlight_toe_gamma: 0.75,
+            surface_postlight_toe_max_gain: 1.45,
+            twilight_surface_recovery: false,
+            twilight_surface_recovery_knee: 0.20,
+            twilight_surface_recovery_gamma: 0.70,
+            twilight_surface_recovery_max_gain: 2.0,
             clouds_enabled: false,
             fractional_clouds: false,
             fractional_cloud_mode: "off".to_string(),
@@ -550,6 +595,14 @@ mod tests {
         assert_eq!(s.land_dark_toe_knee, 0.08);
         assert_eq!(s.land_dark_toe_gamma, 0.65);
         assert_eq!(s.land_dark_toe_max_gain, 1.5);
+        assert!(!s.surface_postlight_toe);
+        assert_eq!(s.surface_postlight_toe_knee, 0.18);
+        assert_eq!(s.surface_postlight_toe_gamma, 0.80);
+        assert_eq!(s.surface_postlight_toe_max_gain, 1.35);
+        assert!(s.twilight_surface_recovery);
+        assert_eq!(s.twilight_surface_recovery_knee, 0.30);
+        assert_eq!(s.twilight_surface_recovery_gamma, 0.50);
+        assert_eq!(s.twilight_surface_recovery_max_gain, 4.0);
         assert!(s.clouds_enabled);
         assert!(s.fractional_clouds);
         assert_eq!(s.fractional_cloud_mode, fractional_mode);
@@ -568,7 +621,7 @@ mod tests {
         assert!(!s.topdown_cloud_footprint);
         assert!(s.topdown_shadow_antialias);
         assert_eq!(s.exposure, 1.5);
-        assert_eq!(s.ground_gain, 1.0);
+        assert_eq!(s.ground_gain, GROUND_DAY_LIFT as f32);
         assert_eq!(s.cloud_softclip, cloud_softclip);
         assert_eq!(s.cloud_highlight_max, 1.25);
     }
@@ -610,10 +663,10 @@ mod tests {
     }
 
     #[test]
-    fn recommended_ir_is_palette_only_and_does_not_silently_migrate_saved_cimss() {
+    fn recommended_ir_selects_cimss_but_loading_preserves_saved_natural() {
         let mut before = StudioSettings {
             mode: "ir-band13".to_string(),
-            ir_enhancement: "cimss".to_string(),
+            ir_enhancement: "natural".to_string(),
             sat: "goes-west".to_string(),
             view: "topdown".to_string(),
             resolution: "native".to_string(),
@@ -623,15 +676,15 @@ mod tests {
         };
         before.sanitize();
         assert_eq!(
-            before.ir_enhancement, "cimss",
-            "loading/sanitizing an existing setting must preserve its explicit legacy token"
+            before.ir_enhancement, "natural",
+            "loading/sanitizing an existing setting must preserve its explicit palette token"
         );
 
         let runtime = runtime_on();
         let plan = plan(StudioPreset::RecommendedDisplay, &before, runtime).unwrap();
         assert_diff_is_exhaustive(&before, runtime, &plan);
         let mut expected = before.clone();
-        expected.ir_enhancement = "natural".to_string();
+        expected.ir_enhancement = "cimss".to_string();
         assert_eq!(plan.settings, expected);
         assert_eq!(
             plan.runtime, runtime,
@@ -682,6 +735,8 @@ mod tests {
         assert_eq!(s.land_dark_toe_knee, 0.08);
         assert_eq!(s.land_dark_toe_gamma, 0.65);
         assert_eq!(s.land_dark_toe_max_gain, 1.5);
+        assert!(!s.surface_postlight_toe);
+        assert!(!s.twilight_surface_recovery);
         assert!(s.clouds_enabled);
         assert!(s.fractional_clouds);
         assert_eq!(s.fractional_cloud_mode, "effective-od");
@@ -710,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn sensor_ir_uses_goes19_fm4_two_kilometre_natural_without_touching_hidden_visible_controls() {
+    fn sensor_ir_uses_goes19_fm4_two_kilometre_natural_and_neutral_surface_recovery() {
         let before = StudioSettings {
             mode: "ir-band13".to_string(),
             sat: "goes-east".to_string(),
@@ -742,6 +797,8 @@ mod tests {
         assert_eq!(s.ir_enhancement, "natural");
         assert_eq!(s.step_quality, "offline");
         assert!(!s.science_cloud_f16);
+        assert!(!s.surface_postlight_toe);
+        assert!(!s.twilight_surface_recovery);
         assert_eq!(s.exposure, original_exposure);
         assert_eq!(s.cloud_optical_depth_scale, original_od);
         assert!(!plan.runtime.gpu_clouds);

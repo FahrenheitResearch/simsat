@@ -70,6 +70,10 @@
 //!   surface-postlight-toe-knee=<f> reflectance-factor knee (default 0.18).
 //!   surface-postlight-toe-gamma=<f> exponent, 0.05..=1 (default 0.80).
 //!   surface-postlight-toe-max-gain=<f> bounded gain, 1..=4 (default 1.35).
+//!   twilight-surface-recovery=<b> on | off - tight low-sun terrain recovery (default on).
+//!   twilight-surface-recovery-knee=<f> reflectance-factor knee (default 0.30).
+//!   twilight-surface-recovery-gamma=<f> exponent (default 0.50).
+//!   twilight-surface-recovery-max-gain=<f> bounded gain (default 4.0).
 //!   cache=<dir>        Brick cache root + seasonal Blue Marble cache.
 //!   bluemarble=<path>  OPTIONAL single-file Blue Marble override (default seasonal pack).
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
@@ -102,7 +106,7 @@
 //!                      perspective camera; `out` becomes a straight-alpha RGBA PNG (for
 //!                      compositing over a host 3-D map with a matching camera).
 //!                      A FLYOVER is N invocations along your own eye/look path.
-//!   ground-gain=<f>    OVERRIDE the shipped GROUND LIFT (default 1.0 = neutral).
+//!   ground-gain=<f>    OVERRIDE the shipped GROUND LIFT (default 1.10; 1.0 = neutral).
 //!   cloud-softclip=<f> OVERRIDE the shipped highlight knee (default 0.65);
 //!                      1.0 = disable the shoulder (hard clamp).
 //!   cloud-highlight-max=<f>  OVERRIDE the physical reflectance ceiling mapped to white
@@ -160,6 +164,8 @@ use simsat::render::{
     DEFAULT_EXPOSURE, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
     LAND_SZA_MAX_GAIN, LandAppearanceConfig, SURFACE_POSTLIGHT_TOE_GAMMA,
     SURFACE_POSTLIGHT_TOE_KNEE, SURFACE_POSTLIGHT_TOE_MAX_GAIN, SurfacePostlightToeConfig,
+    TWILIGHT_SURFACE_RECOVERY_GAMMA, TWILIGHT_SURFACE_RECOVERY_KNEE,
+    TWILIGHT_SURFACE_RECOVERY_MAX_GAIN, TwilightSurfaceRecoveryConfig,
 };
 use simsat::store_out::{self, VisibleFrame};
 use simsat::thermal_sensor::ThermalSensor;
@@ -202,6 +208,10 @@ struct Opts {
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     multiscatter: bool,
     cloud_multiscatter: Option<CloudMultiscatterMode>,
     beer_powder: bool,
@@ -282,6 +292,7 @@ fn run(args: &[String]) -> Result<(), String> {
          aod={:.3} rh-swelling={} atmosphere-correction={} terrain-atmosphere={} \
          land-sza={}({:.2}) land-dark-toe={}({:.3}/{:.2}/{:.2}) \
          surface-postlight-toe={}({:.3}/{:.2}/{:.2}) \
+         twilight-surface-recovery={}({:.3}/{:.2}/{:.2}) \
          cloud-multiscatter={} beer-powder={} clouds={} fractional-clouds={} \
          cloud-od-scale={:.3} feather-exposed-edges={} granulation={} \
          topdown-stratiform-regularization={} topdown-cloud-footprint={} topdown-shadow-antialias={} \
@@ -309,6 +320,10 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.surface_postlight_toe_knee,
         opts.surface_postlight_toe_gamma,
         opts.surface_postlight_toe_max_gain,
+        opts.twilight_surface_recovery,
+        opts.twilight_surface_recovery_knee,
+        opts.twilight_surface_recovery_gamma,
+        opts.twilight_surface_recovery_max_gain,
         resolved_cloud_multiscatter(&opts).slug(),
         opts.beer_powder,
         opts.clouds,
@@ -517,7 +532,9 @@ fn run(args: &[String]) -> Result<(), String> {
     println!(
         "SUMMARY file={} backend={} intent={} observation_operator={} intent_adjustments={} view={} geo_navigation={} geo_fixed_grid_lon={} geo_model_lon={} abi_lattice_crop={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
          sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
-         atmosphere_correction={} terrain_atmosphere={} thermal_sensor={} instrument_footprint={} cloud_multiscatter={} beer_powder={} \
+         atmosphere_correction={} terrain_atmosphere={} \
+         surface_postlight_toe={}({:.3}/{:.2}/{:.2}) twilight_surface_recovery={}({:.3}/{:.2}/{:.2}) \
+         thermal_sensor={} instrument_footprint={} cloud_multiscatter={} beer_powder={} \
          clouds={} fractional_clouds_requested={} fractional_cloud_mode={} cloud_optical_depth_scale={:.3} cloud_optics={} \
          feather_exposed_domain_edges={} granulation={} topdown_cloud_footprint={} \
          steps={} synthetic_green={} \
@@ -562,6 +579,14 @@ fn run(args: &[String]) -> Result<(), String> {
         opts.rh_aerosol_swelling,
         intent_effective.atmosphere_correction,
         opts.terrain_atmosphere,
+        intent_effective.surface_postlight_toe.enabled,
+        intent_effective.surface_postlight_toe.knee,
+        intent_effective.surface_postlight_toe.gamma,
+        intent_effective.surface_postlight_toe.max_gain,
+        intent_effective.twilight_surface_recovery.enabled,
+        intent_effective.twilight_surface_recovery.knee,
+        intent_effective.twilight_surface_recovery.gamma,
+        intent_effective.twilight_surface_recovery.max_gain,
         result
             .thermal_sensor
             .map(|sensor| sensor.slug())
@@ -883,6 +908,12 @@ fn render_params(opts: &Opts) -> RenderParams {
             gamma: opts.surface_postlight_toe_gamma,
             max_gain: opts.surface_postlight_toe_max_gain,
         },
+        twilight_surface_recovery: TwilightSurfaceRecoveryConfig {
+            enabled: opts.twilight_surface_recovery,
+            knee: opts.twilight_surface_recovery_knee,
+            gamma: opts.twilight_surface_recovery_gamma,
+            max_gain: opts.twilight_surface_recovery_max_gain,
+        },
         exposure: opts.exposure,
         multiscatter: opts.multiscatter,
         cloud_multiscatter: opts.cloud_multiscatter,
@@ -1044,6 +1075,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut surface_postlight_toe_knee = SURFACE_POSTLIGHT_TOE_KNEE;
     let mut surface_postlight_toe_gamma = SURFACE_POSTLIGHT_TOE_GAMMA;
     let mut surface_postlight_toe_max_gain = SURFACE_POSTLIGHT_TOE_MAX_GAIN;
+    let twilight_defaults = TwilightSurfaceRecoveryConfig::shipped();
+    let mut twilight_surface_recovery = twilight_defaults.enabled;
+    let mut twilight_surface_recovery_knee = TWILIGHT_SURFACE_RECOVERY_KNEE;
+    let mut twilight_surface_recovery_gamma = TWILIGHT_SURFACE_RECOVERY_GAMMA;
+    let mut twilight_surface_recovery_max_gain = TWILIGHT_SURFACE_RECOVERY_MAX_GAIN;
     let mut multiscatter = true;
     let mut cloud_multiscatter = None;
     let mut beer_powder = false;
@@ -1226,6 +1262,45 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     ));
                 }
             }
+            "twilight-surface-recovery" | "twilight_surface_recovery" => {
+                twilight_surface_recovery = parse_bool(v)?
+            }
+            "twilight-surface-recovery-knee" | "twilight_surface_recovery_knee" => {
+                twilight_surface_recovery_knee = v
+                    .parse()
+                    .map_err(|_| format!("bad twilight-surface-recovery-knee '{v}'"))?;
+                if !twilight_surface_recovery_knee.is_finite()
+                    || !(1.0e-6..=1.0).contains(&twilight_surface_recovery_knee)
+                {
+                    return Err(format!(
+                        "twilight-surface-recovery-knee must be finite and in 1e-6..=1.0, got {twilight_surface_recovery_knee}"
+                    ));
+                }
+            }
+            "twilight-surface-recovery-gamma" | "twilight_surface_recovery_gamma" => {
+                twilight_surface_recovery_gamma = v
+                    .parse()
+                    .map_err(|_| format!("bad twilight-surface-recovery-gamma '{v}'"))?;
+                if !twilight_surface_recovery_gamma.is_finite()
+                    || !(0.05..=1.0).contains(&twilight_surface_recovery_gamma)
+                {
+                    return Err(format!(
+                        "twilight-surface-recovery-gamma must be finite and in 0.05..=1.0, got {twilight_surface_recovery_gamma}"
+                    ));
+                }
+            }
+            "twilight-surface-recovery-max-gain" | "twilight_surface_recovery_max_gain" => {
+                twilight_surface_recovery_max_gain = v
+                    .parse()
+                    .map_err(|_| format!("bad twilight-surface-recovery-max-gain '{v}'"))?;
+                if !twilight_surface_recovery_max_gain.is_finite()
+                    || !(1.0..=4.0).contains(&twilight_surface_recovery_max_gain)
+                {
+                    return Err(format!(
+                        "twilight-surface-recovery-max-gain must be finite and in 1.0..=4.0, got {twilight_surface_recovery_max_gain}"
+                    ));
+                }
+            }
             "multiscatter" | "ms" => multiscatter = parse_bool(v)?,
             "cloud-multiscatter" | "cloud_multiscatter" | "cloud-ms" => {
                 cloud_multiscatter = Some(parse_cloud_multiscatter(v)?)
@@ -1401,6 +1476,10 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         surface_postlight_toe_knee,
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
         multiscatter,
         cloud_multiscatter,
         beer_powder,
@@ -1626,6 +1705,10 @@ fn print_usage() {
          \x20 surface-postlight-toe-knee=<f> reflectance-factor knee (default {SURFACE_POSTLIGHT_TOE_KNEE})\n\
          \x20 surface-postlight-toe-gamma=<f> toe exponent (default {SURFACE_POSTLIGHT_TOE_GAMMA})\n\
          \x20 surface-postlight-toe-max-gain=<f> gain bound (default {SURFACE_POSTLIGHT_TOE_MAX_GAIN})\n\
+         \x20 twilight-surface-recovery=<b> on|off tight low-sun terrain recovery (default on)\n\
+         \x20 twilight-surface-recovery-knee=<f> reflectance-factor knee (default {TWILIGHT_SURFACE_RECOVERY_KNEE})\n\
+         \x20 twilight-surface-recovery-gamma=<f> toe exponent (default {TWILIGHT_SURFACE_RECOVERY_GAMMA})\n\
+         \x20 twilight-surface-recovery-max-gain=<f> gain bound (default {TWILIGHT_SURFACE_RECOVERY_MAX_GAIN})\n\
          \x20 multiscatter=<b>   on | off  legacy compatibility toggle (default on)\n\
          \x20 cloud-multiscatter=<mode> legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b|delta-flux-v3-memory (opt-in)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
@@ -1662,7 +1745,7 @@ fn print_usage() {
          \x20 fov=<deg>          perspective horizontal FOV (default 40)\n\
          \x20 camsize=<WxH>      perspective image dims (default 1280x720)\n\
          \x20 perspective-layer=<b>  on|off cloud-field-only RGBA through the camera\n\
-         \x20 ground-gain=<f>    override shipped 1.0 GROUND LIFT (neutral)\n\
+         \x20 ground-gain=<f>    override shipped 1.10 GROUND LIFT (1.0 = neutral)\n\
          \x20 cloud-softclip=<f> override shipped 0.65 highlight knee (1.0 = disable)\n\
          \x20 cloud-highlight-max=<f> override shipped 1.25 ceiling mapped to white\n\
          \x20 topdown-cloudnorm=<f>  override the top-down cloud normalization (1.0 = none)\n\
@@ -1727,6 +1810,19 @@ mod tests {
             opts.surface_postlight_toe_max_gain,
             SURFACE_POSTLIGHT_TOE_MAX_GAIN
         );
+        assert!(opts.twilight_surface_recovery);
+        assert_eq!(
+            opts.twilight_surface_recovery_knee,
+            TWILIGHT_SURFACE_RECOVERY_KNEE
+        );
+        assert_eq!(
+            opts.twilight_surface_recovery_gamma,
+            TWILIGHT_SURFACE_RECOVERY_GAMMA
+        );
+        assert_eq!(
+            opts.twilight_surface_recovery_max_gain,
+            TWILIGHT_SURFACE_RECOVERY_MAX_GAIN
+        );
         assert!(opts.ground_gain.is_none());
         assert!(opts.cloud_softclip.is_none());
         assert!(opts.cloud_highlight_max.is_none());
@@ -1752,6 +1848,10 @@ mod tests {
         );
         assert_eq!(params.cloud_optics, CloudOpticsMode::Fixed);
         assert_eq!(params.land_appearance, LandAppearanceConfig::shipped());
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::shipped()
+        );
         assert!(params.ground_gain.is_none());
         assert!(params.cloud_softclip.is_none());
         assert!(params.cloud_highlight_max.is_none());
@@ -1946,6 +2046,10 @@ mod tests {
             "surface-postlight-toe-knee=0.18",
             "surface-postlight-toe-gamma=0.8",
             "surface-postlight-toe-max-gain=1.35",
+            "twilight-surface-recovery=on",
+            "twilight-surface-recovery-knee=0.30",
+            "twilight-surface-recovery-gamma=0.50",
+            "twilight-surface-recovery-max-gain=4.0",
         ]);
         assert_eq!(opts.ground_gain, Some(1.6));
         assert_eq!(opts.cloud_softclip, Some(0.65));
@@ -1957,6 +2061,7 @@ mod tests {
         assert_eq!(opts.land_dark_toe_gamma, 0.6);
         assert_eq!(opts.land_dark_toe_max_gain, 1.4);
         assert!(opts.surface_postlight_toe);
+        assert!(opts.twilight_surface_recovery);
 
         let params = render_params(&opts);
         assert_eq!(params.ground_gain, Some(1.6));
@@ -1982,6 +2087,10 @@ mod tests {
                 max_gain: 1.35,
             }
         );
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::shipped()
+        );
     }
 
     #[test]
@@ -1996,6 +2105,16 @@ mod tests {
     }
 
     #[test]
+    fn twilight_surface_recovery_can_be_explicitly_disabled() {
+        let opts = opts_with(&["twilight-surface-recovery=off"]);
+        assert!(!opts.twilight_surface_recovery);
+        assert_eq!(
+            render_params(&opts).twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::off()
+        );
+    }
+
+    #[test]
     fn invalid_land_appearance_values_are_rejected() {
         for arg in [
             "land-sza-max-gain=0.9",
@@ -2005,6 +2124,9 @@ mod tests {
             "surface-postlight-toe-knee=0",
             "surface-postlight-toe-gamma=1.1",
             "surface-postlight-toe-max-gain=nan",
+            "twilight-surface-recovery-knee=0",
+            "twilight-surface-recovery-gamma=1.1",
+            "twilight-surface-recovery-max-gain=nan",
         ] {
             let args = vec![
                 "input=input".to_string(),

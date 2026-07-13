@@ -57,9 +57,10 @@ use crate::ir_enhance::{IrEnhancement, render_ir_rgba};
 use crate::optics::CloudOpticsMode;
 use crate::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePixel, SurfacePostlightToeConfig, WATER_ALBEDO_SCALE,
-    apply_low_sun_illuminant, blend_snow, normals_from_hgt, radiance_to_rgba_softclip,
-    reflectance_from_radiance, shade_surface, snow_fraction, surface_toa_radiance,
+    RHO_HIGHLIGHT_MAX, SurfacePixel, SurfacePostlightToeConfig, TwilightSurfaceRecoveryConfig,
+    WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow, normals_from_hgt,
+    radiance_to_rgba_softclip, reflectance_from_radiance, shade_surface, snow_fraction,
+    surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::{SolarFrame, frame_sun_ecef, sun_enu_and_elevation};
@@ -240,6 +241,7 @@ pub enum RenderIntentAdjustment {
     GroundLiftNeutral,
     LandAppearanceIdentity,
     SurfacePostlightToeOff,
+    TwilightSurfaceRecoveryOff,
     ExposedEdgeFeatherOff,
     GranulationOff,
     TopdownStratiformRegularizationOff,
@@ -261,6 +263,7 @@ impl RenderIntentAdjustment {
             Self::GroundLiftNeutral => "ground lift -> 1.0",
             Self::LandAppearanceIdentity => "land appearance -> identity",
             Self::SurfacePostlightToeOff => "post-lighting surface toe -> off",
+            Self::TwilightSurfaceRecoveryOff => "twilight surface recovery -> off",
             Self::ExposedEdgeFeatherOff => "exposed-domain edge feather -> off",
             Self::GranulationOff => "granulation -> off",
             Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
@@ -347,7 +350,6 @@ pub enum GpuPreviewAdjustment {
     GranulationOff,
     TopdownStratiformRegularizationOff,
     TopdownCloudFootprintOff,
-    SurfacePostlightToeOff,
     ExposedEdgeFeatherOff,
     LegacyCloudTransport,
     ShippedHighlights,
@@ -369,7 +371,6 @@ impl GpuPreviewAdjustment {
             Self::GranulationOff => "granulation -> off",
             Self::TopdownStratiformRegularizationOff => "top-down stratiform reconstruction -> off",
             Self::TopdownCloudFootprintOff => "top-down cloud radiance footprint -> off",
-            Self::SurfacePostlightToeOff => "post-lighting surface toe -> off (GPU unsupported)",
             Self::ExposedEdgeFeatherOff => "exposed-edge feather -> off",
             Self::LegacyCloudTransport => "cloud transport -> legacy octaves",
             Self::ShippedHighlights => "highlight knee/ceiling -> shipped values",
@@ -477,6 +478,9 @@ pub struct RenderParams {
     /// Default-off; water/glint are unchanged and raw reflectance/Sensor Fast Gray force
     /// the identity path.
     pub surface_postlight_toe: SurfacePostlightToeConfig,
+    /// Separate tight low-sun terrain recovery. The shipped visible-display request enables
+    /// it; raw/sensor/thermal/derived/cloud-only product seams remain identity.
+    pub twilight_surface_recovery: TwilightSurfaceRecoveryConfig,
     /// Display exposure gain (visible only). [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
     /// M5 Wrenninge multi-scatter octaves (visible only).
@@ -614,7 +618,8 @@ impl RenderParams {
     /// native resolution, the owner-selected ABI display exposure (with `1.0` retained
     /// as the exact neutral override), multi-scatter + offline steps + clouds + model
     /// cloud fraction with the deterministic two-subcolumn display closure + both land
-    /// visibility corrections + exposed-domain edge feathering on, beer-powder +
+    /// visibility corrections + the owner-selected tight twilight terrain recovery +
+    /// exposed-domain edge feathering on, beer-powder +
     /// granulation off, the seasonal Blue Marble (download on), no sun
     /// override, no IR enhancement, the studio cache dir.
     pub fn new(input: PathBuf) -> Self {
@@ -635,6 +640,7 @@ impl RenderParams {
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::default(),
             surface_postlight_toe: SurfacePostlightToeConfig::default(),
+            twilight_surface_recovery: TwilightSurfaceRecoveryConfig::shipped(),
             exposure: DEFAULT_EXPOSURE,
             multiscatter: true,
             cloud_multiscatter: None,
@@ -1109,6 +1115,10 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
         p.surface_postlight_toe = SurfacePostlightToeConfig::off();
         changes.push(RenderIntentAdjustment::SurfacePostlightToeOff);
     }
+    if !p.twilight_surface_recovery.is_identity() {
+        p.twilight_surface_recovery = TwilightSurfaceRecoveryConfig::off();
+        changes.push(RenderIntentAdjustment::TwilightSurfaceRecoveryOff);
+    }
     if p.feather_exposed_domain_edges {
         p.feather_exposed_domain_edges = false;
         changes.push(RenderIntentAdjustment::ExposedEdgeFeatherOff);
@@ -1195,10 +1205,6 @@ pub fn plan_gpu_preview(
     if p.topdown_cloud_footprint {
         p.topdown_cloud_footprint = false;
         changes.push(GpuPreviewAdjustment::TopdownCloudFootprintOff);
-    }
-    if !p.surface_postlight_toe.is_identity() {
-        p.surface_postlight_toe = SurfacePostlightToeConfig::off();
-        changes.push(GpuPreviewAdjustment::SurfacePostlightToeOff);
     }
     if p.feather_exposed_domain_edges {
         p.feather_exposed_domain_edges = false;
@@ -1384,13 +1390,12 @@ fn render_visible_scene(
         &raster.grid_i,
         &raster.grid_j,
     );
-    // Display-only appearance overrides are deliberately ignored by RgbReflectance.
-    // That product remains the stable pre-tonemap diagnostic even when the same
-    // RenderParams is reused for an RGB A/B render.
+    // Display-only appearance defaults and overrides are deliberately ignored by
+    // RgbReflectance. That product remains the stable pre-tonemap diagnostic even when
+    // the shipped ground calibration is non-neutral or the same RenderParams is reused
+    // for an RGB A/B render.
     if matches!(product, Product::VisibleRgb) {
-        if let Some(g) = params.ground_gain {
-            cfg.ground_day_lift = g;
-        }
+        cfg.ground_day_lift = params.ground_gain.unwrap_or(crate::render::GROUND_DAY_LIFT);
         if let Some(k) = params.cloud_softclip {
             cfg.cloud_softclip_knee = k;
         }
@@ -1400,6 +1405,8 @@ fn render_visible_scene(
         if let Some(n) = params.topdown_cloud_norm {
             cfg.topdown_cloud_norm = n;
         }
+    } else {
+        cfg.ground_day_lift = 1.0;
     }
     let surf = FrameContext {
         luts: &luts,
@@ -1428,6 +1435,11 @@ fn render_visible_scene(
             params.surface_postlight_toe
         } else {
             SurfacePostlightToeConfig::off()
+        },
+        twilight_surface_recovery: if matches!(product, Product::VisibleRgb) {
+            params.twilight_surface_recovery
+        } else {
+            TwilightSurfaceRecoveryConfig::off()
         },
     };
 
@@ -1900,6 +1912,8 @@ fn render_gpu_visible_frame(
             0.0
         },
         land_appearance: params.land_appearance,
+        surface_postlight_toe: params.surface_postlight_toe,
+        twilight_surface_recovery: params.twilight_surface_recovery,
     };
     let surface = gpu::SurfaceFrameInputs {
         width: raster.nx as u32,
@@ -2817,9 +2831,7 @@ fn render_perspective_scene(
     if let Some(m) = params.cloud_highlight_max {
         cfg.cloud_highlight_max = m;
     }
-    if let Some(g) = params.ground_gain {
-        cfg.ground_day_lift = g;
-    }
+    cfg.ground_day_lift = params.ground_gain.unwrap_or(crate::render::GROUND_DAY_LIFT);
     // The frame context: ONE camera — the EYE (the perspective render contract).
     let geo_camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
         .map_err(str::to_string)?;
@@ -2852,6 +2864,11 @@ fn render_perspective_scene(
             SurfacePostlightToeConfig::off()
         } else {
             params.surface_postlight_toe
+        },
+        twilight_surface_recovery: if cloud_layer_only {
+            TwilightSurfaceRecoveryConfig::off()
+        } else {
+            params.twilight_surface_recovery
         },
     };
     let assemble = make_assemble(
@@ -3359,10 +3376,12 @@ fn render_geo_surface_reflectance(
                 let (sx, sy) = raster.model_scan_angle(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = surf.cam.view_dir(sx, sy);
-                let reflectance =
-                    surface_toa_radiance(surf, &pixel, 1.0, crate::render::GROUND_DAY_LIFT)
-                        .map(reflectance_from_radiance)
-                        .unwrap_or([0.0; 3]);
+                // Raw reflectance is a quantitative pre-display product: keep the
+                // whole-surface display lift neutral even when the shipped RGB default
+                // is non-neutral.
+                let reflectance = surface_toa_radiance(surf, &pixel, 1.0, 1.0)
+                    .map(reflectance_from_radiance)
+                    .unwrap_or([0.0; 3]);
                 row.extend_from_slice(&reflectance);
             }
             row
@@ -3700,6 +3719,10 @@ mod tests {
         assert!(p.land_appearance.dark_toe);
         assert!(p.surface_postlight_toe.is_identity());
         assert_eq!(
+            p.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::shipped()
+        );
+        assert_eq!(
             p.cloud_optical_depth_scale,
             clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
@@ -3732,6 +3755,7 @@ mod tests {
             enabled: true,
             ..SurfacePostlightToeConfig::default()
         };
+        requested.twilight_surface_recovery = TwilightSurfaceRecoveryConfig::shipped();
         requested.topdown_shadow_antialias = true;
         requested.synthetic_green = true;
         let before = requested.clone();
@@ -3748,6 +3772,10 @@ mod tests {
             requested.surface_postlight_toe,
             before.surface_postlight_toe
         );
+        assert_eq!(
+            requested.twilight_surface_recovery,
+            before.twilight_surface_recovery
+        );
         assert_eq!(requested.granulation, before.granulation);
         assert!(requested.fractional_clouds);
         assert_eq!(
@@ -3761,6 +3789,7 @@ mod tests {
         assert_eq!(effective.ground_gain, Some(1.0));
         assert_eq!(effective.land_appearance, LandAppearanceConfig::identity());
         assert!(effective.surface_postlight_toe.is_identity());
+        assert!(effective.twilight_surface_recovery.is_identity());
         assert!(!effective.feather_exposed_domain_edges);
         assert_eq!(effective.granulation, Some(false));
         assert!(!effective.topdown_stratiform_regularization);
@@ -3787,6 +3816,7 @@ mod tests {
                 RenderIntentAdjustment::GroundLiftNeutral,
                 RenderIntentAdjustment::LandAppearanceIdentity,
                 RenderIntentAdjustment::SurfacePostlightToeOff,
+                RenderIntentAdjustment::TwilightSurfaceRecoveryOff,
                 RenderIntentAdjustment::ExposedEdgeFeatherOff,
                 RenderIntentAdjustment::GranulationOff,
                 RenderIntentAdjustment::TopdownStratiformRegularizationOff,
@@ -3847,6 +3877,7 @@ mod tests {
             enabled: true,
             ..SurfacePostlightToeConfig::default()
         };
+        requested.twilight_surface_recovery = TwilightSurfaceRecoveryConfig::shipped();
         requested.cloud_softclip = Some(0.8);
         requested.synthetic_green = true;
         requested.topdown_cloud_norm = Some(0.7);
@@ -3867,7 +3898,14 @@ mod tests {
         assert_eq!(effective.granulation, Some(false));
         assert!(!effective.topdown_stratiform_regularization);
         assert!(!effective.topdown_cloud_footprint);
-        assert!(effective.surface_postlight_toe.is_identity());
+        assert_eq!(
+            effective.surface_postlight_toe,
+            requested.surface_postlight_toe
+        );
+        assert_eq!(
+            effective.twilight_surface_recovery,
+            requested.twilight_surface_recovery
+        );
         assert!(!effective.feather_exposed_domain_edges);
         assert_eq!(
             effective.cloud_multiscatter,
@@ -3885,7 +3923,6 @@ mod tests {
             GpuPreviewAdjustment::GranulationOff,
             GpuPreviewAdjustment::TopdownStratiformRegularizationOff,
             GpuPreviewAdjustment::TopdownCloudFootprintOff,
-            GpuPreviewAdjustment::SurfacePostlightToeOff,
             GpuPreviewAdjustment::ExposedEdgeFeatherOff,
             GpuPreviewAdjustment::LegacyCloudTransport,
             GpuPreviewAdjustment::ShippedHighlights,
@@ -4410,6 +4447,34 @@ mod tests {
             bits(&baseline),
             bits(&adjusted),
             "display calibration controls must not mutate raw reflectance bands"
+        );
+    }
+
+    #[test]
+    fn geo_clear_raw_reflectance_is_identical_with_cloud_pipeline_on_or_off() {
+        let src = synthetic_source(16, 16, 16, 3000.0);
+        let mut params = synthetic_params(ViewMode::Geostationary);
+        params.land_appearance = LandAppearanceConfig::identity();
+        params.ground_gain = None;
+
+        params.clouds = true;
+        let through_clear_cloud_scene =
+            render_visible_scene(&src, &params, Product::RgbReflectance)
+                .expect("clear raw bands through cloud-capable path");
+        params.clouds = false;
+        let surface_only = render_visible_scene(&src, &params, Product::RgbReflectance)
+            .expect("clear raw bands through surface-only path");
+
+        let bits = |result: &RenderResult| match &result.data {
+            FrameData::Bands { reflectance } => {
+                reflectance.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            }
+            other => panic!("expected Bands, got {other:?}"),
+        };
+        assert_eq!(
+            bits(&through_clear_cloud_scene),
+            bits(&surface_only),
+            "the non-neutral shipped display lift must never leak into raw reflectance"
         );
     }
 

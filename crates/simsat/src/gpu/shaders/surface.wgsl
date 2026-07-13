@@ -49,7 +49,6 @@ const DESAT_MAX: f32 = 0.55;
 const WV_ABS: vec3<f32> = vec3<f32>(6.0e-6, 1.5e-6, 0.2e-6);
 const WV_H: f32 = 2000.0;
 const SUN_ANG_R: f32 = 4.65e-3;
-const LIMB_DISK_AVG: f32 = 0.832; // 1 - a1/3 - a2/6 (M2 review FINDING 3; was 0.79)
 const STEPS: u32 = 32u;
 const WATER_N: f32 = 1.34; // sea-water refractive index (M3 Cox-Munk glint / Fresnel)
 // True-color calibration (refinement pass; twins of render.rs constants). Daytime
@@ -62,6 +61,10 @@ const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
 const AERIAL_VEIL_ELEV_HI: f32 = 30.0; // WS2: 40 -> 30 (full daytime treatment by 30 deg; twin of render.rs)
 const SURFACE_HELP_ELEV_LO: f32 = 0.0;
 const SURFACE_HELP_ELEV_HI: f32 = 12.0;
+const SURFACE_TWILIGHT_IN_LO: f32 = -6.0;
+const SURFACE_TWILIGHT_IN_HI: f32 = 0.0;
+const SURFACE_TWILIGHT_OUT_LO: f32 = 4.0;
+const SURFACE_TWILIGHT_OUT_HI: f32 = 12.0;
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
 const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
@@ -107,6 +110,8 @@ struct Uniforms {
     p2: vec4<f32>,    // ambient_elev_min, ambient_elev_max, ambient_n, atmosphere_correction
     land0: vec4<f32>, // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
     land1: vec4<f32>, // dark_toe_gamma, dark_toe_max_gain, unused, unused
+    toe0: vec4<f32>,  // enabled, knee, gamma, max_gain (post-view surface toe)
+    twi0: vec4<f32>,  // enabled, knee, gamma, max_gain (tight low-sun recovery)
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -382,6 +387,51 @@ fn land_appearance_gain_gpu(sun_elev: f32, albedo: vec3<f32>) -> f32 {
 }
 // LAND_APPEARANCE_TWIN_END
 
+// Post-light terrain recovery. Both branches consume only the already-lit,
+// view-attenuated LAND contribution and run before additive atmospheric airlight.
+// The established toe retains its daylight gate; the stronger independent recovery
+// uses only the tight -6..+12 degree twilight/low-sun window. Their gains combine by
+// max so enabling both cannot compound them multiplicatively.
+// SURFACE_POSTLIGHT_TOE_TWIN_BEGIN
+fn postlight_dark_gain_gpu(surface: vec3<f32>, config: vec4<f32>) -> f32 {
+    if (config.x <= 0.5) {
+        return 1.0;
+    }
+    let knee = clamp(config.y, 1e-6, 1.0);
+    let gamma = clamp(config.z, 0.05, 1.0);
+    let max_gain = clamp(config.w, 1.0, 4.0);
+    let rho = PI * surface / max(u.solar.xyz, vec3<f32>(1e-6));
+    let y = max(dot(rho, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
+    if (y <= 0.0 || y >= knee || max_gain == 1.0 || gamma == 1.0) {
+        return 1.0;
+    }
+    let power_target = knee * pow(y / knee, gamma);
+    let w = smoothstep(0.0, knee, y);
+    let target_y = power_target * (1.0 - w) + y * w;
+    return clamp(target_y / y, 1.0, max_gain);
+}
+
+fn surface_postlight_toe_gain_gpu(surface: vec3<f32>, sun_elev: f32) -> f32 {
+    let target_gain = postlight_dark_gain_gpu(surface, u.toe0);
+    let weight = smoothstep(SURFACE_HELP_ELEV_LO, SURFACE_HELP_ELEV_HI, sun_elev);
+    return 1.0 + weight * (target_gain - 1.0);
+}
+
+fn twilight_surface_recovery_gain_gpu(surface: vec3<f32>, sun_elev: f32) -> f32 {
+    let target_gain = postlight_dark_gain_gpu(surface, u.twi0);
+    let weight = smoothstep(SURFACE_TWILIGHT_IN_LO, SURFACE_TWILIGHT_IN_HI, sun_elev)
+        * (1.0 - smoothstep(SURFACE_TWILIGHT_OUT_LO, SURFACE_TWILIGHT_OUT_HI, sun_elev));
+    return 1.0 + weight * (target_gain - 1.0);
+}
+
+fn combined_surface_recovery_gain_gpu(surface: vec3<f32>, sun_elev: f32) -> f32 {
+    return max(
+        surface_postlight_toe_gain_gpu(surface, sun_elev),
+        twilight_surface_recovery_gain_gpu(surface, sun_elev),
+    );
+}
+// SURFACE_POSTLIGHT_TOE_TWIN_END
+
 // SUNRISE veil ramp (twin of render::aerial_veil_scale, low-sun visible pass): the full
 // physical veil at/below the terminator gate, smoothly reducing to the daytime de-haze
 // by VEIL_SUNRISE_ELEV_HI and held above (daytime byte-identical: the old ramp also sat
@@ -649,7 +699,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let glint = cox_munk_glint(sun_ecef, to_cam, up_e, cox_munk_mss(0.0) * GLINT_MSS_SCALE) * GLINT_STRENGTH;
         let cos_view = max(dot(to_cam, up_e), 0.0);
         let f_sky = fresnel_unpolarized(cos_view, WATER_N);
-        let l_glint = e_sun * (glint / PI) * t_sun * (disk * LIMB_DISK_AVG);
+        // e_sun is disk-integrated; disk is the finite-disk visibility fraction.
+        let l_glint = e_sun * (glint / PI) * t_sun * disk;
         // WS2 water direct sun (twin of render.rs): the water BODY sees the same
         // physical disk/Tsun/N.L direct term as land. Only the water albedo is retuned
         // toward WATER_ALBEDO_DAY_SCALE across the 0--12 deg surface-help ramp. No cloud
@@ -659,10 +710,10 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if (u.p1.y > 0.0) {
             scale_ratio = 1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
         }
-        let e_direct_w = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG);
+        let e_direct_w = e_sun * t_sun * (disk * ndotl);
         l_surf = albedo * scale_ratio / PI * (e_direct_w + e_ambient) + l_glint + f_sky * (e_ambient / PI);
     } else {
-        let e_direct = e_sun * t_sun * (disk * ndotl * LIMB_DISK_AVG);
+        let e_direct = e_sun * t_sun * (disk * ndotl);
         l_surf = albedo / PI * (e_direct + e_ambient);
         // Finished-visible appearance controls are LAND-only and precede the legacy
         // land gain/aerial veil, matching render::surface_toa_radiance exactly.
@@ -688,7 +739,15 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // in-scatter; the terminator band (<= VEIL_TERMINATOR_ELEV) keeps the full
         // physical veil, daytime keeps the refinement de-haze.
         let veil = select(1.0, aerial_veil_scale(sun_elev), u.p2.w > 0.5);
-        l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
+        if (!is_water && (u.toe0.x > 0.5 || u.twi0.x > 0.5)) {
+            let surface = l_surf * sc.transmittance;
+            l_toa = surface * combined_surface_recovery_gain_gpu(surface, sun_elev)
+                + veil * sc.inscatter;
+        } else {
+            l_toa = l_surf * sc.transmittance + veil * sc.inscatter;
+        }
+    } else if (!is_water && (u.toe0.x > 0.5 || u.twi0.x > 0.5)) {
+        l_toa = l_surf * combined_surface_recovery_gain_gpu(l_surf, sun_elev);
     }
     // Low-sun illuminant correction at the display seam (on-earth pixels only; the
     // off-earth limb above keeps its physical color). Identity outside 2-30 deg.

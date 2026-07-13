@@ -82,6 +82,25 @@ pub const SURFACE_POSTLIGHT_TOE_GAMMA: f64 = 0.80;
 /// Default upper bound for the opt-in post-lighting surface toe.
 pub const SURFACE_POSTLIGHT_TOE_MAX_GAIN: f64 = 1.35;
 
+/// Owner-selected low-sun terrain-recovery parameters used by the shipped visible-display
+/// paths. The explicit [`TwilightSurfaceRecoveryConfig::off`] constructor remains the
+/// identity path for sensor, raw, thermal, derived, and cloud-only products.
+pub const TWILIGHT_SURFACE_RECOVERY_KNEE: f64 = 0.30;
+pub const TWILIGHT_SURFACE_RECOVERY_GAMMA: f64 = 0.50;
+pub const TWILIGHT_SURFACE_RECOVERY_MAX_GAIN: f64 = 4.0;
+
+/// Start/end of the civil-twilight fade-in for the independent post-light surface toe.
+/// This weights a display-side transform of the already-lit surface contribution; it
+/// never adds to the direct-sun irradiance term.
+pub const SURFACE_TWILIGHT_IN_LO_DEG: f64 = -6.0;
+pub const SURFACE_TWILIGHT_IN_HI_DEG: f64 = 0.0;
+
+/// Tight low-sun fade-out for the separate twilight recovery. The owner-selected
+/// branch stays full through +4 degrees and is exact identity by +12 degrees, so the
+/// already-good higher-sun cases remain untouched.
+pub const SURFACE_TWILIGHT_OUT_LO_DEG: f64 = 4.0;
+pub const SURFACE_TWILIGHT_OUT_HI_DEG: f64 = 12.0;
+
 /// Display-only terrain experiment applied to the already-lit, view-attenuated LAND surface
 /// contribution before atmospheric airlight and clouds are composited. It is separate
 /// from [`LandAppearanceConfig`]: this operator responds to the final surface signal,
@@ -111,6 +130,50 @@ impl SurfacePostlightToeConfig {
             knee: SURFACE_POSTLIGHT_TOE_KNEE,
             gamma: SURFACE_POSTLIGHT_TOE_GAMMA,
             max_gain: SURFACE_POSTLIGHT_TOE_MAX_GAIN,
+        }
+    }
+
+    #[inline]
+    pub const fn is_identity(self) -> bool {
+        !self.enabled
+    }
+}
+
+/// Separate low-sun/civil-twilight recovery over the lit, view-attenuated LAND signal.
+/// It deliberately does not retune [`SurfacePostlightToeConfig`], whose established
+/// daylight behavior and parameters remain stable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TwilightSurfaceRecoveryConfig {
+    pub enabled: bool,
+    pub knee: f64,
+    pub gamma: f64,
+    pub max_gain: f64,
+}
+
+impl Default for TwilightSurfaceRecoveryConfig {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl TwilightSurfaceRecoveryConfig {
+    /// Owner-selected shipped visible-display calibration. [`Default`] remains the
+    /// conservative identity constructor so non-display call sites must opt in explicitly.
+    pub const fn shipped() -> Self {
+        Self {
+            enabled: true,
+            knee: TWILIGHT_SURFACE_RECOVERY_KNEE,
+            gamma: TWILIGHT_SURFACE_RECOVERY_GAMMA,
+            max_gain: TWILIGHT_SURFACE_RECOVERY_MAX_GAIN,
+        }
+    }
+
+    pub const fn off() -> Self {
+        Self {
+            enabled: false,
+            knee: TWILIGHT_SURFACE_RECOVERY_KNEE,
+            gamma: TWILIGHT_SURFACE_RECOVERY_GAMMA,
+            max_gain: TWILIGHT_SURFACE_RECOVERY_MAX_GAIN,
         }
     }
 
@@ -318,12 +381,13 @@ pub const LAND_DAY_GAIN: f64 = 1.20;
 /// handled separately by [`CLOUD_SOFTCLIP_KNEE`] + the top-down cloud normalization). It
 /// uses the 0–12 degree surface-help ramp ([`ground_day_lift`]), so it is neutral at/
 /// below the horizon and reaches the requested value by 12 degrees. `1.0` = the
-/// neutral no-op (reproduces the pre-lift ground). The former `1.6` lift compounded
-/// with the land-only gain and display exposure, making terrain brighter than the
-/// visible-satellite references in the v0.1.4 cross-case review. It remains available
-/// through the `render_frame` `ground-gain=` CLI knob and equivalent Python/Studio
-/// controls.
-pub const GROUND_DAY_LIFT: f64 = 1.0;
+/// neutral no-op (reproduces the pre-lift ground). Owner review of the v0.2.1 low-sun
+/// 1974 case selected `1.10`: a restrained surface-only lift that preserves the approved
+/// cloud radiance. The former `1.6` lift compounded with the land-only gain and display
+/// exposure, making terrain brighter than the visible-satellite references in the v0.1.4
+/// cross-case review. The value remains overridable through the `render_frame`
+/// `ground-gain=` CLI knob and equivalent Python/Studio controls.
+pub const GROUND_DAY_LIFT: f64 = 1.10;
 
 /// CLOUD/HIGHLIGHT SOFT-CLIP knee — a Reinhard highlight shoulder applied in
 /// [`radiance_to_rgba`] (the ONE tonemap both the surface pass and the cloud composite
@@ -541,6 +605,9 @@ pub struct FrameContext<'a> {
     /// Optional display-only post-lighting LAND surface toe. Default-off and ignored by
     /// water/glint and raw/sensor products at the high-level API seam.
     pub surface_postlight_toe: SurfacePostlightToeConfig,
+    /// Separate civil-twilight/low-sun terrain recovery. Visible-display entry points use
+    /// the shipped profile; raw/sensor/thermal/derived/cloud-only paths force identity.
+    pub twilight_surface_recovery: TwilightSurfaceRecoveryConfig,
 }
 
 /// One surface pixel's inputs for [`shade_surface`].
@@ -702,6 +769,12 @@ pub fn land_dark_toe_gain(
     gamma: f64,
     max_gain: f64,
 ) -> f64 {
+    let gain = dark_toe_unweighted_gain(albedo, knee, gamma, max_gain);
+    surface_help_ramp(sun_elev_deg, gain)
+}
+
+#[inline]
+fn dark_toe_unweighted_gain(albedo: [f64; 3], knee: f64, gamma: f64, max_gain: f64) -> f64 {
     let knee = if knee.is_finite() {
         knee.clamp(1.0e-6, 1.0)
     } else {
@@ -727,15 +800,32 @@ pub fn land_dark_toe_gain(
     // an overly broad midtone lift while retaining the bounded very-dark recovery.
     let w = atmosphere::smoothstep(0.0, knee, y);
     let target = power_target * (1.0 - w) + y * w;
-    let gain = (target / y).clamp(1.0, max_gain);
-    surface_help_ramp(sun_elev_deg, gain)
+    (target / y).clamp(1.0, max_gain)
+}
+
+/// Independent civil-twilight weight for the post-light surface toe. It fades in from
+/// -6 to 0 degrees, stays fully active through +4 degrees, then fades to exact identity
+/// by +12 degrees. Since this is consumed only after lighting and view attenuation, it
+/// does not create direct sunlight below the horizon.
+#[inline]
+pub fn surface_twilight_weight(sun_elev_deg: f64) -> f64 {
+    atmosphere::smoothstep(
+        SURFACE_TWILIGHT_IN_LO_DEG,
+        SURFACE_TWILIGHT_IN_HI_DEG,
+        sun_elev_deg,
+    ) * (1.0
+        - atmosphere::smoothstep(
+            SURFACE_TWILIGHT_OUT_LO_DEG,
+            SURFACE_TWILIGHT_OUT_HI_DEG,
+            sun_elev_deg,
+        ))
 }
 
 /// Gain for the opt-in post-lighting surface toe. `surface_contribution` is the
 /// already-lit surface radiance after camera/view transmittance but before additive
 /// atmospheric airlight. It is converted to a solar-normalized reflectance factor and
 /// fed through the same smooth, bounded, colour-preserving toe as the established land
-/// correction. The shared daylight ramp keeps night exactly unchanged.
+/// correction. The established daylight activation is retained unchanged.
 #[inline]
 pub fn surface_postlight_toe_gain(
     surface_contribution: [f64; 3],
@@ -750,12 +840,69 @@ pub fn surface_postlight_toe_gain(
         std::f64::consts::PI * surface_contribution[1] / SOLAR_IRRADIANCE_RGB[1],
         std::f64::consts::PI * surface_contribution[2] / SOLAR_IRRADIANCE_RGB[2],
     ];
-    land_dark_toe_gain(
-        rho,
-        sun_elev_deg,
-        config.knee,
-        config.gamma,
-        config.max_gain,
+    let knee = if config.knee.is_finite() {
+        config.knee
+    } else {
+        SURFACE_POSTLIGHT_TOE_KNEE
+    };
+    let gamma = if config.gamma.is_finite() {
+        config.gamma
+    } else {
+        SURFACE_POSTLIGHT_TOE_GAMMA
+    };
+    let max_gain = if config.max_gain.is_finite() {
+        config.max_gain
+    } else {
+        SURFACE_POSTLIGHT_TOE_MAX_GAIN
+    };
+    land_dark_toe_gain(rho, sun_elev_deg, knee, gamma, max_gain)
+}
+
+/// Gain of the separate low-sun terrain recovery. Unlike the established post-light
+/// toe, this branch is weighted only through civil twilight and low sun and is exact
+/// identity again by +12 degrees.
+#[inline]
+pub fn twilight_surface_recovery_gain(
+    surface_contribution: [f64; 3],
+    sun_elev_deg: f64,
+    config: TwilightSurfaceRecoveryConfig,
+) -> f64 {
+    if config.is_identity() {
+        return 1.0;
+    }
+    let rho = [
+        std::f64::consts::PI * surface_contribution[0] / SOLAR_IRRADIANCE_RGB[0],
+        std::f64::consts::PI * surface_contribution[1] / SOLAR_IRRADIANCE_RGB[1],
+        std::f64::consts::PI * surface_contribution[2] / SOLAR_IRRADIANCE_RGB[2],
+    ];
+    let knee = if config.knee.is_finite() {
+        config.knee
+    } else {
+        TWILIGHT_SURFACE_RECOVERY_KNEE
+    };
+    let gamma = if config.gamma.is_finite() {
+        config.gamma
+    } else {
+        TWILIGHT_SURFACE_RECOVERY_GAMMA
+    };
+    let max_gain = if config.max_gain.is_finite() {
+        config.max_gain
+    } else {
+        TWILIGHT_SURFACE_RECOVERY_MAX_GAIN
+    };
+    let target = dark_toe_unweighted_gain(rho, knee, gamma, max_gain);
+    1.0 + surface_twilight_weight(sun_elev_deg) * (target - 1.0)
+}
+
+#[inline]
+pub fn combined_surface_recovery_gain(
+    surface_contribution: [f64; 3],
+    sun_elev_deg: f64,
+    postlight: SurfacePostlightToeConfig,
+    twilight: TwilightSurfaceRecoveryConfig,
+) -> f64 {
+    surface_postlight_toe_gain(surface_contribution, sun_elev_deg, postlight).max(
+        twilight_surface_recovery_gain(surface_contribution, sun_elev_deg, twilight),
     )
 }
 
@@ -807,6 +954,26 @@ pub fn lambert_surface_radiance(
         albedo[0] / pi * (direct_irradiance[0] * mu + ambient_irradiance[0]),
         albedo[1] / pi * (direct_irradiance[1] * mu + ambient_irradiance[1]),
         albedo[2] / pi * (direct_irradiance[2] * mu + ambient_irradiance[2]),
+    ]
+}
+
+/// Direct surface irradiance from the disk-integrated solar bands after atmospheric,
+/// finite-disk, incidence-angle, and shadow attenuation. `SOLAR_IRRADIANCE_RGB` already
+/// integrates the limb-darkened disk, so the full visible disk is normalized to 1.0;
+/// [`atmosphere::LIMB_DARKENING_DISK_AVG`] must not be applied a second time.
+#[inline]
+fn surface_direct_irradiance(
+    e_sun: [f64; 3],
+    t_sun: [f64; 3],
+    disk_visible_fraction: f64,
+    ndotl: f64,
+    shadow: f64,
+) -> [f64; 3] {
+    let scale = disk_visible_fraction * ndotl * shadow;
+    [
+        e_sun[0] * t_sun[0] * scale,
+        e_sun[1] * t_sun[1] * scale,
+        e_sun[2] * t_sun[2] * scale,
     ]
 }
 
@@ -1257,8 +1424,9 @@ pub(crate) fn combine_aerial_veil_with_surface_toe(
     veil: f64,
     sun_elev_deg: f64,
     config: SurfacePostlightToeConfig,
+    twilight: TwilightSurfaceRecoveryConfig,
 ) -> [f64; 3] {
-    if config.is_identity() {
+    if config.is_identity() && twilight.is_identity() {
         return combine_aerial_veil(l_surf, transmittance, inscatter, veil);
     }
     let surface = [
@@ -1266,7 +1434,7 @@ pub(crate) fn combine_aerial_veil_with_surface_toe(
         l_surf[1] * transmittance[1],
         l_surf[2] * transmittance[2],
     ];
-    let gain = surface_postlight_toe_gain(surface, sun_elev_deg, config);
+    let gain = combined_surface_recovery_gain(surface, sun_elev_deg, config, twilight);
     [
         surface[0] * gain + veil * inscatter[0],
         surface[1] * gain + veil * inscatter[1],
@@ -1396,10 +1564,10 @@ pub fn surface_toa_radiance(
         // Cox-Munk wind-ruffled SUN GLINT + Fresnel SKY REFLECTION (M3), replacing the
         // M1 flat dark water (design section 5). Geometry in ECEF using the water
         // point's local up (from the ground intersection); the glint images the
-        // disk-averaged solar disk (LIMB_DARKENING_DISK_AVG, so it is never an
-        // infinitesimal spike — its angular extent comes from the Cox-Munk slope PDF,
-        // widening with wind), attenuated to the surface (t_sun) through the finite-disk
-        // fraction (disk) and any cloud/terrain shadow.
+        // disk-integrated solar irradiance (its angular extent comes from the Cox-Munk
+        // slope PDF, widening with wind), attenuated to the surface (t_sun) through the
+        // finite-disk fraction (disk) and any cloud/terrain shadow. Limb darkening is
+        // already integrated into E_sun and is not applied as a second 0.832 dimming.
         let surf_up = seg
             .map(|(_, t_ground)| norm3(madd3(cam, view, t_ground)))
             .unwrap_or([0.0, 0.0, 1.0]);
@@ -1412,7 +1580,7 @@ pub fn surface_toa_radiance(
             optics::cox_munk_glint_reflectance(sun, to_cam, surf_up, mss) * GLINT_STRENGTH;
         // The specular glint sees the RAW shadow (an occluded solar disk has no mirror
         // image; the CLOUD_SHADOW_FLOOR fill is diffuse-only).
-        let glint_scale = disk * shadow_raw * atmosphere::LIMB_DARKENING_DISK_AVG;
+        let glint_scale = disk * shadow_raw;
         // Fresnel specular sky reflection: the sky colour in the mirror-of-view
         // direction, weighted by the Fresnel reflectance at the view zenith. Uses the
         // SH sky radiance so water reflects the (coloured) sky, not just the sun.
@@ -1443,13 +1611,12 @@ pub fn surface_toa_radiance(
             1.0
         };
         let ndotl = dot(px.normal_enu, px.sun_enu).max(0.0);
+        let e_direct = surface_direct_irradiance(e_sun, t_sun, disk, ndotl, shadow);
         for c in 0..3 {
             let l_glint = glint_rho * e_sun[c] / pi * t_sun[c] * glint_scale;
-            let e_direct =
-                e_sun[c] * t_sun[c] * disk * ndotl * atmosphere::LIMB_DARKENING_DISK_AVG * shadow;
             // Skylight- and sunlight-lit water body (the Blue Marble water texel x the
             // surface-ramped water scale) + the sun glint + the Fresnel sky reflection.
-            l_surf[c] = albedo[c] * scale_ratio / pi * (e_direct + e_ambient[c])
+            l_surf[c] = albedo[c] * scale_ratio / pi * (e_direct[c] + e_ambient[c])
                 + l_glint
                 + f_sky * l_sky[c];
         }
@@ -1457,10 +1624,9 @@ pub fn surface_toa_radiance(
         // Land: Lambertian direct sun (HGT slope N.L, penumbral-shadowed disk) + the
         // aperture-occluded SH ambient. Snow (if any) is already blended into `albedo`.
         let ndotl = dot(px.normal_enu, px.sun_enu).max(0.0);
+        let e_direct = surface_direct_irradiance(e_sun, t_sun, disk, ndotl, shadow);
         for c in 0..3 {
-            let e_direct =
-                e_sun[c] * t_sun[c] * disk * ndotl * atmosphere::LIMB_DARKENING_DISK_AVG * shadow;
-            l_surf[c] = albedo[c] / pi * (e_direct + e_ambient[c]);
+            l_surf[c] = albedo[c] / pi * (e_direct[c] + e_ambient[c]);
         }
 
         // Operational-display corrections for LAND only. Both are scalar
@@ -1510,6 +1676,11 @@ pub fn surface_toa_radiance(
     } else {
         ctx.surface_postlight_toe
     };
+    let twilight_recovery = if px.is_water {
+        TwilightSurfaceRecoveryConfig::off()
+    } else {
+        ctx.twilight_surface_recovery
+    };
     let mut l_toa = l_surf;
     if let Some((t_enter, t_ground)) = seg {
         let p_start = madd3(cam, view, t_enter);
@@ -1541,8 +1712,9 @@ pub fn surface_toa_radiance(
             veil,
             px.sun_elev_deg as f64,
             postlight_toe,
+            twilight_recovery,
         );
-    } else if !postlight_toe.is_identity() {
+    } else if !postlight_toe.is_identity() || !twilight_recovery.is_identity() {
         l_toa = combine_aerial_veil_with_surface_toe(
             l_surf,
             [1.0; 3],
@@ -1550,6 +1722,7 @@ pub fn surface_toa_radiance(
             1.0,
             px.sun_elev_deg as f64,
             postlight_toe,
+            twilight_recovery,
         );
     }
     Some(l_toa)
@@ -1726,7 +1899,7 @@ mod tests {
     #[test]
     fn shipped_visible_display_calibration_is_rc_preset() {
         assert_eq!(DEFAULT_EXPOSURE, 1.5);
-        assert_eq!(GROUND_DAY_LIFT, 1.0);
+        assert_eq!(GROUND_DAY_LIFT, 1.10);
         assert_eq!(CLOUD_SOFTCLIP_KNEE, 0.65);
         assert_eq!(RHO_HIGHLIGHT_MAX, 1.25);
     }
@@ -1782,6 +1955,22 @@ mod tests {
                     "N.L={ndotl}: rho={channel}, expected {expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn disk_integrated_surface_sun_is_unit_normalized_and_keeps_visibility_fraction() {
+        let full = surface_direct_irradiance(SOLAR_IRRADIANCE_RGB, [1.0; 3], 1.0, 1.0, 1.0);
+        assert_eq!(full, SOLAR_IRRADIANCE_RGB);
+
+        let partial = surface_direct_irradiance(SOLAR_IRRADIANCE_RGB, [1.0; 3], 0.5, 0.25, 0.8);
+        for c in 0..3 {
+            assert!((partial[c] - SOLAR_IRRADIANCE_RGB[c] * 0.5 * 0.25 * 0.8).abs() < 1e-12);
+            assert_ne!(
+                full[c],
+                SOLAR_IRRADIANCE_RGB[c] * atmosphere::LIMB_DARKENING_DISK_AVG,
+                "disk-integrated irradiance must not be dimmed by the centre-relative disk average"
+            );
         }
     }
 
@@ -1935,6 +2124,7 @@ mod tests {
             terrain_atmosphere: true,
             land_appearance: LandAppearanceConfig::identity(),
             surface_postlight_toe: SurfacePostlightToeConfig::off(),
+            twilight_surface_recovery: TwilightSurfaceRecoveryConfig::off(),
         };
         (ctx, sun_enu)
     }
@@ -2907,8 +3097,8 @@ mod tests {
         );
         assert_eq!(
             ground_day_lift(90.0, GROUND_DAY_LIFT),
-            1.0,
-            "the shipped ground calibration is neutral"
+            GROUND_DAY_LIFT,
+            "the shipped ground calibration reaches its reviewed daylight lift"
         );
         // Monotone non-decreasing as the sun rises.
         let mut prev = 0.0;
@@ -3040,14 +3230,65 @@ mod tests {
                         gain > 1.0 && gain <= max_gain,
                         "grid gain {gain} outside 1..={max_gain} for {config:?}"
                     );
-                    assert_eq!(
-                        surface_postlight_toe_gain(surface, 0.0, config),
-                        1.0,
-                        "night/horizon must remain identity"
-                    );
+                    assert_eq!(surface_postlight_toe_gain(surface, 0.0, config), 1.0);
+                    assert_eq!(surface_postlight_toe_gain(surface, -6.0, config), 1.0);
+                    assert!(surface_postlight_toe_gain(surface, 28.0, config) > 1.0);
                 }
             }
         }
+    }
+
+    #[test]
+    fn surface_twilight_weight_covers_civil_twilight_and_fades_out_by_12_degrees() {
+        assert_eq!(surface_twilight_weight(-7.0), 0.0);
+        assert_eq!(surface_twilight_weight(-6.0), 0.0);
+        assert!(surface_twilight_weight(-3.0) > 0.0);
+        assert!(surface_twilight_weight(-3.0) < 1.0);
+        assert_eq!(surface_twilight_weight(0.0), 1.0);
+        assert_eq!(surface_twilight_weight(4.0), 1.0);
+        assert!(surface_twilight_weight(8.0) > 0.0);
+        assert!(surface_twilight_weight(8.0) < 1.0);
+        assert_eq!(surface_twilight_weight(12.0), 0.0);
+        assert_eq!(surface_twilight_weight(28.0), 0.0);
+        assert_eq!(surface_twilight_weight(40.0), 0.0);
+    }
+
+    #[test]
+    fn twilight_surface_recovery_config_default_is_off_while_shipped_profile_is_low_sun_only() {
+        let off = TwilightSurfaceRecoveryConfig::default();
+        assert!(off.is_identity());
+        assert_eq!(off.knee, 0.30);
+        assert_eq!(off.gamma, 0.50);
+        assert_eq!(off.max_gain, 4.0);
+        let on = TwilightSurfaceRecoveryConfig::shipped();
+        assert_eq!(
+            on,
+            TwilightSurfaceRecoveryConfig {
+                enabled: true,
+                ..off
+            }
+        );
+        let rho = 0.02;
+        let surface = [
+            rho * SOLAR_IRRADIANCE_RGB[0] / std::f64::consts::PI,
+            rho * SOLAR_IRRADIANCE_RGB[1] / std::f64::consts::PI,
+            rho * SOLAR_IRRADIANCE_RGB[2] / std::f64::consts::PI,
+        ];
+        assert_eq!(twilight_surface_recovery_gain(surface, -6.0, on), 1.0);
+        assert!(twilight_surface_recovery_gain(surface, -3.0, on) > 1.0);
+        assert!(twilight_surface_recovery_gain(surface, 0.0, on) > 1.0);
+        assert_eq!(twilight_surface_recovery_gain(surface, 12.0, on), 1.0);
+        assert_eq!(twilight_surface_recovery_gain(surface, 28.0, on), 1.0);
+        assert_eq!(twilight_surface_recovery_gain(surface, 40.0, on), 1.0);
+        let legacy = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
+        assert_eq!(
+            combined_surface_recovery_gain(surface, 4.0, legacy, on),
+            surface_postlight_toe_gain(surface, 4.0, legacy)
+                .max(twilight_surface_recovery_gain(surface, 4.0, on))
+        );
     }
 
     #[test]
@@ -3066,8 +3307,15 @@ mod tests {
             l_surf[2] * trans[2],
         ];
         let gain = surface_postlight_toe_gain(surface, 20.0, config);
-        let adjusted =
-            combine_aerial_veil_with_surface_toe(l_surf, trans, inscatter, veil, 20.0, config);
+        let adjusted = combine_aerial_veil_with_surface_toe(
+            l_surf,
+            trans,
+            inscatter,
+            veil,
+            20.0,
+            config,
+            TwilightSurfaceRecoveryConfig::off(),
+        );
         for c in 0..3 {
             assert!((adjusted[c] - (surface[c] * gain + veil * inscatter[c])).abs() < 1e-12);
         }
@@ -3079,6 +3327,7 @@ mod tests {
                 veil,
                 20.0,
                 SurfacePostlightToeConfig::off(),
+                TwilightSurfaceRecoveryConfig::off(),
             ),
             combine_aerial_veil(l_surf, trans, inscatter, veil),
             "disabled experiment must preserve the established composite exactly"
@@ -3086,14 +3335,14 @@ mod tests {
     }
 
     #[test]
-    fn surface_postlight_toe_brightens_land_only_and_preserves_ocean_glint() {
-        let (mut ctx, sun) = nadir_surface_pixel(25.0);
+    fn postlight_and_twilight_recovery_brighten_land_only_and_preserve_ocean_glint() {
+        let (mut ctx, sun) = nadir_surface_pixel(4.0);
         let pixel = |is_water| SurfacePixel {
             on_earth: true,
             base_srgb: [0.08, 0.10, 0.06],
             normal_enu: [0.0, 0.0, 1.0],
             sun_enu: [sun[0] as f32, sun[1] as f32, sun[2] as f32],
-            sun_elev_deg: 25.0,
+            sun_elev_deg: 4.0,
             is_water,
             view_dir: nadir_view(),
             wind_speed: 5.0,
@@ -3106,6 +3355,7 @@ mod tests {
             enabled: true,
             ..SurfacePostlightToeConfig::default()
         };
+        ctx.twilight_surface_recovery = TwilightSurfaceRecoveryConfig::shipped();
         let land_adjusted = surface_toa_radiance(&ctx, &pixel(false), 1.0, 1.0).unwrap();
         let water_adjusted = surface_toa_radiance(&ctx, &pixel(true), 1.0, 1.0).unwrap();
         assert!(sum(land_adjusted) > sum(land_base));

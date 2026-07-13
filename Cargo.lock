@@ -4949,7 +4949,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simsat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "eframe",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "simsat_studio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "find-msvc-tools",

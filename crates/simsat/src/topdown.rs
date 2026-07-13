@@ -100,6 +100,7 @@ fn frame_ctx_with_camera<'a>(base: &FrameContext<'a>, camera: [f64; 3]) -> Frame
         terrain_atmosphere: base.terrain_atmosphere,
         land_appearance: base.land_appearance,
         surface_postlight_toe: base.surface_postlight_toe,
+        twilight_surface_recovery: base.twilight_surface_recovery,
     }
 }
 
@@ -605,8 +606,9 @@ pub fn render_topdown_frame_reflectance(
             for px in 0..nx {
                 // The RAW-bands product is physical: no top-down cloud normalization
                 // (target 1.0 = neutral) and NO low-sun illuminant correction (that is
-                // display-side). The ground lift lives in `surface_toa_radiance`
-                // and applies to the reflectance too (like the existing LAND_DAY_GAIN).
+                // display-side). High-level raw-product assembly supplies the neutral
+                // low-level MarchConfig/FrameContext ground lift; an explicitly customized
+                // low-level scene remains caller-owned.
                 if let Some((l, _sun_elev)) =
                     topdown_pixel_radiance(surf, scene, lat, lon, nx, px, py, &assemble, 1.0)
                 {
@@ -1323,6 +1325,7 @@ mod tests {
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
             surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
+            twilight_surface_recovery: crate::render::TwilightSurfaceRecoveryConfig::off(),
         }
     }
 
@@ -1566,6 +1569,9 @@ mod tests {
         let mut clear_cfg = MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m());
         // This test owns an analytic slab; do not inherit the product appearance scale.
         clear_cfg.cloud_optical_depth_scale = 1.0;
+        // Finished display assembly explicitly gives the cloud and surface paths the
+        // same reviewed ground calibration.
+        clear_cfg.ground_day_lift = surf.ground_day_lift;
         let scene = CloudScene {
             vol: &vol,
             mip: &mip,
@@ -1625,7 +1631,10 @@ mod tests {
             luts: &luts,
             sky_sh: &sky_sh,
             sun_ecef,
-            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+            cfg: MarchConfig {
+                ground_day_lift: surf.ground_day_lift,
+                ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+            },
         };
         let cloudy =
             render_topdown_frame_rgba(&surf, Some(&scene), &map.lat, &map.lon, nx, ny, assemble);
@@ -1652,7 +1661,9 @@ mod tests {
         let luts = AtmosphereLuts::build(&params);
         let sky_sh = SkyShTable::build(&luts, &params, 16);
         let sun_ecef = sun_enu_to_ecef([0.0, 0.0, 1.0], 45.0, -100.0);
-        let surf = overhead_surf(&luts, &params, &sky_sh, sun_ecef);
+        let mut surf = overhead_surf(&luts, &params, &sky_sh, sun_ecef);
+        // Raw reflectance owns the neutral display-ground seam.
+        surf.ground_day_lift = 1.0;
         let assemble = |_px: usize, _py: usize| SurfacePixel {
             on_earth: true,
             base_srgb: [FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB, FLAT_ALBEDO_SRGB],
@@ -2069,7 +2080,10 @@ mod tests {
             luts: &luts,
             sky_sh: &sky_sh,
             sun_ecef,
-            cfg: MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m()),
+            cfg: MarchConfig {
+                ground_day_lift: surf.ground_day_lift,
+                ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+            },
         };
         let with_clear = render_perspective_frame_rgba(
             &surf,

@@ -44,7 +44,7 @@ use crate::fractional_clouds::{
 };
 use crate::frame::GridGeoref;
 use crate::render::{
-    CLOUD_SOFTCLIP_KNEE, FrameContext, GROUND_DAY_LIFT, SurfacePixel,
+    CLOUD_SOFTCLIP_KNEE, FrameContext, SurfacePixel,
     radiance_to_rgba_softclip_with_synthetic_green, surface_toa_radiance,
 };
 
@@ -182,16 +182,11 @@ fn multiscatter_thin_gate(tau: f64) -> f64 {
     1.0 - (-tau.max(0.0)).exp()
 }
 
-// LIMB-DARKENING NOTE (WS1 march-physics decision, recorded next to the octave
-// calibration it belongs to): the SURFACE direct-sun term dims by the disk-averaged
-// Hestroffer-Magnan factor `atmosphere::LIMB_DARKENING_DISK_AVG = 0.832`; the CLOUD
-// sun term below does NOT apply it. Applying it now would be a uniform -17% on every
-// sunlit cloud — a LOOK change to the owner-approved M5 brilliance that needs an
-// orchestrator visual round, not a silent physics landing. The omission is absorbed
-// by the octave brightness calibration (`OCTAVE_BRIGHTNESS_SCALE` and the 0.5-0.9
-// anvil reflectance target were tuned WITHOUT the factor), so current behavior is a
-// documented CALIBRATION choice, kept; flagged to the orchestrator for a future
-// cloud/surface consistency look-round.
+// LIMB-DARKENING NOTE: `SOLAR_IRRADIANCE_RGB` is disk-integrated irradiance, so neither
+// clouds nor surfaces multiply it by the centre-relative Hestroffer-Magnan disk average
+// (`LIMB_DARKENING_DISK_AVG`). That average belongs only in a conversion from a
+// centre-normalized resolved solar-disk profile. Geometric finite-disk visibility is
+// still applied independently at each sample.
 
 // ── domain/margin edge feather (zoom-out appearance pass) ─────────────────────
 //
@@ -3006,9 +3001,11 @@ pub struct MarchConfig {
     pub topdown_shadow_antialias: bool,
     /// GROUND LIFT (top-down/basemap appearance pass, [`crate::render::GROUND_DAY_LIFT`]):
     /// the sun-gated daytime surface-brightness lift passed to
-    /// [`crate::render::surface_toa_radiance`] by the cloud/top-down composite. Default =
-    /// the baked `GROUND_DAY_LIFT`; the `render_frame` `ground-gain=` knob overrides it.
-    /// `1.0` = neutral no-op.
+    /// [`crate::render::surface_toa_radiance`] by the cloud/top-down composite. The
+    /// low-level [`MarchConfig::new`] default is the neutral `1.0`; finished-display
+    /// assemblers inject the shipped [`crate::render::GROUND_DAY_LIFT`] or the explicit
+    /// `render_frame` `ground-gain=` override. This keeps direct raw-reflectance helpers
+    /// quantitative by default.
     pub ground_day_lift: f64,
     /// CLOUD/HIGHLIGHT SOFT-CLIP knee ([`crate::render::CLOUD_SOFTCLIP_KNEE`]): the
     /// Reinhard highlight shoulder knee the cloud/top-down RGB tonemap
@@ -3075,10 +3072,11 @@ impl MarchConfig {
             transmittance_floor: 0.003,
             cloud_optical_depth_scale: DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             topdown_shadow_antialias: false,
-            // Appearance-pass baked defaults (the studio's `..MarchConfig::new()` inherits
-            // these; the render_frame CLI knobs override them). Edge feather off by default
-            // (activated only by a zoom-out margin, via `edge_feather_cells_for_margin`).
-            ground_day_lift: GROUND_DAY_LIFT,
+            // The ground lift is display-only, so the low-level march starts neutral.
+            // Finished-display API/Studio assemblers inject GROUND_DAY_LIFT (or an
+            // explicit override). Other appearance defaults remain baked here. Edge
+            // feather stays off until the render assembly supplies a domain-edge band.
+            ground_day_lift: 1.0,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             synthetic_green: false,
@@ -4663,6 +4661,10 @@ mod tests {
     fn visible_cloud_optical_depth_scale_defaults_shipped_and_is_bounded() {
         let cfg = MarchConfig::new(StepQuality::Offline, 250.0);
         assert_eq!(
+            cfg.ground_day_lift, 1.0,
+            "low-level march defaults must not inject a display-only ground lift"
+        );
+        assert_eq!(
             cfg.cloud_optical_depth_scale,
             DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
@@ -5486,7 +5488,7 @@ mod tests {
             flat_albedo_srgb: 0.5,
             raymarch_steps: 8,
             exposure: 1.0,
-            ground_day_lift: GROUND_DAY_LIFT,
+            ground_day_lift: crate::render::GROUND_DAY_LIFT,
             cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
             cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
             synthetic_green: false,
@@ -5494,6 +5496,7 @@ mod tests {
             terrain_atmosphere: true,
             land_appearance: crate::render::LandAppearanceConfig::identity(),
             surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
+            twilight_surface_recovery: crate::render::TwilightSurfaceRecoveryConfig::off(),
         };
         let rnx = raster.nx;
         let lat = raster.lat.clone();
@@ -5602,7 +5605,7 @@ mod tests {
                 flat_albedo_srgb: 0.5,
                 raymarch_steps: 8,
                 exposure,
-                ground_day_lift: GROUND_DAY_LIFT,
+                ground_day_lift: crate::render::GROUND_DAY_LIFT,
                 cloud_softclip_knee: CLOUD_SOFTCLIP_KNEE,
                 cloud_highlight_max: crate::render::RHO_HIGHLIGHT_MAX,
                 synthetic_green: false,
@@ -5610,6 +5613,7 @@ mod tests {
                 terrain_atmosphere: true,
                 land_appearance: crate::render::LandAppearanceConfig::identity(),
                 surface_postlight_toe: crate::render::SurfacePostlightToeConfig::off(),
+                twilight_surface_recovery: crate::render::TwilightSurfaceRecoveryConfig::off(),
             };
             render_cloud_frame_rgba(&scene, &surf, &froxel, &raster, &assemble)
         };

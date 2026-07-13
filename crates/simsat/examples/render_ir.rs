@@ -21,7 +21,7 @@
 //!                       native = one output pixel per source grid cell. ABI 1/2 km are
 //!                       output sampling choices and may upsample coarse or downsample fine data.
 //!   enhancement=<name>  natural | cimss | bd | avn | funktop | rainbow | gray
-//!                       (default natural for Band 13; cimss for a WV band)
+//!                       (default cimss for Band 13 and WV)
 //!   wv=<band>           6.2 | 6.9 | 7.3  — render a WATER-VAPOR band instead of the
 //!                       10.3 um window (band 13). Thermal either way.
 //!   derived=<field>     pw | ctt | cod  — render a DERIVED scalar-field MAP (precipitable
@@ -346,7 +346,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
     let mut margin = 0.0f64;
-    let mut enhancement = IrEnhancement::Natural;
+    let mut enhancement = IrEnhancement::default();
     let mut cache = simsat::ingest::default_cache_dir();
     let mut view = ViewMode::Geostationary;
     let mut canvas: Option<(usize, usize)> = None;
@@ -422,9 +422,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             other => return Err(format!("unknown key '{other}'")),
         }
     }
-    // For a WV band the default remains CIMSS (the classic WV moisture palette); the
-    // 10.3 um window uses the NOAA heritage Natural grayscale. An explicit enhancement=
-    // wins either way.
+    // WV uses CIMSS as its classic moisture palette. Band 13 also ships with the
+    // owner-selected CIMSS Style default. An explicit enhancement= wins either way.
     if wv.is_some() && !enhancement_explicit {
         enhancement = IrEnhancement::Cimss;
     }
@@ -531,7 +530,7 @@ fn print_usage() {
          \x20                     upsample coarse or downsample fine model grids\n\
          \x20 margin=<frac>       zoom-out margin fraction on each side (default 0.0; thermal margin = no-data)\n\
          \x20 enhancement=<name>  natural|cimss|bd|avn|funktop|rainbow|gray\n\
-         \x20                     (default natural for Band 13; cimss for WV)\n\
+         \x20                     (default cimss for Band 13 and WV)\n\
          \x20 sensor=<response>   fast-gray (default) | goes-r-abi-band13-fm4 (official NOAA SRF)\n\
          \x20 instrument-footprint=<mode> off (default) | goes-r-abi-band13-mtf-prototype; exact global 56-urad lattice (requires FM4 + GOES-R exact nav + geo ABI2km)\n\
          \x20 wv=<band>           6.2|6.9|7.3  render a water-vapor band (else band 13)\n\
@@ -563,12 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn band13_defaults_natural_while_water_vapor_stays_cimss() {
+    fn band13_and_water_vapor_default_cimss_while_explicit_natural_is_preserved() {
         let base = vec!["input=input".to_string(), "out=out.png".to_string()];
-        assert_eq!(
-            parse_opts(&base).unwrap().enhancement,
-            IrEnhancement::Natural
-        );
+        assert_eq!(parse_opts(&base).unwrap().enhancement, IrEnhancement::Cimss);
 
         let mut wv = base.clone();
         wv.push("wv=6.2".to_string());

@@ -1,7 +1,8 @@
-# Post-lighting terrain toe experiment
+# Post-lighting terrain recovery controls
 
-This branch exposes a default-off, finished-display experiment for low-sun terrain.
-It does not change any shipped preset.
+The broad post-light surface toe remains a default-off finished-display experiment.
+The separately gated twilight recovery has completed owner cross-case review and is now
+part of the shipped finished-visible preset.
 
 The operator is applied only to the LAND surface contribution after direct and ambient
 lighting and camera/view transmittance, but before additive atmospheric airlight and the
@@ -25,6 +26,14 @@ gain `1.25/1.35/1.45`. These are experiment coordinates, not calibration claims.
 
 The Rust `RenderParams`, `SurfacePostlightToeConfig`, headless `render_frame` CLI,
 Python visible-family functions, and persisted Studio controls carry the same state.
-Sensor Fast Gray forces the operator off and records an intent substitution. The
-current GPU preview has no shader twin: manual GPU routes an enabled request to CPU,
-while one-click/API GPU preview temporarily forces it off and reports that substitution.
+Sensor Fast Gray forces the operator off and records an intent substitution. CPU and
+GPU visible paths share the same sanitized controls, land-only placement, and bounded
+math, so GPU preview preserves an enabled request without a compatibility substitution.
+
+A separate default-on-for-visible `twilight-surface-recovery` /
+`twilight_surface_recovery` control uses the owner-selected D controls
+(`0.30 / 0.50 / 4.0`) and a tight gate:
+fade in from -6 to 0 degrees, remain full through +4, and fade to exact identity at +12.
+When both experiments are enabled, their gains combine by maximum rather than multiply.
+The switch and all three parameters remain exposed in Rust, the CLI, Python, and Studio.
+Sensor QA, raw reflectance, thermal, derived, and cloud-only products force identity.

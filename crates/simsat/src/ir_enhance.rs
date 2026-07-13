@@ -41,19 +41,19 @@
 use rw_sat::palette::{Anchors, anchor_color, band_anchors};
 
 /// User-selectable IR enhancement for Kelvin brightness-temperature bands (ABI /
-/// AHI bands 7-16). [`Natural`](Self::Natural) is the recommended longwave-window
-/// display: NOAA's continuous heritage 8-bit bi-linear grayscale. `Cimss` keeps the
-/// legacy per-band production behaviour ([`ENHANCED_IR`] on the longwave window
-/// 13-15, production palettes elsewhere); the other legacy choices are analysis
-/// palettes whose temperature bands or hard thresholds are intentional.
+/// AHI bands 7-16). [`Cimss`](Self::Cimss) is the shipped longwave-window display:
+/// false-color isotherm bands via [`ENHANCED_IR`] on bands 13-15 and the established
+/// production palettes elsewhere. [`Natural`](Self::Natural) retains NOAA's continuous
+/// heritage 8-bit bi-linear grayscale; the other choices are analysis palettes whose
+/// temperature bands or hard thresholds are intentional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IrEnhancement {
-    /// NOAA heritage continuous bi-linear longwave-IR grayscale (recommended).
-    /// Water-vapor bands retain their existing band-scaled grayscale ranges.
+    /// CIMSS-style false colour on 13-15, production palettes elsewhere (recommended).
     #[default]
-    Natural,
-    /// CIMSS-style false colour on 13-15, production palettes elsewhere.
     Cimss,
+    /// NOAA heritage continuous bi-linear longwave-IR grayscale.
+    /// Water-vapor bands retain their existing band-scaled grayscale ranges.
+    Natural,
     /// NESDIS BD curve — the stepped Dvorak tropical-cyclone enhancement.
     Bd,
     /// NOAA/SSD AVN colour IR enhancement.
@@ -71,8 +71,8 @@ pub enum IrEnhancement {
 impl IrEnhancement {
     /// All enhancements in UI order.
     pub const ALL: [IrEnhancement; 7] = [
-        Self::Natural,
         Self::Cimss,
+        Self::Natural,
         Self::Bd,
         Self::Avn,
         Self::Funktop,
@@ -96,8 +96,8 @@ impl IrEnhancement {
     /// Human-readable label for the picker.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Natural => "Natural (NOAA heritage) — Recommended",
-            Self::Cimss => "CIMSS-style false color (isotherm bands)",
+            Self::Cimss => "CIMSS Style (false-color isotherm bands) — Recommended",
+            Self::Natural => "Natural (NOAA heritage grayscale)",
             Self::Bd => "BD stepped thresholds (Dvorak)",
             Self::Avn => "AVN stepped analysis palette",
             Self::Funktop => "Funktop stepped analysis palette",
@@ -352,13 +352,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enhancement_slugs_round_trip_and_default_is_natural() {
+    fn enhancement_slugs_round_trip_and_default_is_cimss() {
         for e in IrEnhancement::ALL {
             assert_eq!(IrEnhancement::parse(e.slug()), e, "slug {} lost", e.slug());
         }
-        assert_eq!(IrEnhancement::default(), IrEnhancement::Natural);
+        assert_eq!(IrEnhancement::default(), IrEnhancement::Cimss);
         // The LENIENT parse keeps its pinned total behavior (simsat_py wraps it).
-        assert_eq!(IrEnhancement::parse("nonsense"), IrEnhancement::Natural);
+        assert_eq!(IrEnhancement::parse("nonsense"), IrEnhancement::Cimss);
     }
 
     #[test]

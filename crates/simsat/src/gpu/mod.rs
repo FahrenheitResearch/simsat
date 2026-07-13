@@ -26,7 +26,10 @@ use crate::frame::{GridGeoref, MapProjection};
 use crate::optics::EARTH_RADIUS_M;
 use crate::render::{
     FLAT_ALBEDO_SRGB, LAND_DARK_TOE_GAMMA, LAND_DARK_TOE_KNEE, LAND_DARK_TOE_MAX_GAIN,
-    LAND_SZA_MAX_GAIN, LandAppearanceConfig,
+    LAND_SZA_MAX_GAIN, LandAppearanceConfig, SURFACE_POSTLIGHT_TOE_GAMMA,
+    SURFACE_POSTLIGHT_TOE_KNEE, SURFACE_POSTLIGHT_TOE_MAX_GAIN, SurfacePostlightToeConfig,
+    TWILIGHT_SURFACE_RECOVERY_GAMMA, TWILIGHT_SURFACE_RECOVERY_KNEE,
+    TWILIGHT_SURFACE_RECOVERY_MAX_GAIN, TwilightSurfaceRecoveryConfig,
 };
 use crate::solar::SolarFrame;
 
@@ -237,7 +240,7 @@ pub struct SurfaceResources {
 }
 
 /// The packed per-frame uniform (design section 3/6, M2). Mirrors the WGSL
-/// `Uniforms` (11 vec4 = 176 bytes). Built on the CPU from the camera geometry,
+/// `Uniforms` (13 vec4 = 208 bytes). Built on the CPU from the camera geometry,
 /// scan grid, sun, atmosphere params, and the output transform.
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceUniforms {
@@ -280,6 +283,10 @@ pub struct SurfaceUniforms {
     pub atmosphere_correction: f32,
     /// Finished-visible land appearance controls shared by both visible GPU paths.
     pub land_appearance: LandAppearanceConfig,
+    /// Post-light terrain toe applied after view transmittance and before airlight.
+    pub surface_postlight_toe: SurfacePostlightToeConfig,
+    /// Separate tightly gated civil-twilight/low-sun surface recovery.
+    pub twilight_surface_recovery: TwilightSurfaceRecoveryConfig,
 }
 
 /// Sanitize and pack the two land-appearance quads shared by both visible WGSL paths.
@@ -320,11 +327,61 @@ pub fn land_appearance_uniform_quads(config: LandAppearanceConfig) -> [[f32; 4];
     ]
 }
 
+/// Sanitize and pack the post-light surface toe shared by both visible WGSL paths.
+/// The first lane is the exact on/off switch; the remaining lanes mirror the CPU
+/// finite fallbacks and evaluation clamps before the f64 -> f32 upload.
+pub fn surface_postlight_toe_uniform_quad(config: SurfacePostlightToeConfig) -> [f32; 4] {
+    let SurfacePostlightToeConfig {
+        enabled,
+        knee,
+        gamma,
+        max_gain,
+    } = config;
+    let finite_clamped = |value: f64, fallback: f64, lo: f64, hi: f64| {
+        (if value.is_finite() {
+            value.clamp(lo, hi)
+        } else {
+            fallback
+        }) as f32
+    };
+    [
+        if enabled { 1.0 } else { 0.0 },
+        finite_clamped(knee, SURFACE_POSTLIGHT_TOE_KNEE, 1.0e-6, 1.0),
+        finite_clamped(gamma, SURFACE_POSTLIGHT_TOE_GAMMA, 0.05, 1.0),
+        finite_clamped(max_gain, SURFACE_POSTLIGHT_TOE_MAX_GAIN, 1.0, 4.0),
+    ]
+}
+
+/// Sanitize and pack the independent low-sun recovery controls.
+pub fn twilight_surface_recovery_uniform_quad(config: TwilightSurfaceRecoveryConfig) -> [f32; 4] {
+    let TwilightSurfaceRecoveryConfig {
+        enabled,
+        knee,
+        gamma,
+        max_gain,
+    } = config;
+    let finite_clamped = |value: f64, fallback: f64, lo: f64, hi: f64| {
+        (if value.is_finite() {
+            value.clamp(lo, hi)
+        } else {
+            fallback
+        }) as f32
+    };
+    [
+        if enabled { 1.0 } else { 0.0 },
+        finite_clamped(knee, TWILIGHT_SURFACE_RECOVERY_KNEE, 1.0e-6, 1.0),
+        finite_clamped(gamma, TWILIGHT_SURFACE_RECOVERY_GAMMA, 0.05, 1.0),
+        finite_clamped(max_gain, TWILIGHT_SURFACE_RECOVERY_MAX_GAIN, 1.0, 4.0),
+    ]
+}
+
 impl SurfaceUniforms {
-    /// The 11 packed vec4s of the WGSL surface `Uniforms`. The first nine retain the
-    /// historical surface/cloud ABI; the two land-control quads are shared explicitly.
-    pub fn to_vec4s(&self) -> [[f32; 4]; 11] {
+    /// The 13 packed vec4s of the WGSL surface `Uniforms`. The first nine retain the
+    /// historical surface/cloud ABI; the appearance quads are shared explicitly.
+    pub fn to_vec4s(&self) -> [[f32; 4]; 13] {
         let land = land_appearance_uniform_quads(self.land_appearance);
+        let postlight = surface_postlight_toe_uniform_quad(self.surface_postlight_toe);
+        let twilight = twilight_surface_recovery_uniform_quad(self.twilight_surface_recovery);
         [
             [self.cam[0], self.cam[1], self.cam[2], self.r_ground],
             [self.sun[0], self.sun[1], self.sun[2], self.r_top],
@@ -347,13 +404,15 @@ impl SurfaceUniforms {
             ],
             land[0],
             land[1],
+            postlight,
+            twilight,
         ]
     }
 
-    /// Pack into the 176-byte uniform buffer the WGSL `Uniforms` expects (11 vec4).
-    pub fn to_bytes(&self) -> [u8; 176] {
+    /// Pack into the 208-byte uniform buffer the WGSL `Uniforms` expects (13 vec4).
+    pub fn to_bytes(&self) -> [u8; 208] {
         let vec4s = self.to_vec4s();
-        let mut out = [0u8; 176];
+        let mut out = [0u8; 208];
         for (i, v) in vec4s.iter().flatten().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -524,7 +583,7 @@ impl SurfaceResources {
     ) -> RenderedFrame {
         let (w, h) = (inputs.width.max(1), inputs.height.max(1));
 
-        // The 176-byte packed uniform (surface physics + land appearance controls).
+        // The 208-byte packed uniform (surface physics + appearance controls).
         let uniform_bytes = inputs.uniforms.to_bytes();
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("simsat-surface-uniforms"),
@@ -1490,10 +1549,10 @@ pub struct CloudFrameInputs<'a> {
     pub scan_rect: [f32; 4],
 }
 
-/// The 28 packed vec4s of the WGSL cloud `Uniforms` (the historical surface 9, the
-/// cloud 16, shared land-appearance 2, then the camera-ray selector), in declaration order. Kept as a
-/// pure function so the layout is unit-testable on the headless nodes.
-pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 28] {
+/// The 30 packed vec4s of the WGSL cloud `Uniforms` (the historical surface 9, the
+/// cloud 16, shared appearance 4, then the camera-ray selector), in declaration order.
+/// Kept as a pure function so the layout is unit-testable on the headless nodes.
+pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 30] {
     let s = inputs.surface.uniforms.to_vec4s();
     let m = &inputs.march;
     let so = &inputs.sun_od;
@@ -1555,10 +1614,12 @@ pub fn cloud_uniform_quads(inputs: &CloudFrameInputs) -> [[f32; 4]; 28] {
             m.ground_day_lift,
             crate::clouds::validated_cloud_optical_depth_scale(m.cloud_optical_depth_scale),
         ],
-        // land0/land1: exact twins of the clear-surface land controls. Appended to
-        // preserve every historical cloud-uniform offset above.
+        // land0/land1/toe0/twi0: exact twins of the clear-surface appearance controls.
+        // Appended to preserve every historical cloud-uniform offset above.
         s[9],
         s[10],
+        s[11],
+        s[12],
         // ray0: view-mode tag, Top-down synthetic camera radius, shadow-AA flag, reserved.
         [
             inputs.view_mode.shader_tag(),
@@ -1985,7 +2046,7 @@ impl CloudPassResources {
             }
         };
 
-        // The 448-byte packed cloud uniform.
+        // The 480-byte packed cloud uniform.
         let quads = cloud_uniform_quads(inputs);
         let uniform_bytes = quads_to_bytes(&quads);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2643,7 +2704,7 @@ mod tests {
         let mut inputs = test_cloud_inputs(test_surface_uniforms());
         inputs.view_mode = CloudViewMode::TopDownNadir;
         let quads = cloud_uniform_quads(&inputs);
-        assert_eq!(quads[27][0], 1.0);
+        assert_eq!(quads[29][0], 1.0);
         assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
         assert_eq!(quads[24], [32.0, 3.2, 2.0, 0.75]);
     }
@@ -2802,6 +2863,18 @@ mod tests {
             ambient_n: 48.0,
             atmosphere_correction: 1.0,
             land_appearance: LandAppearanceConfig::identity(),
+            surface_postlight_toe: SurfacePostlightToeConfig {
+                enabled: true,
+                knee: 0.2,
+                gamma: 0.8,
+                max_gain: 1.5,
+            },
+            twilight_surface_recovery: TwilightSurfaceRecoveryConfig {
+                enabled: true,
+                knee: 0.3,
+                gamma: 0.5,
+                max_gain: 4.0,
+            },
         }
     }
 
@@ -2887,7 +2960,7 @@ mod tests {
     fn cloud_uniform_quads_pack_the_wgsl_layout() {
         let inputs = test_cloud_inputs(test_surface_uniforms());
         let quads = cloud_uniform_quads(&inputs);
-        assert_eq!(quads.len(), 28);
+        assert_eq!(quads.len(), 30);
         // The first 9 quads are the surface uniforms verbatim.
         assert_eq!(quads[0], [1.0, 2.0, 3.0, 6_370_000.0]);
         assert_eq!(quads[8], [-20.0, 90.0, 48.0, 1.0]);
@@ -2906,8 +2979,10 @@ mod tests {
         // Appended land controls preserve every historical cloud offset above.
         assert_eq!(quads[25], [0.0, 4.0, 0.0, 0.08]);
         assert_eq!(quads[26], [0.65, 1.5, 0.0, 0.0]);
+        assert_eq!(quads[27], [1.0, 0.2, 0.8, 1.5]);
+        assert_eq!(quads[28], [1.0, 0.3, 0.5, 4.0]);
         assert_eq!(
-            quads[27],
+            quads[29],
             [
                 0.0,
                 (EARTH_RADIUS_M + TOPDOWN_CAMERA_ALTITUDE_M) as f32,
@@ -2917,7 +2992,7 @@ mod tests {
         );
         let mut aa = test_cloud_inputs(test_surface_uniforms());
         aa.march.topdown_shadow_antialias = true;
-        assert_eq!(cloud_uniform_quads(&aa)[27][2], 1.0);
+        assert_eq!(cloud_uniform_quads(&aa)[29][2], 1.0);
         let mut invalid = test_cloud_inputs(test_surface_uniforms());
         invalid.march.cloud_optical_depth_scale = f32::NAN;
         assert_eq!(
@@ -2926,9 +3001,9 @@ mod tests {
         );
         invalid.march.cloud_optical_depth_scale = 99.0;
         assert_eq!(cloud_uniform_quads(&invalid)[24][3], 4.0);
-        // 28 vec4 = 448 bytes, little-endian f32s in order.
+        // 30 vec4 = 480 bytes, little-endian f32s in order.
         let bytes = quads_to_bytes(&quads);
-        assert_eq!(bytes.len(), 448);
+        assert_eq!(bytes.len(), 480);
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         assert_eq!(
             f32::from_le_bytes(bytes[9 * 16..9 * 16 + 4].try_into().unwrap()),
@@ -2983,6 +3058,28 @@ mod tests {
         assert!(SURFACE_WGSL.contains("albedo / PI * (e_direct + e_ambient)"));
     }
 
+    #[test]
+    fn visible_wgsl_uses_disk_integrated_surface_solar_normalization() {
+        for (name, shader) in [("surface", SURFACE_WGSL), ("clouds", CLOUDS_WGSL)] {
+            assert!(
+                !shader.contains("LIMB_DISK_AVG"),
+                "{name} must not re-dim disk-integrated solar irradiance"
+            );
+            assert!(
+                shader.contains("fn disk_fraction(elev: f32) -> f32"),
+                "{name} must retain the finite-solar-disk horizon ramp"
+            );
+        }
+        assert!(
+            SURFACE_WGSL.contains("e_sun * t_sun * (disk * ndotl)"),
+            "surface shader direct light must retain finite-disk visibility"
+        );
+        assert!(
+            CLOUDS_WGSL.contains("e_sun * t_sun * (disk * ndotl * shadow)"),
+            "cloud shader direct surface light must retain cloud shadows"
+        );
+    }
+
     /// Executable f32 transcription of the marked WGSL helper. The exhaustive property
     /// test below anchors both shader copies to the public f64 CPU reference over the
     /// whole solar-elevation range and representative reflectance/control domains.
@@ -3034,6 +3131,62 @@ mod tests {
                 ) * (gain - 1.0)
             };
         sza * toe
+    }
+
+    /// Executable f32 transcription of the post-light helper shared by both WGSL
+    /// visible paths. Inputs are passed through the real uniform packers first, so
+    /// this also exercises the upload-time finite fallbacks and clamps.
+    fn wgsl_postlight_dark_gain(surface: [f32; 3], config: [f32; 4]) -> f32 {
+        if config[0] <= 0.5 {
+            return 1.0;
+        }
+        let knee = config[1].clamp(1.0e-6, 1.0);
+        let gamma = config[2].clamp(0.05, 1.0);
+        let max_gain = config[3].clamp(1.0, 4.0);
+        let solar = crate::atmosphere::SOLAR_IRRADIANCE_RGB.map(|v| v as f32);
+        let rho = [
+            std::f32::consts::PI * surface[0] / solar[0].max(1.0e-6),
+            std::f32::consts::PI * surface[1] / solar[1].max(1.0e-6),
+            std::f32::consts::PI * surface[2] / solar[2].max(1.0e-6),
+        ];
+        let y = (0.2126 * rho[0] + 0.7152 * rho[1] + 0.0722 * rho[2]).max(0.0);
+        if y <= 0.0 || y >= knee || max_gain == 1.0 || gamma == 1.0 {
+            return 1.0;
+        }
+        let power_target = knee * (y / knee).powf(gamma);
+        let w = wgsl_smoothstep(0.0, knee, y);
+        let target_y = power_target * (1.0 - w) + y * w;
+        (target_y / y).clamp(1.0, max_gain)
+    }
+
+    fn wgsl_combined_surface_recovery_gain(
+        surface: [f32; 3],
+        sun_elev: f32,
+        postlight: SurfacePostlightToeConfig,
+        twilight: TwilightSurfaceRecoveryConfig,
+    ) -> f32 {
+        let postlight = surface_postlight_toe_uniform_quad(postlight);
+        let twilight = twilight_surface_recovery_uniform_quad(twilight);
+        let postlight_target = wgsl_postlight_dark_gain(surface, postlight);
+        let postlight_gain = 1.0
+            + wgsl_smoothstep(
+                crate::render::SURFACE_HELP_ELEV_LO_DEG as f32,
+                crate::render::SURFACE_HELP_ELEV_HI_DEG as f32,
+                sun_elev,
+            ) * (postlight_target - 1.0);
+        let twilight_target = wgsl_postlight_dark_gain(surface, twilight);
+        let twilight_weight = wgsl_smoothstep(
+            crate::render::SURFACE_TWILIGHT_IN_LO_DEG as f32,
+            crate::render::SURFACE_TWILIGHT_IN_HI_DEG as f32,
+            sun_elev,
+        ) * (1.0
+            - wgsl_smoothstep(
+                crate::render::SURFACE_TWILIGHT_OUT_LO_DEG as f32,
+                crate::render::SURFACE_TWILIGHT_OUT_HI_DEG as f32,
+                sun_elev,
+            ));
+        let twilight_gain = 1.0 + twilight_weight * (twilight_target - 1.0);
+        postlight_gain.max(twilight_gain)
     }
 
     #[test]
@@ -3132,6 +3285,180 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn postlight_uniforms_sanitize_and_keep_disabled_identity_exact() {
+        assert_eq!(
+            surface_postlight_toe_uniform_quad(SurfacePostlightToeConfig::off()),
+            [0.0, 0.18, 0.80, 1.35]
+        );
+        assert_eq!(
+            twilight_surface_recovery_uniform_quad(TwilightSurfaceRecoveryConfig::off()),
+            [0.0, 0.30, 0.50, 4.0]
+        );
+        assert_eq!(
+            twilight_surface_recovery_uniform_quad(TwilightSurfaceRecoveryConfig::shipped()),
+            [1.0, 0.30, 0.50, 4.0]
+        );
+        assert_eq!(
+            twilight_surface_recovery_uniform_quad(TwilightSurfaceRecoveryConfig {
+                enabled: true,
+                knee: f64::NAN,
+                gamma: -9.0,
+                max_gain: f64::INFINITY,
+            }),
+            [1.0, 0.30, 0.05, 4.0]
+        );
+
+        let surface = [0.1, 0.2, 0.3];
+        for elev in [-90.0, -6.0, 0.0, 4.0, 12.0, 90.0] {
+            assert_eq!(
+                wgsl_combined_surface_recovery_gain(
+                    surface,
+                    elev,
+                    SurfacePostlightToeConfig::off(),
+                    TwilightSurfaceRecoveryConfig::off(),
+                )
+                .to_bits(),
+                1.0f32.to_bits(),
+                "both disabled must be an exact shader identity at {elev} degrees"
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_postlight_and_twilight_math_track_cpu_and_combine_by_max() {
+        let legacy = SurfacePostlightToeConfig {
+            enabled: true,
+            knee: 0.18,
+            gamma: 0.80,
+            max_gain: 1.35,
+        };
+        let twilight = TwilightSurfaceRecoveryConfig::shipped();
+        let invalid_legacy = SurfacePostlightToeConfig {
+            enabled: true,
+            knee: f64::NAN,
+            gamma: -3.0,
+            max_gain: 99.0,
+        };
+        let invalid_twilight = TwilightSurfaceRecoveryConfig {
+            enabled: true,
+            knee: f64::INFINITY,
+            gamma: f64::NAN,
+            max_gain: -4.0,
+        };
+        let configs = [
+            (
+                SurfacePostlightToeConfig::off(),
+                TwilightSurfaceRecoveryConfig::off(),
+            ),
+            (legacy, TwilightSurfaceRecoveryConfig::off()),
+            (SurfacePostlightToeConfig::off(), twilight),
+            (legacy, twilight),
+            (invalid_legacy, invalid_twilight),
+        ];
+        let rhos = [
+            [0.0f32, 0.0, 0.0],
+            [1.0e-6, 1.0e-6, 1.0e-6],
+            [0.002, 0.004, 0.008],
+            [0.01, 0.02, 0.04],
+            [0.08, 0.08, 0.08],
+            [0.18, 0.18, 0.18],
+            [0.31, 0.20, 0.12],
+        ];
+        let elevations = [
+            -10.0f32, -6.0, -5.0, -3.0, 0.0, 2.0, 4.0, 8.0, 11.0, 12.0, 20.0, 40.0,
+        ];
+        let solar = crate::atmosphere::SOLAR_IRRADIANCE_RGB.map(|v| v as f32);
+
+        for (postlight, twilight) in configs {
+            for rho in rhos {
+                let surface = [
+                    solar[0] * rho[0] / std::f32::consts::PI,
+                    solar[1] * rho[1] / std::f32::consts::PI,
+                    solar[2] * rho[2] / std::f32::consts::PI,
+                ];
+                for elev in elevations {
+                    let gpu =
+                        wgsl_combined_surface_recovery_gain(surface, elev, postlight, twilight);
+                    let cpu = crate::render::combined_surface_recovery_gain(
+                        surface.map(|v| v as f64),
+                        elev as f64,
+                        postlight,
+                        twilight,
+                    ) as f32;
+                    let delta = (gpu - cpu).abs();
+                    assert!(
+                        delta <= 4.0e-5,
+                        "CPU/WGSL recovery delta {delta} at elev={elev}, rho={rho:?}, postlight={postlight:?}, twilight={twilight:?}: gpu={gpu}, cpu={cpu}"
+                    );
+                    assert!((1.0..=4.0).contains(&gpu));
+                }
+            }
+        }
+
+        let surface = [0.4, 0.5, 0.6];
+        for elev in [-6.0f32, 0.0, 4.0, 8.0, 12.0] {
+            let combined = wgsl_combined_surface_recovery_gain(surface, elev, legacy, twilight);
+            let legacy_only = wgsl_combined_surface_recovery_gain(
+                surface,
+                elev,
+                legacy,
+                TwilightSurfaceRecoveryConfig::off(),
+            );
+            let twilight_only = wgsl_combined_surface_recovery_gain(
+                surface,
+                elev,
+                SurfacePostlightToeConfig::off(),
+                twilight,
+            );
+            assert_eq!(combined.to_bits(), legacy_only.max(twilight_only).to_bits());
+        }
+    }
+
+    #[test]
+    fn twilight_shader_gate_boundaries_and_both_visible_callsites_are_locked() {
+        let surface = [0.1, 0.1, 0.1];
+        let twilight = TwilightSurfaceRecoveryConfig::shipped();
+        let gain = |elev| {
+            wgsl_combined_surface_recovery_gain(
+                surface,
+                elev,
+                SurfacePostlightToeConfig::off(),
+                twilight,
+            )
+        };
+        assert_eq!(gain(-6.0).to_bits(), 1.0f32.to_bits());
+        assert!(gain(-3.0) > 1.0);
+        assert_eq!(gain(0.0).to_bits(), gain(4.0).to_bits());
+        assert!(gain(8.0) > 1.0);
+        assert_eq!(gain(12.0).to_bits(), 1.0f32.to_bits());
+
+        fn marked_helper(shader: &str) -> &str {
+            shader
+                .split_once("// SURFACE_POSTLIGHT_TOE_TWIN_BEGIN")
+                .and_then(|(_, rest)| rest.split_once("// SURFACE_POSTLIGHT_TOE_TWIN_END"))
+                .map(|(helper, _)| helper)
+                .expect("marked surface-recovery WGSL helper")
+        }
+        assert_eq!(marked_helper(SURFACE_WGSL), marked_helper(CLOUDS_WGSL));
+        for (name, shader) in [("surface", SURFACE_WGSL), ("clouds", CLOUDS_WGSL)] {
+            for constant in [
+                "const SURFACE_TWILIGHT_IN_LO: f32 = -6.0;",
+                "const SURFACE_TWILIGHT_IN_HI: f32 = 0.0;",
+                "const SURFACE_TWILIGHT_OUT_LO: f32 = 4.0;",
+                "const SURFACE_TWILIGHT_OUT_HI: f32 = 12.0;",
+            ] {
+                assert!(shader.contains(constant), "{name}: missing {constant}");
+            }
+            assert!(shader.contains("if (!is_water && (u.toe0.x > 0.5 || u.twi0.x > 0.5))"));
+            assert!(shader.contains("let surface = l_surf * sc.transmittance;"));
+            assert!(
+                shader.contains("surface * combined_surface_recovery_gain_gpu(surface, sun_elev)")
+            );
+            assert!(shader.contains("+ veil * sc.inscatter;"));
         }
     }
 
@@ -3435,7 +3762,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_uniforms_pack_176_bytes_in_order() {
+    fn surface_uniforms_pack_208_bytes_in_order() {
         let u = SurfaceUniforms {
             cam: [1.0, 2.0, 3.0],
             r_ground: 6_370_000.0,
@@ -3462,9 +3789,21 @@ mod tests {
             ambient_n: 48.0,
             atmosphere_correction: 1.0,
             land_appearance: LandAppearanceConfig::identity(),
+            surface_postlight_toe: SurfacePostlightToeConfig {
+                enabled: true,
+                knee: 0.2,
+                gamma: 0.8,
+                max_gain: 1.5,
+            },
+            twilight_surface_recovery: TwilightSurfaceRecoveryConfig {
+                enabled: true,
+                knee: 0.3,
+                gamma: 0.5,
+                max_gain: 4.0,
+            },
         };
         let bytes = u.to_bytes();
-        assert_eq!(bytes.len(), 176);
+        assert_eq!(bytes.len(), 208);
         // Spot-check the layout: cam.x at [0], r_ground at [3*4], ambient_n at [34*4].
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         assert_eq!(
@@ -3479,5 +3818,13 @@ mod tests {
         assert_eq!(f32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1.0);
         assert_eq!(f32::from_le_bytes(bytes[144..148].try_into().unwrap()), 0.0);
         assert_eq!(f32::from_le_bytes(bytes[148..152].try_into().unwrap()), 4.0);
+        assert_eq!(f32::from_le_bytes(bytes[176..180].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[180..184].try_into().unwrap()), 0.2);
+        assert_eq!(f32::from_le_bytes(bytes[184..188].try_into().unwrap()), 0.8);
+        assert_eq!(f32::from_le_bytes(bytes[188..192].try_into().unwrap()), 1.5);
+        assert_eq!(f32::from_le_bytes(bytes[192..196].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[196..200].try_into().unwrap()), 0.3);
+        assert_eq!(f32::from_le_bytes(bytes[200..204].try_into().unwrap()), 0.5);
+        assert_eq!(f32::from_le_bytes(bytes[204..208].try_into().unwrap()), 4.0);
     }
 }

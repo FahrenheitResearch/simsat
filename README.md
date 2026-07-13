@@ -31,9 +31,10 @@ supercell case and Hurricane Michael), thumbnailed for the README.
   Cox-Munk glint, snow blend, ABI-style display transform.
 - **Infrared band 13 (10.3 um)** — a real radiative-transfer march (gray-body
   Planck emission per voxel + surface term) inverted to true-Kelvin brightness
-  temperature. The default/recommended display is NOAA's continuous heritage
-  bi-linear grayscale (`natural`); legacy linear grayscale and the BD, Rainbow,
-  CIMSS, AVN, and Funktop analysis palettes remain available unchanged.
+  temperature. The default/recommended display is CIMSS Style (`cimss`), with
+  false-color isotherm bands that make cloud-top structure easy to read. NOAA's
+  continuous heritage bi-linear grayscale (`natural`), legacy linear grayscale,
+  and the BD, Rainbow, AVN, and Funktop palettes remain available unchanged.
 - **Water vapor 6.2 / 6.9 / 7.3 um (bands 8/9/10)** — the same thermal march
   with water vapor as the dominant emitter; upper/mid/lower-level moisture.
 - **GeoColor Style / SimSat Day-Night Color** — broad-RGB visible by day, IR by night,
@@ -53,6 +54,13 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 `render_perspective` in Python). A **web map layer** product renders the cloud
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
+
+New in v0.2.1: **CIMSS Style is the reviewed Band-13 display default**. Fresh
+Studio settings, the Recommended IR quick preset, thermal product transitions,
+and the headless IR CLI now select `cimss`. An explicitly saved `natural` choice
+is preserved, Sensor QA retains its neutral Natural grayscale, and Python still
+returns raw Kelvin unless a display enhancement is explicitly requested. Palette
+selection never changes the raw floating-point Kelvin field.
 
 New in v0.2.0: **natural infrared, faster reviewed cloud closure, and cleaner
 top-down lighting**. Band 13 now defaults to NOAA's continuous heritage
@@ -131,8 +139,11 @@ by default and has an explicit legacy off switch in Rust, the CLI, Python, and
 Studio. Sources without a complete trusted field retain the conservative
 full-cell fallback.
 
-The current visible preset uses cloud-OD scale `0.15`, exposure `1.5`, neutral ground lift `1.0`,
-highlight knee `0.65`, and highlight ceiling `1.25`. The OD value is the owner's
+The current visible preset uses cloud-OD scale `0.15`, exposure `1.5`, a restrained sun-gated
+ground lift of `1.10` (`1.0` remains the neutral override),
+highlight knee `0.65`, highlight ceiling `1.25`, and the owner-selected tight twilight
+terrain recovery (`0.30 / 0.50 / 4.0`) from -6 through +12 degrees solar elevation. The
+older broad post-light surface toe remains off. The OD value is the owner's
 cross-file visual selection, superseding the earlier tied `0.20`/`0.30` midpoint
 candidate. It is not a claimed physical optimum; every value remains overridable. Raw RGB
 reflectance, thermal products, and derived cloud optical depth do not consume these display
@@ -176,7 +187,7 @@ simsat-render-frame input=wrfout_d03_2025-06-21_02:15:00 out=frame.png \
     atmosphere-correction=on terrain-atmosphere=on fractional-clouds=on cloud-od-scale=0.15 \
     multiscatter=on beer-powder=off granulation=off feather-exposed-domain-edges=on clouds=on
 simsat-render-ir input=wrfout_d03_2025-06-21_02:15:00 out=ir.png \
-    bt-out=ir-band13-kelvin.bin enhancement=natural sensor=goes-r-abi-band13-fm4
+    bt-out=ir-band13-kelvin.bin enhancement=cimss sensor=goes-r-abi-band13-fm4
 ```
 
 `simsat-render-frame` renders visible, GeoColor Style/SimSat Day-Night Color, and Sandwich;
@@ -205,7 +216,7 @@ cloud optical-depth scale
 range `0.0..=4.0`). The `0.15` default is an owner-selected cross-file visual
 calibration, not a claimed physical optimum. Finished RGB products also expose
 `exposure=`, `ground-gain=`, `cloud-softclip=`, and `cloud-highlight-max=`;
-omitting them keeps the shipped `1.5` exposure, neutral `1.0` ground gain, `0.65`
+omitting them keeps the shipped `1.5` exposure, `1.10` ground gain (`1.0` is neutral), `0.65`
 highlight knee, and `1.25` highlight ceiling.
 `fractional-clouds=off` restores legacy horizontally-full cloudy cells; `on` remains
 the compatibility alias for `effective-od`. Finished display renders now default to
@@ -256,10 +267,14 @@ rgb, geo = simsat.render_visible_rgb(
     land_sza_normalization=True,   # owner-selected display default
     land_sza_max_gain=4.0,         # bounded low-sun terrain recovery; 1.0 is identity
     land_dark_toe=True,            # independently switchable; both false = legacy identity
-    surface_postlight_toe=False,   # opt-in CPU terrain recovery after lighting/view attenuation
+    surface_postlight_toe=False,   # opt-in CPU/GPU terrain recovery after lighting/view attenuation
     surface_postlight_toe_knee=0.18,
     surface_postlight_toe_gamma=0.80,
     surface_postlight_toe_max_gain=1.35,
+    twilight_surface_recovery=True,   # shipped tight low-sun terrain recovery; independently switchable
+    twilight_surface_recovery_knee=0.30,
+    twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0,
     fractional_clouds=True,
     fractional_cloud_mode="deterministic-2",  # Recommended; effective-od remains explicit
     cloud_optical_depth_scale=0.15,

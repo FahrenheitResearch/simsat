@@ -133,7 +133,7 @@ pub const PW_STANDARD_KG_M2: f64 = 14.2;
 
 /// Total solar irradiance at the top of the atmosphere (W m^-2).
 pub const TSI_W_M2: f64 = 1361.0;
-/// Band-averaged solar irradiance per RGB band at the top of the atmosphere
+/// Disk-integrated, band-averaged solar irradiance per RGB band at the top of the atmosphere
 /// (W m^-2). A CIE-ish split of the ~42% of the 1361 W/m^2 TSI that falls in the
 /// visible, with the mild blue excess of the solar spectrum. NOTE these cancel in
 /// the reflectance factor (rho = pi L / E_band), so they set only the debug-HDR
@@ -147,8 +147,9 @@ pub const SUN_ANGULAR_RADIUS_RAD: f64 = 4.65e-3;
 
 /// Hestroffer-Magnan (1998) limb-darkening coefficients for the visible solar
 /// disk: I(mu)/I(1) = 1 - a1(1-mu) - a2(1-mu)^2, mu = cos(angle from disk centre).
-/// Defined now (documented) for M3's finite-disk glint; M2 uses only the
-/// disk-AVERAGED dimming factor [`LIMB_DARKENING_DISK_AVG`].
+/// Defined for resolving the brightness profile of a finite solar disk. The
+/// disk-integrated [`SOLAR_IRRADIANCE_RGB`] is already normalized over that profile;
+/// surface direct irradiance must not multiply it by the disk average again.
 pub const LIMB_DARKENING_A1: f64 = 0.397;
 pub const LIMB_DARKENING_A2: f64 = 0.216;
 
@@ -1221,13 +1222,13 @@ pub fn limb_darkening(mu: f64) -> f64 {
     (1.0 - LIMB_DARKENING_A1 * (1.0 - m) - LIMB_DARKENING_A2 * (1.0 - m) * (1.0 - m)).max(0.0)
 }
 
-/// Disk-averaged limb-darkening factor (intensity-weighted mean over the disk) —
-/// the constant dimming M2 applies to the direct term. `<I>/I(1)` for the H-M law
+/// Disk-averaged limb-darkening factor relative to disk-centre radiance. This is useful
+/// when converting a centre-normalized limb profile to a disk-integrated quantity; it
+/// is **not** an extra dimming factor for [`SOLAR_IRRADIANCE_RGB`], which is already a
+/// disk-integrated irradiance. `<I>/I(1)` for the H-M law
 /// `I(mu) = 1 - a1(1-mu) - a2(1-mu)^2`, area-weighted over the disk with `mu` the
 /// projected radius parameter: `<I>/I(1) = 1 - a1/3 - a2/6`. With a1=0.397, a2=0.216
-/// this is `1 - 0.13233 - 0.036 = 0.8317` (~0.832). The earlier 0.79 was ~5% low and
-/// dimmed the daytime disk (M2 review FINDING 3; `E_sun` cancels in `rho = pi L / E`,
-/// so this factor does NOT cancel — it is a direct multiplicative albedo dimming).
+/// this is `1 - 0.13233 - 0.036 = 0.8317` (~0.832).
 pub const LIMB_DARKENING_DISK_AVG: f64 = 0.832;
 
 // ── ECEF camera geometry for the space camera ────────────────────────────────

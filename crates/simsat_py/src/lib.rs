@@ -73,7 +73,7 @@ use simsat_engine::derived::DerivedField;
 use simsat_engine::instrument_footprint::InstrumentFootprint;
 use simsat_engine::ir_enhance::IrEnhancement;
 use simsat_engine::optics::CloudOpticsMode;
-use simsat_engine::render::SurfacePostlightToeConfig;
+use simsat_engine::render::{SurfacePostlightToeConfig, TwilightSurfaceRecoveryConfig};
 use simsat_engine::solar::SolarFrame;
 use simsat_engine::thermal_sensor::ThermalSensor;
 use simsat_engine::topdown::{configure_global_rayon, effective_thread_count};
@@ -245,11 +245,13 @@ impl Georef {
 /// `land_sza_normalization` / `land_sza_max_gain` and `land_dark_toe` plus its
 /// knee/gamma/max-gain parameters are independently switchable and default on in the
 /// owner-selected current display preset. Passing both booleans false is the exact legacy
-/// identity. `surface_postlight_toe` is a separate default-off CPU display experiment
-/// over LAND after lighting and view transmittance but before atmospheric airlight/cloud
-/// compositing; its knee/gamma/max-gain defaults are 0.18/0.80/1.35. Sensor Fast Gray
-/// and GPU preview explicitly substitute it off and report the adjustment. Raw
-/// visible bands deliberately expose none of these display-only land controls.
+/// identity. `surface_postlight_toe` is a separate default-off display experiment over
+/// LAND after lighting and view transmittance but before atmospheric airlight/cloud
+/// compositing; its knee/gamma/max-gain defaults are 0.18/0.80/1.35. The independent
+/// `twilight_surface_recovery` uses the tighter -6..+12 degree low-sun gate and is enabled
+/// for finished visible-family displays with the owner-selected 0.30/0.50/4.0 controls.
+/// Both run on CPU and GPU. Sensor Fast Gray substitutes both off and reports the
+/// adjustment. Raw visible bands deliberately expose neither display-only control.
 ///
 /// `threads` (default None = all cores, or RAYON_NUM_THREADS) caps the render worker
 /// threads for THIS PROCESS. The pool is global and built ONCE — the first render call's
@@ -264,7 +266,9 @@ impl Georef {
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
     surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
-    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
+    surface_postlight_toe_max_gain=1.35, twilight_surface_recovery=true,
+    twilight_surface_recovery_knee=0.30, twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
@@ -302,6 +306,10 @@ fn render_visible_rgb<'py>(
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -352,6 +360,10 @@ fn render_visible_rgb<'py>(
         surface_postlight_toe_knee,
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -411,7 +423,9 @@ fn render_visible_rgb<'py>(
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
     surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
-    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
+    surface_postlight_toe_max_gain=1.35, twilight_surface_recovery=true,
+    twilight_surface_recovery_knee=0.30, twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
@@ -450,6 +464,10 @@ fn render_geocolor<'py>(
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -500,6 +518,10 @@ fn render_geocolor<'py>(
         surface_postlight_toe_knee,
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -560,7 +582,9 @@ fn render_geocolor<'py>(
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
     surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
-    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
+    surface_postlight_toe_max_gain=1.35, twilight_surface_recovery=true,
+    twilight_surface_recovery_knee=0.30, twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="deterministic-2", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
@@ -599,6 +623,10 @@ fn render_sandwich<'py>(
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -649,6 +677,10 @@ fn render_sandwich<'py>(
         surface_postlight_toe_knee,
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
         exposure,
         ground_gain,
         cloud_softclip,
@@ -855,6 +887,10 @@ fn render_visible_bands<'py>(
         simsat_engine::render::SURFACE_POSTLIGHT_TOE_KNEE,
         simsat_engine::render::SURFACE_POSTLIGHT_TOE_GAMMA,
         simsat_engine::render::SURFACE_POSTLIGHT_TOE_MAX_GAIN,
+        false,
+        simsat_engine::render::TWILIGHT_SURFACE_RECOVERY_KNEE,
+        simsat_engine::render::TWILIGHT_SURFACE_RECOVERY_GAMMA,
+        simsat_engine::render::TWILIGHT_SURFACE_RECOVERY_MAX_GAIN,
         None,
         None,
         None,
@@ -901,9 +937,9 @@ fn render_visible_bands<'py>(
 /// off-domain; row 0 = north). If `enhancement` is given (one of 'natural', 'cimss',
 /// 'bd', 'avn', 'funktop', 'rainbow', 'gray') the return is instead
 /// `(bt, rgb, georef)` with `rgb` a numpy `H x W x 3` uint8 colored image. 'natural'
-/// is the recommended continuous NOAA heritage Band-13 grayscale. `sensor='fast-gray'`
-/// preserves the historical
-/// center-wavelength response; `sensor='goes-r-abi-band13-fm4'` applies NOAA's official
+/// remains the continuous NOAA heritage Band-13 grayscale; 'cimss' is the recommended
+/// false-color display. `sensor='fast-gray'` preserves the historical center-wavelength
+/// response; `sensor='goes-r-abi-band13-fm4'` applies NOAA's official
 /// FM4/GOES-19 Band 13 SRF and emits a warning that absorption remains gray.
 #[pyfunction]
 #[pyo3(signature = (
@@ -928,6 +964,7 @@ fn render_ir<'py>(
     threads: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    force_surface_recovery_identity(&mut params);
     params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
     params.geo_navigation = parse_geo_navigation(geo_navigation)?;
@@ -1005,6 +1042,7 @@ fn render_water_vapor<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let wv_band = parse_wv_band(band)?;
     let mut params = RenderParams::new(PathBuf::from(&input));
+    force_surface_recovery_identity(&mut params);
     params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
     params.geo_navigation = parse_geo_navigation(geo_navigation)?;
@@ -1248,6 +1286,7 @@ fn render_cloud_layer<'py>(
     threads: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray3<u8>>, Bound<'py, PyArray2<f32>>, Georef)> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    force_surface_recovery_identity(&mut params);
     params.storage_profile = parse_storage_profile(storage_profile)?;
     params.intent = parse_intent(intent)?;
     params.satellite = parse_sat(sat)?;
@@ -1344,7 +1383,9 @@ fn render_cloud_layer<'py>(
     land_dark_toe=true, land_dark_toe_knee=0.08, land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5, surface_postlight_toe=false,
     surface_postlight_toe_knee=0.18, surface_postlight_toe_gamma=0.80,
-    surface_postlight_toe_max_gain=1.35, exposure=None, ground_gain=None, cloud_softclip=None,
+    surface_postlight_toe_max_gain=1.35, twilight_surface_recovery=true,
+    twilight_surface_recovery_knee=0.30, twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0, exposure=None, ground_gain=None, cloud_softclip=None,
     cloud_highlight_max=None, multiscatter=true, cloud_multiscatter=None, beer_powder=false,
     steps="offline", clouds=true, fractional_clouds=true, fractional_cloud_mode="effective-od", cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
@@ -1377,6 +1418,10 @@ fn render_perspective<'py>(
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -1442,6 +1487,16 @@ fn render_perspective<'py>(
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
     )?;
+    apply_twilight_surface_recovery_controls(
+        &mut params,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
+    )?;
+    if cloud_layer_only {
+        force_surface_recovery_identity(&mut params);
+    }
     params.multiscatter = multiscatter;
     params.cloud_multiscatter = cloud_multiscatter
         .map(parse_cloud_multiscatter)
@@ -1642,6 +1697,7 @@ fn render_derived_impl<'py>(
     threads: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut params = RenderParams::new(PathBuf::from(&input));
+    force_surface_recovery_identity(&mut params);
     params.storage_profile = parse_storage_profile(storage_profile)?;
     params.satellite = parse_sat(sat)?;
     params.view = parse_view(view)?;
@@ -1713,6 +1769,10 @@ fn build_visible_params(
     surface_postlight_toe_knee: f64,
     surface_postlight_toe_gamma: f64,
     surface_postlight_toe_max_gain: f64,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f64,
+    twilight_surface_recovery_gamma: f64,
+    twilight_surface_recovery_max_gain: f64,
     exposure: Option<f64>,
     ground_gain: Option<f64>,
     cloud_softclip: Option<f64>,
@@ -1783,6 +1843,13 @@ fn build_visible_params(
         surface_postlight_toe_knee,
         surface_postlight_toe_gamma,
         surface_postlight_toe_max_gain,
+    )?;
+    apply_twilight_surface_recovery_controls(
+        &mut params,
+        twilight_surface_recovery,
+        twilight_surface_recovery_knee,
+        twilight_surface_recovery_gamma,
+        twilight_surface_recovery_max_gain,
     )?;
     params.multiscatter = multiscatter;
     params.cloud_multiscatter = cloud_multiscatter
@@ -1941,6 +2008,38 @@ fn apply_surface_postlight_toe_controls(
         max_gain: bounded("surface_postlight_toe_max_gain", max_gain, 1.0, 4.0)?,
     };
     Ok(())
+}
+
+/// Validate and apply the independent, tightly gated low-sun terrain recovery.
+fn apply_twilight_surface_recovery_controls(
+    params: &mut RenderParams,
+    enabled: bool,
+    knee: f64,
+    gamma: f64,
+    max_gain: f64,
+) -> PyResult<()> {
+    let bounded = |name: &str, value: f64, lo: f64, hi: f64| -> PyResult<f64> {
+        if !value.is_finite() || !(lo..=hi).contains(&value) {
+            return Err(value_err(format!(
+                "{name} must be finite and in {lo}..={hi}, got {value}"
+            )));
+        }
+        Ok(value)
+    };
+    params.twilight_surface_recovery = TwilightSurfaceRecoveryConfig {
+        enabled,
+        knee: bounded("twilight_surface_recovery_knee", knee, 1.0e-6, 1.0)?,
+        gamma: bounded("twilight_surface_recovery_gamma", gamma, 0.05, 1.0)?,
+        max_gain: bounded("twilight_surface_recovery_max_gain", max_gain, 1.0, 4.0)?,
+    };
+    Ok(())
+}
+
+/// Keep products that do not consume finished-visible terrain appearance on an explicit
+/// identity request, even though the engine product seams also ignore these controls.
+fn force_surface_recovery_identity(params: &mut RenderParams) {
+    params.surface_postlight_toe = SurfacePostlightToeConfig::off();
+    params.twilight_surface_recovery = TwilightSurfaceRecoveryConfig::off();
 }
 
 /// Build the Python [`Georef`] from a render result: scalars + the projection dict + the
@@ -2675,6 +2774,55 @@ mod tests {
             let mut params = RenderParams::new(PathBuf::from("input"));
             assert!(
                 apply_surface_postlight_toe_controls(&mut params, true, knee, gamma, max_gain,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn twilight_surface_recovery_helper_keeps_shipped_default_and_supports_explicit_off() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::shipped()
+        );
+        apply_twilight_surface_recovery_controls(&mut params, false, 0.30, 0.50, 4.0).unwrap();
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::off()
+        );
+        apply_twilight_surface_recovery_controls(&mut params, true, 0.30, 0.50, 4.0).unwrap();
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::shipped()
+        );
+    }
+
+    #[test]
+    fn non_visible_product_helper_forces_both_postlight_controls_to_identity() {
+        let mut params = RenderParams::new(PathBuf::from("input"));
+        params.surface_postlight_toe = SurfacePostlightToeConfig {
+            enabled: true,
+            ..SurfacePostlightToeConfig::default()
+        };
+        force_surface_recovery_identity(&mut params);
+        assert_eq!(
+            params.surface_postlight_toe,
+            SurfacePostlightToeConfig::off()
+        );
+        assert_eq!(
+            params.twilight_surface_recovery,
+            TwilightSurfaceRecoveryConfig::off()
+        );
+    }
+
+    #[test]
+    fn twilight_surface_recovery_helper_rejects_invalid_values() {
+        for (knee, gamma, max_gain) in [(0.0, 0.50, 4.0), (0.30, 1.1, 4.0), (0.30, 0.50, f64::NAN)]
+        {
+            let mut params = RenderParams::new(PathBuf::from("input"));
+            assert!(
+                apply_twilight_surface_recovery_controls(&mut params, true, knee, gamma, max_gain,)
                     .is_err()
             );
         }

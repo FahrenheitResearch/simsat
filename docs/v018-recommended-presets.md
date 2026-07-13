@@ -60,16 +60,20 @@ simsat-render-frame input=<run> out=<image.png> product=visible backend=cpu `
   intent=display resolution=native steps=offline `
   aerosol-optical-depth=0.05 rh-aerosol-swelling=off `
   atmosphere-correction=on terrain-atmosphere=on `
-  land-sza-normalization=on land-sza-max-gain=1.6 `
+  land-sza-normalization=on land-sza-max-gain=4.0 `
   land-dark-toe=on land-dark-toe-knee=0.08 land-dark-toe-gamma=0.65 `
-  land-dark-toe-max-gain=1.5 clouds=on fractional-clouds=effective-od `
+  land-dark-toe-max-gain=1.5 surface-postlight-toe=off `
+  twilight-surface-recovery=on twilight-surface-recovery-knee=0.30 `
+  twilight-surface-recovery-gamma=0.50 twilight-surface-recovery-max-gain=4.0 `
+  clouds=on fractional-clouds=deterministic-2 `
   cloud-optics=fixed cloud-optical-depth-scale=0.15 multiscatter=on `
   beer-powder=off granulation=off feather-exposed-domain-edges=on `
   topdown-stratiform-regularization=off topdown-cloud-footprint=off `
-  exposure=1.5 ground-gain=1.0 cloud-softclip=0.65 cloud-highlight-max=1.25
+  topdown-shadow-antialias=on `
+  exposure=1.5 ground-gain=1.10 cloud-softclip=0.65 cloud-highlight-max=1.25
 ```
 
-For High Quality Visible, replace `fractional-clouds=effective-od` with
+For High Quality Visible, replace `fractional-clouds=deterministic-2` with
 `fractional-clouds=deterministic-4` and set `cloud-softclip=0.45`.
 
 Visible Sensor QA:
@@ -85,6 +89,7 @@ simsat-render-frame input=<run> out=<image.png> product=visible backend=cpu `
   granulation=off feather-exposed-domain-edges=off `
   topdown-stratiform-regularization=off topdown-cloud-footprint=off `
   atmosphere-correction=off land-sza-normalization=off land-dark-toe=off `
+  surface-postlight-toe=off twilight-surface-recovery=off `
   exposure=1.0 ground-gain=1.0 cloud-softclip=1.0 cloud-highlight-max=1.0
 ```
 
@@ -114,19 +119,24 @@ rgb, geo = simsat.render_visible_rgb(
     atmosphere_correction=True,
     terrain_atmosphere=True,
     land_sza_normalization=True,
-    land_sza_max_gain=1.6,
+    land_sza_max_gain=4.0,
     land_dark_toe=True,
     land_dark_toe_knee=0.08,
     land_dark_toe_gamma=0.65,
     land_dark_toe_max_gain=1.5,
+    surface_postlight_toe=False,
+    twilight_surface_recovery=True,
+    twilight_surface_recovery_knee=0.30,
+    twilight_surface_recovery_gamma=0.50,
+    twilight_surface_recovery_max_gain=4.0,
     exposure=1.5,
-    ground_gain=1.0,
+    ground_gain=1.10,
     cloud_softclip=0.65,  # 0.45 for High Quality Visible
     cloud_highlight_max=1.25,
     steps="offline",
     clouds=True,
     fractional_clouds=True,
-    fractional_cloud_mode="effective-od",  # "deterministic-4" for High Quality
+    fractional_cloud_mode="deterministic-2",  # "deterministic-4" for High Quality
     cloud_optical_depth_scale=0.15,
     cloud_optics="fixed",
     multiscatter=True,

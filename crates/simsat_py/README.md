@@ -77,9 +77,9 @@ sensor-compatible default),
 `bluemarble_month`, `bluemarble_download=True`. Thermal functions (`render_ir`,
 `render_water_vapor`) take `enhancement=`
 (`natural`/`cimss`/`bd`/`avn`/`funktop`/`rainbow`/`gray`). For Band 13,
-`natural` is the recommended continuous NOAA heritage bi-linear grayscale; the
-false-color choices are analysis enhancements and may intentionally emphasize
-temperature bands. For water vapor, `cimss` remains the classic moisture palette;
+`cimss` is the recommended Band-13 display and intentionally emphasizes temperature
+bands; `natural` remains NOAA's continuous heritage bi-linear grayscale. For water
+vapor, `cimss` remains the classic moisture palette;
 the derived-field functions take `colormap=`.
 
 The visible-family functions (including raw RGB reflectance, cloud layer, and perspective)
@@ -116,7 +116,7 @@ cannot be changed by a tonemap choice. The land controls are irrelevant to
 | keyword | omitted behavior | effect |
 |---|---:|---|
 | `exposure` | shipped `1.5` | whole finished-visible display gain before the ABI stretch (`1.0` is the exact neutral override; intentionally absent from raw RGB reflectance) |
-| `ground_gain` | shipped `1.0` | sun-gated daytime surface-radiance lift (`1.0` is neutral; accepted but irrelevant for ground-free cloud layers) |
+| `ground_gain` | shipped `1.10` | sun-gated daytime surface-radiance lift (`1.0` is neutral; accepted but irrelevant for ground-free cloud layers) |
 | `cloud_softclip` | shipped `0.65` | highlight shoulder knee (`1.0` disables the shoulder/hard-clamps) |
 | `cloud_highlight_max` | shipped `1.25` | physical reflectance factor mapped to display white; raising it retains structure in brighter cloud tops |
 | `land_sza_normalization` | `True` | owner-selected bounded land-only solar-zenith display correction; exact identity through twilight and at/above a 60-degree sun; set false with `land_dark_toe=False` for the legacy identity |
@@ -129,6 +129,10 @@ cannot be changed by a tonemap choice. The land controls are irrelevant to
 | `surface_postlight_toe_knee` | `0.18` | linear reflectance-factor luminance knee for the post-lighting terrain experiment (`1e-6..=1`) |
 | `surface_postlight_toe_gamma` | `0.80` | post-lighting toe exponent (`0.05..=1`; `1.0` is identity) |
 | `surface_postlight_toe_max_gain` | `1.35` | bounded terrain-signal lift (`1..=4`; `1.0` is identity) |
+| `twilight_surface_recovery` | `True` | shipped land-only recovery gated from civil twilight through low sun; exact identity at/below -6 and at/above +12 degrees; independently switchable off |
+| `twilight_surface_recovery_knee` | `0.30` | owner-selected D linear reflectance-factor knee (`1e-6..=1`) |
+| `twilight_surface_recovery_gamma` | `0.50` | owner-selected D toe exponent (`0.05..=1`) |
+| `twilight_surface_recovery_max_gain` | `4.0` | owner-selected D bounded lift (`1..=4`) |
 
 `cloud_optical_depth_scale` is a labeled calibration/sensitivity control: the shipped
 `0.15` is an owner-selected visual calibration after broad cross-file review, not a
@@ -139,9 +143,12 @@ claimed physical optimum. It supersedes the earlier tied `0.20`/`0.30` midpoint 
 The two land operators are likewise finished-visible display controls: raw RGB
 reflectance, IR/WV, derived products, cloud-only layers, water/glint, and cloud radiance do
 not consume them. Both remain independently switchable despite being shipped on.
-The post-lighting surface toe is a separate default-off CPU experiment. Sensor Fast Gray
-and GPU preview explicitly substitute it off and report that adjustment rather than
-silently ignoring it.
+The two post-light controls remain independent on CPU and GPU. The older broad
+`surface_postlight_toe` stays off; the owner-selected tight `twilight_surface_recovery`
+is shipped on for finished visible/GeoColor/Sandwich/Perspective displays. If both are
+enabled their gains combine by maximum rather than multiplying. Raw RGB reflectance,
+IR/WV, derived fields, cloud-only layers, and Sensor Fast Gray keep both at identity;
+Sensor Fast Gray reports the substitutions rather than silently ignoring them.
 `fractional_clouds=True` consumes model cloud fraction when the input supplies it
 and safely falls back to full-cell coverage otherwise; set it false for the legacy A/B.
 `fractional_cloud_mode="deterministic-4"`, `"deterministic-8"`, or
@@ -236,7 +243,7 @@ ax.imshow(rgb, extent=geo.extent, transform=crs, origin="upper")
 bt, geo = simsat.render_ir(wrfout)
 ax.pcolormesh(geo.lon, geo.lat, bt, transform=ccrs.PlateCarree())
 # or let SimSat color it:
-bt, ir_rgb, geo = simsat.render_ir(wrfout, enhancement="natural")
+bt, ir_rgb, geo = simsat.render_ir(wrfout, enhancement="cimss")
 
 # Experimental complete-radiance Band-13 footprint on the exact global ABI lattice.
 bt_mtf, geo_mtf = simsat.render_ir(
