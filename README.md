@@ -54,6 +54,18 @@ interactive orbit controls in the studio, `eye=/look=/fov=` in the CLI,
 field as a transparent EPSG:3857 overlay (straight-alpha clouds + a multiply
 shadow layer) for Mapbox-class basemaps.
 
+New in v0.2.0: **natural infrared, faster reviewed cloud closure, and cleaner
+top-down lighting**. Band 13 now defaults to NOAA's continuous heritage
+`natural` grayscale, which preserves the raw floating-point Kelvin field without
+turning smooth cold-cloud gradients into false-color red rings; CIMSS, BD, AVN,
+Funktop, Rainbow, and legacy grayscale remain explicit analysis choices. The
+Recommended display path now uses a deterministic two-subcolumn maximum-overlap
+closure, with the higher-member references and effective-OD closure still
+available. Low-sun land recovery is more useful, top-down cloud-front atmosphere
+is restored, and top-down ground cloud shadows receive a display-only antialiasing
+pass. The post-light surface toe remains an opt-in, default-off experiment. All
+relevant controls are available in Studio, the CLI, and Python.
+
 New in v0.1.7 development: **explicit render intent and provenance**. `Display`
 is the unchanged default and preserves the reviewed SimSat look. `Sensor Fast
 Gray` (`simsat-fast-gray-v1`) uses unscaled cloud extinction and neutralizes
@@ -78,7 +90,7 @@ refused instead of silently converted. CLI and Python equivalents remain explici
 to avoid duplicating Studio-only policy; see
 [the recommended-settings contract](docs/v018-recommended-presets.md).
 
-New in the v0.1.9 local RC: visible surface lighting now stays physically useful
+New in v0.1.9: visible surface lighting now stays physically useful
 through low sun instead of switching important land controls on only after the
 scene is already well into daylight. Land normalization, dark-toe recovery,
 ground lift, and water-albedo assistance share a 0--12 degree surface-help ramp;
