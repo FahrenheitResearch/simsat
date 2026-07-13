@@ -31,9 +31,10 @@
 //!   - [`scan_angle_rect`] + the 9-sample-point pattern from
 //!     `sat_window.rs::window_scan_angle_rect` / `SatNativeWindow::sample_points`.
 //!   - sub-lon presets from `sat_window.rs` (GOES-East -75.2, GOES-West -137.0,
-//!     Himawari 140.7).
+//!     Himawari 140.7), plus EUMETSAT's operational Meteosat-12 (MTG-I1) 0 deg
+//!     service camera.
 //!
-//! The historical path uses one CGMS sweep-y pair for all three presets.  The
+//! The historical path uses one CGMS sweep-y pair for all platform presets. The
 //! opt-in ABI path is GOES-East/West only and uses sweep-x; the distinction is
 //! material for registration (several ABI pixels over CONUS), not cosmetic.
 
@@ -68,6 +69,11 @@ pub const GOES_EAST_SUB_LON_DEG: f64 = -75.2;
 pub const GOES_WEST_SUB_LON_DEG: f64 = -137.0;
 /// Himawari-8/9 sub-satellite longitude (deg). `sat_window.rs:218`.
 pub const HIMAWARI_SUB_LON_DEG: f64 = 140.7;
+/// Operational Meteosat-12 / MTG-I1 0-degree service longitude (deg).
+///
+/// Source: EUMETSAT, "MTG in operations".  This is a camera-geometry preset;
+/// it does not imply an FCI spectral-response model.
+pub const MTG_I1_SUB_LON_DEG: f64 = 0.0;
 
 /// ABI visible (1 km) class output pixel pitch (radians): 28 urad. This was the
 /// M1 fixed default; the owner native-resolution fix makes [`ResolutionMode::Native`]
@@ -92,12 +98,19 @@ pub const ABI_2KM_LATTICE_INDEX_MAX: i32 = ABI_2KM_FULL_DISK_AXIS as i32 / 2 - 1
 /// Hard per-axis raster cap (design section 1 / player 4096^2 cap).
 pub const MAX_AXIS: usize = 4096;
 
-/// The three v1 satellites (owner decision 3), selectable in the studio.
+/// Geostationary platform-camera presets selectable by every SimSat frontend.
+///
+/// These select view geometry.  They do not by themselves select an
+/// instrument spectral response; in particular, [`SatellitePreset::MtgI1`]
+/// uses SimSat's existing generic visible/thermal/water-vapor physics rather
+/// than claiming an FCI observation operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SatellitePreset {
     GoesEast,
     GoesWest,
     Himawari,
+    /// Meteosat-12 / MTG-I1, providing EUMETSAT's operational 0-degree service.
+    MtgI1,
 }
 
 /// Geostationary sensor-raster navigation contract.
@@ -151,10 +164,11 @@ pub struct GeoNavigationGeometry {
 
 impl SatellitePreset {
     /// All presets in UI order.
-    pub const ALL: [SatellitePreset; 3] = [
+    pub const ALL: [SatellitePreset; 4] = [
         SatellitePreset::GoesEast,
         SatellitePreset::GoesWest,
         SatellitePreset::Himawari,
+        SatellitePreset::MtgI1,
     ];
 
     /// Sub-satellite longitude (deg).
@@ -163,6 +177,7 @@ impl SatellitePreset {
             Self::GoesEast => GOES_EAST_SUB_LON_DEG,
             Self::GoesWest => GOES_WEST_SUB_LON_DEG,
             Self::Himawari => HIMAWARI_SUB_LON_DEG,
+            Self::MtgI1 => MTG_I1_SUB_LON_DEG,
         }
     }
 
@@ -172,6 +187,7 @@ impl SatellitePreset {
             Self::GoesEast => "GOES-East (-75.2)",
             Self::GoesWest => "GOES-West (-137.0)",
             Self::Himawari => "Himawari (140.7)",
+            Self::MtgI1 => "MTG-I1 / Meteosat-12 (0.0)",
         }
     }
 
@@ -181,6 +197,7 @@ impl SatellitePreset {
             Self::GoesEast => "goese",
             Self::GoesWest => "goesw",
             Self::Himawari => "himawari",
+            Self::MtgI1 => "mtgi1",
         }
     }
 }
@@ -546,9 +563,9 @@ impl GeoCamera {
         }
     }
 
-    /// Build a camera for an explicit navigation contract.  The ABI ellipsoid is
-    /// meaningful only for the two GOES presets; Himawari retains its separate
-    /// historical sweep-y geometry.
+    /// Build a camera for an explicit navigation contract. The ABI ellipsoid is
+    /// meaningful only for the two GOES presets; Himawari and MTG-I1 retain the
+    /// model-sphere sweep-y geometry.
     pub fn for_navigation(
         preset: SatellitePreset,
         navigation: GeoNavigation,
@@ -559,8 +576,10 @@ impl GeoCamera {
                 let sub_lon_deg = match preset {
                     SatellitePreset::GoesEast => GOES_R_EAST_SUB_LON_DEG,
                     SatellitePreset::GoesWest => GOES_R_WEST_SUB_LON_DEG,
-                    SatellitePreset::Himawari => {
-                        return Err("GOES-R ABI ellipsoid navigation is unavailable for Himawari");
+                    SatellitePreset::Himawari | SatellitePreset::MtgI1 => {
+                        return Err(
+                            "GOES-R ABI ellipsoid navigation is available only for GOES-East/West",
+                        );
                     }
                 };
                 Ok(Self {
@@ -1902,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn goes_r_navigation_is_opt_in_and_himawari_is_rejected() {
+    fn goes_r_navigation_is_opt_in_and_non_goes_platforms_are_rejected() {
         let default = GeoCamera::new(SatellitePreset::GoesEast);
         assert_eq!(default.navigation, GeoNavigation::ModelSphere);
         assert_eq!(default.sub_lon_deg, GOES_EAST_SUB_LON_DEG);
@@ -1913,6 +1932,10 @@ mod tests {
         assert_eq!(abi.sub_lon_deg, -75.0);
         assert!(
             GeoCamera::for_navigation(SatellitePreset::Himawari, GeoNavigation::GoesRAbiFixedGrid)
+                .is_err()
+        );
+        assert!(
+            GeoCamera::for_navigation(SatellitePreset::MtgI1, GeoNavigation::GoesRAbiFixedGrid)
                 .is_err()
         );
     }
@@ -2140,10 +2163,40 @@ mod tests {
     }
 
     #[test]
+    fn mtg_i1_builds_a_native_geostationary_raster_over_europe() {
+        // European Lambert domain anchored near central Germany. This is the
+        // model geometry used by WRF; the MTG-I1 preset supplies the 0-degree
+        // geostationary viewpoint and does not claim FCI sensor radiometry.
+        let proj = MapProjection::lambert(30.0, 60.0, 10.0);
+        let (nx, ny) = (120usize, 100usize);
+        let georef = GridGeoref::new(proj, 59.5, 49.5, 51.0, 10.0, 3000.0, 3000.0);
+        let camera = GeoCamera::new(SatellitePreset::MtgI1);
+        let raster = build_surface_raster_mode(
+            &camera,
+            &georef,
+            nx,
+            ny,
+            ResolutionMode::Native,
+            0.0,
+            MAX_AXIS,
+        )
+        .expect("central-European WRF domain must be visible from MTG-I1 at 0 degrees");
+
+        assert_eq!((raster.nx, raster.ny), (nx, ny));
+        assert!(raster.lat.iter().any(|value| value.is_finite()));
+        assert!(raster.grid_i.iter().any(|value| value.is_finite()));
+        let (lat_min, lat_max, lon_min, lon_max) = raster.lat_lon_bbox().unwrap();
+        assert!(lat_min < 51.0 && lat_max > 51.0);
+        assert!(lon_min < 10.0 && lon_max > 10.0);
+    }
+
+    #[test]
     fn presets_carry_expected_sub_lons() {
         assert_eq!(SatellitePreset::GoesEast.sub_lon_deg(), -75.2);
         assert_eq!(SatellitePreset::GoesWest.sub_lon_deg(), -137.0);
         assert_eq!(SatellitePreset::Himawari.sub_lon_deg(), 140.7);
+        assert_eq!(SatellitePreset::MtgI1.sub_lon_deg(), 0.0);
+        assert_eq!(SatellitePreset::MtgI1.slug(), "mtgi1");
     }
 
     #[test]
