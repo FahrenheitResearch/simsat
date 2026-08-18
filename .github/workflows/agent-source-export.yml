@@ -24,12 +24,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Apply the compressed implementation patch
+      - name: Reconstruct and apply the implementation patch
         run: |
-          base64 --decode agent.patch.gz.b64 | gzip --decompress > /tmp/agent.patch
+          cat agent.patch.part-* | base64 --decode | gzip --decompress > /tmp/agent.patch
+          test "$(sha256sum /tmp/agent.patch | cut -d' ' -f1)" = "eed0fcefb46eeb71c156082a1bb1eccdd6e4fad16ee9df159d4394d388afda92"
           git apply --check /tmp/agent.patch
           git apply /tmp/agent.patch
-          rm agent.patch.gz.b64
+          rm -f agent.patch.gz.b64 agent.patch.part-*
 
       - name: Install Linux desktop build headers
         run: |
