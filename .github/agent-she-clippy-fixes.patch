@@ -1,0 +1,66 @@
+diff --git a/crates/simsat/src/atmosphere.rs b/crates/simsat/src/atmosphere.rs
+index 0323b8d..81034c2 100644
+--- a/crates/simsat/src/atmosphere.rs
++++ b/crates/simsat/src/atmosphere.rs
+@@ -1095,9 +1095,9 @@ impl<const N: usize> LogShRgb<N> {
+         let w = weight.clamp(0.0, 1.0);
+         let mut log_coef = [[0.0; 3]; N];
+         for (index, out) in log_coef.iter_mut().enumerate() {
+-            for channel in 0..3 {
+-                out[channel] =
+-                    self.log_coef[index][channel] * (1.0 - w) + other.log_coef[index][channel] * w;
++            for (channel, value) in out.iter_mut().enumerate() {
++                *value = self.log_coef[index][channel] * (1.0 - w)
++                    + other.log_coef[index][channel] * w;
+             }
+         }
+         let mut amplitude = [0.0; 3];
+@@ -1332,8 +1332,8 @@ fn reference_sky_irradiance(samples: &[SkyDirectionalSample], normal: [f64; 3])
+     for sample in samples {
+         let cosine = dot3(normal, sample.direction).max(0.0);
+         let weight = cosine * sample.solid_angle;
+-        for channel in 0..3 {
+-            irradiance[channel] += sample.radiance[channel] * weight;
++        for (out, radiance) in irradiance.iter_mut().zip(sample.radiance) {
++            *out += radiance * weight;
+         }
+     }
+     irradiance
+@@ -1372,8 +1372,8 @@ fn reference_cox_munk_sky_reflection(
+         if !kernel.is_finite() || kernel <= 0.0 {
+             continue;
+         }
+-        for channel in 0..3 {
+-            reflected[channel] += sample.radiance[channel] * kernel * sample.solid_angle;
++        for (out, radiance) in reflected.iter_mut().zip(sample.radiance) {
++            *out += radiance * kernel * sample.solid_angle;
+         }
+     }
+     reflected
+@@ -1497,8 +1497,8 @@ impl SkyShAmbient {
+         let w = weight.clamp(0.0, 1.0);
+         let mut coef = [[0.0; 3]; SH2_COUNT];
+         for (index, out) in coef.iter_mut().enumerate() {
+-            for channel in 0..3 {
+-                out[channel] =
++            for (channel, value) in out.iter_mut().enumerate() {
++                *value =
+                     self.coef[index][channel] * (1.0 - w) + other.coef[index][channel] * w;
+             }
+         }
+diff --git a/crates/simsat/src/render.rs b/crates/simsat/src/render.rs
+index 5071384..324b7a4 100644
+--- a/crates/simsat/src/render.rs
++++ b/crates/simsat/src/render.rs
+@@ -1243,11 +1243,6 @@ fn madd3(a: [f64; 3], b: [f64; 3], s: f64) -> [f64; 3] {
+     [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s]
+ }
+ 
+-#[inline]
+-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+-}
+-
+ #[inline]
+ fn norm3(a: [f64; 3]) -> [f64; 3] {
+     let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
