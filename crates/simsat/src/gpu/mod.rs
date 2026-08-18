@@ -19,6 +19,7 @@ use eframe::egui_wgpu::wgpu;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+use crate::atmosphere::SKY_SHE_GPU_WIDTH;
 use crate::bluemarble::BlueMarbleCrop;
 use crate::bricks::{LogQuant, VolumeBrick};
 use crate::camera::{SurfaceRaster, TOPDOWN_CAMERA_ALTITUDE_M, topdown_nadir_ray};
@@ -442,7 +443,9 @@ pub struct SurfaceFrameInputs<'a> {
     pub transmittance_lut: &'a [f32],
     /// Multiple-scattering LUT, `32*32*4` f32 RGBA (optics config).
     pub multiscatter_lut: &'a [f32],
-    /// Ambient irradiance vs sun elevation, `ambient_n*4` f32 RGBA (per frame).
+    /// Positive sky-lighting SHE table, `SKY_SHE_GPU_WIDTH * sky_rows * 4` f32
+    /// RGBA. Rows are sun elevations; columns follow
+    /// `SkyShTable::to_she_rgba_f32`.
     pub ambient_lut: &'a [f32],
     pub ambient_n: u32,
     /// The packed per-frame uniform.
@@ -617,10 +620,10 @@ impl SurfaceResources {
         let ambient_tex = upload_rgba32f(
             device,
             queue,
+            SKY_SHE_GPU_WIDTH as u32,
             inputs.ambient_n.max(1),
-            1,
             inputs.ambient_lut,
-            "ambient",
+            "sky-she",
         );
 
         // Domain textures (normals + landmask), always present.
@@ -1540,9 +1543,9 @@ pub struct CloudFrameInputs<'a> {
     /// index `4*((z*dim + y)*dim + x)` — uploaded as a `dim^3` Rgba32Float 3-D texture.
     pub froxel_dim: u32,
     pub froxel_data: &'a [f32],
-    /// SH-2 sky-ambient table (`SkyShTable::to_rgba_f32`): 9 coef columns x `sh_rows`
-    /// elevation rows of RGBA f32 (binding 14). Row count must equal the scalar
-    /// ambient LUT's entry count (both come from the same table).
+    /// Positive sky-lighting SHE table (`SkyShTable::to_she_rgba_f32`):
+    /// `SKY_SHE_GPU_WIDTH` columns x `sh_rows` elevation rows of RGBA f32 (binding 14).
+    /// Row count must equal the surface sky-SHE table's row count.
     pub sh_rows: u32,
     pub sh_data: &'a [f32],
     /// The scan-angle rect the froxel was built over (`x_min, x_max, y_min, y_max`).
@@ -1753,7 +1756,7 @@ impl CloudPassResources {
                 },
                 tex2d(7, false),  // transmittance_lut
                 tex2d(8, false),  // multiscatter_lut
-                tex2d(9, false),  // ambient_lut (scalar; layout-bound, shader-legacy)
+                tex2d(9, false),  // positive sky-SHE table (surface twin binding)
                 tex3d(10, true),  // volume (Rgba8Unorm, hardware trilinear)
                 tex3d(11, true),  // occupancy (R8Unorm, hardware trilinear)
                 tex2d(12, false), // sun_od (R32Float)
@@ -1970,10 +1973,10 @@ impl CloudPassResources {
         let ambient_tex = upload_rgba32f(
             device,
             queue,
+            SKY_SHE_GPU_WIDTH as u32,
             s.ambient_n.max(1),
-            1,
             s.ambient_lut,
-            "ambient",
+            "sky-she-surface",
         );
         let normal_tex = upload_rgba8(device, queue, s.nx, s.ny, s.normals_rgba, "normals");
         let landmask_tex = upload_r8(device, queue, s.nx, s.ny, s.landmask_r8, "landmask");
@@ -1985,7 +1988,7 @@ impl CloudPassResources {
             }
         };
 
-        // Froxel (3-D Rgba32Float) + the SH-2 sky-ambient table (9 x rows Rgba32Float).
+        // Froxel (3-D Rgba32Float) + positive sky-SHE table (43 x rows RGBA32F).
         let fdim = inputs.froxel_dim.max(1);
         let froxel_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("simsat-froxel"),
@@ -2023,10 +2026,10 @@ impl CloudPassResources {
         let sh_tex = upload_rgba32f(
             device,
             queue,
-            9,
+            SKY_SHE_GPU_WIDTH as u32,
             inputs.sh_rows.max(1),
             inputs.sh_data,
-            "sh-ambient",
+            "sky-she-cloud",
         );
 
         // Top-down uses one reviewed local-up vector per output pixel. Geo keeps
@@ -2732,7 +2735,7 @@ mod tests {
         let landmask = vec![255u8; 4];
         let transmittance = [1.0f32, 1.0, 1.0, 1.0].repeat(256 * 64);
         let multiscatter = [0.0f32, 0.0, 0.0, 1.0].repeat(32 * 32);
-        let ambient = [0.0f32, 0.0, 0.0, 1.0].repeat(2);
+        let ambient = [0.0f32, 0.0, 0.0, 1.0].repeat(SKY_SHE_GPU_WIDTH * 2);
         let mut uniforms = test_surface_uniforms();
         uniforms.sun = sun;
         uniforms.ambient_n = 2.0;
@@ -2751,7 +2754,7 @@ mod tests {
         let texture_a = vec![255u8; 2 * 2 * 2 * 4];
         let occupancy = vec![255u8; 1];
         let froxel = vec![0.0f32, 0.0, 0.0, 1.0];
-        let sh = vec![0.0f32; 9 * 2 * 4];
+        let sh = vec![0.0f32; SKY_SHE_GPU_WIDTH * 2 * 4];
         let surface = SurfaceFrameInputs {
             width,
             height,

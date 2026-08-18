@@ -509,6 +509,7 @@ struct PreparedRender {
     // M2 atmosphere frame data.
     transmittance_lut: Vec<f32>,
     multiscatter_lut: Vec<f32>,
+    /// Positive sky-SHE texture rows (`SkyShTable::to_she_rgba_f32`).
     ambient_lut: Vec<f32>,
     ambient_n: u32,
     uniforms: SurfaceUniforms,
@@ -574,6 +575,7 @@ struct GpuCloudPrep {
     froxel_dim: u32,
     froxel_data: Vec<f32>,
     sh_rows: u32,
+    /// Positive sky-SHE texture rows shared with the surface pass.
     sh_data: Vec<f32>,
     scan_rect: [f32; 4],
     /// The CPU reference frame for the parity instrument (`Some` on a parity render):
@@ -6732,8 +6734,9 @@ fn prepare_render(
     };
     // Cached under EVERY AtmosphereParams field (raw f64 bits) — `pw_ratio` comes
     // from the brick, so a timestep whose domain-mean moisture moved rebuilds (a
-    // stale LUT can never recolour a frame); the SH-2 sky ambient (M5) is built
-    // from the same LUTs + params, so it lives in the same slot.
+    // stale LUT can never recolour a frame); the positive log-SH sky fields and
+    // Cox-Munk reflected-sky SHE are built from the same LUTs + params, so they live
+    // in the same slot.
     let atmo_key = pipeline::AtmoLutKey {
         aod_bits: params.aod.to_bits(),
         pw_ratio_bits: params.pw_ratio.to_bits(),
@@ -6743,11 +6746,9 @@ fn prepare_render(
     };
     let (atmo_arc, atmo_hit) = scache.atmo.get_or_insert_with(atmo_key, || {
         let luts = AtmosphereLuts::build(&params);
-        // SH-2 directional sky ambient (M5): projects the sky-view LUT into 9 RGB SH-2
-        // coefficients per elevation entry (the "how much sky and what colour" ambient).
-        // The clouds-OFF GPU surface pass still consumes the flat-hemisphere scalar
-        // derived from it (`to_scalar_rgba_f32`); the clouds-ON CPU path evaluates the SH
-        // directionally at the terrain normal + cloud up.
+        // Positive sky-lighting tables: direct log-SH3 diffuse irradiance plus the
+        // Cox-Munk reflected-sky log-SH4 fit. CPU and both WGSL paths consume the same
+        // coefficients; direct sunlight remains outside these diffuse/environment fits.
         let sky_sh = SkyShTable::build(&luts, &params, SKY_SH_ENTRIES);
         (luts, sky_sh)
     });
@@ -6825,9 +6826,9 @@ fn prepare_render(
     let transmittance_lut = luts.transmittance.data.clone();
     let multiscatter_lut = luts.multiscatter.data.clone();
     let ambient_n = sky_sh.entries.len() as u32;
-    // The clouds-OFF GPU surface pass consumes the flat-hemisphere scalar of the SH
-    // ambient (a documented CPU/GPU divergence; see SkyShTable::to_scalar_rgba_f32).
-    let ambient_lut = sky_sh.to_scalar_rgba_f32();
+    // One production upload layout is shared by the clouds-off surface pass and the
+    // GPU cloud pass: positive log-SH3 irradiance + calm-water Cox-Munk sky SHE.
+    let ambient_lut = sky_sh.to_she_rgba_f32();
 
     // ── M6 IR (band 13) OR the M4/M5 cloud raymarch. IR is a SEPARATE thermal pass
     // (a top-down slant-ray gray-body emission march -> true-Kelvin BT plane, coloured
@@ -7142,7 +7143,7 @@ fn prepare_render(
             froxel_dim: froxel.dim as u32,
             froxel_data: froxel.data.clone(),
             sh_rows: sky_sh.entries.len() as u32,
-            sh_data: sky_sh.to_rgba_f32(),
+            sh_data: ambient_lut.clone(),
             scan_rect: [
                 scan_rect.0 as f32,
                 scan_rect.1 as f32,
@@ -7172,8 +7173,8 @@ fn prepare_render(
         // blocks. The scene resources below are built regardless (cheap) and the render
         // call selects the ray path + clouds on/off.
         status("Building horizon map...");
-        // M3 horizon map (penumbral terrain shadows + the ambient aperture that
-        // completes M5's SH-2 sky ambient; design section 6). Built here (clouds-on CPU
+        // M3 horizon map (penumbral terrain shadows + the ambient aperture applied to
+        // direct log-SH3 sky irradiance; design section 6). Built here (clouds-on CPU
         // path only) from HGT, sun-independent. The clouds-OFF GPU surface pass does NOT
         // get the M3 per-texel terrain shadow/aperture/snow (deferred GPU activation,
         // per M4/M5/M6). `hgt_dx_m`/`hgt_dy_m` are the projection cell size in metres.

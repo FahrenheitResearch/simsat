@@ -20,7 +20,7 @@
 
 use crate::bricks::VolumeBrick;
 use crate::camera::GEO_ORBIT_RADIUS_M;
-use crate::optics::EARTH_RADIUS_M;
+use crate::optics::{EARTH_RADIUS_M, WATER_REFRACTIVE_INDEX_VIS, fresnel_reflectance_unpolarized};
 
 use std::f64::consts::PI;
 
@@ -866,8 +866,8 @@ pub fn ambient_irradiance_from_sky_view(lut: &Lut2, r_obs: f64) -> [f64; 3] {
 }
 
 /// A compact table of ambient irradiance vs sun elevation, the "cheap projection"
-/// of the sky-view LUT the surface render consumes per pixel (full SH-2 directional
-/// ambient is M5). Entries span `elev_min_deg`..`elev_max_deg`.
+/// of the sky-view LUT retained for compatibility and scalar diagnostics. Production
+/// surface/cloud lighting uses the positive log-SH tables below.
 #[derive(Debug, Clone)]
 pub struct AmbientTable {
     pub elev_min_deg: f64,
@@ -935,130 +935,636 @@ impl AmbientTable {
     }
 }
 
-// ── SH-2 directional sky ambient (design section 6, M5) ──────────────────────
+// ── Positive log-SH sky lighting + Cox-Munk sky reflection ───────────────────
+//
+// Radiance and irradiance are strictly non-negative energy quantities. A truncated
+// linear SH series can undershoot below zero around a bright horizon or twilight
+// gradient; clamping those lobes discards energy and produces direction-dependent
+// colour shifts. The production representation below follows the Spherical Harmonic
+// Exponentials construction: fit `log(value / amplitude)` by regularized least squares,
+// reconstruct with `amplitude * exp(SH)`, and keep exact zero in the separate amplitude.
+//
+// IMPORTANT: diffuse irradiance is fitted DIRECTLY after the cosine integral. The
+// exponential is nonlinear, so convolving log-radiance coefficients with the linear
+// Lambertian SH band factors would be mathematically wrong.
 
-/// Number of real SH basis functions up to order 2 (`l = 0,1,2` -> 1 + 3 + 5 = 9).
+/// Legacy SH-2 coefficient count retained for source compatibility and diagnostics.
 pub const SH2_COUNT: usize = 9;
+/// Real SH coefficient count through degree 3 (`1 + 3 + 5 + 7`).
+pub const SH3_COUNT: usize = 16;
+/// Real SH coefficient count through degree 4 (`SH3_COUNT + 9`).
+pub const SH4_COUNT: usize = 25;
+/// Number of Cox-Munk roughness knots fitted per sky-elevation entry.
+pub const COX_MUNK_SKY_MSS_COUNT: usize = 6;
+/// GPU row width: 16 log-irradiance coefficients + amplitude, then 25 calm-water
+/// sky-reflection coefficients + amplitude.
+pub const SKY_SHE_GPU_WIDTH: usize = SH3_COUNT + 1 + SH4_COUNT + 1;
 
-/// The 9 real spherical-harmonic basis functions (`l <= 2`) at a unit direction
-/// `d = (x, y, z)`. Standard real SH (e.g. Sloan 2008 "Stupid Spherical Harmonics
-/// (SH) Tricks"): index 0 = Y_0^0; 1..=3 = Y_1^{-1,0,1}; 4..=8 = Y_2^{-2,-1,0,1,2}.
+/// Cox-Munk mean-square-slope knots after SimSat's visible glint narrowing. The first
+/// knot is exactly the GPU path's current calm-water state:
+/// `(0.003 + 0.00512 * 0 m/s) * GLINT_MSS_SCALE(0.4) = 0.0012`.
+pub const COX_MUNK_SKY_MSS_LEVELS: [f64; COX_MUNK_SKY_MSS_COUNT] =
+    [0.0012, 0.004, 0.010, 0.020, 0.040, 0.080];
+
+const LOG_SHE_RELATIVE_FLOOR: f64 = 1.0e-7;
+const LOG_SHE_ZERO_AMPLITUDE: f64 = 1.0e-12;
+const LOG_SHE_EXP_LIMIT: f64 = 80.0;
+const LOG_SHE_REGULARIZATION: f64 = 1.0e-4;
+const LOG_SH3_IRRADIANCE_SAMPLES: usize = 96;
+const COX_MUNK_SKY_VIEW_SAMPLES: usize = 96;
+const COX_MUNK_SKY_MIN_VIEW_COSINE: f64 = 0.04;
+const GOLDEN_ANGLE_RAD: f64 = PI * (3.0 - 2.236_067_977_499_79);
+
+const SH3_BANDS: [u8; SH3_COUNT] = [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3];
+const SH4_BANDS: [u8; SH4_COUNT] = [
+    0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+];
+
+/// The 9 real spherical-harmonic basis functions (`l <= 2`) at a unit direction.
+/// Ordering is the established SimSat ordering: `l=0`, then each band's `m=-l..l`.
 pub fn sh2_basis(d: [f64; 3]) -> [f64; SH2_COUNT] {
     let (x, y, z) = (d[0], d[1], d[2]);
     [
-        0.282094791773878,                       // Y00 = 1/(2 sqrt(pi))
-        0.488602511902920 * y,                   // Y1-1
-        0.488602511902920 * z,                   // Y10
-        0.488602511902920 * x,                   // Y11
-        1.092548430592079 * x * y,               // Y2-2
-        1.092548430592079 * y * z,               // Y2-1
-        0.315391565252520 * (3.0 * z * z - 1.0), // Y20
-        1.092548430592079 * x * z,               // Y21
-        0.546274215296040 * (x * x - y * y),     // Y22
+        0.282094791773878,
+        0.488602511902920 * y,
+        0.488602511902920 * z,
+        0.488602511902920 * x,
+        1.092548430592079 * x * y,
+        1.092548430592079 * y * z,
+        0.315391565252520 * (3.0 * z * z - 1.0),
+        1.092548430592079 * x * z,
+        0.546274215296040 * (x * x - y * y),
     ]
 }
 
-/// Cosine-lobe convolution coefficients `A_l` (Ramamoorthi & Hanrahan 2001, "An
-/// Efficient Representation for Irradiance Environment Maps"): turning a projected
-/// sky-RADIANCE SH into diffuse IRRADIANCE at a surface normal is a per-band SH dot
-/// product with these. `A_0 = pi`, `A_1 = 2 pi / 3`, `A_2 = pi / 4` (odd `l > 1`
-/// vanish; only `l <= 2` are kept, which is exact to ~99% for a smooth environment).
-const SH2_COSINE_A: [f64; SH2_COUNT] = [
-    PI,             // l = 0
-    2.0 * PI / 3.0, // l = 1
-    2.0 * PI / 3.0,
-    2.0 * PI / 3.0,
-    PI / 4.0, // l = 2
-    PI / 4.0,
-    PI / 4.0,
-    PI / 4.0,
-    PI / 4.0,
-];
+/// Real SH basis through degree 3, extending [`sh2_basis`] without changing its first
+/// nine entries. The degree-3 ordering is `m=-3..3`.
+pub fn sh3_basis(d: [f64; 3]) -> [f64; SH3_COUNT] {
+    let (x, y, z) = (d[0], d[1], d[2]);
+    let low = sh2_basis(d);
+    [
+        low[0],
+        low[1],
+        low[2],
+        low[3],
+        low[4],
+        low[5],
+        low[6],
+        low[7],
+        low[8],
+        0.590043589926644 * y * (3.0 * x * x - y * y),
+        2.890611442640554 * x * y * z,
+        0.457045799464466 * y * (5.0 * z * z - 1.0),
+        0.373176332590115 * z * (5.0 * z * z - 3.0),
+        0.457045799464466 * x * (5.0 * z * z - 1.0),
+        1.445305721320277 * z * (x * x - y * y),
+        0.590043589926644 * x * (x * x - 3.0 * y * y),
+    ]
+}
 
-/// SH-2 (9 RGB-coefficient) projection of a sky-view LUT — the directional, COLORED
-/// sky ambient (design section 6, "how much sky and what color"). The frame is
-/// SUN-RELATIVE: `+z` = local up, `+x` = the sun's horizontal azimuth (the sky-view
-/// LUT's azimuth origin), `+y = z x x`. This replaces M2's scalar [`AmbientTable`]:
-/// the DC (`l=0`) term is the mean sky radiance the scalar carried, and the `l=1/l=2`
-/// terms carry the sun-side-vs-antisun-side gradient (orange fill toward a sunset sun,
-/// cool fill away) the scalar could not.
+/// Real SH basis through degree 4. The degree-4 ordering is `m=-4..4`.
+pub fn sh4_basis(d: [f64; 3]) -> [f64; SH4_COUNT] {
+    let (x, y, z) = (d[0], d[1], d[2]);
+    let low = sh3_basis(d);
+    [
+        low[0],
+        low[1],
+        low[2],
+        low[3],
+        low[4],
+        low[5],
+        low[6],
+        low[7],
+        low[8],
+        low[9],
+        low[10],
+        low[11],
+        low[12],
+        low[13],
+        low[14],
+        low[15],
+        2.503342941796704 * x * y * (x * x - y * y),
+        1.770130769779931 * y * z * (3.0 * x * x - y * y),
+        0.946174695757560 * x * y * (7.0 * z * z - 1.0),
+        0.669046543557289 * y * z * (7.0 * z * z - 3.0),
+        0.105785546915204 * (35.0 * z.powi(4) - 30.0 * z * z + 3.0),
+        0.669046543557289 * x * z * (7.0 * z * z - 3.0),
+        0.473087347878780 * (x * x - y * y) * (7.0 * z * z - 1.0),
+        1.770130769779931 * x * z * (x * x - 3.0 * y * y),
+        0.625835735449176 * (x.powi(4) - 6.0 * x * x * y * y + y.powi(4)),
+    ]
+}
+
+/// Strictly-positive RGB spherical-harmonic exponential. `amplitude` is factored out
+/// so a physically exact zero remains exact instead of becoming an arbitrary log floor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogShRgb<const N: usize> {
+    pub log_coef: [[f64; 3]; N],
+    pub amplitude: [f64; 3],
+}
+
+impl<const N: usize> LogShRgb<N> {
+    pub const fn dark() -> Self {
+        Self {
+            log_coef: [[0.0; 3]; N],
+            amplitude: [0.0; 3],
+        }
+    }
+
+    fn evaluate(&self, basis: [f64; N]) -> [f64; 3] {
+        let mut log_value = [0.0; 3];
+        for (coefficient, basis_value) in self.log_coef.iter().zip(basis) {
+            for channel in 0..3 {
+                log_value[channel] += coefficient[channel] * basis_value;
+            }
+        }
+        let mut out = [0.0; 3];
+        for channel in 0..3 {
+            let amplitude = self.amplitude[channel];
+            if amplitude > 0.0 && amplitude.is_finite() {
+                out[channel] = amplitude
+                    * log_value[channel]
+                        .clamp(-LOG_SHE_EXP_LIMIT, LOG_SHE_EXP_LIMIT)
+                        .exp();
+            }
+        }
+        out
+    }
+
+    fn lerp(self, other: Self, weight: f64) -> Self {
+        let w = weight.clamp(0.0, 1.0);
+        let mut log_coef = [[0.0; 3]; N];
+        for (index, out) in log_coef.iter_mut().enumerate() {
+            for channel in 0..3 {
+                out[channel] =
+                    self.log_coef[index][channel] * (1.0 - w) + other.log_coef[index][channel] * w;
+            }
+        }
+        let mut amplitude = [0.0; 3];
+        for (channel, out) in amplitude.iter_mut().enumerate() {
+            let a = self.amplitude[channel];
+            let b = other.amplitude[channel];
+            *out = if a > 0.0 && b > 0.0 {
+                ((1.0 - w) * a.ln() + w * b.ln()).exp()
+            } else {
+                a * (1.0 - w) + b * w
+            };
+        }
+        Self {
+            log_coef,
+            amplitude,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShFitSample<const N: usize> {
+    basis: [f64; N],
+    value: [f64; 3],
+    weight: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SkyDirectionalSample {
+    direction: [f64; 3],
+    radiance: [f64; 3],
+    solid_angle: f64,
+}
+
+#[allow(clippy::needless_range_loop)]
+fn solve_spd<const N: usize>(matrix: [[f64; N]; N], rhs: [[f64; 3]; N]) -> Option<[[f64; 3]; N]> {
+    let mut lower = [[0.0; N]; N];
+    for row in 0..N {
+        for column in 0..=row {
+            let mut sum = matrix[row][column];
+            for k in 0..column {
+                sum -= lower[row][k] * lower[column][k];
+            }
+            if row == column {
+                if !sum.is_finite() || sum <= 1.0e-14 {
+                    return None;
+                }
+                lower[row][column] = sum.sqrt();
+            } else {
+                lower[row][column] = sum / lower[column][column];
+            }
+        }
+    }
+
+    let mut y = [[0.0; 3]; N];
+    for row in 0..N {
+        for channel in 0..3 {
+            let mut sum = rhs[row][channel];
+            for k in 0..row {
+                sum -= lower[row][k] * y[k][channel];
+            }
+            y[row][channel] = sum / lower[row][row];
+        }
+    }
+
+    let mut solution = [[0.0; 3]; N];
+    for row in (0..N).rev() {
+        for channel in 0..3 {
+            let mut sum = y[row][channel];
+            for k in row + 1..N {
+                sum -= lower[k][row] * solution[k][channel];
+            }
+            solution[row][channel] = sum / lower[row][row];
+        }
+    }
+    Some(solution)
+}
+
+#[allow(clippy::needless_range_loop)]
+fn fit_log_she<const N: usize>(samples: &[ShFitSample<N>], bands: &[u8; N]) -> LogShRgb<N> {
+    if samples.is_empty() {
+        return LogShRgb::dark();
+    }
+
+    let mut total_weight = 0.0;
+    let mut weighted_value = [0.0; 3];
+    for sample in samples {
+        if !sample.weight.is_finite() || sample.weight <= 0.0 {
+            continue;
+        }
+        total_weight += sample.weight;
+        for channel in 0..3 {
+            let value = if sample.value[channel].is_finite() {
+                sample.value[channel].max(0.0)
+            } else {
+                0.0
+            };
+            weighted_value[channel] += sample.weight * value;
+        }
+    }
+    if total_weight <= 0.0 {
+        return LogShRgb::dark();
+    }
+
+    let mean = weighted_value.map(|value| value / total_weight);
+    let mut ata = [[0.0; N]; N];
+    let mut atb = [[0.0; 3]; N];
+    for sample in samples {
+        if !sample.weight.is_finite() || sample.weight <= 0.0 {
+            continue;
+        }
+        for row in 0..N {
+            for column in 0..N {
+                ata[row][column] += sample.weight * sample.basis[row] * sample.basis[column];
+            }
+            for channel in 0..3 {
+                if mean[channel] <= LOG_SHE_ZERO_AMPLITUDE {
+                    continue;
+                }
+                let value = if sample.value[channel].is_finite() {
+                    sample.value[channel].max(0.0)
+                } else {
+                    0.0
+                };
+                let log_ratio = (value / mean[channel]).max(LOG_SHE_RELATIVE_FLOOR).ln();
+                atb[row][channel] += sample.weight * sample.basis[row] * log_ratio;
+            }
+        }
+    }
+
+    for index in 0..N {
+        let degree = f64::from(bands[index]);
+        let laplacian = degree * (degree + 1.0);
+        let penalty = if degree == 0.0 {
+            1.0e-10
+        } else {
+            LOG_SHE_REGULARIZATION * laplacian * laplacian
+        };
+        ata[index][index] += total_weight * penalty;
+    }
+
+    let log_coef = solve_spd(ata, atb).unwrap_or([[0.0; 3]; N]);
+    let mut predicted_weight = [0.0; 3];
+    for sample in samples {
+        if !sample.weight.is_finite() || sample.weight <= 0.0 {
+            continue;
+        }
+        let mut log_value = [0.0; 3];
+        for index in 0..N {
+            for channel in 0..3 {
+                log_value[channel] += log_coef[index][channel] * sample.basis[index];
+            }
+        }
+        for channel in 0..3 {
+            predicted_weight[channel] += sample.weight
+                * log_value[channel]
+                    .clamp(-LOG_SHE_EXP_LIMIT, LOG_SHE_EXP_LIMIT)
+                    .exp();
+        }
+    }
+
+    let mut amplitude = [0.0; 3];
+    for channel in 0..3 {
+        if weighted_value[channel] > LOG_SHE_ZERO_AMPLITUDE
+            && predicted_weight[channel].is_finite()
+            && predicted_weight[channel] > 0.0
+        {
+            amplitude[channel] = weighted_value[channel] / predicted_weight[channel];
+        }
+    }
+    LogShRgb {
+        log_coef,
+        amplitude,
+    }
+}
+
+fn fibonacci_hemisphere(index: usize, count: usize, min_z: f64) -> [f64; 3] {
+    let count = count.max(1);
+    let z = min_z.clamp(0.0, 0.999)
+        + (1.0 - min_z.clamp(0.0, 0.999)) * (index as f64 + 0.5) / count as f64;
+    let radius = (1.0 - z * z).max(0.0).sqrt();
+    let azimuth = GOLDEN_ANGLE_RAD * index as f64;
+    [radius * azimuth.cos(), radius * azimuth.sin(), z]
+}
+
+fn upper_sky_samples(lut: &Lut2, r_obs: f64) -> Vec<SkyDirectionalSample> {
+    let (width, height) = (lut.width, lut.height);
+    let d_azimuth = 2.0 * PI / width.max(1) as f64;
+    let mut samples = Vec::with_capacity(width * height / 2);
+    for y in 0..height {
+        let v0 = y as f64 / height.max(1) as f64;
+        let v1 = (y as f64 + 1.0) / height.max(1) as f64;
+        let z0 = skyview_v_to_zenith(v0, r_obs);
+        let z1 = skyview_v_to_zenith(v1, r_obs);
+        let zenith = 0.5 * (z0 + z1);
+        if zenith >= PI / 2.0 {
+            continue;
+        }
+        let d_zenith = (z1 - z0).abs();
+        let (sin_zenith, cos_zenith) = zenith.sin_cos();
+        let solid_angle = sin_zenith * d_zenith * d_azimuth;
+        if solid_angle <= 0.0 {
+            continue;
+        }
+        for x in 0..width {
+            let azimuth = (x as f64 + 0.5) / width.max(1) as f64 * 2.0 * PI;
+            let direction = [
+                sin_zenith * azimuth.cos(),
+                sin_zenith * azimuth.sin(),
+                cos_zenith,
+            ];
+            let raw = lut.fetch(x, y);
+            let radiance = raw.map(|value| {
+                if value.is_finite() {
+                    value.max(0.0)
+                } else {
+                    0.0
+                }
+            });
+            samples.push(SkyDirectionalSample {
+                direction,
+                radiance,
+                solid_angle,
+            });
+        }
+    }
+    samples
+}
+
+fn reference_sky_irradiance(samples: &[SkyDirectionalSample], normal: [f64; 3]) -> [f64; 3] {
+    let normal = norm3(normal);
+    let mut irradiance = [0.0; 3];
+    for sample in samples {
+        let cosine = dot3(normal, sample.direction).max(0.0);
+        let weight = cosine * sample.solid_angle;
+        for channel in 0..3 {
+            irradiance[channel] += sample.radiance[channel] * weight;
+        }
+    }
+    irradiance
+}
+
+fn reference_cox_munk_sky_reflection(
+    samples: &[SkyDirectionalSample],
+    to_camera: [f64; 3],
+    mss: f64,
+) -> [f64; 3] {
+    let view = norm3(to_camera);
+    let mu_view = view[2];
+    if mu_view <= 1.0e-4 {
+        return [0.0; 3];
+    }
+    let mss = mss.max(1.0e-4);
+    let mut reflected = [0.0; 3];
+    for sample in samples {
+        let half_sum = add3(sample.direction, view);
+        let half_length = len3(half_sum);
+        if half_length <= 1.0e-9 {
+            continue;
+        }
+        let half = scl3(half_sum, 1.0 / half_length);
+        let cos_beta = half[2];
+        if cos_beta <= 1.0e-4 {
+            continue;
+        }
+        let cos_omega = dot3(sample.direction, half).clamp(0.0, 1.0);
+        let tan2_beta = (1.0 - cos_beta * cos_beta) / (cos_beta * cos_beta);
+        let slope_pdf = (-tan2_beta / mss).exp() / (PI * mss);
+        let fresnel = fresnel_reflectance_unpolarized(cos_omega, WATER_REFRACTIVE_INDEX_VIS);
+        // `f_r * mu_i`: the incoming-cosine cancels the Cox-Munk BRDF's `mu_i`
+        // denominator, leaving this positive environment-integration kernel.
+        let kernel = fresnel * slope_pdf / (4.0 * mu_view * cos_beta.powi(4));
+        if !kernel.is_finite() || kernel <= 0.0 {
+            continue;
+        }
+        for channel in 0..3 {
+            reflected[channel] += sample.radiance[channel] * kernel * sample.solid_angle;
+        }
+    }
+    reflected
+}
+
+fn fit_cox_munk_sky_she(sky_samples: &[SkyDirectionalSample], mss: f64) -> LogShRgb<SH4_COUNT> {
+    let weight = 2.0 * PI / COX_MUNK_SKY_VIEW_SAMPLES as f64;
+    let mut fit_samples = Vec::with_capacity(COX_MUNK_SKY_VIEW_SAMPLES);
+    for index in 0..COX_MUNK_SKY_VIEW_SAMPLES {
+        let view = fibonacci_hemisphere(
+            index,
+            COX_MUNK_SKY_VIEW_SAMPLES,
+            COX_MUNK_SKY_MIN_VIEW_COSINE,
+        );
+        let macro_fresnel =
+            fresnel_reflectance_unpolarized(view[2], WATER_REFRACTIVE_INDEX_VIS).max(1.0e-8);
+        let full = reference_cox_munk_sky_reflection(sky_samples, view, mss);
+        let prefiltered = full.map(|value| value / macro_fresnel);
+        let reflection = [-view[0], -view[1], view[2]];
+        fit_samples.push(ShFitSample {
+            basis: sh4_basis(reflection),
+            value: prefiltered,
+            weight,
+        });
+    }
+    fit_log_she(&fit_samples, &SH4_BANDS)
+}
+
+/// One sky-elevation entry. `coef` is the legacy linear SH-2 radiance projection kept
+/// for diagnostics/source compatibility; production evaluation uses the positive
+/// log-SH3 fields and the Cox-Munk environment-reflection SHE table.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkyShAmbient {
-    /// 9 SH-2 coefficients, each an RGB triple (sky RADIANCE projection).
     pub coef: [[f64; 3]; SH2_COUNT],
+    log_irradiance: LogShRgb<SH3_COUNT>,
+    log_radiance: LogShRgb<SH3_COUNT>,
+    cox_munk_sky: [LogShRgb<SH4_COUNT>; COX_MUNK_SKY_MSS_COUNT],
 }
 
 impl SkyShAmbient {
-    /// Project a sky-view LUT into SH-2 over the full sphere. Texel `(x, y)` is the
-    /// sky radiance in the direction (zenith from [`skyview_v_to_zenith`], azimuth =
-    /// `u*2pi` sun-relative); each term is weighted by the texel solid angle
-    /// `sin(zenith) dZenith dAzimuth` (the same quadrature the scalar ambient uses).
+    fn dark() -> Self {
+        Self {
+            coef: [[0.0; 3]; SH2_COUNT],
+            log_irradiance: LogShRgb::dark(),
+            log_radiance: LogShRgb::dark(),
+            cox_munk_sky: [LogShRgb::dark(); COX_MUNK_SKY_MSS_COUNT],
+        }
+    }
+
+    /// Project one sky-view LUT into all production representations.
     pub fn project(lut: &Lut2, r_obs: f64) -> Self {
-        let (w, h) = (lut.width, lut.height);
-        let d_az = 2.0 * PI / w.max(1) as f64;
-        let mut coef = [[0.0f64; 3]; SH2_COUNT];
-        for y in 0..h {
-            let v0 = y as f64 / h as f64;
-            let v1 = (y as f64 + 1.0) / h as f64;
+        let (width, height) = (lut.width, lut.height);
+        let d_azimuth = 2.0 * PI / width.max(1) as f64;
+
+        // Legacy full-sphere linear SH-2 projection retained for diagnostics.
+        let mut coef = [[0.0; 3]; SH2_COUNT];
+        for y in 0..height {
+            let v0 = y as f64 / height.max(1) as f64;
+            let v1 = (y as f64 + 1.0) / height.max(1) as f64;
             let z0 = skyview_v_to_zenith(v0, r_obs);
             let z1 = skyview_v_to_zenith(v1, r_obs);
-            let zc = 0.5 * (z0 + z1);
+            let zenith = 0.5 * (z0 + z1);
             let d_zenith = (z1 - z0).abs();
-            let (sz, cz) = zc.sin_cos();
-            let solid = sz * d_zenith * d_az;
-            for x in 0..w {
-                let az = (x as f64 + 0.5) / w as f64 * 2.0 * PI;
-                let dir = [sz * az.cos(), sz * az.sin(), cz];
-                let basis = sh2_basis(dir);
-                let rad = lut.fetch(x, y);
-                for (i, b) in basis.iter().enumerate() {
-                    let bw = b * solid;
-                    coef[i][0] += rad[0] * bw;
-                    coef[i][1] += rad[1] * bw;
-                    coef[i][2] += rad[2] * bw;
+            let (sin_zenith, cos_zenith) = zenith.sin_cos();
+            let solid_angle = sin_zenith * d_zenith * d_azimuth;
+            for x in 0..width {
+                let azimuth = (x as f64 + 0.5) / width.max(1) as f64 * 2.0 * PI;
+                let direction = [
+                    sin_zenith * azimuth.cos(),
+                    sin_zenith * azimuth.sin(),
+                    cos_zenith,
+                ];
+                let basis = sh2_basis(direction);
+                let radiance = lut.fetch(x, y);
+                for (index, basis_value) in basis.iter().enumerate() {
+                    let weight = basis_value * solid_angle;
+                    for channel in 0..3 {
+                        coef[index][channel] += radiance[channel] * weight;
+                    }
                 }
             }
         }
-        Self { coef }
+
+        let sky_samples = upper_sky_samples(lut, r_obs);
+        let radiance_samples: Vec<_> = sky_samples
+            .iter()
+            .map(|sample| ShFitSample {
+                basis: sh3_basis(sample.direction),
+                value: sample.radiance,
+                weight: sample.solid_angle,
+            })
+            .collect();
+        let log_radiance = fit_log_she(&radiance_samples, &SH3_BANDS);
+
+        // Fit the FINAL Lambertian irradiance, not a post-hoc convolution of log SH.
+        let normal_weight = 2.0 * PI / LOG_SH3_IRRADIANCE_SAMPLES as f64;
+        let mut irradiance_samples = Vec::with_capacity(LOG_SH3_IRRADIANCE_SAMPLES);
+        for index in 0..LOG_SH3_IRRADIANCE_SAMPLES {
+            let normal = fibonacci_hemisphere(index, LOG_SH3_IRRADIANCE_SAMPLES, 0.0);
+            irradiance_samples.push(ShFitSample {
+                basis: sh3_basis(normal),
+                value: reference_sky_irradiance(&sky_samples, normal),
+                weight: normal_weight,
+            });
+        }
+        let log_irradiance = fit_log_she(&irradiance_samples, &SH3_BANDS);
+
+        let cox_munk_sky = core::array::from_fn(|index| {
+            fit_cox_munk_sky_she(&sky_samples, COX_MUNK_SKY_MSS_LEVELS[index])
+        });
+
+        Self {
+            coef,
+            log_irradiance,
+            log_radiance,
+            cox_munk_sky,
+        }
     }
 
-    /// Raw SH reconstruction of the sky RADIANCE in unit direction `dir` (sun-relative
-    /// frame). SH truncation can ring slightly negative; the result is clamped `>= 0`.
-    pub fn radiance(&self, dir: [f64; 3]) -> [f64; 3] {
-        let basis = sh2_basis(norm3(dir));
-        let mut out = [0.0; 3];
-        for (i, b) in basis.iter().enumerate() {
-            for (c, o) in out.iter_mut().enumerate() {
-                *o += self.coef[i][c] * b;
+    fn lerp(self, other: Self, weight: f64) -> Self {
+        let w = weight.clamp(0.0, 1.0);
+        let mut coef = [[0.0; 3]; SH2_COUNT];
+        for (index, out) in coef.iter_mut().enumerate() {
+            for channel in 0..3 {
+                out[channel] =
+                    self.coef[index][channel] * (1.0 - w) + other.coef[index][channel] * w;
             }
         }
-        [out[0].max(0.0), out[1].max(0.0), out[2].max(0.0)]
+        Self {
+            coef,
+            log_irradiance: self.log_irradiance.lerp(other.log_irradiance, w),
+            log_radiance: self.log_radiance.lerp(other.log_radiance, w),
+            cox_munk_sky: core::array::from_fn(|index| {
+                self.cox_munk_sky[index].lerp(other.cox_munk_sky[index], w)
+            }),
+        }
     }
 
-    /// Diffuse IRRADIANCE (per band, W m^-2) at a surface with unit `normal` (in the
-    /// sun-relative frame), via the cosine-lobe convolution. At `normal = up` this
-    /// reproduces the scalar hemisphere irradiance M2's ambient table carried.
+    /// Strictly-positive sky radiance in a sun-relative direction.
+    pub fn radiance(&self, direction: [f64; 3]) -> [f64; 3] {
+        self.log_radiance.evaluate(sh3_basis(norm3(direction)))
+    }
+
+    /// Strictly-positive diffuse sky irradiance at a receiver normal. This evaluates
+    /// the directly fitted irradiance field; no nonlinear-after-linear convolution.
     pub fn irradiance(&self, normal: [f64; 3]) -> [f64; 3] {
-        let basis = sh2_basis(norm3(normal));
-        let mut out = [0.0; 3];
-        for ((coef, &b), &a_l) in self.coef.iter().zip(basis.iter()).zip(SH2_COSINE_A.iter()) {
-            let a = a_l * b;
-            for (c, o) in out.iter_mut().enumerate() {
-                *o += coef[c] * a;
+        self.log_irradiance.evaluate(sh3_basis(norm3(normal)))
+    }
+
+    fn cox_munk_sky_she_at(&self, mss: f64) -> LogShRgb<SH4_COUNT> {
+        let mss = if mss.is_finite() {
+            mss.clamp(
+                COX_MUNK_SKY_MSS_LEVELS[0],
+                COX_MUNK_SKY_MSS_LEVELS[COX_MUNK_SKY_MSS_COUNT - 1],
+            )
+        } else {
+            COX_MUNK_SKY_MSS_LEVELS[0]
+        };
+        for index in 0..COX_MUNK_SKY_MSS_COUNT - 1 {
+            let low = COX_MUNK_SKY_MSS_LEVELS[index];
+            let high = COX_MUNK_SKY_MSS_LEVELS[index + 1];
+            if mss <= high {
+                let weight = (mss.ln() - low.ln()) / (high.ln() - low.ln());
+                return self.cox_munk_sky[index].lerp(self.cox_munk_sky[index + 1], weight);
             }
         }
-        [out[0].max(0.0), out[1].max(0.0), out[2].max(0.0)]
+        self.cox_munk_sky[COX_MUNK_SKY_MSS_COUNT - 1]
+    }
+
+    /// Full Cox-Munk reflected-sky radiance for a flat water surface. `to_camera` is in
+    /// the sun-relative local frame (`z=up`). The table stores the positive prefiltered
+    /// environment divided by macro Fresnel; runtime restores the exact water Fresnel.
+    pub fn cox_munk_sky_reflection(&self, to_camera: [f64; 3], mss: f64) -> [f64; 3] {
+        let view = norm3(to_camera);
+        if view[2] <= 1.0e-4 {
+            return [0.0; 3];
+        }
+        let reflection = [-view[0], -view[1], view[2]];
+        let prefiltered = self
+            .cox_munk_sky_she_at(mss)
+            .evaluate(sh4_basis(reflection));
+        let fresnel = fresnel_reflectance_unpolarized(view[2], WATER_REFRACTIVE_INDEX_VIS);
+        prefiltered.map(|value| value * fresnel)
     }
 }
 
 /// Build the sun-relative orthonormal frame at a point: `z` = local up, `x` = the
-/// sun's horizontal direction (the SH azimuth origin), `y = z x x`. `up` and `sun`
-/// are unit vectors in ANY consistent basis (ENU for terrain, ECEF for cloud voxels).
-/// If the sun is at the zenith the horizontal axis is arbitrary (ambient is then
-/// azimuth-symmetric, so the choice does not matter).
+/// sun's horizontal direction, `y = z x x`.
 pub fn sun_relative_frame(up: [f64; 3], sun: [f64; 3]) -> ([f64; 3], [f64; 3], [f64; 3]) {
     let z = norm3(up);
-    let sun_h = madd3(sun, z, -dot3(sun, z)); // sun minus its up-projection
+    let sun_h = madd3(sun, z, -dot3(sun, z));
     let x = if len3(sun_h) > 1.0e-6 {
         norm3(sun_h)
     } else {
@@ -1079,22 +1585,15 @@ pub fn to_frame(v: [f64; 3], frame: ([f64; 3], [f64; 3], [f64; 3])) -> [f64; 3] 
     [dot3(v, frame.0), dot3(v, frame.1), dot3(v, frame.2)]
 }
 
-/// A sun-elevation table of [`SkyShAmbient`] projections — the M5 replacement for the
-/// scalar [`AmbientTable`] in the render path. Built per frame at `n` elevations
-/// (mirroring the ambient table so per-pixel elevation interpolation keeps the
-/// terminator fade), each entry the SH-2 projection of that elevation's sky-view LUT.
-/// Receivers evaluate it directionally at their normal (terrain slope / cloud up).
+/// A sun-elevation table of positive sky-lighting representations.
 #[derive(Debug, Clone)]
 pub struct SkyShTable {
     pub elev_min_deg: f64,
     pub elev_max_deg: f64,
-    /// `n` SH-2 projections, index 0 = `elev_min_deg`, last = `elev_max_deg`.
     pub entries: Vec<SkyShAmbient>,
 }
 
 impl SkyShTable {
-    /// Build the table by projecting a sky-view LUT into SH-2 at `n` sun elevations
-    /// (same span/resolution as [`AmbientTable::build`]).
     pub fn build(luts: &AtmosphereLuts, params: &AtmosphereParams, n: usize) -> Self {
         let (elev_min_deg, elev_max_deg) = (-20.0, 90.0);
         let cfg = SkyViewConfig {
@@ -1106,11 +1605,11 @@ impl SkyShTable {
         let r_obs = R_GROUND_M + cfg.observer_altitude_m;
         let n = n.max(1);
         let mut entries = Vec::with_capacity(n);
-        for i in 0..n {
-            let t = i as f64 / (n - 1).max(1) as f64;
-            let elev = (elev_min_deg + t * (elev_max_deg - elev_min_deg)).to_radians();
-            let sv = build_sky_view_lut(luts, params, elev, &cfg);
-            entries.push(SkyShAmbient::project(&sv, r_obs));
+        for index in 0..n {
+            let weight = index as f64 / (n - 1).max(1) as f64;
+            let elevation = (elev_min_deg + weight * (elev_max_deg - elev_min_deg)).to_radians();
+            let sky_view = build_sky_view_lut(luts, params, elevation, &cfg);
+            entries.push(SkyShAmbient::project(&sky_view, r_obs));
         }
         Self {
             elev_min_deg,
@@ -1119,33 +1618,19 @@ impl SkyShTable {
         }
     }
 
-    /// The SH-2 coefficients interpolated at a sun elevation (deg).
     pub fn at(&self, elev_deg: f64) -> SkyShAmbient {
-        let n = self.entries.len();
-        if n == 0 {
-            return SkyShAmbient {
-                coef: [[0.0; 3]; SH2_COUNT],
-            };
+        let count = self.entries.len();
+        if count == 0 {
+            return SkyShAmbient::dark();
         }
-        let t = ((elev_deg - self.elev_min_deg) / (self.elev_max_deg - self.elev_min_deg))
+        let normalized = ((elev_deg - self.elev_min_deg) / (self.elev_max_deg - self.elev_min_deg))
             .clamp(0.0, 1.0);
-        let f = t * (n - 1) as f64;
-        let i0 = (f.floor() as usize).min(n - 1);
-        let i1 = (i0 + 1).min(n - 1);
-        let w = f - i0 as f64;
-        let e0 = &self.entries[i0].coef;
-        let e1 = &self.entries[i1].coef;
-        let mut coef = [[0.0f64; 3]; SH2_COUNT];
-        for (k, out) in coef.iter_mut().enumerate() {
-            for (c, o) in out.iter_mut().enumerate() {
-                *o = e0[k][c] * (1.0 - w) + e1[k][c] * w;
-            }
-        }
-        SkyShAmbient { coef }
+        let coordinate = normalized * (count - 1) as f64;
+        let low = (coordinate.floor() as usize).min(count - 1);
+        let high = (low + 1).min(count - 1);
+        self.entries[low].lerp(self.entries[high], coordinate - low as f64)
     }
 
-    /// Directional diffuse irradiance at a receiver: `up` + `sun` build the sun-relative
-    /// frame, `normal` is the receiver normal (same basis as `up`/`sun`).
     pub fn irradiance(
         &self,
         elev_deg: f64,
@@ -1157,41 +1642,100 @@ impl SkyShTable {
         self.at(elev_deg).irradiance(to_frame(normal, frame))
     }
 
-    /// Raw sky radiance in a direction `dir` (same basis as `up`/`sun`) — the "what
-    /// colour is the sky in that direction" query used for the directional-fill test.
-    pub fn radiance(&self, elev_deg: f64, up: [f64; 3], sun: [f64; 3], dir: [f64; 3]) -> [f64; 3] {
+    pub fn radiance(
+        &self,
+        elev_deg: f64,
+        up: [f64; 3],
+        sun: [f64; 3],
+        direction: [f64; 3],
+    ) -> [f64; 3] {
         let frame = sun_relative_frame(up, sun);
-        self.at(elev_deg).radiance(to_frame(dir, frame))
+        self.at(elev_deg).radiance(to_frame(direction, frame))
     }
 
-    /// The flat-receiver (`normal = up`) hemisphere irradiance — the SH counterpart of
-    /// the M2 scalar ambient value, for places that want a non-directional number.
+    /// Cox-Munk reflected clear-sky environment radiance. The direct solar disk is not
+    /// in the sky-view LUT and remains on SimSat's existing analytic glint path.
+    pub fn cox_munk_sky_reflection(
+        &self,
+        elev_deg: f64,
+        up: [f64; 3],
+        sun: [f64; 3],
+        to_camera: [f64; 3],
+        mss: f64,
+    ) -> [f64; 3] {
+        let frame = sun_relative_frame(up, sun);
+        self.at(elev_deg)
+            .cox_munk_sky_reflection(to_frame(to_camera, frame), mss)
+    }
+
     pub fn scalar_irradiance(&self, elev_deg: f64) -> [f64; 3] {
         self.at(elev_deg).irradiance([0.0, 0.0, 1.0])
     }
 
-    /// Flatten to `n * 9` RGBA f32 texels (row = elevation entry, column = SH coef) for
-    /// the GPU-mirror upload (`clouds.wgsl` SH-ambient twin, activated in M5-GPU).
+    /// Legacy `n x 9` linear-SH2 upload retained for external diagnostics.
     pub fn to_rgba_f32(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.entries.len() * SH2_COUNT * 4);
-        for e in &self.entries {
-            for c in &e.coef {
-                out.extend_from_slice(&[c[0] as f32, c[1] as f32, c[2] as f32, 1.0]);
+        for entry in &self.entries {
+            for coefficient in &entry.coef {
+                out.extend_from_slice(&[
+                    coefficient[0] as f32,
+                    coefficient[1] as f32,
+                    coefficient[2] as f32,
+                    1.0,
+                ]);
             }
         }
         out
     }
 
-    /// The per-entry flat (`normal = up`) hemisphere irradiance packed as `n * 4` RGBA
-    /// f32 — the SCALAR ambient LUT the clouds-OFF GPU surface pass still consumes. The
-    /// SH directional ambient is the CPU cloud path (the shipping cloud render);
-    /// `surface.wgsl` keeps this M2-style scalar LUT until the M5-GPU activation wires
-    /// the SH table binding (a documented CPU/GPU divergence, per the M4 pattern).
+    /// Production GPU upload, `SKY_SHE_GPU_WIDTH x entries.len()` RGBA32F. Each row is
+    /// direct log-SH3 irradiance followed by the calm-water Cox-Munk sky-reflection SHE.
+    pub fn to_she_rgba_f32(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.entries.len() * SKY_SHE_GPU_WIDTH * 4);
+        for entry in &self.entries {
+            for coefficient in &entry.log_irradiance.log_coef {
+                out.extend_from_slice(&[
+                    coefficient[0] as f32,
+                    coefficient[1] as f32,
+                    coefficient[2] as f32,
+                    1.0,
+                ]);
+            }
+            out.extend_from_slice(&[
+                entry.log_irradiance.amplitude[0] as f32,
+                entry.log_irradiance.amplitude[1] as f32,
+                entry.log_irradiance.amplitude[2] as f32,
+                1.0,
+            ]);
+            let water = entry.cox_munk_sky_she_at(COX_MUNK_SKY_MSS_LEVELS[0]);
+            for coefficient in &water.log_coef {
+                out.extend_from_slice(&[
+                    coefficient[0] as f32,
+                    coefficient[1] as f32,
+                    coefficient[2] as f32,
+                    1.0,
+                ]);
+            }
+            out.extend_from_slice(&[
+                water.amplitude[0] as f32,
+                water.amplitude[1] as f32,
+                water.amplitude[2] as f32,
+                1.0,
+            ]);
+        }
+        out
+    }
+
     pub fn to_scalar_rgba_f32(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.entries.len() * 4);
-        for e in &self.entries {
-            let irr = e.irradiance([0.0, 0.0, 1.0]);
-            out.extend_from_slice(&[irr[0] as f32, irr[1] as f32, irr[2] as f32, 1.0]);
+        for entry in &self.entries {
+            let irradiance = entry.irradiance([0.0, 0.0, 1.0]);
+            out.extend_from_slice(&[
+                irradiance[0] as f32,
+                irradiance[1] as f32,
+                irradiance[2] as f32,
+                1.0,
+            ]);
         }
         out
     }
@@ -2297,7 +2841,7 @@ mod tests {
         assert!((len3(up) - 1.0).abs() < 1.0e-9);
     }
 
-    // ── SH-2 directional sky ambient (M5) ──
+    // ── Positive log-SH sky lighting + Cox-Munk sky SHE ──
 
     /// Fill an analytic sky into a sky-view-parameterised `Lut2` (the same texel
     /// direction convention [`SkyShAmbient::project`] reads).
@@ -2316,23 +2860,30 @@ mod tests {
     }
 
     #[test]
-    fn sh2_projection_round_trips_a_constant_sky() {
+    fn log_sh3_irradiance_round_trips_a_constant_sky() {
         // An isotropic sky of radiance c projects to a DC-only SH; its cosine-lobe
         // irradiance is pi*c at ANY normal, and the l=1 (directional) coefs vanish.
         let r_obs = R_GROUND_M + 500.0;
         let c = [0.3, 0.5, 0.7];
         let lut = analytic_sky_lut(96, 64, r_obs, |_| c);
+        let samples = upper_sky_samples(&lut, r_obs);
         let sh = SkyShAmbient::project(&lut, r_obs);
-        for &n in &[[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.6, 0.0, 0.8]] {
-            let e = sh.irradiance(n);
-            for ch in 0..3 {
-                let want = PI * c[ch];
+        for &normal in &[[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.6, 0.0, 0.8]] {
+            let fitted = sh.irradiance(normal);
+            let reference = reference_sky_irradiance(&samples, normal);
+            for channel in 0..3 {
                 assert!(
-                    (e[ch] - want).abs() < 0.08 * want,
-                    "constant-sky irradiance {} vs pi*c {want} (normal {n:?})",
-                    e[ch]
+                    (fitted[channel] - reference[channel]).abs() < 0.08 * reference[channel],
+                    "constant-sky irradiance {} vs reference {} (normal {normal:?})",
+                    fitted[channel],
+                    reference[channel]
                 );
             }
+        }
+        let up = sh.irradiance([0.0, 0.0, 1.0]);
+        for channel in 0..3 {
+            let expected = PI * c[channel];
+            assert!((up[channel] - expected).abs() < 0.08 * expected);
         }
         // Directional (l=1) coefficients are ~0 for an isotropic sky.
         for k in 1..=3 {
@@ -2347,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn sh2_captures_a_directional_sky_gradient() {
+    fn log_sh_fields_capture_a_directional_sky_gradient() {
         // A sky brighter (and warmer) toward +x (the sun azimuth). The SH must be
         // brighter toward +x than -x, both as raw radiance and as tilted irradiance.
         let r_obs = R_GROUND_M + 500.0;
@@ -2379,7 +2930,7 @@ mod tests {
 
     #[test]
     fn sunset_sky_sh_gives_warm_sun_side_cool_antisun_fill() {
-        // The REAL sky-view LUT at a ~2 deg (sunset) sun, projected to SH-2. A cloud
+        // The real sky-view LUT at a ~2 deg sun, fitted to positive log-SH. A cloud
         // face tilted toward the (warm, bright) sun horizon gets warmer + brighter fill
         // than one tilted toward the (cool, blue) anti-sun sky — the M5 directional,
         // coloured ambient requirement.
@@ -2413,10 +2964,9 @@ mod tests {
     }
 
     #[test]
-    fn sh2_scalar_irradiance_tracks_the_ambient_table() {
-        // SH irradiance at the up normal (flat receiver) reproduces the scalar ambient
-        // table's hemisphere irradiance to within SH-2 truncation, so the terrain
-        // surface does not regress when the scalar ambient is replaced by the SH.
+    fn direct_log_sh3_irradiance_tracks_the_ambient_table() {
+        // Directly fitted log-SH3 irradiance at the up normal reproduces the scalar
+        // hemisphere integral without relying on nonlinear coefficient convolution.
         let luts = small_luts();
         let params = AtmosphereParams::default();
         let ambient = AmbientTable::build(&luts, &params, 16);
@@ -2431,6 +2981,145 @@ mod tests {
                     "SH-vs-scalar ambient at elev {elev} band {c}: ratio {ratio} out of band"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn log_sh3_fields_are_strictly_positive_without_post_clamping() {
+        let r_obs = R_GROUND_M + 500.0;
+        let lut = analytic_sky_lut(80, 48, r_obs, |direction| {
+            let horizon = (-direction[2].max(0.0) / 0.28).exp();
+            let sun_side = direction[0].max(0.0).powi(3);
+            [
+                0.02 + 0.90 * horizon * sun_side,
+                0.04 + 0.45 * horizon * sun_side,
+                0.10 + 0.18 * horizon,
+            ]
+        });
+        let sky = SkyShAmbient::project(&lut, r_obs);
+        for index in 0..257 {
+            let direction = fibonacci_hemisphere(index, 257, 0.0);
+            for value in sky.radiance(direction) {
+                assert!(value.is_finite() && value > 0.0, "radiance {value}");
+            }
+            for value in sky.irradiance(direction) {
+                assert!(value.is_finite() && value > 0.0, "irradiance {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_log_sh3_irradiance_matches_held_out_cosine_integrals() {
+        let r_obs = R_GROUND_M + 500.0;
+        let lut = analytic_sky_lut(80, 48, r_obs, |direction| {
+            let horizon = (-direction[2].max(0.0) / 0.35).exp();
+            let sun_side = direction[0].max(0.0);
+            [
+                0.04 + 0.42 * horizon * (0.4 + 0.6 * sun_side * sun_side),
+                0.08 + 0.24 * horizon * (0.5 + 0.5 * sun_side),
+                0.18 + 0.10 * horizon,
+            ]
+        });
+        let samples = upper_sky_samples(&lut, r_obs);
+        let sky = SkyShAmbient::project(&lut, r_obs);
+        let mut relative_error = [0.0; 3];
+        let count = 41usize;
+        for index in 0..count {
+            let normal = fibonacci_hemisphere(index, count, 0.0);
+            let reference = reference_sky_irradiance(&samples, normal);
+            let fitted = sky.irradiance(normal);
+            for channel in 0..3 {
+                relative_error[channel] +=
+                    (fitted[channel] - reference[channel]).abs() / reference[channel].max(1.0e-8);
+            }
+        }
+        for (channel, error_sum) in relative_error.into_iter().enumerate() {
+            let mean_error = error_sum / count as f64;
+            assert!(
+                mean_error < 0.12,
+                "held-out irradiance band {channel} mean relative error {mean_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cox_munk_sky_she_matches_held_out_environment_integrals() {
+        let r_obs = R_GROUND_M + 500.0;
+        let lut = analytic_sky_lut(72, 44, r_obs, |direction| {
+            let horizon = (-direction[2].max(0.0) / 0.35).exp();
+            let sun_side = direction[0].max(0.0);
+            [
+                0.04 + 0.35 * horizon * (0.4 + 0.6 * sun_side * sun_side),
+                0.09 + 0.20 * horizon * (0.5 + 0.5 * sun_side),
+                0.22 + 0.08 * horizon,
+            ]
+        });
+        let samples = upper_sky_samples(&lut, r_obs);
+        let sky = SkyShAmbient::project(&lut, r_obs);
+        let luminance = |rgb: [f64; 3]| 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        for &mss in &[0.0012, 0.015, 0.060] {
+            let count = 37usize;
+            let mut mean_relative_error = 0.0;
+            let mut maximum_relative_error: f64 = 0.0;
+            for index in 0..count {
+                let view = fibonacci_hemisphere(index, count, COX_MUNK_SKY_MIN_VIEW_COSINE);
+                let reference = luminance(reference_cox_munk_sky_reflection(&samples, view, mss));
+                let fitted = luminance(sky.cox_munk_sky_reflection(view, mss));
+                let relative = (fitted - reference).abs() / reference.max(1.0e-8);
+                mean_relative_error += relative;
+                maximum_relative_error = maximum_relative_error.max(relative);
+            }
+            mean_relative_error /= count as f64;
+            assert!(
+                mean_relative_error < 0.24,
+                "MSS {mss}: mean held-out Cox-Munk SHE error {mean_relative_error}"
+            );
+            assert!(
+                maximum_relative_error < 0.85,
+                "MSS {mss}: max held-out Cox-Munk SHE error {maximum_relative_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cox_munk_sky_she_is_continuous_across_mss_knots() {
+        let r_obs = R_GROUND_M + 500.0;
+        let lut = analytic_sky_lut(48, 32, r_obs, |direction| {
+            [
+                0.08 + 0.20 * direction[0].max(0.0),
+                0.12 + 0.12 * direction[0].max(0.0),
+                0.24 + 0.06 * direction[2].max(0.0),
+            ]
+        });
+        let sky = SkyShAmbient::project(&lut, r_obs);
+        let view = norm3([0.55, -0.20, 0.81]);
+        let below = sky.cox_munk_sky_reflection(view, 0.020 * (1.0 - 1.0e-5));
+        let above = sky.cox_munk_sky_reflection(view, 0.020 * (1.0 + 1.0e-5));
+        for channel in 0..3 {
+            let scale = below[channel].max(above[channel]).max(1.0e-8);
+            assert!(
+                (below[channel] - above[channel]).abs() / scale < 2.0e-4,
+                "MSS knot discontinuity in band {channel}: {below:?} vs {above:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_she_gpu_layout_has_the_documented_width() {
+        let r_obs = R_GROUND_M + 500.0;
+        let lut = analytic_sky_lut(32, 24, r_obs, |_| [0.2, 0.3, 0.5]);
+        let entry = SkyShAmbient::project(&lut, r_obs);
+        let table = SkyShTable {
+            elev_min_deg: -20.0,
+            elev_max_deg: 90.0,
+            entries: vec![entry, entry],
+        };
+        let packed = table.to_she_rgba_f32();
+        assert_eq!(packed.len(), 2 * SKY_SHE_GPU_WIDTH * 4);
+        let irradiance_amplitude = SH3_COUNT * 4;
+        let water_amplitude = (SKY_SHE_GPU_WIDTH - 1) * 4;
+        for offset in [irradiance_amplitude, water_amplitude] {
+            assert!(packed[offset..offset + 3].iter().all(|value| *value > 0.0));
         }
     }
 }

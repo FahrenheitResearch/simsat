@@ -559,9 +559,9 @@ use crate::optics;
 pub struct FrameContext<'a> {
     pub luts: &'a AtmosphereLuts,
     pub params: &'a AtmosphereParams,
-    /// SH-2 directional sky ambient (M5) — replaces M2's scalar ambient table. Terrain
-    /// evaluates it at the terrain normal over the full upper hemisphere (no horizon
-    /// occlusion; the ambient-aperture cone from a horizon map arrives with M3).
+    /// Positive direct log-SH3 sky irradiance plus Cox-Munk reflected-sky SHE.
+    /// Terrain evaluates the irradiance at its bent normal; water evaluates the
+    /// prefiltered environment at its view direction and MSS.
     pub sky_sh: &'a SkyShTable,
     /// Geostationary camera geometry (ECEF).
     pub cam: CameraGeometry,
@@ -1258,17 +1258,6 @@ fn norm3(a: [f64; 3]) -> [f64; 3] {
     }
 }
 
-/// Reflect `incident` about a unit `normal`: `incident - 2 (incident . n) n`.
-#[inline]
-fn reflect(incident: [f64; 3], normal: [f64; 3]) -> [f64; 3] {
-    let d = 2.0 * dot3(incident, normal);
-    [
-        incident[0] - d * normal[0],
-        incident[1] - d * normal[1],
-        incident[2] - d * normal[2],
-    ]
-}
-
 // ── ABI SYNTHETIC-GREEN display mode (prototype; OFF by default) ────────────────
 //
 // Real GOES-R "true color" has NO green band: the display green is SYNTHESIZED as a
@@ -1581,16 +1570,14 @@ pub fn surface_toa_radiance(
         // The specular glint sees the RAW shadow (an occluded solar disk has no mirror
         // image; the CLOUD_SHADOW_FLOOR fill is diffuse-only).
         let glint_scale = disk * shadow_raw;
-        // Fresnel specular sky reflection: the sky colour in the mirror-of-view
-        // direction, weighted by the Fresnel reflectance at the view zenith. Uses the
-        // SH sky radiance so water reflects the (coloured) sky, not just the sun.
-        let cos_view = dot3(to_cam, surf_up).max(0.0);
-        let f_sky =
-            optics::fresnel_reflectance_unpolarized(cos_view, optics::WATER_REFRACTIVE_INDEX_VIS);
-        let sky_dir = reflect(view, surf_up); // surface -> sky specular direction
-        let l_sky = ctx
-            .sky_sh
-            .radiance(px.sun_elev_deg as f64, surf_up, sun, sky_dir);
+        // Cox-Munk SKY ENVIRONMENT reflection. Each sun-elevation/MSS table entry is
+        // fitted in log-SH4 against a numerical integral of the clear-sky LUT through
+        // the same Cox-Munk slope PDF and water Fresnel used by the analytic sun glint.
+        // The sky-view LUT contains scattered sky radiance but no solar disk, so the
+        // direct glint above remains separate and is not double-counted.
+        let l_sky =
+            ctx.sky_sh
+                .cox_munk_sky_reflection(px.sun_elev_deg as f64, surf_up, sun, to_cam, mss);
         // WATER DIRECT SUN (WS2): the diffuse water body now sees the same disk-gated,
         // shadow-weighted direct solar irradiance the land branch has — this is what
         // makes cloud shadows exist over the ocean and the ocean brightness respond to
@@ -1615,10 +1602,9 @@ pub fn surface_toa_radiance(
         for c in 0..3 {
             let l_glint = glint_rho * e_sun[c] / pi * t_sun[c] * glint_scale;
             // Skylight- and sunlight-lit water body (the Blue Marble water texel x the
-            // surface-ramped water scale) + the sun glint + the Fresnel sky reflection.
-            l_surf[c] = albedo[c] * scale_ratio / pi * (e_direct[c] + e_ambient[c])
-                + l_glint
-                + f_sky * l_sky[c];
+            // surface-ramped water scale) + analytic solar glint + Cox-Munk sky SHE.
+            l_surf[c] =
+                albedo[c] * scale_ratio / pi * (e_direct[c] + e_ambient[c]) + l_glint + l_sky[c];
         }
     } else {
         // Land: Lambertian direct sun (HGT slope N.L, penumbral-shadowed disk) + the
@@ -1669,8 +1655,8 @@ pub fn surface_toa_radiance(
     }
 
     // Aerial perspective: raymarch the shell from atmosphere entry to the ground.
-    // The experiment targets terrain only. Dark ocean, Fresnel sky reflection, and
-    // Cox-Munk glint stay on the reviewed path exactly.
+    // The experiment targets terrain only. Dark ocean, Cox-Munk sky reflection, and
+    // analytic solar glint stay on the reviewed path exactly.
     let postlight_toe = if px.is_water {
         SurfacePostlightToeConfig::off()
     } else {
@@ -2609,8 +2595,8 @@ mod tests {
     fn water_glint_adds_specular_brightness() {
         // Overhead sun + nadir view = the specular glint geometry (facet normal = up).
         // The glint contributes to the direct-lit case (shadow 1) but is killed when the
-        // sun is occluded (shadow 0); the ambient + Fresnel sky reflection are shadow-
-        // independent, so the lit water must be brighter than the occluded water.
+        // sun is occluded (shadow 0); the ambient + Cox-Munk sky environment are
+        // shadow-independent, so the lit water must be brighter than occluded water.
         let view = nadir_view();
         let (ctx, sun) = nadir_surface_pixel(90.0);
         let water = SurfacePixel {

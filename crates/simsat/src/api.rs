@@ -1879,7 +1879,7 @@ fn render_gpu_visible_frame(
 
     let normals_rgba = gpu::normals_to_rgba8(normals);
     let landmask_r8 = gpu::landmask_to_r8(&brick.landmask);
-    let ambient_lut = sky_sh.to_scalar_rgba_f32();
+    let sky_she_data = sky_sh.to_she_rgba_f32();
     let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
     let scan = &raster.scan;
     let uniforms = gpu::SurfaceUniforms {
@@ -1927,7 +1927,7 @@ fn render_gpu_visible_frame(
         bluemarble,
         transmittance_lut: &luts.transmittance.data,
         multiscatter_lut: &luts.multiscatter.data,
-        ambient_lut: &ambient_lut,
+        ambient_lut: &sky_she_data,
         ambient_n: sky_sh.entries.len() as u32,
         uniforms,
     };
@@ -1994,7 +1994,6 @@ fn render_gpu_visible_frame(
     let iq = brick.quant.get("ext_ice");
     let pq = brick.quant.get("ext_precip");
     let tq = brick.quant.get("tau_up");
-    let sh_data = sky_sh.to_rgba_f32();
     let inputs = gpu::CloudFrameInputs {
         surface,
         view_mode,
@@ -2028,7 +2027,7 @@ fn render_gpu_visible_frame(
         froxel_dim: froxel.dim as u32,
         froxel_data: &froxel.data,
         sh_rows: sky_sh.entries.len() as u32,
-        sh_data: &sh_data,
+        sh_data: &sky_she_data,
         scan_rect: [
             scan_rect.0 as f32,
             scan_rect.1 as f32,
