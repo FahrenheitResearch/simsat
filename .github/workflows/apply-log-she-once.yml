@@ -44,13 +44,7 @@ jobs:
       - name: Reject malformed diffs
         run: git diff --check
 
-      - name: Lint SimSat
-        run: cargo clippy -p simsat --all-targets --locked -- -D warnings
-
-      - name: Test SimSat library
-        run: cargo test -p simsat --lib --locked
-
-      - name: Commit validated implementation
+      - name: Commit formatted implementation
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -60,3 +54,9 @@ jobs:
                   crates/simsat/src/lib.rs
           git commit -m "feat(simsat): add positive sky SHE [log-she-applied]"
           git push origin HEAD:feature/log-sh3-sky-cox-munk-she
+
+      - name: Lint SimSat
+        run: cargo clippy -p simsat --all-targets --locked -- -D warnings
+
+      - name: Test SimSat library
+        run: cargo test -p simsat --lib --locked
