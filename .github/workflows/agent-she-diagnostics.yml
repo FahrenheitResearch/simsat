@@ -1,0 +1,72 @@
+name: Agent apply and validate SimSat SHE lint fixes
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/agent-she-diagnostics.yml'
+      - '.github/agent-she-clippy-fixes.patch'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-she-fix-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  apply-validate-and-push:
+    if: github.head_ref == 'agent/simsat-she-implementation'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/simsat-she-implementation
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Linux desktop build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply and format the lint corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .github/agent-she-clippy-fixes.patch
+          git apply .github/agent-she-clippy-fixes.patch
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Run Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        shell: bash
+        run: cargo test --workspace --locked
+
+      - name: Commit the validated correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/agent-she-clippy-fixes.patch
+          rm -f .github/agent-she-diagnostic-trigger.txt
+          rm -f .github/workflows/agent-she-diagnostics.yml
+          git config user.name "FahrenheitResearch automation"
+          git config user.email "fahrenheitagi@gmail.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: satisfy positive sky SHE gates"
+          git push origin HEAD:agent/simsat-she-implementation

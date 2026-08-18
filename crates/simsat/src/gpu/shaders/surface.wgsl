@@ -19,7 +19,7 @@
 //               grid_u < 0 -> outside the WRF domain (flat up-normal, land).
 //   lut_light = (sun_e, sun_n, sun_u, sun_elev_deg)  local-ENU sun + elevation.
 //   transmittance_lut (256x64), multiscatter_lut (32x32): optics-config LUTs.
-//   ambient_lut (N x 1): scalar sky irradiance vs sun elevation (sky-view projection).
+//   sky_she_lut (43 x N): positive log-SH3 irradiance + calm-water Cox-Munk SHE.
 
 const PI: f32 = 3.14159265358979;
 const DEG2RAD: f32 = 0.017453292519943295;
@@ -107,7 +107,7 @@ struct Uniforms {
     solar: vec4<f32>, // xyz band solar irradiance, w pitch_y
     p0: vec4<f32>,    // mie_sca_ground, mie_ext_ground, mie_g, pw_ratio
     p1: vec4<f32>,    // bm_present, water_scale, flat_albedo, output_transform
-    p2: vec4<f32>,    // ambient_elev_min, ambient_elev_max, ambient_n, atmosphere_correction
+    p2: vec4<f32>,    // sky_elev_min, sky_elev_max, sky_rows, atmosphere_correction
     land0: vec4<f32>, // sza_enabled, sza_max_gain, dark_toe_enabled, dark_toe_knee
     land1: vec4<f32>, // dark_toe_gamma, dark_toe_max_gain, unused, unused
     toe0: vec4<f32>,  // enabled, knee, gamma, max_gain (post-view surface toe)
@@ -123,7 +123,7 @@ struct Uniforms {
 @group(0) @binding(6) var samp: sampler;
 @group(0) @binding(7) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(8) var multiscatter_lut: texture_2d<f32>;
-@group(0) @binding(9) var ambient_lut: texture_2d<f32>;
+@group(0) @binding(9) var sky_she_lut: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -516,16 +516,134 @@ fn cox_munk_glint(to_sun: vec3<f32>, to_cam: vec3<f32>, up: vec3<f32>, mss: f32)
     return max(rho, 0.0);
 }
 
-fn sample_ambient(elev_deg: f32) -> vec3<f32> {
-    let n = i32(u.p2.z);
-    let t = clamp((elev_deg - u.p2.x) / (u.p2.y - u.p2.x), 0.0, 1.0);
-    let f = t * f32(n - 1);
-    let i0 = min(i32(floor(f)), n - 1);
-    let i1 = min(i0 + 1, n - 1);
-    let w = f - floor(f);
-    let a = textureLoad(ambient_lut, vec2<i32>(i0, 0), 0).rgb;
-    let b = textureLoad(ambient_lut, vec2<i32>(i1, 0), 0).rgb;
-    return mix(a, b, w);
+// ── Positive sky-lighting SHE (twin of atmosphere.rs) ────────────────────────
+// Texture row layout (43 RGBA32F texels per sun-elevation row):
+//   0..15  direct log-SH3 diffuse-irradiance coefficients
+//   16     irradiance amplitude
+//   17..41 calm-water Cox-Munk log-SH4 coefficients
+//   42     water-SHE amplitude
+const SKY_SHE_IRRADIANCE_OFFSET: i32 = 0;
+const SKY_SHE_IRRADIANCE_AMPLITUDE: i32 = 16;
+const SKY_SHE_WATER_OFFSET: i32 = 17;
+const SKY_SHE_WATER_AMPLITUDE: i32 = 42;
+const SKY_SHE_LOG_LIMIT: f32 = 80.0;
+
+fn sky_she_texel(column: i32, elev_deg: f32) -> vec3<f32> {
+    let count = max(i32(u.p2.z), 1);
+    if (count == 1) {
+        return textureLoad(sky_she_lut, vec2<i32>(column, 0), 0).rgb;
+    }
+    let span = max(u.p2.y - u.p2.x, 1.0e-6);
+    let t = clamp((elev_deg - u.p2.x) / span, 0.0, 1.0);
+    let coordinate = t * f32(count - 1);
+    let low = min(i32(floor(coordinate)), count - 1);
+    let high = min(low + 1, count - 1);
+    let weight = coordinate - floor(coordinate);
+    let a = textureLoad(sky_she_lut, vec2<i32>(column, low), 0).rgb;
+    let b = textureLoad(sky_she_lut, vec2<i32>(column, high), 0).rgb;
+    return mix(a, b, weight);
+}
+
+fn log_sh3_sum(offset: i32, elev_deg: f32, direction: vec3<f32>) -> vec3<f32> {
+    let n = normalize(direction);
+    let x = n.x;
+    let y = n.y;
+    let z = n.z;
+    let x2 = x * x;
+    let y2 = y * y;
+    let z2 = z * z;
+    var value = sky_she_texel(offset + 0, elev_deg) * 0.282094791773878;
+    value = value + sky_she_texel(offset + 1, elev_deg) * (0.488602511902920 * y);
+    value = value + sky_she_texel(offset + 2, elev_deg) * (0.488602511902920 * z);
+    value = value + sky_she_texel(offset + 3, elev_deg) * (0.488602511902920 * x);
+    value = value + sky_she_texel(offset + 4, elev_deg) * (1.092548430592079 * x * y);
+    value = value + sky_she_texel(offset + 5, elev_deg) * (1.092548430592079 * y * z);
+    value = value + sky_she_texel(offset + 6, elev_deg) * (0.315391565252520 * (3.0 * z2 - 1.0));
+    value = value + sky_she_texel(offset + 7, elev_deg) * (1.092548430592079 * x * z);
+    value = value + sky_she_texel(offset + 8, elev_deg) * (0.546274215296040 * (x2 - y2));
+    value = value + sky_she_texel(offset + 9, elev_deg) * (0.590043589926644 * y * (3.0 * x2 - y2));
+    value = value + sky_she_texel(offset + 10, elev_deg) * (2.890611442640554 * x * y * z);
+    value = value + sky_she_texel(offset + 11, elev_deg) * (0.457045799464466 * y * (5.0 * z2 - 1.0));
+    value = value + sky_she_texel(offset + 12, elev_deg) * (0.373176332590115 * z * (5.0 * z2 - 3.0));
+    value = value + sky_she_texel(offset + 13, elev_deg) * (0.457045799464466 * x * (5.0 * z2 - 1.0));
+    value = value + sky_she_texel(offset + 14, elev_deg) * (1.445305721320277 * z * (x2 - y2));
+    value = value + sky_she_texel(offset + 15, elev_deg) * (0.590043589926644 * x * (x2 - 3.0 * y2));
+    return value;
+}
+
+fn sky_irradiance_she(elev_deg: f32, normal_sun_frame: vec3<f32>) -> vec3<f32> {
+    let amplitude = max(
+        sky_she_texel(SKY_SHE_IRRADIANCE_AMPLITUDE, elev_deg),
+        vec3<f32>(0.0),
+    );
+    let log_value = clamp(
+        log_sh3_sum(SKY_SHE_IRRADIANCE_OFFSET, elev_deg, normal_sun_frame),
+        vec3<f32>(-SKY_SHE_LOG_LIMIT),
+        vec3<f32>(SKY_SHE_LOG_LIMIT),
+    );
+    return amplitude * exp(log_value);
+}
+
+fn log_sh4_sum(offset: i32, elev_deg: f32, direction: vec3<f32>) -> vec3<f32> {
+    let n = normalize(direction);
+    let x = n.x;
+    let y = n.y;
+    let z = n.z;
+    let x2 = x * x;
+    let y2 = y * y;
+    let z2 = z * z;
+    var value = log_sh3_sum(offset, elev_deg, n);
+    value = value + sky_she_texel(offset + 16, elev_deg) * (2.503342941796704 * x * y * (x2 - y2));
+    value = value + sky_she_texel(offset + 17, elev_deg) * (1.770130769779931 * y * z * (3.0 * x2 - y2));
+    value = value + sky_she_texel(offset + 18, elev_deg) * (0.946174695757560 * x * y * (7.0 * z2 - 1.0));
+    value = value + sky_she_texel(offset + 19, elev_deg) * (0.669046543557289 * y * z * (7.0 * z2 - 3.0));
+    value = value + sky_she_texel(offset + 20, elev_deg) * (0.105785546915204 * (35.0 * z2 * z2 - 30.0 * z2 + 3.0));
+    value = value + sky_she_texel(offset + 21, elev_deg) * (0.669046543557289 * x * z * (7.0 * z2 - 3.0));
+    value = value + sky_she_texel(offset + 22, elev_deg) * (0.473087347878780 * (x2 - y2) * (7.0 * z2 - 1.0));
+    value = value + sky_she_texel(offset + 23, elev_deg) * (1.770130769779931 * x * z * (x2 - 3.0 * y2));
+    value = value + sky_she_texel(offset + 24, elev_deg) * (0.625835735449176 * (x2 * x2 - 6.0 * x2 * y2 + y2 * y2));
+    return value;
+}
+
+fn cox_munk_sky_she(elev_deg: f32, to_camera_sun_frame: vec3<f32>) -> vec3<f32> {
+    let view = normalize(to_camera_sun_frame);
+    if (view.z <= 1.0e-4) {
+        return vec3<f32>(0.0);
+    }
+    let reflection = vec3<f32>(-view.x, -view.y, view.z);
+    let amplitude = max(
+        sky_she_texel(SKY_SHE_WATER_AMPLITUDE, elev_deg),
+        vec3<f32>(0.0),
+    );
+    let log_value = clamp(
+        log_sh4_sum(SKY_SHE_WATER_OFFSET, elev_deg, reflection),
+        vec3<f32>(-SKY_SHE_LOG_LIMIT),
+        vec3<f32>(SKY_SHE_LOG_LIMIT),
+    );
+    let macro_fresnel = fresnel_unpolarized(view.z, WATER_N);
+    return amplitude * exp(log_value) * macro_fresnel;
+}
+
+// Express any direction in the local sun-relative frame (z=up, x=sun horizontal).
+fn sun_frame_direction(up: vec3<f32>, sun: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let z = normalize(up);
+    let sun_h = sun - z * dot(sun, z);
+    var x_axis: vec3<f32>;
+    if (length(sun_h) > 1.0e-6) {
+        x_axis = normalize(sun_h);
+    } else {
+        var seed = vec3<f32>(0.0, 0.0, 1.0);
+        if (abs(z.z) >= 0.9) {
+            seed = vec3<f32>(1.0, 0.0, 0.0);
+        }
+        x_axis = normalize(seed - z * dot(seed, z));
+    }
+    let y_axis = cross(z, x_axis);
+    return vec3<f32>(
+        dot(direction, x_axis),
+        dot(direction, y_axis),
+        dot(direction, z),
+    );
 }
 
 fn view_dir(px: f32, py: f32) -> vec3<f32> {
@@ -685,20 +803,25 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // handles the terminator). Below the whole disk, disk == 0 anyway.
     let mu_sun = sin(max(sun_elev, 0.0) * DEG2RAD);
     let t_sun = sample_transmittance(R_GROUND + 1.0, mu_sun);
-    let e_ambient = sample_ambient(sun_elev);
+    let e_ambient = sky_irradiance_she(
+        sun_elev,
+        sun_frame_direction(vec3<f32>(0.0, 0.0, 1.0), sun_enu, normal),
+    );
     var l_surf: vec3<f32>;
     if (is_water) {
-        // M3 Cox-Munk sun glint + Fresnel sky reflection (design section 5), replacing
-        // M1 flat dark water. Calm-sea wind = 0 on the GPU pass (per-pixel U10/V10
-        // upload deferred); the sky reflection uses the scalar ambient as a gray sky
-        // (the directional SH radiance is a CPU-path feature) — documented divergence.
+        // Analytic Cox-Munk SUN glint + positive Cox-Munk SKY SHE. The GPU path still
+        // uses the calm-water MSS knot because per-pixel U10/V10 upload is deferred;
+        // unlike the old ambient/PI shortcut, the reflected sky was fitted against the
+        // full Cox-Munk environment integral at that exact MSS.
         let gnd2 = ray_sphere(cam, view, R_GROUND);
         let up_e = normalize(cam + view * max(gnd2.x, 0.0));
         let to_cam = -view;
         // GLINT_MSS_SCALE narrows the Cox-Munk core (round 2); GLINT_STRENGTH lifts the peak.
         let glint = cox_munk_glint(sun_ecef, to_cam, up_e, cox_munk_mss(0.0) * GLINT_MSS_SCALE) * GLINT_STRENGTH;
-        let cos_view = max(dot(to_cam, up_e), 0.0);
-        let f_sky = fresnel_unpolarized(cos_view, WATER_N);
+        let l_sky = cox_munk_sky_she(
+            sun_elev,
+            sun_frame_direction(up_e, sun_ecef, to_cam),
+        );
         // e_sun is disk-integrated; disk is the finite-disk visibility fraction.
         let l_glint = e_sun * (glint / PI) * t_sun * disk;
         // WS2 water direct sun (twin of render.rs): the water BODY sees the same
@@ -711,7 +834,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             scale_ratio = 1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / u.p1.y - 1.0);
         }
         let e_direct_w = e_sun * t_sun * (disk * ndotl);
-        l_surf = albedo * scale_ratio / PI * (e_direct_w + e_ambient) + l_glint + f_sky * (e_ambient / PI);
+        l_surf = albedo * scale_ratio / PI * (e_direct_w + e_ambient) + l_glint + l_sky;
     } else {
         let e_direct = e_sun * t_sun * (disk * ndotl);
         l_surf = albedo / PI * (e_direct + e_ambient);

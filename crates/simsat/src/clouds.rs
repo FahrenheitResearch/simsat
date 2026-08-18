@@ -23,7 +23,7 @@
 //!     the M2 froxel, output through the ABI reflectance stretch.
 //!
 //! NOT M4 (these are M5): Wrenninge multi-scatter octaves, penumbral/pre-blurred
-//! cloud shadows, full SH-2 directional ambient. Sub-grid noise is off (owner
+//! cloud shadows, positive direct log-SH3 directional ambient. Sub-grid noise is off (owner
 //! default) and not built here.
 //!
 //! Geometry: distances are metres, ECEF radii are measured from the earth CENTRE.
@@ -3100,7 +3100,7 @@ pub struct CloudScene<'a> {
     pub sun_od: &'a SunOdMap,
     pub georef: &'a GridGeoref,
     pub luts: &'a AtmosphereLuts,
-    /// SH-2 directional sky ambient (M5) — replaces M2's scalar ambient table. Cloud
+    /// Positive direct log-SH3 sky irradiance — replaces M2's scalar ambient. Cloud
     /// voxels evaluate its upper-hemisphere irradiance (the sky colour, warm at sunset)
     /// attenuated by `tau_up`/`tau_down`.
     pub sky_sh: &'a SkyShTable,
@@ -3452,7 +3452,7 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
             [tr[0] * disk_sun, tr[1] * disk_sun, tr[2] * disk_sun]
         };
 
-        // SH-2 directional sky ambient (M5): the sky irradiance at the voxel's local up
+        // Positive direct log-SH3 sky ambient: irradiance at the voxel's local up
         // in the sun-relative frame (the sky COLOUR, warm at sunset), attenuated from
         // above by e^-tau_up (the brick channel) + a ground bounce from below by
         // e^-tau_down. Replaces M2's scalar white-balanced ambient (design section 6).
