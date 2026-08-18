@@ -1,0 +1,102 @@
+name: Agent finalize SimSat SHE
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/agent-she-finalize.yml'
+      - '.github/agent-she-final-fixes.patch'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-she-finalize-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  apply-validate-and-push:
+    if: github.head_ref == 'agent/simsat-she-implementation'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/simsat-she-implementation
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Linux desktop build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply final fixes and format
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .github/agent-she-final-fixes.patch
+          git apply .github/agent-she-final-fixes.patch
+          cargo fmt --all
+          git diff --check
+
+      - name: Capture formatting, Clippy, and test receipts
+        shell: bash
+        run: |
+          set +e
+          cargo fmt --all -- --check > /tmp/fmt.log 2>&1
+          echo $? > /tmp/fmt.status
+          cargo clippy --workspace --all-targets --locked -- -D warnings > /tmp/clippy.log 2>&1
+          echo $? > /tmp/clippy.status
+          cargo test --workspace --locked > /tmp/test.log 2>&1
+          echo $? > /tmp/test.status
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simsat-she-final-validation
+          path: |
+            /tmp/fmt.log
+            /tmp/fmt.status
+            /tmp/clippy.log
+            /tmp/clippy.status
+            /tmp/test.log
+            /tmp/test.status
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce captured gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat /tmp/fmt.log
+          cat /tmp/clippy.log
+          cat /tmp/test.log
+          test "$(cat /tmp/fmt.status)" = 0
+          test "$(cat /tmp/clippy.status)" = 0
+          test "$(cat /tmp/test.status)" = 0
+
+      - name: Commit the validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/agent-she-final-fixes.patch
+          rm -f .github/agent-she-clippy-fixes.patch
+          rm -f .github/agent-she-diagnostic-trigger.txt
+          rm -f .github/workflows/agent-she-finalize.yml
+          rm -f .github/workflows/agent-she-diagnostics.yml
+          git config user.name "FahrenheitResearch automation"
+          git config user.email "fahrenheitagi@gmail.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "perf: finalize positive sky SHE implementation"
+          git push origin HEAD:agent/simsat-she-implementation
