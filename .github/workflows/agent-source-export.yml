@@ -1,19 +1,21 @@
 name: Agent apply SimSat SHE patch
 
 on:
-  push:
-    branches: [agent/simsat-she-implementation]
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/agent/**'
 
 permissions:
   contents: write
 
 concurrency:
-  group: agent-she-apply-${{ github.ref }}
+  group: agent-she-apply-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   apply-format-and-push:
-    if: github.event.head_commit.message == 'chore: activate SimSat SHE patch formatter'
+    if: github.head_ref == 'agent/simsat-she-implementation'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
