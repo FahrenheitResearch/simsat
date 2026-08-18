@@ -1,0 +1,26 @@
+name: Agent source export
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    if: github.head_ref == 'agent/simsat-she-implementation'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pack source tree
+        run: tar --exclude=.git -czf /tmp/simsat-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simsat-source-agent
+          path: /tmp/simsat-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
