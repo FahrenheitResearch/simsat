@@ -1,0 +1,62 @@
+name: Apply log-SH3 sky patch once
+
+on:
+  push:
+    branches: [feature/log-sh3-sky-cox-munk-she]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-log-she-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[log-she-applied]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/log-sh3-sky-cox-munk-she
+          fetch-depth: 0
+
+      - name: Install Linux desktop build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply the source patch
+        run: python .github/patches/apply_log_she_once.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Reject malformed diffs
+        run: git diff --check
+
+      - name: Lint SimSat
+        run: cargo clippy -p simsat --all-targets --locked -- -D warnings
+
+      - name: Test SimSat library
+        run: cargo test -p simsat --lib --locked
+
+      - name: Commit validated implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/simsat/src/she.rs \
+                  crates/simsat/src/atmosphere.rs \
+                  crates/simsat/src/render.rs \
+                  crates/simsat/src/lib.rs
+          git commit -m "feat(simsat): add positive sky SHE [log-she-applied]"
+          git push origin HEAD:feature/log-sh3-sky-cox-munk-she
