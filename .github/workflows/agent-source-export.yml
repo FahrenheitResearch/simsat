@@ -1,4 +1,4 @@
-name: Agent source export
+name: Agent implementation validation
 
 on:
   pull_request:
@@ -7,20 +7,81 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: agent-she-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  export-source:
+  validate-and-export:
     if: github.head_ref == 'agent/simsat-she-implementation'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Pack source tree
+
+      - name: Apply the compressed implementation patch
+        run: |
+          base64 --decode agent.patch.gz.b64 | gzip --decompress > /tmp/agent.patch
+          git apply --check /tmp/agent.patch
+          git apply /tmp/agent.patch
+          rm agent.patch.gz.b64
+
+      - name: Install Linux desktop build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format the applied source
+        run: cargo fmt --all
+
+      - name: Validate implementation
+        id: validate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          : > /tmp/simsat-she-validation.log
+          cargo fmt --all --check >> /tmp/simsat-she-validation.log 2>&1
+          fmt_status=$?
+          cargo clippy --workspace --all-targets --locked -- -D warnings >> /tmp/simsat-she-validation.log 2>&1
+          clippy_status=$?
+          cargo test --workspace --locked >> /tmp/simsat-she-validation.log 2>&1
+          test_status=$?
+          {
+            echo
+            echo "fmt_status=$fmt_status"
+            echo "clippy_status=$clippy_status"
+            echo "test_status=$test_status"
+          } >> /tmp/simsat-she-validation.log
+          test $fmt_status -eq 0 -a $clippy_status -eq 0 -a $test_status -eq 0
+
+      - name: Pack formatted source
+        if: always()
         run: tar --exclude=.git -czf /tmp/simsat-source.tar.gz .
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: simsat-source-agent
-          path: /tmp/simsat-source.tar.gz
+          path: |
+            /tmp/simsat-source.tar.gz
+            /tmp/simsat-she-validation.log
           if-no-files-found: error
           retention-days: 1
+
+      - name: Fail after exporting diagnostics
+        if: steps.validate.outcome == 'failure'
+        run: exit 1
