@@ -41,7 +41,7 @@ numpy = "0.23"
 # crate (its own `[workspace]` below), so the netcrust hdf5-reader redirect must be repeated
 # here exactly as in the repo-root Cargo.toml.
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "472d7e9d9b5a49f81dce1da1826cc5b2145aaf95" }
 
 # An empty `[workspace]` table makes this crate its OWN workspace root (standalone), so it
 # is not pulled into the repo-root virtual workspace and the node trio stays Python-free.
