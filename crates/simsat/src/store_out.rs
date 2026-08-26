@@ -399,6 +399,9 @@ pub fn write_visible_frame(
                 COMPOSITE_G_VAR.to_string(),
                 COMPOSITE_B_VAR.to_string(),
             ],
+            lead_seconds: None,
+            valid_unix: None,
+            source_provenance: Vec::new(),
         },
     );
     manifest.save(&manifest_path).map_err(|e| e.to_string())?;
@@ -643,6 +646,9 @@ pub fn write_ir_frame(store_root: &Path, frame: &IrFrame) -> Result<WrittenVisib
             written_unix,
             encode_ms,
             variables: vec![variable.clone()],
+            lead_seconds: None,
+            valid_unix: None,
+            source_provenance: Vec::new(),
         },
     );
     manifest.save(&manifest_path).map_err(|e| e.to_string())?;
