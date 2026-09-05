@@ -1,0 +1,34 @@
+{
+  "ir_planes": {
+    "12": {
+      "baseline_sha256": "6267f46675b04e07e96fdeaccd752ac6fb11418a94b29412db4ef0f0ca3f1019",
+      "candidate_sha256": "6267f46675b04e07e96fdeaccd752ac6fb11418a94b29412db4ef0f0ca3f1019",
+      "byte_identical": true
+    },
+    "15": {
+      "baseline_sha256": "7e504bc9160359c567fac75658c18a81e885d5b81d5932c156c8dd7081b753ec",
+      "candidate_sha256": "7e504bc9160359c567fac75658c18a81e885d5b81d5932c156c8dd7081b753ec",
+      "byte_identical": true
+    },
+    "18": {
+      "baseline_sha256": "5e068b4b950275f7f9af1385e120a2c2bc473eb4712e98ace4d5c794a24cd1b0",
+      "candidate_sha256": "5e068b4b950275f7f9af1385e120a2c2bc473eb4712e98ace4d5c794a24cd1b0",
+      "byte_identical": true
+    },
+    "21": {
+      "baseline_sha256": "b91796e4c6c2bf3fd7b0678eee050c0421f48cef527322937f1f6e92911c89d4",
+      "candidate_sha256": "b91796e4c6c2bf3fd7b0678eee050c0421f48cef527322937f1f6e92911c89d4",
+      "byte_identical": true
+    }
+  },
+  "main_head": "22dd23b2b956360c53ca6b7b2b445fe76202c392",
+  "source_commits": [
+    "4a1b33f diagnostics: audit native cloud temperatures and collocated ABI cold tails",
+    "a5139d9 validation: score both intents and independent ABI bands with immutable runs",
+    "4f38b5b radiometry: add official ABI FM4 reflective-band response quadrature",
+    "e984c29 sensor: preserve unclipped gray radiometry and requested cloud overlap",
+    "2a685a3 validator: synthetic condensate cloud mask and both-cloudy regimes",
+    "56e6ca2 render: sun glint is the unscaled Cox & Munk 1954 kernel (fix high-sun ocean whiteout)"
+  ],
+  "regression_gates": "pass"
+}
