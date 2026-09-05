@@ -1,6 +1,6 @@
 # SimSat realism and 3D progress
 
-Historical milestone; active work is satellite-only support for meteorologists on cloud-seeding missions. See [SATELLITE-ONLY.md](SATELLITE-ONLY.md).
+Historical milestone; active work targets the highest achievable realism in overhead simulated satellite imagery. Cloud-seeding support is one application. See [SATELLITE-ONLY.md](SATELLITE-ONLY.md).
 
 Worktree: `C:\Users\drew\simsat-wt-nextgen-abi`, branch `codex/nextgen-abi`. Main is untouched; nothing merged or pushed. Cargo jobs remains 6.
 
