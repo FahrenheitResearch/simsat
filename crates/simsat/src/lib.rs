@@ -222,6 +222,7 @@ mod tests {
     }
 }
 
+pub mod abi_first_order;
 pub mod nbar_surface;
 pub mod spectral_surface;
 mod surface_grid;

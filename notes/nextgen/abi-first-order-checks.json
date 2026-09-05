@@ -1,0 +1,68 @@
+{
+  "workspace_tests": {
+    "passed": 723,
+    "failed": 0,
+    "ignored": 3
+  },
+  "targeted_physics_tests": 7,
+  "clippy_workspace_all_targets": "pass -D warnings",
+  "gui_inclusive_workspace_build": "pass",
+  "format": "pass",
+  "release_build": "pass",
+  "jobs": 6,
+  "final_source_scouts": {
+    "12": {
+      "sampled_pixels": 720,
+      "identical_files": 13,
+      "all_scientific_planes_and_previews_byte_identical": true,
+      "native_run_binary_sha256": "505fca49e1a24998bece706c1198f0a04354cb6fab26f50f2c315b9ddcc1b6f3",
+      "final_binary_sha256": "6c27825a38af842a2c60470506cdc65054e39d09e5bca82ed7ce4dcb65e49324"
+    },
+    "15": {
+      "sampled_pixels": 720,
+      "identical_files": 13,
+      "all_scientific_planes_and_previews_byte_identical": true,
+      "native_run_binary_sha256": "505fca49e1a24998bece706c1198f0a04354cb6fab26f50f2c315b9ddcc1b6f3",
+      "final_binary_sha256": "6c27825a38af842a2c60470506cdc65054e39d09e5bca82ed7ce4dcb65e49324"
+    },
+    "18": {
+      "sampled_pixels": 720,
+      "identical_files": 13,
+      "all_scientific_planes_and_previews_byte_identical": true,
+      "native_run_binary_sha256": "505fca49e1a24998bece706c1198f0a04354cb6fab26f50f2c315b9ddcc1b6f3",
+      "final_binary_sha256": "6c27825a38af842a2c60470506cdc65054e39d09e5bca82ed7ce4dcb65e49324"
+    },
+    "21": {
+      "sampled_pixels": 720,
+      "identical_files": 13,
+      "all_scientific_planes_and_previews_byte_identical": true,
+      "native_run_binary_sha256": "505fca49e1a24998bece706c1198f0a04354cb6fab26f50f2c315b9ddcc1b6f3",
+      "final_binary_sha256": "6c27825a38af842a2c60470506cdc65054e39d09e5bca82ed7ce4dcb65e49324"
+    }
+  },
+  "render_preservation": "All four native images use the archived original release binary; final lint-only source cleanup matches every scientific and preview file on 720 sampled rays per hour.",
+  "gpu": "New scene reference is CPU only. Existing underlying transport/Rayleigh/HG WGSL twins have prior adapter evidence. No full-scene GPU equivalence claim.",
+  "promotion": "No default change. Original display/IR gates and full ABI goal unfinished.",
+  "logs": {
+    "abi-first-order-workspace-tests-final.log": {
+      "bytes": 83470,
+      "sha256": "998cfca4aae058da93442c29259da0069786218327a204e7e15788964ada9e33"
+    },
+    "abi-first-order-clippy-final.log": {
+      "bytes": 1102,
+      "sha256": "acb589c4e2e8a83f51f92c32eb513fdaa56e080788eebf8b9779752665eec3f3"
+    },
+    "abi-first-order-gui-build-final.log": {
+      "bytes": 1022,
+      "sha256": "a334fd626e5d7daabcb0fa95d1457d4b4fc2835177f34002eb5c05b69027a1ba"
+    },
+    "abi-first-order-release-final.log": {
+      "bytes": 999,
+      "sha256": "80fbf6c7019c4d68eadc3217900f0a6714c6e38a14b73b7d824b65236de3341c"
+    },
+    "abi-first-order-geometry-tests.log": {
+      "bytes": 1929,
+      "sha256": "e5095bc1d85a40c8e69696c99a1a31267ed8e31cc2010ba7cfa3f21c24121562"
+    }
+  }
+}

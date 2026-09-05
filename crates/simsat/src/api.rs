@@ -1252,6 +1252,67 @@ fn model_grid_satellite_raster_for_source(
         .ok_or_else(|| "model-grid satellite raster requires a nondegenerate grid with every ground point visible from the satellite".to_string())
 }
 
+/// Explicit first-order ABI reference. Separate from all shipped products and
+/// display intent. Configuration and omitted physics must accompany the result.
+pub fn render_abi_first_order(
+    params: &RenderParams,
+    config: &crate::abi_first_order::FirstOrderConfig,
+) -> Result<
+    (
+        crate::abi_first_order::FirstOrderFrame,
+        SurfaceRaster,
+        String,
+    ),
+    String,
+> {
+    validate_model_grid_satellite_params(params)?;
+    config.validate()?;
+    if params.intent != RenderIntent::SensorFastGray
+        || params.sun_override.is_some()
+        || params.nbar_surface.is_some()
+    {
+        return Err(
+            "ABI first-order requires sensor-fast-gray, actual Sun and spectral surface input"
+                .into(),
+        );
+    }
+    let path = params
+        .spectral_surface
+        .as_ref()
+        .ok_or("ABI first-order requires spectral-surface")?;
+    let surface = crate::spectral_surface::SpectralSurface::load(path)?;
+    let src = resolve_source(params)?;
+    let raster = model_grid_satellite_raster_for_source(&src, params)?;
+    let (time, fallback) = resolve_frame_time(src.time_iso.as_deref());
+    if fallback || (time.month == 2 && time.day == 29) {
+        return Err("ABI first-order requires a known non-leap-climatology frame date".into());
+    }
+    let days = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let doy = days[..(time.month - 1) as usize].iter().sum::<u32>() + time.day;
+    if surface.climatology_doy() != doy {
+        return Err("spectral land day differs from frame".into());
+    }
+    let solar = SolarFrame::new(time.year, time.month, time.day, time.ut);
+    let (sun, _) = resolve_frame_sun(params, &raster, &solar, &src.params);
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
+    let cam = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
+    crate::log_line!(
+        "ABI first-order: unscaled gray conservative clouds; full-cell coverage; spectral land/Rayleigh; reference exponential dry air; NO multiple scattering, gases, aerosol, diffuse boundary, finite Sun or PSF"
+    );
+    let frame = crate::abi_first_order::render(
+        &src.brick,
+        &src.georef,
+        &raster,
+        &cam,
+        sun,
+        &surface,
+        horiz_pitch_m(&src.params),
+        config,
+    )?;
+    Ok((frame, raster, src.time_iso.ok_or("missing frame time")?))
+}
+
 /// Resolve an output intent on a clone, preserving the caller request exactly.
 ///
 /// Display is an exact no-op. Sensor Fast Gray keeps the physical/model controls

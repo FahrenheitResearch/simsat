@@ -61,3 +61,8 @@ path = "examples/render_frame.rs"
 [[bin]]
 name = "simsat-render-ir"
 path = "examples/render_ir.rs"
+
+# Explicit incomplete spectral reference; separate from all shipped products.
+[[bin]]
+name = "simsat-render-abi-first-order"
+path = "examples/render_abi_first_order.rs"
