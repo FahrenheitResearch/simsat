@@ -260,10 +260,11 @@ pub const FLAT_ALBEDO_SRGB: f32 = 0.30;
 // radiance path, and each is a no-op at its identity value (so the identity set
 // reproduces the pre-refinement output). Round 2 (this pass) pushed the daytime look
 // further per the orchestrator's review against the real GOES references: more
-// de-haze (lower veil), more vivid land (higher vibrancy), a modest LAND-only daytime
-// BRIGHTNESS lift (LAND_DAY_GAIN, distinct from the global exposure), and a brighter
-// + tighter sun glint (higher GLINT_STRENGTH + a narrowed Cox-Munk core GLINT_MSS_SCALE).
-// All are sun-gated or surface-scoped. Surface help begins above the horizon so terrain
+// de-haze (lower veil), more vivid land (higher vibrancy), and a modest LAND-only daytime
+// BRIGHTNESS lift (LAND_DAY_GAIN, distinct from the global exposure). The round-2 sun-glint
+// levers (a GLINT_STRENGTH gain and a GLINT_MSS_SCALE core narrowing) were REMOVED — see
+// the sun-glint note after [`CLOUD_SOFTCLIP_KNEE`]: the glint is the unscaled Cox & Munk
+// kernel. All are sun-gated or surface-scoped. Surface help begins above the horizon so terrain
 // remains visible in the same low-sun interval as the corrected atmosphere and clouds.
 
 /// Daytime aerial-perspective (Rayleigh) VEIL reduction. A geostationary view marches
@@ -405,29 +406,31 @@ pub const GROUND_DAY_LIFT: f64 = 1.10;
 /// baked value; `1.0` disables it).
 pub const CLOUD_SOFTCLIP_KNEE: f64 = 0.65;
 
-/// Sun-GLINT brightness gain. The Cox-Munk specular glint over water is physically a
-/// thin, dim streak once band-averaged; real GOES shows a DISTINCT bright glint. This
-/// is a calibrated display gain on the glint reflectance (its Cox-Munk angular WIDTH
-/// is set by [`GLINT_MSS_SCALE`] below — this constant only lifts the peak brightness).
-/// `1.0` = the raw Cox-Munk glint. Round 2: `2.0 -> 3.5` (the round-1 glint read as a
-/// soft sheen; the orchestrator wants a distinct bright glitter streak toward the sun).
-pub const GLINT_STRENGTH: f64 = 3.5;
-
-/// Sun-GLINT specular-core NARROWING (refinement pass, round 2). Scales the Cox-Munk
-/// mean-square slope `sigma^2` that sets the glint's angular width: `< 1` TIGHTENS the
-/// sea-surface slope distribution, so the specular core is SMALLER and (energy pulled
-/// into a narrower peak) BRIGHTER — a distinct glitter streak instead of a broad sheen.
-/// This is physically the low-wind / calm-sea limit of the same Cox-Munk model (a
-/// tighter slope PDF is exactly what a calmer sea has), applied as a calibration on the
-/// modelled `sigma^2` at the glint call site; the Cox-Munk kernel itself is unchanged.
-/// `1.0` = the raw modelled slope variance. Round 3: `0.6 -> 0.4` (tightened after the
-/// review — round-2 confirmed the high-sun glint is a physically-correct broad wash and
-/// asked to sharpen the LOW-sun streak where the specular core collapses to a tight
-/// bright glitter facing the sensor; 0.5 was still blob-like at the coarse Michael d01
-/// domain, so one more notch to the very-calm/glassy-sea limit). Water-only, and
-/// negligible at twilight (the near-horizon specular facet is far off-normal, so the
-/// tighter core makes it even smaller) — twilight-safe.
-pub const GLINT_MSS_SCALE: f64 = 0.4;
+// ── Sun glint: the UNSCALED Cox & Munk 1954 kernel ─────────────────────────────
+//
+// Two display calibrations used to sit on the water-surface direct term: a
+// `GLINT_STRENGTH = 3.5` gain on the Cox-Munk reflectance factor and a
+// `GLINT_MSS_SCALE = 0.4` narrowing of the modelled slope variance (refinement rounds
+// 2-3, "a distinct glitter streak"). Both were removed (recast/high-sun-visible), for
+// two reasons that hold for ANY case:
+//
+//   1. Energy. The Cox-Munk slope PDF integrates to one, so the glint's
+//      directional-hemispherical reflectance is the Fresnel reflectance of the facets
+//      (~0.021 at an overhead sun, n = 1.34). A 3.5x gain made the sea reflect 3.5x the
+//      energy Fresnel allows; the narrowing then re-shaped a measured distribution
+//      (`sigma^2 = 0.003 + 0.00512 W`, Cox & Munk 1954, from sun-glitter photographs)
+//      with no physical source. `optics::tests::glint_hemispherical_integral_is_bounded_by_fresnel`
+//      now pins the integral to Fresnel.
+//   2. Geometry. A streak is what the glint looks like when the specular point lies
+//      off-domain; at a near-overhead sun EVERY nadir-viewed water pixel is within a
+//      few degrees of the specular direction, so the gain whitened the whole ocean and
+//      coast: validated against GOES-19 (04 Sep 2026 18 UTC, 83 deg sun) the scaled
+//      kernel returned a reflectance factor of 1.0-1.8 over clear ocean (clear-sky
+//      luminance bias +0.36 against an observed ~0.08).
+//
+// The kernel now runs on the measured slope statistics at the pixel's 10 m wind and
+// the unpolarised Fresnel reflectance of water with no gain
+// (`render::tests::water_glint_carries_no_gain_over_the_cox_munk_kernel`).
 
 // ── SNOWH snow blend (design section 5, M3) ───────────────────────────────────
 
@@ -1572,12 +1575,14 @@ pub fn surface_toa_radiance(
             .map(|(_, t_ground)| norm3(madd3(cam, view, t_ground)))
             .unwrap_or([0.0, 0.0, 1.0]);
         let to_cam = [-view[0], -view[1], -view[2]];
-        // GLINT_MSS_SCALE (refinement pass, round 2): narrow the Cox-Munk slope
-        // variance so the specular core is tighter/brighter (a distinct glitter streak,
-        // physically the calmer-sea limit). GLINT_STRENGTH then lifts the peak brightness.
-        let mss = optics::cox_munk_mean_square_slope(px.wind_speed as f64) * GLINT_MSS_SCALE;
-        let glint_rho =
-            optics::cox_munk_glint_reflectance(sun, to_cam, surf_up, mss) * GLINT_STRENGTH;
+        // Cox & Munk 1954 slope statistics at this pixel's 10 m wind, UNSCALED: the
+        // glint's angular width is the measured `sigma^2 = 0.003 + 0.00512 W` and its
+        // reflectance factor is the raw kernel — no display gain, no core narrowing
+        // (see the sun-glint note by the calibration constants). At a near-overhead
+        // sun a nadir-viewed water pixel is within a few degrees of the specular
+        // direction, so any gain here brightens the WHOLE ocean, not a streak.
+        let mss = optics::cox_munk_mean_square_slope(px.wind_speed as f64);
+        let glint_rho = optics::cox_munk_glint_reflectance(sun, to_cam, surf_up, mss);
         // The specular glint sees the RAW shadow (an occluded solar disk has no mirror
         // image; the CLOUD_SHADOW_FLOOR fill is diffuse-only).
         let glint_scale = disk * shadow_raw;
@@ -2638,8 +2643,10 @@ mod tests {
 
     // ── True-color refinement calibration (orchestrator-approved, frozen) ──
     //
-    // The five levers (AERIAL_VEIL_DAY_SCALE, LAND_VIBRANCY, LAND_DAY_GAIN, GLINT_STRENGTH,
-    // GLINT_MSS_SCALE) are display/albedo calibrations of the shipped radiance path; each is
+    // The three levers (AERIAL_VEIL_DAY_SCALE, LAND_VIBRANCY, LAND_DAY_GAIN) are
+    // display/albedo calibrations of the shipped radiance path (the former glint levers
+    // are gone: the glint is the unscaled Cox-Munk kernel, pinned by
+    // water_glint_carries_no_gain_over_the_cox_munk_kernel below); each is
     // a NO-OP at its identity value. These sanity tests pin the clean parameterization and the
     // intended directional effects. They do NOT re-tune the approved constants (frozen); they
     // assert PROPERTIES that hold for the shipped values, not the values themselves.
@@ -2706,21 +2713,6 @@ mod tests {
                 albedo[c]
             );
         }
-
-        // Glint strength x1.0 and mss-scale x1.0 leave the raw Cox-Munk kernel unchanged.
-        let up = [0.0, 0.0, 1.0];
-        let se = 40.0f64.to_radians();
-        let to_sun = [se.cos(), 0.0, se.sin()];
-        let spec_view = [-se.cos(), 0.0, se.sin()];
-        let raw_mss = optics::cox_munk_mean_square_slope(5.0);
-        let raw = optics::cox_munk_glint_reflectance(to_sun, spec_view, up, raw_mss);
-        let identity = 1.0f64;
-        assert_eq!(raw * identity, raw, "glint strength 1.0 is a no-op");
-        assert_eq!(
-            optics::cox_munk_glint_reflectance(to_sun, spec_view, up, raw_mss * identity),
-            raw,
-            "glint mss-scale 1.0 is a no-op"
-        );
     }
 
     #[test]
@@ -2792,78 +2784,57 @@ mod tests {
     }
 
     #[test]
-    fn glint_peak_scales_up_with_glint_strength() {
-        // (c) The glint PEAK scales linearly with GLINT_STRENGTH (a display gain on the
-        // Cox-Munk reflectance): a larger strength -> a brighter peak, monotonically, and the
-        // shipped strength (> 1) lifts the peak above the raw Cox-Munk glint.
-        let up = [0.0, 0.0, 1.0];
-        let se = 35.0f64.to_radians();
-        let to_sun = [se.cos(), 0.0, se.sin()];
-        let spec_view = [-se.cos(), 0.0, se.sin()]; // the specular peak direction
-        let mss = optics::cox_munk_mean_square_slope(4.0) * GLINT_MSS_SCALE;
-        let peak = optics::cox_munk_glint_reflectance(to_sun, spec_view, up, mss);
-        assert!(
-            peak > 0.0,
-            "there must be a specular peak to scale, got {peak}"
-        );
-        let mut prev = -1.0;
-        for &strength in &[1.0f64, 2.0, GLINT_STRENGTH, 6.0] {
-            let scaled = peak * strength;
-            assert!(
-                scaled > prev,
-                "the peak must rise with strength {strength}: {scaled} <= {prev}"
+    fn water_glint_carries_no_gain_over_the_cox_munk_kernel() {
+        // The high-sun ocean regression (GOES-19, 04 Sep 2026 18 UTC, 83 deg sun): a
+        // nadir-viewed water pixel is then only ~3.5 deg from the specular direction,
+        // so a gain on the glint brightens the WHOLE ocean. With a ZERO water-body
+        // albedo, lit minus sun-occluded water isolates the glint exactly (ambient, sky
+        // reflection and airlight cancel; there is no diffuse direct term). In
+        // reflectance-factor units that difference is the kernel times the sun and view
+        // transmittances, so it must sit BELOW the raw Cox & Munk kernel and, in the
+        // red band, ABOVE 0.6x of it (near-zenith two-way red transmittance is ~0.8:
+        // Rayleigh 0.046 + Mie 0.05 + ozone 0.014 + water vapour 0.012 per pass) — for
+        // calm to fresh winds. A hidden gain of 1.3x or more fails the upper bound.
+        let view = nadir_view();
+        let (mut ctx, sun) = nadir_surface_pixel(83.0);
+        ctx.flat_albedo_srgb = 0.0; // the fixture has no Blue Marble: flat albedo -> 0
+        let surf_up = [-view[0], -view[1], -view[2]];
+        for &wind in &[0.0f32, 2.0, 5.0, 10.0] {
+            let water = SurfacePixel {
+                on_earth: true,
+                normal_enu: [0.0, 0.0, 1.0],
+                sun_enu: [sun[0] as f32, sun[1] as f32, sun[2] as f32],
+                sun_elev_deg: 83.0,
+                is_water: true,
+                view_dir: view,
+                wind_speed: wind,
+                ..Default::default()
+            };
+            let lit = reflectance_from_radiance(
+                surface_toa_radiance(&ctx, &water, 1.0, 1.0).expect("on earth"),
             );
-            prev = scaled;
-        }
-        // The shipped strength (> 1) lifts the peak above the raw Cox-Munk glint. Encoded
-        // via the runtime peak (peak > 0), so `peak * GLINT_STRENGTH > peak` iff strength > 1.
-        assert!(
-            peak * GLINT_STRENGTH > peak,
-            "the shipped glint is brighter than the raw Cox-Munk peak"
-        );
-    }
-
-    #[test]
-    fn glint_core_tightens_with_smaller_mss_scale() {
-        // (c) A SMALLER GLINT_MSS_SCALE tightens the Cox-Munk slope PDF: energy concentrates
-        // into a narrower, BRIGHTER specular core. Assert (1) the peak rises as the mss-scale
-        // shrinks, and (2) the core is narrower (a fixed off-specular shoulder is a smaller
-        // fraction of the peak at the tighter scale).
-        let up = [0.0, 0.0, 1.0];
-        let se = 35.0f64.to_radians();
-        let to_sun = [se.cos(), 0.0, se.sin()];
-        let spec_view = [-se.cos(), 0.0, se.sin()];
-        let off = 6.0f64.to_radians(); // a small azimuth offset = the core "shoulder"
-        let off_view = [-se.cos() * off.cos(), se.cos() * off.sin(), se.sin()];
-        let base_mss = optics::cox_munk_mean_square_slope(4.0);
-
-        // (1) The peak brightens as the mss-scale shrinks (a tighter PDF -> higher 1/(pi*mss)).
-        let mut prev_peak = -1.0;
-        for &scale in &[1.0f64, 0.6, GLINT_MSS_SCALE, 0.2] {
-            let peak = optics::cox_munk_glint_reflectance(to_sun, spec_view, up, base_mss * scale);
-            assert!(
-                peak > prev_peak,
-                "smaller mss-scale must brighten the peak at {scale}: {peak} <= {prev_peak}"
+            let occluded = reflectance_from_radiance(
+                surface_toa_radiance(&ctx, &water, 0.0, 1.0).expect("on earth"),
             );
-            prev_peak = peak;
+            let mss = optics::cox_munk_mean_square_slope(wind as f64);
+            let raw = optics::cox_munk_glint_reflectance(ctx.sun_ecef, surf_up, surf_up, mss);
+            assert!(
+                raw > 0.05 && raw < 1.0,
+                "wind {wind}: raw Cox-Munk kernel {raw} outside the expected near-specular range"
+            );
+            for c in 0..3 {
+                let glint = lit[c] as f64 - occluded[c] as f64;
+                assert!(
+                    glint <= raw + 1.0e-6,
+                    "wind {wind} band {c}: rendered glint {glint} exceeds the unscaled kernel {raw}"
+                );
+            }
+            let red = lit[0] as f64 - occluded[0] as f64;
+            assert!(
+                red >= 0.6 * raw,
+                "wind {wind}: red glint {red} is too weak against the kernel {raw}"
+            );
         }
-
-        // (2) The core NARROWS: at the shipped tight scale the off-specular shoulder is a
-        // SMALLER fraction of the peak than at the untightened (1.0) scale.
-        let shoulder_ratio = |scale: f64| {
-            let peak = optics::cox_munk_glint_reflectance(to_sun, spec_view, up, base_mss * scale);
-            let shoulder =
-                optics::cox_munk_glint_reflectance(to_sun, off_view, up, base_mss * scale);
-            shoulder / peak
-        };
-        // The shipped mss-scale (< 1) tightens the core: its off-specular shoulder is a
-        // smaller fraction of the peak than the untightened (1.0) scale (runtime-encoded).
-        assert!(
-            shoulder_ratio(GLINT_MSS_SCALE) < shoulder_ratio(1.0),
-            "the tightened core must fall off faster: {} !< {}",
-            shoulder_ratio(GLINT_MSS_SCALE),
-            shoulder_ratio(1.0)
-        );
     }
 
     // ── top-down / basemap appearance pass (ground lift + highlight soft-clip) ──

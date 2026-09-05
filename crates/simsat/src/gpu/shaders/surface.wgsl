@@ -53,8 +53,8 @@ const STEPS: u32 = 32u;
 const WATER_N: f32 = 1.34; // sea-water refractive index (M3 Cox-Munk glint / Fresnel)
 // True-color calibration (refinement pass; twins of render.rs constants). Daytime
 // aerial-perspective veil reduction (Rayleigh correction), land-albedo vibrancy, a
-// LAND-only daytime brightness lift, and the sun-glint brightness gain + core
-// narrowing. Round 2 values. Each is a no-op at its identity value; the surface-help
+// LAND-only daytime brightness lift. (The round-2 sun-glint gain + core narrowing
+// were removed: the glint is the unscaled Cox & Munk kernel — twin of render.rs.) Each is a no-op at its identity value; the surface-help
 // controls begin above the horizon so terrain follows visible daylight.
 const AERIAL_VEIL_DAY_SCALE: f32 = 0.40;
 const AERIAL_VEIL_ELEV_LO: f32 = 20.0;
@@ -68,8 +68,6 @@ const SURFACE_TWILIGHT_OUT_HI: f32 = 12.0;
 const LAND_VIBRANCY: f32 = 1.45;
 const LAND_DAY_GAIN: f32 = 1.20;   // LAND-only daytime surface-reflectance lift (not the global exposure)
 const LAND_SZA_REFERENCE_ELEV: f32 = 60.0;
-const GLINT_STRENGTH: f32 = 3.5;
-const GLINT_MSS_SCALE: f32 = 0.4;  // < 1 tightens the Cox-Munk core -> smaller, brighter glint streak (round 3: 0.6->0.4)
 // WS2 bright-cloud tonemap + water lighting (twins of render.rs). This pass has an
 // implicit exposure of 1.0, so the exposure-aware shoulder bound is RHO_HIGHLIGHT_MAX
 // itself (the CPU paths derive x_max = exposure * RHO_HIGHLIGHT_MAX at their seam).
@@ -695,8 +693,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let gnd2 = ray_sphere(cam, view, R_GROUND);
         let up_e = normalize(cam + view * max(gnd2.x, 0.0));
         let to_cam = -view;
-        // GLINT_MSS_SCALE narrows the Cox-Munk core (round 2); GLINT_STRENGTH lifts the peak.
-        let glint = cox_munk_glint(sun_ecef, to_cam, up_e, cox_munk_mss(0.0) * GLINT_MSS_SCALE) * GLINT_STRENGTH;
+        // Unscaled Cox & Munk 1954 kernel at calm-sea variance; CPU uses model wind.
+        let glint = cox_munk_glint(sun_ecef, to_cam, up_e, cox_munk_mss(0.0));
         let cos_view = max(dot(to_cam, up_e), 0.0);
         let f_sky = fresnel_unpolarized(cos_view, WATER_N);
         // e_sun is disk-integrated; disk is the finite-disk visibility fraction.

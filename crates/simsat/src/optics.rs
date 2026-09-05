@@ -901,6 +901,75 @@ fn norm3(a: [f64; 3]) -> [f64; 3] {
 mod tests {
     use super::*;
 
+    /// Directional-hemispherical reflectance of the glint kernel: the Cox-Munk BRDF
+    /// `rho / pi` integrated against `cos(theta_v)` over the viewing hemisphere
+    /// (midpoint rule in view zenith x azimuth; `up = +z`).
+    fn glint_hemispherical_reflectance(
+        to_sun: [f64; 3],
+        mss: f64,
+        n_theta: usize,
+        n_phi: usize,
+    ) -> f64 {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let up = [0.0, 0.0, 1.0];
+        let d_theta = FRAC_PI_2 / n_theta as f64;
+        let d_phi = 2.0 * PI / n_phi as f64;
+        let mut sum = 0.0;
+        for i in 0..n_theta {
+            let theta = (i as f64 + 0.5) * d_theta;
+            let (st, ct) = theta.sin_cos();
+            let d_omega = st * d_theta * d_phi;
+            for j in 0..n_phi {
+                let phi = (j as f64 + 0.5) * d_phi;
+                let v = [st * phi.cos(), st * phi.sin(), ct];
+                sum += cox_munk_glint_reflectance(to_sun, v, up, mss) / PI * ct * d_omega;
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn glint_hemispherical_integral_is_bounded_by_fresnel() {
+        // Energy bound on the sun glint. The Cox-Munk slope PDF integrates to one, so
+        // for an overhead sun the glint's directional-hemispherical reflectance is the
+        // Fresnel reflectance of the facets: F(0) = ((n-1)/(n+1))^2 = 0.0211 for
+        // n = 1.34, rising by < 1 % at 15 m/s (tilted facets see a slightly larger
+        // incidence angle). Any hidden gain on the kernel fails this: the removed 3.5x
+        // display gain put the integral at 3.5 F(0).
+        let f0 = fresnel_reflectance_unpolarized(1.0, WATER_REFRACTIVE_INDEX_VIS);
+        assert!(
+            (f0 - 0.0211).abs() < 5e-4,
+            "F(0) for n = 1.34 should be ~0.0211, got {f0}"
+        );
+        for &wind in &[0.0f64, 2.0, 5.0, 10.0, 15.0] {
+            let mss = cox_munk_mean_square_slope(wind);
+            let dhr = glint_hemispherical_reflectance([0.0, 0.0, 1.0], mss, 720, 720);
+            assert!(
+                dhr >= 0.98 * f0 && dhr <= 1.05 * f0,
+                "wind {wind} m/s: overhead-sun glint albedo {dhr} must equal Fresnel {f0}"
+            );
+        }
+        // Lower suns: the kernel has no facet masking/shadowing term (a documented
+        // Cox-Munk simplification), so the integral grows toward grazing, but it must
+        // remain a reflectance — bounded by one, never creating energy — and stay of
+        // Fresnel order (< 0.1) down to a 30 deg sun.
+        let mss = cox_munk_mean_square_slope(5.0);
+        for &elev_deg in &[60.0f64, 30.0, 10.0, 5.0] {
+            let e = elev_deg.to_radians();
+            let dhr = glint_hemispherical_reflectance([e.cos(), 0.0, e.sin()], mss, 720, 720);
+            assert!(
+                dhr > 0.0 && dhr <= 1.0,
+                "sun {elev_deg} deg: glint albedo {dhr} must be a bounded reflectance"
+            );
+            if elev_deg >= 30.0 {
+                assert!(
+                    dhr < 0.1,
+                    "sun {elev_deg} deg: glint albedo {dhr} should be of Fresnel order"
+                );
+            }
+        }
+    }
+
     #[test]
     fn kappa_is_two_sevenths() {
         assert!((KAPPA - 2.0 / 7.0).abs() < 1.0e-12);
