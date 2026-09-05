@@ -1,0 +1,48 @@
+{
+  "schema": "simsat-visible-material-indices-preparation-v1",
+  "wavelength_contract_um": [
+    0.4,
+    1.0
+  ],
+  "interpolation": "n_real linear in log wavelength; log positive n_imag linear in log wavelength",
+  "water_source": {
+    "distribution": {
+      "url": "https://www.libradtran.org/download/libRadtran-2.0.6.tar.gz",
+      "retrieved_utc": "2026-09-05T06:21:46.920664+00:00",
+      "bytes": 154147176,
+      "sha256": "64930cc40b6e4a37aa220520974d330fc1563796f466a649b2238131f2d69840",
+      "last_modified": "Sat, 18 Jan 2025 10:28:42 GMT",
+      "etag": "\"9301968-62bf87dcdc4c9\""
+    },
+    "member": "libRadtran-2.0.6/libsrc_f/REFWAT.f",
+    "member_sha256": "f80caefb0a926a2e258ca9761ba5f07f8e83867f032b0d033b57a226959d5a5f",
+    "reference": "Segelstein 1981, as tabulated in official libRadtran REFWAT",
+    "temperature": "fixed tabulation; REFWAT does not model temperature dependence below 10 um"
+  },
+  "ice_source": {
+    "url": "https://www.atmos.washington.edu/ice_optical_constants/IOP_2008_ASCIItable.dat",
+    "retrieved_utc": "2026-09-05T06:24:57.372369+00:00",
+    "bytes": 16514,
+    "sha256": "891d0e0690cc6c6ed2dfe81291fa20a3af177fa85ef93127c58c5f86d3c370af",
+    "reference": "Warren and Brandt 2008, doi:10.1029/2007JD009744",
+    "material": "ice Ih reference optical constants; not an ice crystal habit phase function"
+  },
+  "artifacts": {
+    "water-segelstein-1981-visible.txt": {
+      "sha256": "08f70d712526a8cda3054b03b76187563ca851debdf52d7103bb77d77b4c2d70",
+      "rows": 121,
+      "support_um": [
+        0.39994,
+        1.0
+      ]
+    },
+    "ice-ih-warren-brandt-2008-visible.txt": {
+      "sha256": "cdee3ca276805f0ade063a9d3a4840c7cd20549302dcc8a6e35e8201009d09d9",
+      "rows": 61,
+      "support_um": [
+        0.4,
+        1.0
+      ]
+    }
+  }
+}

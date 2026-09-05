@@ -140,6 +140,7 @@ pub mod instrument_footprint;
 pub mod ir;
 pub mod ir_enhance;
 pub mod log;
+pub mod material_indices;
 pub mod optics;
 pub mod platform;
 pub mod precision_audit;

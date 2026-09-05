@@ -1,0 +1,409 @@
+[
+  {
+    "key": "ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C01_G19_s20262472100206_e20262472109514_c20262472109551.nc",
+    "size": 61684151,
+    "etag": "\"eb69b6d43711b65b3e8b6e4cc03b4064\"",
+    "last_modified": "2026-09-04T21:10:19.000Z",
+    "url": "https://noaa-goes19.s3.amazonaws.com/ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C01_G19_s20262472100206_e20262472109514_c20262472109551.nc",
+    "retrieved_utc": "2026-09-05T06:37:26.179429+00:00",
+    "variables": {
+      "kappa0": {
+        "value": 0.0015644000377506018,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "Inverse of the incoming top of atmosphere radiance at current earth-sun distance (PI d2 esun-1)-1, where d is the ratio of instantaneous Earth-Sun distance divided by the mean Earth-Sun distance, esun is the bandpass-weighted solar irradiance and PI is a standard constant used to convert ABI L1b radiance to reflectance",
+          "units": "(W m-2 um-1)-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "esun": {
+        "value": 2041.9620361328125,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "bandpass-weighted solar irradiance at the mean Earth-Sun distance",
+          "standard_name": "toa_shortwave_irradiance_per_unit_wavelength",
+          "units": "W m-2 um-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "earth_sun_distance_anomaly_in_AU": {
+        "value": 1.008389949798584,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "earth sun distance anomaly in astronomical units",
+          "units": "ua",
+          "coordinates": "t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "band_wavelength": {
+        "value": [
+          0.4699999988079071
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band central wavelength",
+          "standard_name": "sensor_band_central_radiation_wavelength",
+          "units": "um"
+        }
+      },
+      "band_id": {
+        "value": [
+          1
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band number",
+          "standard_name": "sensor_band_identifier",
+          "units": "1"
+        }
+      },
+      "t": {
+        "value": 841827906.05444,
+        "attributes": {
+          "long_name": "J2000 epoch mid-point between the start and end image scan in seconds",
+          "standard_name": "time",
+          "units": "seconds since 2000-01-01 12:00:00",
+          "axis": "T",
+          "bounds": "time_bounds"
+        }
+      },
+      "time_bounds": {
+        "value": [
+          841827620.634112,
+          841828191.474768
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            2
+          ],
+          "long_name": "Scan start and end times in seconds since epoch (2000-01-01 12:00:00)"
+        }
+      },
+      "nominal_satellite_subpoint_lon": {
+        "value": -75.19999694824219,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "nominal satellite subpoint longitude (platform longitude)",
+          "standard_name": "longitude",
+          "units": "degrees_east"
+        }
+      }
+    },
+    "global_attributes": {
+      "platform_ID": "G19",
+      "instrument_ID": "FM4",
+      "time_coverage_start": "2026-09-04T21:00:20.6Z",
+      "time_coverage_end": "2026-09-04T21:09:51.4Z",
+      "date_created": "2026-09-04T21:09:55.1Z",
+      "production_site": "GCCS",
+      "scene_id": "Full Disk"
+    },
+    "read_bytes": 145847,
+    "read_ranges": [
+      {
+        "start": 0,
+        "end": 65535,
+        "sha256": "4707abdbcf0d12c08eee8984e359d327070fcfa680469695de158edbf2c67fe9"
+      },
+      {
+        "start": 65536,
+        "end": 131071,
+        "sha256": "7de06191b5be61dcdd18603867e47052955c31f6c99670e484b553d544918e2a"
+      },
+      {
+        "start": 61669376,
+        "end": 61684150,
+        "sha256": "32f23ff1f68d4c84194761cb4b98ca48f035677a9122dd248a48d6f8c7006ce1"
+      }
+    ],
+    "full_file_sha256": null
+  },
+  {
+    "key": "ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C02_G19_s20262472100206_e20262472109514_c20262472109531.nc",
+    "size": 383664925,
+    "etag": "\"a1628c3c26cfd9d987449008bdac71a5\"",
+    "last_modified": "2026-09-04T21:10:59.000Z",
+    "url": "https://noaa-goes19.s3.amazonaws.com/ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C02_G19_s20262472100206_e20262472109514_c20262472109531.nc",
+    "retrieved_utc": "2026-09-05T06:37:27.090713+00:00",
+    "variables": {
+      "kappa0": {
+        "value": 0.001969400094822049,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "Inverse of the incoming top of atmosphere radiance at current earth-sun distance (PI d2 esun-1)-1, where d is the ratio of instantaneous Earth-Sun distance divided by the mean Earth-Sun distance, esun is the bandpass-weighted solar irradiance and PI is a standard constant used to convert ABI L1b radiance to reflectance",
+          "units": "(W m-2 um-1)-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "esun": {
+        "value": 1622.087890625,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "bandpass-weighted solar irradiance at the mean Earth-Sun distance",
+          "standard_name": "toa_shortwave_irradiance_per_unit_wavelength",
+          "units": "W m-2 um-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "earth_sun_distance_anomaly_in_AU": {
+        "value": 1.008389949798584,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "earth sun distance anomaly in astronomical units",
+          "units": "ua",
+          "coordinates": "t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "band_wavelength": {
+        "value": [
+          0.6399999856948853
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band central wavelength",
+          "standard_name": "sensor_band_central_radiation_wavelength",
+          "units": "um"
+        }
+      },
+      "band_id": {
+        "value": [
+          2
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band number",
+          "standard_name": "sensor_band_identifier",
+          "units": "1"
+        }
+      },
+      "t": {
+        "value": 841827906.055505,
+        "attributes": {
+          "long_name": "J2000 epoch mid-point between the start and end image scan in seconds",
+          "standard_name": "time",
+          "units": "seconds since 2000-01-01 12:00:00",
+          "axis": "T",
+          "bounds": "time_bounds"
+        }
+      },
+      "time_bounds": {
+        "value": [
+          841827620.634112,
+          841828191.476897
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            2
+          ],
+          "long_name": "Scan start and end times in seconds since epoch (2000-01-01 12:00:00)"
+        }
+      },
+      "nominal_satellite_subpoint_lon": {
+        "value": -75.19999694824219,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "nominal satellite subpoint longitude (platform longitude)",
+          "standard_name": "longitude",
+          "units": "degrees_east"
+        }
+      }
+    },
+    "global_attributes": {
+      "platform_ID": "G19",
+      "instrument_ID": "FM4",
+      "time_coverage_start": "2026-09-04T21:00:20.6Z",
+      "time_coverage_end": "2026-09-04T21:09:51.4Z",
+      "date_created": "2026-09-04T21:09:53.1Z",
+      "production_site": "GCCS",
+      "scene_id": "Full Disk"
+    },
+    "read_bytes": 213789,
+    "read_ranges": [
+      {
+        "start": 0,
+        "end": 65535,
+        "sha256": "578e79bed92a994eea4947c7d493ce5a5abc6ebd37a8b810b3aa9775baca50f9"
+      },
+      {
+        "start": 65536,
+        "end": 131071,
+        "sha256": "e0c307a7541cb98586783bfcc551d77894a957e352ad3ff05016ea196344f5bb"
+      },
+      {
+        "start": 383647744,
+        "end": 383664924,
+        "sha256": "0f8ff134c97c6e048dd84e0a56fe5a41c6aaf3f23297deb0d265d03d0a966af9"
+      },
+      {
+        "start": 131072,
+        "end": 196607,
+        "sha256": "0727bf00d83f8d3841e6c4b10cb77a1e9e2f03829a1a87f0e803eee56c5f6d41"
+      }
+    ],
+    "full_file_sha256": null
+  },
+  {
+    "key": "ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C03_G19_s20262472100206_e20262472109514_c20262472109545.nc",
+    "size": 69426767,
+    "etag": "\"2171a35dd7eefe98bb578ee99ac8b8d4\"",
+    "last_modified": "2026-09-04T21:10:19.000Z",
+    "url": "https://noaa-goes19.s3.amazonaws.com/ABI-L1b-RadF/2026/247/21/OR_ABI-L1b-RadF-M6C03_G19_s20262472100206_e20262472109514_c20262472109545.nc",
+    "retrieved_utc": "2026-09-05T06:37:27.832919+00:00",
+    "variables": {
+      "kappa0": {
+        "value": 0.0033515000250190496,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "Inverse of the incoming top of atmosphere radiance at current earth-sun distance (PI d2 esun-1)-1, where d is the ratio of instantaneous Earth-Sun distance divided by the mean Earth-Sun distance, esun is the bandpass-weighted solar irradiance and PI is a standard constant used to convert ABI L1b radiance to reflectance",
+          "units": "(W m-2 um-1)-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "esun": {
+        "value": 953.1771240234375,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "bandpass-weighted solar irradiance at the mean Earth-Sun distance",
+          "standard_name": "toa_shortwave_irradiance_per_unit_wavelength",
+          "units": "W m-2 um-1",
+          "coordinates": "band_id band_wavelength t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "earth_sun_distance_anomaly_in_AU": {
+        "value": 1.008389949798584,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "earth sun distance anomaly in astronomical units",
+          "units": "ua",
+          "coordinates": "t",
+          "cell_methods": "t: mean"
+        }
+      },
+      "band_wavelength": {
+        "value": [
+          0.8700000047683716
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band central wavelength",
+          "standard_name": "sensor_band_central_radiation_wavelength",
+          "units": "um"
+        }
+      },
+      "band_id": {
+        "value": [
+          3
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            3
+          ],
+          "long_name": "ABI band number",
+          "standard_name": "sensor_band_identifier",
+          "units": "1"
+        }
+      },
+      "t": {
+        "value": 841827906.055283,
+        "attributes": {
+          "long_name": "J2000 epoch mid-point between the start and end image scan in seconds",
+          "standard_name": "time",
+          "units": "seconds since 2000-01-01 12:00:00",
+          "axis": "T",
+          "bounds": "time_bounds"
+        }
+      },
+      "time_bounds": {
+        "value": [
+          841827620.634112,
+          841828191.476454
+        ],
+        "attributes": {
+          "_Netcdf4Coordinates": [
+            2
+          ],
+          "long_name": "Scan start and end times in seconds since epoch (2000-01-01 12:00:00)"
+        }
+      },
+      "nominal_satellite_subpoint_lon": {
+        "value": -75.19999694824219,
+        "attributes": {
+          "_FillValue": [
+            -999.0
+          ],
+          "long_name": "nominal satellite subpoint longitude (platform longitude)",
+          "standard_name": "longitude",
+          "units": "degrees_east"
+        }
+      }
+    },
+    "global_attributes": {
+      "platform_ID": "G19",
+      "instrument_ID": "FM4",
+      "time_coverage_start": "2026-09-04T21:00:20.6Z",
+      "time_coverage_end": "2026-09-04T21:09:51.4Z",
+      "date_created": "2026-09-04T21:09:54.5Z",
+      "production_site": "GCCS",
+      "scene_id": "Full Disk"
+    },
+    "read_bytes": 155215,
+    "read_ranges": [
+      {
+        "start": 0,
+        "end": 65535,
+        "sha256": "c45f83ffe800a330d44992b9fba15df9fbdf31274a66b79fee42e5cb2c7c9c3c"
+      },
+      {
+        "start": 65536,
+        "end": 131071,
+        "sha256": "f953a3ca6d59d9533416d32a33bf97e28c946ab6dd8bb6adb57b5149903d0d22"
+      },
+      {
+        "start": 69402624,
+        "end": 69426766,
+        "sha256": "f8d37098eb3874defd4ef36906f5ef1c162e10f81e8aae57e210dfbcbfa2fed1"
+      }
+    ],
+    "full_file_sha256": null
+  }
+]

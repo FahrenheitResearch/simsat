@@ -1,0 +1,23 @@
+{
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 2402,
+  "check": "visible-material-index-cpu-wgsl",
+  "contract": "host selects exact native material knots; GPU performs the same log-wavelength interpolation",
+  "driver": "NVIDIA",
+  "driver_info": "610.74",
+  "materials": [
+    "liquid-water-segelstein-1981",
+    "ice-ih-warren-brandt-2008"
+  ],
+  "max_relative_error": {
+    "imaginary_index": 9.881842757630821e-6,
+    "real_index": 8.651763061529039e-8
+  },
+  "passed": true,
+  "tolerance": 0.00002,
+  "wavelength_um": [
+    0.4,
+    1.0
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "source": "GOES-19 2026-09-04 21:00 scan L1B scalar calibration variables, exact matching scan start to CMI reference",
+  "rows": [
+    {
+      "band": 1,
+      "official_esun": 2041.9620361328125,
+      "hsrs_srf_esun": 2041.9425716732,
+      "solar_relative_difference": -9.532233835929382e-06,
+      "distance_au": 1.008389949798584,
+      "official_kappa0": 0.0015644000377506018,
+      "pi_d2_over_esun": 0.001564441134077126,
+      "kappa_formula_relative_residual": -2.6269014301139038e-05,
+      "operational_rho_over_hsrs_rho": 0.9999641990022654
+    },
+    {
+      "band": 2,
+      "official_esun": 1622.087890625,
+      "hsrs_srf_esun": 1622.1118524063,
+      "solar_relative_difference": 1.4772184317779491e-05,
+      "distance_au": 1.008389949798584,
+      "official_kappa0": 0.001969400094822049,
+      "pi_d2_over_esun": 0.001969393534106949,
+      "kappa_formula_relative_residual": 3.331337788292643e-06,
+      "operational_rho_over_hsrs_rho": 1.0000181035713172
+    },
+    {
+      "band": 3,
+      "official_esun": 953.1771240234375,
+      "hsrs_srf_esun": 953.1941541042,
+      "solar_relative_difference": 1.7866648635678217e-05,
+      "distance_au": 1.008389949798584,
+      "official_kappa0": 0.0033515000250190496,
+      "pi_d2_over_esun": 0.0033514541243559104,
+      "kappa_formula_relative_residual": 1.3695745618491628e-05,
+      "operational_rho_over_hsrs_rho": 1.0000315626389513
+    }
+  ],
+  "metadata_bytes_read": 514851,
+  "full_source_bytes": 514775843,
+  "full_file_hashes": "not computed; only verified HTTP 206 ranges with ETag/If-Match were read",
+  "max_abs_solar_relative_difference": 1.7866648635678217e-05
+}
