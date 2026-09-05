@@ -149,6 +149,7 @@ pub mod solar;
 pub mod store_out;
 pub mod thermal_sensor;
 pub mod topdown;
+pub mod visible_sensor;
 pub mod web_layer;
 pub mod wv;
 
