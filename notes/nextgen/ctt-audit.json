@@ -1,0 +1,2932 @@
+{
+  "schema_version": 1,
+  "diagnostic": "native WRF / cached visible tau=1 / colocated ABI C13",
+  "limitations": [
+    "CTT is visible tau=1; thin columns are NaN.",
+    "Both-cloudy column masks do not match cloud height or optical thickness.",
+    "Cloudy voxel thresholds measure support, not emissivity.",
+    "A temperature minimum alone cannot validate absorption/scattering physics."
+  ],
+  "hours": [
+    {
+      "hour": 12,
+      "date": "2026-09-04",
+      "wrf": "C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_12_00_00",
+      "brick": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_12_00_00\\t20260904_1200.ssb",
+      "reference": "C:\\Users\\drew\\soma-render-work\\out\\simsat\\goesfd-12z\\abi-reference-aligned.npz",
+      "baseline": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\ir13_d01_12Z.bin",
+      "brick_header": {
+        "format_version": 6,
+        "storage_profile": "compact-u8",
+        "nx": 474,
+        "ny": 380,
+        "nz": 80,
+        "z_min_m": 0.0,
+        "dz_m": 250.0,
+        "temperature_encoding": "celsius_f16",
+        "quant": {
+          "ext_ice": {
+            "vmin": 6.947000976651907e-08,
+            "vmax": 0.006947000976651907
+          },
+          "ext_liquid": {
+            "vmin": 2.270524203777313e-06,
+            "vmax": 0.22705242037773132
+          },
+          "ext_precip": {
+            "vmin": 2.138776145875454e-07,
+            "vmax": 0.02138776145875454
+          },
+          "ext_snow": {
+            "vmin": 2.1375944837927818e-07,
+            "vmax": 0.02137594483792782
+          },
+          "qvapor": {
+            "vmin": 2.1649545058608054e-07,
+            "vmax": 0.021649545058608055
+          },
+          "tau_up": {
+            "vmin": 0.009488062744140624,
+            "vmax": 948.8062744140625
+          }
+        },
+        "channels_3d": [
+          "ext_liquid",
+          "ext_ice",
+          "ext_snow",
+          "ext_precip",
+          "tau_up",
+          "qvapor",
+          "cloud_fraction"
+        ],
+        "science_channels_3d": [],
+        "science_encoding": null,
+        "planes_2d": [
+          "hgt",
+          "landmask",
+          "tsk",
+          "u10",
+          "v10",
+          "snowh",
+          "ivgtyp"
+        ],
+        "has_snowh": true,
+        "has_ivgtyp": true,
+        "has_cloud_fraction": false,
+        "time_iso": "2026-09-04T12:00:00Z"
+      },
+      "native_metadata": {
+        "has_CLDFRA": false,
+        "MP_PHYSICS": 8,
+        "species": [
+          "QCLOUD",
+          "QICE",
+          "QSNOW",
+          "QRAIN",
+          "QGRAUP"
+        ],
+        "nz": 49,
+        "all_temperature": {
+          "n": 8825880,
+          "min": 195.0353546142578,
+          "p01": 197.6199493408203,
+          "median": 270.77593994140625,
+          "mean": 259.4183044433594,
+          "max": 303.0254211425781
+        },
+        "all_height": {
+          "n": 8825880,
+          "min": 4.800179958343506,
+          "p01": 8.987091064453125,
+          "median": 5381.78759765625,
+          "mean": 6691.43310546875,
+          "max": 16549.46484375
+        },
+        "temperature_reconstruction": "f32 P+PB; f64 Poisson at kappa=2/7 and theta offset 300 K; f32 temperature before resampling, matching ingest.rs",
+        "difference_from_all_f64_max_abs_kelvin": 1.5258787868788204e-05
+      },
+      "grid_check": {
+        "latitude_max_abs_degrees": 0.0,
+        "longitude_max_abs_degrees": 0.0
+      },
+      "mask_evidence": {
+        "source": "reproduced from the cached SSB using the T3 formula",
+        "supplied_path": "C:\\Users\\drew\\soma-render-work\\out\\simsat-validator-both-cloudy\\cloudmask_d01_12Z.bin",
+        "mismatch_count": 0
+      },
+      "native_threshold_sensitivity": {
+        "0.0": {
+          "minimum_cloudy_voxel": {
+            "n": 172155,
+            "min": 195.0353546142578,
+            "p01": 197.43946838378906,
+            "median": 208.67750549316406,
+            "mean": 214.4740753173828,
+            "max": 301.0591125488281
+          },
+          "highest_cloudy_temperature": {
+            "n": 172155,
+            "min": 195.0353546142578,
+            "p01": 197.43946838378906,
+            "median": 208.67750549316406,
+            "mean": 214.47567749023438,
+            "max": 301.0591125488281
+          },
+          "cloud_column_count": 172155
+        },
+        "1e-08": {
+          "minimum_cloudy_voxel": {
+            "n": 131142,
+            "min": 196.2334747314453,
+            "p01": 199.30763244628906,
+            "median": 234.23660278320312,
+            "mean": 239.9573211669922,
+            "max": 302.16656494140625
+          },
+          "highest_cloudy_temperature": {
+            "n": 131142,
+            "min": 196.2334747314453,
+            "p01": 199.30763244628906,
+            "median": 234.23660278320312,
+            "mean": 239.9581756591797,
+            "max": 302.16656494140625
+          },
+          "cloud_column_count": 131142
+        },
+        "1e-06": {
+          "minimum_cloudy_voxel": {
+            "n": 106483,
+            "min": 198.2213897705078,
+            "p01": 201.72071838378906,
+            "median": 247.19564819335938,
+            "mean": 249.7218475341797,
+            "max": 301.5666198730469
+          },
+          "highest_cloudy_temperature": {
+            "n": 106483,
+            "min": 198.2213897705078,
+            "p01": 201.72071838378906,
+            "median": 247.19564819335938,
+            "mean": 249.72274780273438,
+            "max": 301.5666198730469
+          },
+          "cloud_column_count": 106483
+        },
+        "1e-05": {
+          "minimum_cloudy_voxel": {
+            "n": 80166,
+            "min": 201.07069396972656,
+            "p01": 205.4271697998047,
+            "median": 258.61358642578125,
+            "mean": 260.3357238769531,
+            "max": 301.3191833496094
+          },
+          "highest_cloudy_temperature": {
+            "n": 80166,
+            "min": 201.07069396972656,
+            "p01": 205.4271697998047,
+            "median": 258.61358642578125,
+            "mean": 260.3382568359375,
+            "max": 301.3191833496094
+          },
+          "cloud_column_count": 80166
+        }
+      },
+      "regimes": {
+        "valid": {
+          "n": 180120,
+          "observed": {
+            "n": 180120,
+            "min": 199.83509826660156,
+            "p01": 212.0120391845703,
+            "median": 289.04693603515625,
+            "mean": 281.1067810058594,
+            "max": 297.2093200683594
+          },
+          "baseline_bt": {
+            "n": 180120,
+            "min": 209.57540893554688,
+            "p01": 222.42459106445312,
+            "median": 292.274658203125,
+            "mean": 287.4082946777344,
+            "max": 299.9122314453125
+          },
+          "baseline_bias": 6.301521301269531,
+          "ctt": {
+            "n": 50390,
+            "min": 213.80624389648438,
+            "p01": 219.58749389648438,
+            "median": 290.8374938964844,
+            "mean": 276.8749694824219,
+            "max": 298.1812438964844,
+            "minus_observed_mean": -1.3316959142684937,
+            "fraction_at_or_colder_than_observed": 0.49406628299265726
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 172155,
+            "min": 195.08749389648438,
+            "p01": 197.58749389648438,
+            "median": 215.80624389648438,
+            "mean": 223.51515197753906,
+            "max": 301.7437438964844,
+            "minus_observed_mean": -57.007225036621094,
+            "fraction_at_or_colder_than_observed": 0.9616624553454736
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 106483,
+            "min": 198.2213897705078,
+            "p01": 201.72071838378906,
+            "median": 247.19564819335938,
+            "mean": 249.7218475341797,
+            "max": 301.5666198730469,
+            "minus_observed_mean": -28.349994659423828,
+            "fraction_at_or_colder_than_observed": 0.7626663411060921
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 106483,
+            "min": 198.2213897705078,
+            "p01": 201.72071838378906,
+            "median": 247.19564819335938,
+            "mean": 249.72274780273438,
+            "max": 301.5666198730469,
+            "minus_observed_mean": -28.349092483520508,
+            "fraction_at_or_colder_than_observed": 0.7626663411060921
+          },
+          "native_min_air_temperature_k": {
+            "n": 180120,
+            "min": 195.0353546142578,
+            "p01": 196.44168090820312,
+            "median": 197.7978057861328,
+            "mean": 197.98533630371094,
+            "max": 201.29437255859375,
+            "minus_observed_mean": -83.1214370727539,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        },
+        "both_cloudy": {
+          "n": 77990,
+          "observed": {
+            "n": 77990,
+            "min": 199.83509826660156,
+            "p01": 208.18505859375,
+            "median": 276.23699951171875,
+            "mean": 272.55517578125,
+            "max": 296.6056823730469
+          },
+          "baseline_bt": {
+            "n": 77990,
+            "min": 209.57540893554688,
+            "p01": 219.87057495117188,
+            "median": 287.9498291015625,
+            "mean": 280.1517028808594,
+            "max": 299.7867431640625
+          },
+          "baseline_bias": 7.596553325653076,
+          "ctt": {
+            "n": 36905,
+            "min": 213.80624389648438,
+            "p01": 220.2449951171875,
+            "median": 289.8843688964844,
+            "mean": 275.0044250488281,
+            "max": 298.1812438964844,
+            "minus_observed_mean": 2.405496597290039,
+            "fraction_at_or_colder_than_observed": 0.41278959490583933
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 77990,
+            "min": 195.64999389648438,
+            "p01": 197.58749389648438,
+            "median": 214.74374389648438,
+            "mean": 221.31521606445312,
+            "max": 297.0718688964844,
+            "minus_observed_mean": -51.23992919921875,
+            "fraction_at_or_colder_than_observed": 0.9509039620464163
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 77823,
+            "min": 198.23760986328125,
+            "p01": 205.5533905029297,
+            "median": 243.09410095214844,
+            "mean": 247.90512084960938,
+            "max": 300.0535583496094,
+            "minus_observed_mean": -24.635889053344727,
+            "fraction_at_or_colder_than_observed": 0.7352839134960102
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 77823,
+            "min": 198.23760986328125,
+            "p01": 205.5533905029297,
+            "median": 243.09410095214844,
+            "mean": 247.90579223632812,
+            "max": 300.0535583496094,
+            "minus_observed_mean": -24.635202407836914,
+            "fraction_at_or_colder_than_observed": 0.7352839134960102
+          },
+          "native_min_air_temperature_k": {
+            "n": 77990,
+            "min": 195.1290283203125,
+            "p01": 196.5066680908203,
+            "median": 197.84852600097656,
+            "mean": 198.03936767578125,
+            "max": 201.29437255859375,
+            "minus_observed_mean": -74.51580810546875,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        },
+        "obs_le235": {
+          "n": 8829,
+          "observed": {
+            "n": 8829,
+            "min": 199.83509826660156,
+            "p01": 203.0401153564453,
+            "median": 217.82086181640625,
+            "mean": 218.79434204101562,
+            "max": 234.9912872314453
+          },
+          "baseline_bt": {
+            "n": 8829,
+            "min": 216.72018432617188,
+            "p01": 220.93617248535156,
+            "median": 290.97967529296875,
+            "mean": 283.8730163574219,
+            "max": 298.98193359375
+          },
+          "baseline_bias": 65.07867431640625,
+          "ctt": {
+            "n": 3551,
+            "min": 220.14999389648438,
+            "p01": 222.55624389648438,
+            "median": 291.3062438964844,
+            "mean": 273.3150634765625,
+            "max": 297.3843688964844,
+            "minus_observed_mean": 56.18122482299805,
+            "fraction_at_or_colder_than_observed": 0.021402421852999155
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 8815,
+            "min": 197.08749389648438,
+            "p01": 197.21249389648438,
+            "median": 206.58749389648438,
+            "mean": 211.6294708251953,
+            "max": 297.6031188964844,
+            "minus_observed_mean": -7.175351619720459,
+            "fraction_at_or_colder_than_observed": 0.7507657402155417
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 5463,
+            "min": 205.41249084472656,
+            "p01": 208.30792236328125,
+            "median": 247.19287109375,
+            "mean": 253.45616149902344,
+            "max": 297.4925537109375,
+            "minus_observed_mean": 35.65892791748047,
+            "fraction_at_or_colder_than_observed": 0.23228995057660626
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 5463,
+            "min": 205.41249084472656,
+            "p01": 208.30792236328125,
+            "median": 247.19287109375,
+            "mean": 253.456298828125,
+            "max": 297.4925537109375,
+            "minus_observed_mean": 35.6590576171875,
+            "fraction_at_or_colder_than_observed": 0.23228995057660626
+          },
+          "native_min_air_temperature_k": {
+            "n": 8829,
+            "min": 196.14898681640625,
+            "p01": 196.26449584960938,
+            "median": 197.609375,
+            "mean": 197.59812927246094,
+            "max": 200.86668395996094,
+            "minus_observed_mean": -21.196210861206055,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        },
+        "obs_le205": {
+          "n": 311,
+          "observed": {
+            "n": 311,
+            "min": 199.83509826660156,
+            "p01": 200.43759155273438,
+            "median": 203.79666137695312,
+            "mean": 203.55592346191406,
+            "max": 204.9904327392578
+          },
+          "baseline_bt": {
+            "n": 311,
+            "min": 285.9455261230469,
+            "p01": 289.35479736328125,
+            "median": 290.88043212890625,
+            "mean": 291.7256774902344,
+            "max": 297.50299072265625
+          },
+          "baseline_bias": 88.16976165771484,
+          "ctt": {
+            "n": 247,
+            "min": 291.1343688964844,
+            "p01": 291.1968688964844,
+            "median": 292.7906188964844,
+            "mean": 292.7733459472656,
+            "max": 294.9781188964844,
+            "minus_observed_mean": 89.28746795654297,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 311,
+            "min": 197.27499389648438,
+            "p01": 197.46249389648438,
+            "median": 208.39999389648438,
+            "mean": 208.64639282226562,
+            "max": 292.4624938964844,
+            "minus_observed_mean": 5.090447425842285,
+            "fraction_at_or_colder_than_observed": 0.10610932475884244
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 311,
+            "min": 211.22654724121094,
+            "p01": 215.0369873046875,
+            "median": 293.67864990234375,
+            "mean": 283.27569580078125,
+            "max": 295.4851379394531,
+            "minus_observed_mean": 79.71975708007812,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 311,
+            "min": 211.22654724121094,
+            "p01": 215.0369873046875,
+            "median": 293.67864990234375,
+            "mean": 283.27569580078125,
+            "max": 295.4851379394531,
+            "minus_observed_mean": 79.71975708007812,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 311,
+            "min": 197.2819366455078,
+            "p01": 197.4534912109375,
+            "median": 198.03842163085938,
+            "mean": 198.00390625,
+            "max": 198.5946807861328,
+            "minus_observed_mean": -5.552034854888916,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        },
+        "both_cloudy_obs_le205": {
+          "n": 311,
+          "observed": {
+            "n": 311,
+            "min": 199.83509826660156,
+            "p01": 200.43759155273438,
+            "median": 203.79666137695312,
+            "mean": 203.55592346191406,
+            "max": 204.9904327392578
+          },
+          "baseline_bt": {
+            "n": 311,
+            "min": 285.9455261230469,
+            "p01": 289.35479736328125,
+            "median": 290.88043212890625,
+            "mean": 291.7256774902344,
+            "max": 297.50299072265625
+          },
+          "baseline_bias": 88.16976165771484,
+          "ctt": {
+            "n": 247,
+            "min": 291.1343688964844,
+            "p01": 291.1968688964844,
+            "median": 292.7906188964844,
+            "mean": 292.7733459472656,
+            "max": 294.9781188964844,
+            "minus_observed_mean": 89.28746795654297,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 311,
+            "min": 197.27499389648438,
+            "p01": 197.46249389648438,
+            "median": 208.39999389648438,
+            "mean": 208.64639282226562,
+            "max": 292.4624938964844,
+            "minus_observed_mean": 5.090447425842285,
+            "fraction_at_or_colder_than_observed": 0.10610932475884244
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 311,
+            "min": 211.22654724121094,
+            "p01": 215.0369873046875,
+            "median": 293.67864990234375,
+            "mean": 283.27569580078125,
+            "max": 295.4851379394531,
+            "minus_observed_mean": 79.71975708007812,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 311,
+            "min": 211.22654724121094,
+            "p01": 215.0369873046875,
+            "median": 293.67864990234375,
+            "mean": 283.27569580078125,
+            "max": 295.4851379394531,
+            "minus_observed_mean": 79.71975708007812,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 311,
+            "min": 197.2819366455078,
+            "p01": 197.4534912109375,
+            "median": 198.03842163085938,
+            "mean": 198.00390625,
+            "max": 198.5946807861328,
+            "minus_observed_mean": -5.552034854888916,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        },
+        "obs_le200": {
+          "n": 1,
+          "observed": {
+            "n": 1,
+            "min": 199.83509826660156,
+            "p01": 199.83509826660156,
+            "median": 199.83509826660156,
+            "mean": 199.83509826660156,
+            "max": 199.83509826660156
+          },
+          "baseline_bt": {
+            "n": 1,
+            "min": 289.8150939941406,
+            "p01": 289.8150939941406,
+            "median": 289.8150939941406,
+            "mean": 289.8150939941406,
+            "max": 289.8150939941406
+          },
+          "baseline_bias": 89.97999572753906,
+          "ctt": {
+            "n": 1,
+            "min": 291.3062438964844,
+            "p01": 291.3062438964844,
+            "median": 291.3062438964844,
+            "mean": 291.3062438964844,
+            "max": 291.3062438964844,
+            "minus_observed_mean": 91.47114562988281,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 1,
+            "min": 212.46249389648438,
+            "p01": 212.46249389648438,
+            "median": 212.46249389648438,
+            "mean": 212.46249389648438,
+            "max": 212.46249389648438,
+            "minus_observed_mean": 12.627395629882812,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 1,
+            "min": 292.59869384765625,
+            "p01": 292.59869384765625,
+            "median": 292.59869384765625,
+            "mean": 292.59869384765625,
+            "max": 292.59869384765625,
+            "minus_observed_mean": 92.76359558105469,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 1,
+            "min": 292.59869384765625,
+            "p01": 292.59869384765625,
+            "median": 292.59869384765625,
+            "mean": 292.59869384765625,
+            "max": 292.59869384765625,
+            "minus_observed_mean": 92.76359558105469,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 1,
+            "min": 197.98440551757812,
+            "p01": 197.98440551757812,
+            "median": 197.98440551757812,
+            "mean": 197.98440551757812,
+            "max": 197.98440551757812,
+            "minus_observed_mean": -1.8506927490234375,
+            "fraction_at_or_colder_than_observed": 1.0
+          }
+        }
+      },
+      "cold_area": {
+        "193": {
+          "observed": 0.0,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.0,
+          "native_min_q1e6": 0.0
+        },
+        "200": {
+          "observed": 5.5518543193426606e-06,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.08051299133910726,
+          "native_min_q1e6": 0.0017432822562735953
+        },
+        "205": {
+          "observed": 0.0017266266933155675,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.18243393293359983,
+          "native_min_q1e6": 0.012569398178991784
+        },
+        "220": {
+          "observed": 0.02925827226293582,
+          "baseline": 0.005879413724183878,
+          "ctt": 0.0030646235842771486,
+          "brick_min_cloudy": 0.570819453697535,
+          "native_min_q1e6": 0.12715411947590496
+        },
+        "235": {
+          "observed": 0.049017321785476346,
+          "baseline": 0.027093049078392183,
+          "ctt": 0.024328225627359538,
+          "brick_min_cloudy": 0.721063735287586,
+          "native_min_q1e6": 0.24300466355762826
+        }
+      },
+      "minima_locations": {
+        "observed": {
+          "north_first_row": 302,
+          "column": 425,
+          "lat": 10.8457670211792,
+          "lon": -83.66009521484375,
+          "observed": 199.83509826660156,
+          "baseline": 289.8150939941406,
+          "ctt": 291.3062438964844,
+          "brick_min_cloudy": 212.46249389648438,
+          "native_min_q1e6": 292.59869384765625,
+          "native_highest_q1e6": 292.59869384765625,
+          "native_highest_height_q1e6": 1032.466796875,
+          "native_min_air": 197.98440551757812
+        },
+        "baseline": {
+          "north_first_row": 274,
+          "column": 472,
+          "lat": 11.609206199645996,
+          "lon": -82.35359191894531,
+          "observed": 272.9074401855469,
+          "baseline": 209.57540893554688,
+          "ctt": 213.80624389648438,
+          "brick_min_cloudy": 199.83749389648438,
+          "native_min_q1e6": 200.70559692382812,
+          "native_highest_q1e6": 200.70559692382812,
+          "native_highest_height_q1e6": 15363.66015625,
+          "native_min_air": 199.42698669433594
+        },
+        "ctt": {
+          "north_first_row": 268,
+          "column": 472,
+          "lat": 11.772533416748047,
+          "lon": -82.35359191894531,
+          "observed": 286.5799255371094,
+          "baseline": 209.96246337890625,
+          "ctt": 213.80624389648438,
+          "brick_min_cloudy": 199.77499389648438,
+          "native_min_q1e6": 200.6055908203125,
+          "native_highest_q1e6": 200.6055908203125,
+          "native_highest_height_q1e6": 15363.7529296875,
+          "native_min_air": 199.4112091064453
+        },
+        "brick_min_cloudy_voxel_k": {
+          "north_first_row": 379,
+          "column": 191,
+          "lat": 8.736632347106934,
+          "lon": -90.16480255126953,
+          "observed": 292.05059814453125,
+          "baseline": 297.9822082519531,
+          "ctt": null,
+          "brick_min_cloudy": 195.08749389648438,
+          "native_min_q1e6": null,
+          "native_highest_q1e6": null,
+          "native_highest_height_q1e6": null,
+          "native_min_air": 195.05137634277344
+        },
+        "native_min_cloudy_k_1e-06": {
+          "north_first_row": 140,
+          "column": 473,
+          "lat": 15.231736183166504,
+          "lon": -82.32579803466797,
+          "observed": 295.575927734375,
+          "baseline": 248.14453125,
+          "ctt": null,
+          "brick_min_cloudy": 197.83749389648438,
+          "native_min_q1e6": 198.2213897705078,
+          "native_highest_q1e6": 198.2213897705078,
+          "native_highest_height_q1e6": 15970.58203125,
+          "native_min_air": 197.74932861328125
+        }
+      },
+      "executable_check": {
+        "command": [
+          "C:\\Users\\drew\\simsat\\target\\release\\simsat-render-ir.exe",
+          "input=C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_12_00_00\\run.json",
+          "derived=ctt",
+          "view=topdown",
+          "resolution=native",
+          "ts=0",
+          "threads=6",
+          "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\ctt-final\\ctt-check-12z.png"
+        ],
+        "stdout": "DERIVEDSUMMARY file=ctt-check-12z.png field=ctt units=K view=topdown dims=474x380 canvas=none res=Model_native_(one_pixel_per_source_grid_cell) sat=goese in_domain_frac=0.280 min=213.806 max=298.181 median=290.837 wall_s=0.162",
+        "passed": true
+      }
+    },
+    {
+      "hour": 15,
+      "date": "2026-09-04",
+      "wrf": "C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_15_00_00",
+      "brick": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_15_00_00\\t20260904_1500.ssb",
+      "reference": "C:\\Users\\drew\\soma-render-work\\out\\simsat\\goesfd-15z\\abi-reference-aligned.npz",
+      "baseline": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\ir13_d01_15Z.bin",
+      "brick_header": {
+        "format_version": 6,
+        "storage_profile": "compact-u8",
+        "nx": 474,
+        "ny": 380,
+        "nz": 80,
+        "z_min_m": 0.0,
+        "dz_m": 250.0,
+        "temperature_encoding": "celsius_f16",
+        "quant": {
+          "ext_ice": {
+            "vmin": 6.928822956979275e-08,
+            "vmax": 0.006928822956979275
+          },
+          "ext_liquid": {
+            "vmin": 2.4947178363800047e-06,
+            "vmax": 0.2494717836380005
+          },
+          "ext_precip": {
+            "vmin": 2.4639056995511056e-07,
+            "vmax": 0.024639056995511055
+          },
+          "ext_snow": {
+            "vmin": 2.4625441059470176e-07,
+            "vmax": 0.024625441059470177
+          },
+          "qvapor": {
+            "vmin": 2.1633684635162353e-07,
+            "vmax": 0.021633684635162354
+          },
+          "tau_up": {
+            "vmin": 0.01038565673828125,
+            "vmax": 1038.565673828125
+          }
+        },
+        "channels_3d": [
+          "ext_liquid",
+          "ext_ice",
+          "ext_snow",
+          "ext_precip",
+          "tau_up",
+          "qvapor",
+          "cloud_fraction"
+        ],
+        "science_channels_3d": [],
+        "science_encoding": null,
+        "planes_2d": [
+          "hgt",
+          "landmask",
+          "tsk",
+          "u10",
+          "v10",
+          "snowh",
+          "ivgtyp"
+        ],
+        "has_snowh": true,
+        "has_ivgtyp": true,
+        "has_cloud_fraction": false,
+        "time_iso": "2026-09-04T15:00:00Z"
+      },
+      "native_metadata": {
+        "has_CLDFRA": false,
+        "MP_PHYSICS": 8,
+        "species": [
+          "QCLOUD",
+          "QICE",
+          "QSNOW",
+          "QRAIN",
+          "QGRAUP"
+        ],
+        "nz": 49,
+        "all_temperature": {
+          "n": 8825880,
+          "min": 195.584228515625,
+          "p01": 197.49525451660156,
+          "median": 270.896728515625,
+          "mean": 259.6602783203125,
+          "max": 307.0224609375
+        },
+        "all_height": {
+          "n": 8825880,
+          "min": 4.995091915130615,
+          "p01": 8.993809700012207,
+          "median": 5391.2041015625,
+          "mean": 6699.59912109375,
+          "max": 16573.767578125
+        },
+        "temperature_reconstruction": "f32 P+PB; f64 Poisson at kappa=2/7 and theta offset 300 K; f32 temperature before resampling, matching ingest.rs",
+        "difference_from_all_f64_max_abs_kelvin": 1.5258788266692136e-05
+      },
+      "grid_check": {
+        "latitude_max_abs_degrees": 0.0,
+        "longitude_max_abs_degrees": 0.0
+      },
+      "mask_evidence": {
+        "source": "reproduced from the cached SSB using the T3 formula",
+        "supplied_path": "C:\\Users\\drew\\soma-render-work\\out\\simsat-validator-both-cloudy\\cloudmask_d01_15Z.bin",
+        "mismatch_count": 0
+      },
+      "native_threshold_sensitivity": {
+        "0.0": {
+          "minimum_cloudy_voxel": {
+            "n": 173513,
+            "min": 196.0625,
+            "p01": 196.39889526367188,
+            "median": 204.4039306640625,
+            "mean": 211.294921875,
+            "max": 302.4600830078125
+          },
+          "highest_cloudy_temperature": {
+            "n": 173513,
+            "min": 196.19566345214844,
+            "p01": 196.77565002441406,
+            "median": 204.4039306640625,
+            "mean": 211.3077392578125,
+            "max": 302.4600830078125
+          },
+          "cloud_column_count": 173513
+        },
+        "1e-08": {
+          "minimum_cloudy_voxel": {
+            "n": 116152,
+            "min": 196.0625,
+            "p01": 196.2969512939453,
+            "median": 233.88626098632812,
+            "mean": 239.92605590820312,
+            "max": 302.6002502441406
+          },
+          "highest_cloudy_temperature": {
+            "n": 116152,
+            "min": 196.0625,
+            "p01": 196.3029327392578,
+            "median": 233.88626098632812,
+            "mean": 239.92626953125,
+            "max": 302.6002502441406
+          },
+          "cloud_column_count": 116152
+        },
+        "1e-06": {
+          "minimum_cloudy_voxel": {
+            "n": 86582,
+            "min": 196.4253692626953,
+            "p01": 201.5253143310547,
+            "median": 251.45790100097656,
+            "mean": 251.05470275878906,
+            "max": 301.553955078125
+          },
+          "highest_cloudy_temperature": {
+            "n": 86582,
+            "min": 196.4253692626953,
+            "p01": 201.5253143310547,
+            "median": 251.45790100097656,
+            "mean": 251.05470275878906,
+            "max": 301.553955078125
+          },
+          "cloud_column_count": 86582
+        },
+        "1e-05": {
+          "minimum_cloudy_voxel": {
+            "n": 65600,
+            "min": 199.8499755859375,
+            "p01": 205.46121215820312,
+            "median": 258.806640625,
+            "mean": 259.4515075683594,
+            "max": 300.1126708984375
+          },
+          "highest_cloudy_temperature": {
+            "n": 65600,
+            "min": 199.8499755859375,
+            "p01": 205.46121215820312,
+            "median": 258.806640625,
+            "mean": 259.4515075683594,
+            "max": 300.1126708984375
+          },
+          "cloud_column_count": 65600
+        }
+      },
+      "regimes": {
+        "valid": {
+          "n": 180120,
+          "observed": {
+            "n": 180120,
+            "min": 196.33106994628906,
+            "p01": 215.01072692871094,
+            "median": 292.6785888671875,
+            "mean": 283.1950378417969,
+            "max": 304.1793518066406
+          },
+          "baseline_bt": {
+            "n": 180120,
+            "min": 211.05909729003906,
+            "p01": 221.48846435546875,
+            "median": 298.17852783203125,
+            "mean": 291.9248352050781,
+            "max": 314.8712463378906
+          },
+          "baseline_bias": 8.729783058166504,
+          "ctt": {
+            "n": 40402,
+            "min": 212.08749389648438,
+            "p01": 218.55624389648438,
+            "median": 291.0874938964844,
+            "mean": 274.7987365722656,
+            "max": 302.1031188964844,
+            "minus_observed_mean": -3.5862481594085693,
+            "fraction_at_or_colder_than_observed": 0.522350378694124
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 173513,
+            "min": 196.14999389648438,
+            "p01": 196.46249389648438,
+            "median": 214.05624389648438,
+            "mean": 221.0673828125,
+            "max": 302.2437438964844,
+            "minus_observed_mean": -61.764122009277344,
+            "fraction_at_or_colder_than_observed": 0.9392264556546195
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 86582,
+            "min": 196.4253692626953,
+            "p01": 201.5253143310547,
+            "median": 251.45790100097656,
+            "mean": 251.05470275878906,
+            "max": 301.553955078125,
+            "minus_observed_mean": -30.406932830810547,
+            "fraction_at_or_colder_than_observed": 0.7661407682890208
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 86582,
+            "min": 196.4253692626953,
+            "p01": 201.5253143310547,
+            "median": 251.45790100097656,
+            "mean": 251.05470275878906,
+            "max": 301.553955078125,
+            "minus_observed_mean": -30.406932830810547,
+            "fraction_at_or_colder_than_observed": 0.7661407682890208
+          },
+          "native_min_air_temperature_k": {
+            "n": 180120,
+            "min": 195.584228515625,
+            "p01": 196.3138427734375,
+            "median": 197.78289794921875,
+            "mean": 197.91900634765625,
+            "max": 201.258544921875,
+            "minus_observed_mean": -85.27605438232422,
+            "fraction_at_or_colder_than_observed": 0.9999888962913613
+          }
+        },
+        "both_cloudy": {
+          "n": 53568,
+          "observed": {
+            "n": 53568,
+            "min": 196.33106994628906,
+            "p01": 212.98519897460938,
+            "median": 280.83929443359375,
+            "mean": 273.1585693359375,
+            "max": 297.4113464355469
+          },
+          "baseline_bt": {
+            "n": 53568,
+            "min": 211.05909729003906,
+            "p01": 218.48048400878906,
+            "median": 290.5262451171875,
+            "mean": 282.75030517578125,
+            "max": 313.30059814453125
+          },
+          "baseline_bias": 9.59174919128418,
+          "ctt": {
+            "n": 27263,
+            "min": 212.08749389648438,
+            "p01": 218.64999389648438,
+            "median": 290.7437438964844,
+            "mean": 275.14654541015625,
+            "max": 302.1031188964844,
+            "minus_observed_mean": 4.719217777252197,
+            "fraction_at_or_colder_than_observed": 0.32916406851777136
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 53568,
+            "min": 196.14999389648438,
+            "p01": 196.58749389648438,
+            "median": 215.14999389648438,
+            "mean": 226.85203552246094,
+            "max": 295.9312438964844,
+            "minus_observed_mean": -46.306461334228516,
+            "fraction_at_or_colder_than_observed": 0.8703517025089605
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 53355,
+            "min": 196.89657592773438,
+            "p01": 201.88821411132812,
+            "median": 255.25070190429688,
+            "mean": 254.420166015625,
+            "max": 299.8210754394531,
+            "minus_observed_mean": -18.69281005859375,
+            "fraction_at_or_colder_than_observed": 0.6444007122106644
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 53355,
+            "min": 196.89657592773438,
+            "p01": 201.88821411132812,
+            "median": 255.25070190429688,
+            "mean": 254.420166015625,
+            "max": 299.8210754394531,
+            "minus_observed_mean": -18.692808151245117,
+            "fraction_at_or_colder_than_observed": 0.6444007122106644
+          },
+          "native_min_air_temperature_k": {
+            "n": 53568,
+            "min": 195.61807250976562,
+            "p01": 196.38858032226562,
+            "median": 197.81103515625,
+            "mean": 197.958251953125,
+            "max": 200.83383178710938,
+            "minus_observed_mean": -75.2002944946289,
+            "fraction_at_or_colder_than_observed": 0.9999626642771804
+          }
+        },
+        "obs_le235": {
+          "n": 7836,
+          "observed": {
+            "n": 7836,
+            "min": 196.33106994628906,
+            "p01": 204.1514129638672,
+            "median": 221.51632690429688,
+            "mean": 221.61431884765625,
+            "max": 234.9960174560547
+          },
+          "baseline_bt": {
+            "n": 7836,
+            "min": 214.2366180419922,
+            "p01": 217.18328857421875,
+            "median": 297.5166015625,
+            "mean": 282.4981994628906,
+            "max": 309.9830627441406
+          },
+          "baseline_bias": 60.88388442993164,
+          "ctt": {
+            "n": 2947,
+            "min": 215.05624389648438,
+            "p01": 217.25811767578125,
+            "median": 266.7242126464844,
+            "mean": 260.898681640625,
+            "max": 297.4781188964844,
+            "minus_observed_mean": 38.273826599121094,
+            "fraction_at_or_colder_than_observed": 0.09501187648456057
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 7816,
+            "min": 196.27499389648438,
+            "p01": 197.64999389648438,
+            "median": 214.58749389648438,
+            "mean": 221.7030487060547,
+            "max": 302.2437438964844,
+            "minus_observed_mean": 0.1035788431763649,
+            "fraction_at_or_colder_than_observed": 0.6045291709314228
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 3918,
+            "min": 203.5522003173828,
+            "p01": 208.58535766601562,
+            "median": 231.27828979492188,
+            "mean": 248.45074462890625,
+            "max": 298.59832763671875,
+            "minus_observed_mean": 26.14992332458496,
+            "fraction_at_or_colder_than_observed": 0.34711587544665645
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 3918,
+            "min": 203.5522003173828,
+            "p01": 208.58535766601562,
+            "median": 231.27828979492188,
+            "mean": 248.45074462890625,
+            "max": 298.59832763671875,
+            "minus_observed_mean": 26.14992332458496,
+            "fraction_at_or_colder_than_observed": 0.34711587544665645
+          },
+          "native_min_air_temperature_k": {
+            "n": 7836,
+            "min": 196.21961975097656,
+            "p01": 196.54090881347656,
+            "median": 197.45401000976562,
+            "mean": 197.38890075683594,
+            "max": 199.70037841796875,
+            "minus_observed_mean": -24.225427627563477,
+            "fraction_at_or_colder_than_observed": 0.9997447677386422
+          }
+        },
+        "obs_le205": {
+          "n": 111,
+          "observed": {
+            "n": 111,
+            "min": 196.33106994628906,
+            "p01": 196.7699432373047,
+            "median": 203.3492889404297,
+            "mean": 202.58181762695312,
+            "max": 204.9384765625
+          },
+          "baseline_bt": {
+            "n": 111,
+            "min": 215.1712646484375,
+            "p01": 215.1793212890625,
+            "median": 239.62416076660156,
+            "mean": 250.2102813720703,
+            "max": 298.3314514160156
+          },
+          "baseline_bias": 47.62849807739258,
+          "ctt": {
+            "n": 88,
+            "min": 217.24374389648438,
+            "p01": 217.27093505859375,
+            "median": 224.77499389648438,
+            "mean": 238.8720703125,
+            "max": 295.3687438964844,
+            "minus_observed_mean": 36.30854415893555,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 111,
+            "min": 203.52499389648438,
+            "p01": 203.53125,
+            "median": 206.71249389648438,
+            "mean": 207.35073852539062,
+            "max": 233.93124389648438,
+            "minus_observed_mean": 4.768931865692139,
+            "fraction_at_or_colder_than_observed": 0.08108108108108109
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 99,
+            "min": 211.5496368408203,
+            "p01": 211.5541229248047,
+            "median": 211.95838928222656,
+            "mean": 221.77120971679688,
+            "max": 294.7851867675781,
+            "minus_observed_mean": 19.233816146850586,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 99,
+            "min": 211.5496368408203,
+            "p01": 211.5541229248047,
+            "median": 211.95838928222656,
+            "mean": 221.77120971679688,
+            "max": 294.7851867675781,
+            "minus_observed_mean": 19.233816146850586,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 111,
+            "min": 196.73155212402344,
+            "p01": 196.753662109375,
+            "median": 197.30905151367188,
+            "mean": 197.28990173339844,
+            "max": 197.6227569580078,
+            "minus_observed_mean": -5.291889190673828,
+            "fraction_at_or_colder_than_observed": 0.9819819819819819
+          }
+        },
+        "both_cloudy_obs_le205": {
+          "n": 99,
+          "observed": {
+            "n": 99,
+            "min": 196.33106994628906,
+            "p01": 196.65066528320312,
+            "median": 203.47653198242188,
+            "mean": 202.53736877441406,
+            "max": 204.9384765625
+          },
+          "baseline_bt": {
+            "n": 99,
+            "min": 215.1712646484375,
+            "p01": 215.1753387451172,
+            "median": 235.1580810546875,
+            "mean": 244.42282104492188,
+            "max": 297.52581787109375
+          },
+          "baseline_bias": 41.88545608520508,
+          "ctt": {
+            "n": 88,
+            "min": 217.24374389648438,
+            "p01": 217.27093505859375,
+            "median": 224.77499389648438,
+            "mean": 238.8720703125,
+            "max": 295.3687438964844,
+            "minus_observed_mean": 36.30854415893555,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 99,
+            "min": 203.52499389648438,
+            "p01": 203.52499389648438,
+            "median": 206.64999389648438,
+            "mean": 206.10769653320312,
+            "max": 208.58749389648438,
+            "minus_observed_mean": 3.5703165531158447,
+            "fraction_at_or_colder_than_observed": 0.09090909090909091
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 99,
+            "min": 211.5496368408203,
+            "p01": 211.5541229248047,
+            "median": 211.95838928222656,
+            "mean": 221.77120971679688,
+            "max": 294.7851867675781,
+            "minus_observed_mean": 19.233816146850586,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 99,
+            "min": 211.5496368408203,
+            "p01": 211.5541229248047,
+            "median": 211.95838928222656,
+            "mean": 221.77120971679688,
+            "max": 294.7851867675781,
+            "minus_observed_mean": 19.233816146850586,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 99,
+            "min": 197.22067260742188,
+            "p01": 197.26742553710938,
+            "median": 197.3119354248047,
+            "mean": 197.31092834472656,
+            "max": 197.36215209960938,
+            "minus_observed_mean": -5.226435661315918,
+            "fraction_at_or_colder_than_observed": 0.9797979797979798
+          }
+        },
+        "obs_le200": {
+          "n": 15,
+          "observed": {
+            "n": 15,
+            "min": 196.33106994628906,
+            "p01": 196.37672424316406,
+            "median": 198.989501953125,
+            "mean": 198.4697723388672,
+            "max": 199.652099609375
+          },
+          "baseline_bt": {
+            "n": 15,
+            "min": 219.04615783691406,
+            "p01": 219.3376007080078,
+            "median": 279.1480407714844,
+            "mean": 263.8166198730469,
+            "max": 297.5904846191406
+          },
+          "baseline_bias": 65.34684753417969,
+          "ctt": {
+            "n": 11,
+            "min": 217.39999389648438,
+            "p01": 217.61561584472656,
+            "median": 269.1617126464844,
+            "mean": 253.16949462890625,
+            "max": 282.6890563964844,
+            "minus_observed_mean": 54.742252349853516,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 15,
+            "min": 203.64999389648438,
+            "p01": 203.64999389648438,
+            "median": 206.64999389648438,
+            "mean": 206.76663208007812,
+            "max": 208.52499389648438,
+            "minus_observed_mean": 8.296894073486328,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 13,
+            "min": 211.8187255859375,
+            "p01": 211.8197479248047,
+            "median": 212.01402282714844,
+            "mean": 229.99623107910156,
+            "max": 284.18408203125,
+            "minus_observed_mean": 31.637277603149414,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 13,
+            "min": 211.8187255859375,
+            "p01": 211.8197479248047,
+            "median": 212.01402282714844,
+            "mean": 229.99623107910156,
+            "max": 284.18408203125,
+            "minus_observed_mean": 31.637277603149414,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 15,
+            "min": 197.26846313476562,
+            "p01": 197.26870727539062,
+            "median": 197.30921936035156,
+            "mean": 197.3013153076172,
+            "max": 197.34262084960938,
+            "minus_observed_mean": -1.1684468984603882,
+            "fraction_at_or_colder_than_observed": 0.8666666666666667
+          }
+        }
+      },
+      "cold_area": {
+        "193": {
+          "observed": 0.0,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.0,
+          "native_min_q1e6": 0.0
+        },
+        "200": {
+          "observed": 8.327781479013991e-05,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.10888296691094826,
+          "native_min_q1e6": 0.0032978014656895403
+        },
+        "205": {
+          "observed": 0.0006162558294470353,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.24935043304463692,
+          "native_min_q1e6": 0.012552742616033756
+        },
+        "220": {
+          "observed": 0.0192871419053964,
+          "baseline": 0.007150788363313346,
+          "ctt": 0.004458139018432157,
+          "brick_min_cloudy": 0.6328836331334666,
+          "native_min_q1e6": 0.11332445036642239
+        },
+        "235": {
+          "observed": 0.04350433044636909,
+          "baseline": 0.0318454363757495,
+          "ctt": 0.03075727292915834,
+          "brick_min_cloudy": 0.7650177659338219,
+          "native_min_q1e6": 0.1870142127470575
+        }
+      },
+      "minima_locations": {
+        "observed": {
+          "north_first_row": 304,
+          "column": 160,
+          "lat": 10.791158676147461,
+          "lon": -91.02654266357422,
+          "observed": 196.33106994628906,
+          "baseline": 252.72998046875,
+          "ctt": 269.1617126464844,
+          "brick_min_cloudy": 203.64999389648438,
+          "native_min_q1e6": 211.82725524902344,
+          "native_highest_q1e6": 211.82725524902344,
+          "native_highest_height_q1e6": 13580.6474609375,
+          "native_min_air": 197.32032775878906
+        },
+        "baseline": {
+          "north_first_row": 316,
+          "column": 152,
+          "lat": 10.463306427001953,
+          "lon": -91.2489242553711,
+          "observed": 282.5635681152344,
+          "baseline": 211.05909729003906,
+          "ctt": 212.33749389648438,
+          "brick_min_cloudy": 203.77499389648438,
+          "native_min_q1e6": 211.55386352539062,
+          "native_highest_q1e6": 211.55386352539062,
+          "native_highest_height_q1e6": 13578.6865234375,
+          "native_min_air": 197.49551391601562
+        },
+        "ctt": {
+          "north_first_row": 318,
+          "column": 152,
+          "lat": 10.40863037109375,
+          "lon": -91.2489242553711,
+          "observed": 273.516845703125,
+          "baseline": 212.08900451660156,
+          "ctt": 212.08749389648438,
+          "brick_min_cloudy": 202.27499389648438,
+          "native_min_q1e6": 208.05908203125,
+          "native_highest_q1e6": 208.05908203125,
+          "native_highest_height_q1e6": 13973.3251953125,
+          "native_min_air": 197.53062438964844
+        },
+        "brick_min_cloudy_voxel_k": {
+          "north_first_row": 339,
+          "column": 256,
+          "lat": 9.833961486816406,
+          "lon": -88.35794067382812,
+          "observed": 289.4742126464844,
+          "baseline": 297.4056091308594,
+          "ctt": null,
+          "brick_min_cloudy": 196.14999389648438,
+          "native_min_q1e6": null,
+          "native_highest_q1e6": null,
+          "native_highest_height_q1e6": null,
+          "native_min_air": 196.1278076171875
+        },
+        "native_min_cloudy_k_1e-06": {
+          "north_first_row": 340,
+          "column": 212,
+          "lat": 9.806571006774902,
+          "lon": -89.58104705810547,
+          "observed": 294.874267578125,
+          "baseline": 296.7402648925781,
+          "ctt": null,
+          "brick_min_cloudy": 196.46249389648438,
+          "native_min_q1e6": 196.4253692626953,
+          "native_highest_q1e6": 196.4253692626953,
+          "native_highest_height_q1e6": 16269.1669921875,
+          "native_min_air": 196.4253692626953
+        }
+      },
+      "executable_check": {
+        "command": [
+          "C:\\Users\\drew\\simsat\\target\\release\\simsat-render-ir.exe",
+          "input=C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_15_00_00\\run.json",
+          "derived=ctt",
+          "view=topdown",
+          "resolution=native",
+          "ts=0",
+          "threads=6",
+          "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\ctt-final\\ctt-check-15z.png"
+        ],
+        "stdout": "DERIVEDSUMMARY file=ctt-check-15z.png field=ctt units=K view=topdown dims=474x380 canvas=none res=Model_native_(one_pixel_per_source_grid_cell) sat=goese in_domain_frac=0.224 min=212.087 max=302.103 median=291.087 wall_s=0.149",
+        "passed": true
+      }
+    },
+    {
+      "hour": 18,
+      "date": "2026-09-04",
+      "wrf": "C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_18_00_00",
+      "brick": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_18_00_00\\t20260904_1800.ssb",
+      "reference": "C:\\Users\\drew\\soma-render-work\\out\\simsat\\goesfd-18z\\abi-reference-aligned.npz",
+      "baseline": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\ir13_d01_18Z.bin",
+      "brick_header": {
+        "format_version": 6,
+        "storage_profile": "compact-u8",
+        "nx": 474,
+        "ny": 380,
+        "nz": 80,
+        "z_min_m": 0.0,
+        "dz_m": 250.0,
+        "temperature_encoding": "celsius_f16",
+        "quant": {
+          "ext_ice": {
+            "vmin": 9.70817543566227e-08,
+            "vmax": 0.00970817543566227
+          },
+          "ext_liquid": {
+            "vmin": 2.224629521369934e-06,
+            "vmax": 0.2224629521369934
+          },
+          "ext_precip": {
+            "vmin": 2.2783244028687477e-07,
+            "vmax": 0.022783244028687477
+          },
+          "ext_snow": {
+            "vmin": 2.2734038531780244e-07,
+            "vmax": 0.022734038531780243
+          },
+          "qvapor": {
+            "vmin": 2.1676508709788323e-07,
+            "vmax": 0.021676508709788322
+          },
+          "tau_up": {
+            "vmin": 0.01074243896484375,
+            "vmax": 1074.243896484375
+          }
+        },
+        "channels_3d": [
+          "ext_liquid",
+          "ext_ice",
+          "ext_snow",
+          "ext_precip",
+          "tau_up",
+          "qvapor",
+          "cloud_fraction"
+        ],
+        "science_channels_3d": [],
+        "science_encoding": null,
+        "planes_2d": [
+          "hgt",
+          "landmask",
+          "tsk",
+          "u10",
+          "v10",
+          "snowh",
+          "ivgtyp"
+        ],
+        "has_snowh": true,
+        "has_ivgtyp": true,
+        "has_cloud_fraction": false,
+        "time_iso": "2026-09-04T18:00:00Z"
+      },
+      "native_metadata": {
+        "has_CLDFRA": false,
+        "MP_PHYSICS": 8,
+        "species": [
+          "QCLOUD",
+          "QICE",
+          "QSNOW",
+          "QRAIN",
+          "QGRAUP"
+        ],
+        "nz": 49,
+        "all_temperature": {
+          "n": 8825880,
+          "min": 195.7983856201172,
+          "p01": 197.34326171875,
+          "median": 270.9850769042969,
+          "mean": 260.0068664550781,
+          "max": 312.10498046875
+        },
+        "all_height": {
+          "n": 8825880,
+          "min": 5.091587066650391,
+          "p01": 8.998575210571289,
+          "median": 5391.07666015625,
+          "mean": 6700.6181640625,
+          "max": 16568.892578125
+        },
+        "temperature_reconstruction": "f32 P+PB; f64 Poisson at kappa=2/7 and theta offset 300 K; f32 temperature before resampling, matching ingest.rs",
+        "difference_from_all_f64_max_abs_kelvin": 1.5258786334015895e-05
+      },
+      "grid_check": {
+        "latitude_max_abs_degrees": 0.0,
+        "longitude_max_abs_degrees": 0.0
+      },
+      "mask_evidence": {
+        "source": "reproduced from the cached SSB using the T3 formula",
+        "supplied_path": "C:\\Users\\drew\\soma-render-work\\out\\simsat-validator-both-cloudy\\cloudmask_d01_18Z.bin",
+        "mismatch_count": 0
+      },
+      "native_threshold_sensitivity": {
+        "0.0": {
+          "minimum_cloudy_voxel": {
+            "n": 176260,
+            "min": 195.7983856201172,
+            "p01": 196.13648986816406,
+            "median": 201.1720428466797,
+            "mean": 208.0908660888672,
+            "max": 302.86859130859375
+          },
+          "highest_cloudy_temperature": {
+            "n": 176260,
+            "min": 195.9176483154297,
+            "p01": 196.51266479492188,
+            "median": 201.1720428466797,
+            "mean": 208.1291961669922,
+            "max": 302.86859130859375
+          },
+          "cloud_column_count": 176260
+        },
+        "1e-08": {
+          "minimum_cloudy_voxel": {
+            "n": 115412,
+            "min": 195.7983856201172,
+            "p01": 196.06961059570312,
+            "median": 229.39590454101562,
+            "mean": 237.00698852539062,
+            "max": 303.6705322265625
+          },
+          "highest_cloudy_temperature": {
+            "n": 115412,
+            "min": 195.7983856201172,
+            "p01": 196.0706329345703,
+            "median": 229.39590454101562,
+            "mean": 237.0071563720703,
+            "max": 303.6705322265625
+          },
+          "cloud_column_count": 115412
+        },
+        "1e-06": {
+          "minimum_cloudy_voxel": {
+            "n": 80667,
+            "min": 196.5356903076172,
+            "p01": 201.65419006347656,
+            "median": 255.4466552734375,
+            "mean": 250.8809356689453,
+            "max": 303.6638488769531
+          },
+          "highest_cloudy_temperature": {
+            "n": 80667,
+            "min": 196.5356903076172,
+            "p01": 201.65419006347656,
+            "median": 255.4466552734375,
+            "mean": 250.8809356689453,
+            "max": 303.6638488769531
+          },
+          "cloud_column_count": 80667
+        },
+        "1e-05": {
+          "minimum_cloudy_voxel": {
+            "n": 57033,
+            "min": 199.9551544189453,
+            "p01": 205.63572692871094,
+            "median": 262.6243896484375,
+            "mean": 258.57794189453125,
+            "max": 303.0955810546875
+          },
+          "highest_cloudy_temperature": {
+            "n": 57033,
+            "min": 199.9551544189453,
+            "p01": 205.63572692871094,
+            "median": 262.6243896484375,
+            "mean": 258.57794189453125,
+            "max": 303.0955810546875
+          },
+          "cloud_column_count": 57033
+        }
+      },
+      "regimes": {
+        "valid": {
+          "n": 180115,
+          "observed": {
+            "n": 180115,
+            "min": 192.13153076171875,
+            "p01": 206.9511260986328,
+            "median": 292.6154479980469,
+            "mean": 281.3879089355469,
+            "max": 313.7496032714844
+          },
+          "baseline_bt": {
+            "n": 180115,
+            "min": 213.00857543945312,
+            "p01": 222.3529052734375,
+            "median": 298.4347229003906,
+            "mean": 293.6161804199219,
+            "max": 322.56103515625
+          },
+          "baseline_bias": 12.228229522705078,
+          "ctt": {
+            "n": 37733,
+            "min": 214.18124389648438,
+            "p01": 219.3162384033203,
+            "median": 286.2906188964844,
+            "mean": 271.9793701171875,
+            "max": 298.0718688964844,
+            "minus_observed_mean": -5.1776604652404785,
+            "fraction_at_or_colder_than_observed": 0.6286804653751358
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 176255,
+            "min": 195.83749389648438,
+            "p01": 196.21249389648438,
+            "median": 211.64999389648438,
+            "mean": 218.5706329345703,
+            "max": 303.0874938964844,
+            "minus_observed_mean": -62.79891586303711,
+            "fraction_at_or_colder_than_observed": 0.938401747468157
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 80667,
+            "min": 196.5356903076172,
+            "p01": 201.65419006347656,
+            "median": 255.4466552734375,
+            "mean": 250.8809051513672,
+            "max": 303.6638488769531,
+            "minus_observed_mean": -28.301864624023438,
+            "fraction_at_or_colder_than_observed": 0.7966206751211772
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 80667,
+            "min": 196.5356903076172,
+            "p01": 201.65419006347656,
+            "median": 255.4466552734375,
+            "mean": 250.8809051513672,
+            "max": 303.6638488769531,
+            "minus_observed_mean": -28.301860809326172,
+            "fraction_at_or_colder_than_observed": 0.7966206751211772
+          },
+          "native_min_air_temperature_k": {
+            "n": 180115,
+            "min": 195.7983856201172,
+            "p01": 196.13111877441406,
+            "median": 197.7609405517578,
+            "mean": 197.8599395751953,
+            "max": 200.3855743408203,
+            "minus_observed_mean": -83.5279312133789,
+            "fraction_at_or_colder_than_observed": 0.9995280792826805
+          }
+        },
+        "both_cloudy": {
+          "n": 55180,
+          "observed": {
+            "n": 55180,
+            "min": 196.5345916748047,
+            "p01": 205.9875946044922,
+            "median": 278.6502685546875,
+            "mean": 271.1864318847656,
+            "max": 305.7684326171875
+          },
+          "baseline_bt": {
+            "n": 55180,
+            "min": 213.00857543945312,
+            "p01": 218.96580505371094,
+            "median": 289.234619140625,
+            "mean": 281.9891052246094,
+            "max": 320.936767578125
+          },
+          "baseline_bias": 10.802651405334473,
+          "ctt": {
+            "n": 27310,
+            "min": 214.18124389648438,
+            "p01": 218.86874389648438,
+            "median": 284.3921813964844,
+            "mean": 270.7669982910156,
+            "max": 298.0718688964844,
+            "minus_observed_mean": 1.0031996965408325,
+            "fraction_at_or_colder_than_observed": 0.49271329183449286
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 55180,
+            "min": 195.83749389648438,
+            "p01": 196.21249389648438,
+            "median": 214.61874389648438,
+            "mean": 225.13917541503906,
+            "max": 296.2281188964844,
+            "minus_observed_mean": -46.047245025634766,
+            "fraction_at_or_colder_than_observed": 0.9014316781442552
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 54987,
+            "min": 196.5356903076172,
+            "p01": 202.29397583007812,
+            "median": 258.732177734375,
+            "mean": 251.29995727539062,
+            "max": 301.10601806640625,
+            "minus_observed_mean": -19.864582061767578,
+            "fraction_at_or_colder_than_observed": 0.7060032371287759
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 54987,
+            "min": 196.5356903076172,
+            "p01": 202.29397583007812,
+            "median": 258.732177734375,
+            "mean": 251.29995727539062,
+            "max": 301.10601806640625,
+            "minus_observed_mean": -19.86457633972168,
+            "fraction_at_or_colder_than_observed": 0.7060032371287759
+          },
+          "native_min_air_temperature_k": {
+            "n": 55180,
+            "min": 195.80294799804688,
+            "p01": 196.14564514160156,
+            "median": 197.72323608398438,
+            "mean": 197.75982666015625,
+            "max": 199.9466552734375,
+            "minus_observed_mean": -73.4266128540039,
+            "fraction_at_or_colder_than_observed": 0.9999637549836897
+          }
+        },
+        "obs_le235": {
+          "n": 13147,
+          "observed": {
+            "n": 13147,
+            "min": 192.13153076171875,
+            "p01": 198.33563232421875,
+            "median": 216.4727020263672,
+            "mean": 217.98681640625,
+            "max": 234.99708557128906
+          },
+          "baseline_bt": {
+            "n": 13147,
+            "min": 215.03477478027344,
+            "p01": 218.52809143066406,
+            "median": 298.0462646484375,
+            "mean": 287.3470764160156,
+            "max": 318.1354675292969
+          },
+          "baseline_bias": 69.36024475097656,
+          "ctt": {
+            "n": 3264,
+            "min": 216.55624389648438,
+            "p01": 218.80624389648438,
+            "median": 269.9576110839844,
+            "mean": 264.5281982421875,
+            "max": 297.2749938964844,
+            "minus_observed_mean": 47.68596649169922,
+            "fraction_at_or_colder_than_observed": 0.040747549019607844
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 12884,
+            "min": 196.46249389648438,
+            "p01": 197.08749389648438,
+            "median": 214.61874389648438,
+            "mean": 220.7231903076172,
+            "max": 300.8062438964844,
+            "minus_observed_mean": 2.8381197452545166,
+            "fraction_at_or_colder_than_observed": 0.5087705681465383
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 6093,
+            "min": 200.8145751953125,
+            "p01": 208.27923583984375,
+            "median": 226.7002410888672,
+            "mean": 241.363037109375,
+            "max": 300.80657958984375,
+            "minus_observed_mean": 23.896421432495117,
+            "fraction_at_or_colder_than_observed": 0.21188248810109964
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 6093,
+            "min": 200.8145751953125,
+            "p01": 208.27923583984375,
+            "median": 226.7002410888672,
+            "mean": 241.363037109375,
+            "max": 300.80657958984375,
+            "minus_observed_mean": 23.896421432495117,
+            "fraction_at_or_colder_than_observed": 0.21188248810109964
+          },
+          "native_min_air_temperature_k": {
+            "n": 13147,
+            "min": 196.30990600585938,
+            "p01": 196.5250244140625,
+            "median": 197.46189880371094,
+            "mean": 197.43141174316406,
+            "max": 198.89927673339844,
+            "minus_observed_mean": -20.555416107177734,
+            "fraction_at_or_colder_than_observed": 0.9935346466874572
+          }
+        },
+        "obs_le205": {
+          "n": 1056,
+          "observed": {
+            "n": 1056,
+            "min": 192.13153076171875,
+            "p01": 194.70350646972656,
+            "median": 202.35433959960938,
+            "mean": 201.715576171875,
+            "max": 204.99839782714844
+          },
+          "baseline_bt": {
+            "n": 1056,
+            "min": 216.7624053955078,
+            "p01": 217.8130340576172,
+            "median": 298.0661315917969,
+            "mean": 286.87890625,
+            "max": 304.7281799316406
+          },
+          "baseline_bias": 85.1633071899414,
+          "ctt": {
+            "n": 257,
+            "min": 220.61874389648438,
+            "p01": 220.82374572753906,
+            "median": 261.8374938964844,
+            "mean": 260.895751953125,
+            "max": 295.4468688964844,
+            "minus_observed_mean": 57.73265838623047,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 1056,
+            "min": 197.27499389648438,
+            "p01": 197.78436279296875,
+            "median": 212.74374389648438,
+            "mean": 214.40675354003906,
+            "max": 290.7124938964844,
+            "minus_observed_mean": 12.691165924072266,
+            "fraction_at_or_colder_than_observed": 0.048295454545454544
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 354,
+            "min": 202.43882751464844,
+            "p01": 204.50808715820312,
+            "median": 222.88917541503906,
+            "mean": 243.84092712402344,
+            "max": 299.9915466308594,
+            "minus_observed_mean": 40.62763595581055,
+            "fraction_at_or_colder_than_observed": 0.00847457627118644
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 354,
+            "min": 202.43882751464844,
+            "p01": 204.50808715820312,
+            "median": 222.88917541503906,
+            "mean": 243.84092712402344,
+            "max": 299.9915466308594,
+            "minus_observed_mean": 40.62763595581055,
+            "fraction_at_or_colder_than_observed": 0.00847457627118644
+          },
+          "native_min_air_temperature_k": {
+            "n": 1056,
+            "min": 196.5342559814453,
+            "p01": 196.79127502441406,
+            "median": 197.2955322265625,
+            "mean": 197.28518676757812,
+            "max": 198.1316375732422,
+            "minus_observed_mean": -4.430412292480469,
+            "fraction_at_or_colder_than_observed": 0.9195075757575758
+          }
+        },
+        "both_cloudy_obs_le205": {
+          "n": 351,
+          "observed": {
+            "n": 351,
+            "min": 196.5345916748047,
+            "p01": 197.72503662109375,
+            "median": 203.68582153320312,
+            "mean": 203.20928955078125,
+            "max": 204.9978485107422
+          },
+          "baseline_bt": {
+            "n": 351,
+            "min": 216.7624053955078,
+            "p01": 217.3874969482422,
+            "median": 271.9151611328125,
+            "mean": 264.10052490234375,
+            "max": 297.94940185546875
+          },
+          "baseline_bias": 60.89121627807617,
+          "ctt": {
+            "n": 257,
+            "min": 220.61874389648438,
+            "p01": 220.82374572753906,
+            "median": 261.8374938964844,
+            "mean": 260.895751953125,
+            "max": 295.4468688964844,
+            "minus_observed_mean": 57.73265838623047,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 351,
+            "min": 197.33749389648438,
+            "p01": 197.33749389648438,
+            "median": 212.21249389648438,
+            "mean": 212.10617065429688,
+            "max": 290.7124938964844,
+            "minus_observed_mean": 8.896883964538574,
+            "fraction_at_or_colder_than_observed": 0.12535612535612536
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 351,
+            "min": 202.43882751464844,
+            "p01": 204.50750732421875,
+            "median": 222.8641357421875,
+            "mean": 243.38780212402344,
+            "max": 296.3984680175781,
+            "minus_observed_mean": 40.178524017333984,
+            "fraction_at_or_colder_than_observed": 0.008547008547008548
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 351,
+            "min": 202.43882751464844,
+            "p01": 204.50750732421875,
+            "median": 222.8641357421875,
+            "mean": 243.38780212402344,
+            "max": 296.3984680175781,
+            "minus_observed_mean": 40.178524017333984,
+            "fraction_at_or_colder_than_observed": 0.008547008547008548
+          },
+          "native_min_air_temperature_k": {
+            "n": 351,
+            "min": 196.5342559814453,
+            "p01": 196.769287109375,
+            "median": 197.0990447998047,
+            "mean": 197.1988983154297,
+            "max": 198.1316375732422,
+            "minus_observed_mean": -6.010377883911133,
+            "fraction_at_or_colder_than_observed": 0.9943019943019943
+          }
+        },
+        "obs_le200": {
+          "n": 258,
+          "observed": {
+            "n": 258,
+            "min": 192.13153076171875,
+            "p01": 193.50657653808594,
+            "median": 198.28982543945312,
+            "mean": 197.89227294921875,
+            "max": 199.9903564453125
+          },
+          "baseline_bt": {
+            "n": 258,
+            "min": 290.8910217285156,
+            "p01": 291.3509216308594,
+            "median": 298.2004699707031,
+            "mean": 297.63592529296875,
+            "max": 298.3963317871094
+          },
+          "baseline_bias": 99.74364471435547,
+          "ctt": {
+            "n": 23,
+            "min": 292.5093688964844,
+            "p01": 292.5299987792969,
+            "median": 293.5249938964844,
+            "mean": 293.8564758300781,
+            "max": 295.1343688964844,
+            "minus_observed_mean": 95.18798828125,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 258,
+            "min": 204.21249389648438,
+            "p01": 205.16561889648438,
+            "median": 214.83749389648438,
+            "mean": 215.96856689453125,
+            "max": 267.6421813964844,
+            "minus_observed_mean": 18.07631492614746,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 25,
+            "min": 293.3855895996094,
+            "p01": 293.38934326171875,
+            "median": 294.45086669921875,
+            "mean": 294.20635986328125,
+            "max": 294.5204772949219,
+            "minus_observed_mean": 95.60183715820312,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 25,
+            "min": 293.3855895996094,
+            "p01": 293.38934326171875,
+            "median": 294.45086669921875,
+            "mean": 294.20635986328125,
+            "max": 294.5204772949219,
+            "minus_observed_mean": 95.60183715820312,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 258,
+            "min": 196.94129943847656,
+            "p01": 196.95875549316406,
+            "median": 197.38121032714844,
+            "mean": 197.34925842285156,
+            "max": 197.5623779296875,
+            "minus_observed_mean": -0.5430111885070801,
+            "fraction_at_or_colder_than_observed": 0.6705426356589147
+          }
+        }
+      },
+      "cold_area": {
+        "193": {
+          "observed": 5.552008439052827e-06,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.0,
+          "native_min_q1e6": 0.0
+        },
+        "200": {
+          "observed": 0.0014324181772756295,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.19985009577214558,
+          "native_min_q1e6": 0.0010160175443466675
+        },
+        "205": {
+          "observed": 0.005862920911639786,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.35992005107847763,
+          "native_min_q1e6": 0.008699997223995781
+        },
+        "220": {
+          "observed": 0.04287816117480499,
+          "baseline": 0.0056686006162729365,
+          "ctt": 0.0021763873081087084,
+          "brick_min_cloudy": 0.672931182855398,
+          "native_min_q1e6": 0.10219581933764539
+        },
+        "235": {
+          "observed": 0.07299225494822752,
+          "baseline": 0.030713710684840242,
+          "ctt": 0.02924242844849124,
+          "brick_min_cloudy": 0.783604919079477,
+          "native_min_q1e6": 0.1775199178302751
+        }
+      },
+      "minima_locations": {
+        "observed": {
+          "north_first_row": 275,
+          "column": 114,
+          "lat": 11.581974983215332,
+          "lon": -92.30524444580078,
+          "observed": 192.13153076171875,
+          "baseline": 298.3189392089844,
+          "ctt": null,
+          "brick_min_cloudy": 218.64999389648438,
+          "native_min_q1e6": null,
+          "native_highest_q1e6": null,
+          "native_highest_height_q1e6": null,
+          "native_min_air": 197.5413360595703
+        },
+        "baseline": {
+          "north_first_row": 349,
+          "column": 412,
+          "lat": 9.559953689575195,
+          "lon": -84.02146911621094,
+          "observed": 277.22320556640625,
+          "baseline": 213.00857543945312,
+          "ctt": 214.27499389648438,
+          "brick_min_cloudy": 206.39999389648438,
+          "native_min_q1e6": 211.17591857910156,
+          "native_highest_q1e6": 211.17591857910156,
+          "native_highest_height_q1e6": 13582.5654296875,
+          "native_min_air": 198.0930633544922
+        },
+        "ctt": {
+          "north_first_row": 350,
+          "column": 413,
+          "lat": 9.532541275024414,
+          "lon": -83.99366760253906,
+          "observed": 289.07623291015625,
+          "baseline": 214.55384826660156,
+          "ctt": 214.18124389648438,
+          "brick_min_cloudy": 206.39999389648438,
+          "native_min_q1e6": 211.3624267578125,
+          "native_highest_q1e6": 211.3624267578125,
+          "native_highest_height_q1e6": 13582.3935546875,
+          "native_min_air": 198.09422302246094
+        },
+        "brick_min_cloudy_voxel_k": {
+          "north_first_row": 371,
+          "column": 252,
+          "lat": 8.956369400024414,
+          "lon": -88.46913146972656,
+          "observed": 295.6593017578125,
+          "baseline": 267.71038818359375,
+          "ctt": null,
+          "brick_min_cloudy": 195.83749389648438,
+          "native_min_q1e6": 205.88510131835938,
+          "native_highest_q1e6": 205.88510131835938,
+          "native_highest_height_q1e6": 14352.431640625,
+          "native_min_air": 195.8209228515625
+        },
+        "native_min_cloudy_k_1e-06": {
+          "north_first_row": 337,
+          "column": 155,
+          "lat": 9.8887357711792,
+          "lon": -91.16552734375,
+          "observed": 290.7380065917969,
+          "baseline": 272.9739685058594,
+          "ctt": null,
+          "brick_min_cloudy": 196.64999389648438,
+          "native_min_q1e6": 196.5356903076172,
+          "native_highest_q1e6": 196.5356903076172,
+          "native_highest_height_q1e6": 16273.4248046875,
+          "native_min_air": 196.5356903076172
+        }
+      },
+      "executable_check": {
+        "command": [
+          "C:\\Users\\drew\\simsat\\target\\release\\simsat-render-ir.exe",
+          "input=C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_18_00_00\\run.json",
+          "derived=ctt",
+          "view=topdown",
+          "resolution=native",
+          "ts=0",
+          "threads=6",
+          "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\ctt-final\\ctt-check-18z.png"
+        ],
+        "stdout": "DERIVEDSUMMARY file=ctt-check-18z.png field=ctt units=K view=topdown dims=474x380 canvas=none res=Model_native_(one_pixel_per_source_grid_cell) sat=goese in_domain_frac=0.209 min=214.181 max=298.072 median=286.291 wall_s=0.151",
+        "passed": true
+      }
+    },
+    {
+      "hour": 21,
+      "date": "2026-09-04",
+      "wrf": "C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_21_00_00",
+      "brick": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_21_00_00\\t20260904_2100.ssb",
+      "reference": "C:\\Users\\drew\\soma-render-work\\out\\simsat\\goesfd-21z\\abi-reference-aligned.npz",
+      "baseline": "C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\ir13_d01_21Z.bin",
+      "brick_header": {
+        "format_version": 6,
+        "storage_profile": "compact-u8",
+        "nx": 474,
+        "ny": 380,
+        "nz": 80,
+        "z_min_m": 0.0,
+        "dz_m": 250.0,
+        "temperature_encoding": "celsius_f16",
+        "quant": {
+          "ext_ice": {
+            "vmin": 1.7985749989748e-07,
+            "vmax": 0.017985749989748
+          },
+          "ext_liquid": {
+            "vmin": 2.7802950143814086e-06,
+            "vmax": 0.27802950143814087
+          },
+          "ext_precip": {
+            "vmin": 2.469966560602188e-07,
+            "vmax": 0.02469966560602188
+          },
+          "ext_snow": {
+            "vmin": 2.4657342582941053e-07,
+            "vmax": 0.024657342582941055
+          },
+          "qvapor": {
+            "vmin": 2.145126648247242e-07,
+            "vmax": 0.02145126648247242
+          },
+          "tau_up": {
+            "vmin": 0.014031180419921876,
+            "vmax": 1403.1180419921875
+          }
+        },
+        "channels_3d": [
+          "ext_liquid",
+          "ext_ice",
+          "ext_snow",
+          "ext_precip",
+          "tau_up",
+          "qvapor",
+          "cloud_fraction"
+        ],
+        "science_channels_3d": [],
+        "science_encoding": null,
+        "planes_2d": [
+          "hgt",
+          "landmask",
+          "tsk",
+          "u10",
+          "v10",
+          "snowh",
+          "ivgtyp"
+        ],
+        "has_snowh": true,
+        "has_ivgtyp": true,
+        "has_cloud_fraction": false,
+        "time_iso": "2026-09-04T21:00:00Z"
+      },
+      "native_metadata": {
+        "has_CLDFRA": false,
+        "MP_PHYSICS": 8,
+        "species": [
+          "QCLOUD",
+          "QICE",
+          "QSNOW",
+          "QRAIN",
+          "QGRAUP"
+        ],
+        "nz": 49,
+        "all_temperature": {
+          "n": 8825880,
+          "min": 195.65586853027344,
+          "p01": 197.4285430908203,
+          "median": 271.15435791015625,
+          "mean": 260.1445617675781,
+          "max": 312.21246337890625
+        },
+        "all_height": {
+          "n": 8825880,
+          "min": 5.104432582855225,
+          "p01": 9.000252723693848,
+          "median": 5382.41455078125,
+          "mean": 6694.60400390625,
+          "max": 16551.177734375
+        },
+        "temperature_reconstruction": "f32 P+PB; f64 Poisson at kappa=2/7 and theta offset 300 K; f32 temperature before resampling, matching ingest.rs",
+        "difference_from_all_f64_max_abs_kelvin": 1.5258769280990236e-05
+      },
+      "grid_check": {
+        "latitude_max_abs_degrees": 0.0,
+        "longitude_max_abs_degrees": 0.0
+      },
+      "mask_evidence": {
+        "source": "reproduced from the cached SSB using the T3 formula",
+        "supplied_path": "C:\\Users\\drew\\soma-render-work\\out\\simsat-validator-both-cloudy\\cloudmask_d01_21Z.bin",
+        "mismatch_count": 0
+      },
+      "native_threshold_sensitivity": {
+        "0.0": {
+          "minimum_cloudy_voxel": {
+            "n": 177428,
+            "min": 195.88026428222656,
+            "p01": 196.30718994140625,
+            "median": 200.02828979492188,
+            "mean": 206.0364990234375,
+            "max": 303.8636779785156
+          },
+          "highest_cloudy_temperature": {
+            "n": 177428,
+            "min": 195.88026428222656,
+            "p01": 196.60183715820312,
+            "median": 200.02828979492188,
+            "mean": 206.0797576904297,
+            "max": 303.8636779785156
+          },
+          "cloud_column_count": 177428
+        },
+        "1e-08": {
+          "minimum_cloudy_voxel": {
+            "n": 114518,
+            "min": 196.04635620117188,
+            "p01": 196.42080688476562,
+            "median": 215.37109375,
+            "mean": 231.47869873046875,
+            "max": 308.12701416015625
+          },
+          "highest_cloudy_temperature": {
+            "n": 114518,
+            "min": 196.04635620117188,
+            "p01": 196.42080688476562,
+            "median": 215.37109375,
+            "mean": 231.4788360595703,
+            "max": 308.12701416015625
+          },
+          "cloud_column_count": 114518
+        },
+        "1e-06": {
+          "minimum_cloudy_voxel": {
+            "n": 81385,
+            "min": 196.880615234375,
+            "p01": 201.2335662841797,
+            "median": 222.49948120117188,
+            "mean": 240.27491760253906,
+            "max": 304.34259033203125
+          },
+          "highest_cloudy_temperature": {
+            "n": 81385,
+            "min": 196.880615234375,
+            "p01": 201.2335662841797,
+            "median": 222.49948120117188,
+            "mean": 240.27491760253906,
+            "max": 304.34259033203125
+          },
+          "cloud_column_count": 81385
+        },
+        "1e-05": {
+          "minimum_cloudy_voxel": {
+            "n": 61335,
+            "min": 198.52191162109375,
+            "p01": 203.85191345214844,
+            "median": 235.07322692871094,
+            "mean": 249.0082244873047,
+            "max": 306.2597961425781
+          },
+          "highest_cloudy_temperature": {
+            "n": 61335,
+            "min": 198.52191162109375,
+            "p01": 203.85191345214844,
+            "median": 235.07322692871094,
+            "mean": 249.0082550048828,
+            "max": 306.2597961425781
+          },
+          "cloud_column_count": 61335
+        }
+      },
+      "regimes": {
+        "valid": {
+          "n": 180120,
+          "observed": {
+            "n": 180120,
+            "min": 192.98655700683594,
+            "p01": 207.9707489013672,
+            "median": 288.9246826171875,
+            "mean": 275.75048828125,
+            "max": 308.8541259765625
+          },
+          "baseline_bt": {
+            "n": 180120,
+            "min": 206.4167938232422,
+            "p01": 215.20233154296875,
+            "median": 298.5027770996094,
+            "mean": 289.2467346191406,
+            "max": 317.74493408203125
+          },
+          "baseline_bias": 13.49628734588623,
+          "ctt": {
+            "n": 43951,
+            "min": 207.71249389648438,
+            "p01": 212.74374389648438,
+            "median": 275.1910095214844,
+            "mean": 262.6758117675781,
+            "max": 303.5249938964844,
+            "minus_observed_mean": -8.801053047180176,
+            "fraction_at_or_colder_than_observed": 0.6391890969488749
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 177428,
+            "min": 196.08749389648438,
+            "p01": 196.39999389648438,
+            "median": 206.52499389648438,
+            "mean": 213.93829345703125,
+            "max": 303.8843688964844,
+            "minus_observed_mean": -61.824729919433594,
+            "fraction_at_or_colder_than_observed": 0.9454539306084722
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 81385,
+            "min": 196.880615234375,
+            "p01": 201.2335662841797,
+            "median": 222.49948120117188,
+            "mean": 240.27488708496094,
+            "max": 304.34259033203125,
+            "minus_observed_mean": -31.80887794494629,
+            "fraction_at_or_colder_than_observed": 0.795343122196965
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 81385,
+            "min": 196.880615234375,
+            "p01": 201.2335662841797,
+            "median": 222.49948120117188,
+            "mean": 240.27488708496094,
+            "max": 304.34259033203125,
+            "minus_observed_mean": -31.80887794494629,
+            "fraction_at_or_colder_than_observed": 0.795343122196965
+          },
+          "native_min_air_temperature_k": {
+            "n": 180120,
+            "min": 195.65586853027344,
+            "p01": 196.15325927734375,
+            "median": 197.93601989746094,
+            "mean": 197.90713500976562,
+            "max": 199.9174041748047,
+            "minus_observed_mean": -77.84332275390625,
+            "fraction_at_or_colder_than_observed": 0.9999611370197646
+          }
+        },
+        "both_cloudy": {
+          "n": 59667,
+          "observed": {
+            "n": 59667,
+            "min": 192.98655700683594,
+            "p01": 206.70025634765625,
+            "median": 270.31243896484375,
+            "mean": 263.2935485839844,
+            "max": 300.3376159667969
+          },
+          "baseline_bt": {
+            "n": 59667,
+            "min": 206.50953674316406,
+            "p01": 212.81591796875,
+            "median": 285.4839172363281,
+            "mean": 272.25244140625,
+            "max": 316.1822509765625
+          },
+          "baseline_bias": 8.958939552307129,
+          "ctt": {
+            "n": 32985,
+            "min": 207.71249389648438,
+            "p01": 212.68124389648438,
+            "median": 262.5718688964844,
+            "mean": 259.6414794921875,
+            "max": 303.5249938964844,
+            "minus_observed_mean": -3.6921136379241943,
+            "fraction_at_or_colder_than_observed": 0.5255115961800818
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 59667,
+            "min": 196.08749389648438,
+            "p01": 196.27499389648438,
+            "median": 207.39999389648438,
+            "mean": 215.18397521972656,
+            "max": 297.5562438964844,
+            "minus_observed_mean": -48.109500885009766,
+            "fraction_at_or_colder_than_observed": 0.9187993363165569
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 59389,
+            "min": 196.88165283203125,
+            "p01": 202.14256286621094,
+            "median": 222.4004669189453,
+            "mean": 238.70968627929688,
+            "max": 303.5535583496094,
+            "minus_observed_mean": -24.519630432128906,
+            "fraction_at_or_colder_than_observed": 0.7243428917813063
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 59389,
+            "min": 196.88165283203125,
+            "p01": 202.14256286621094,
+            "median": 222.4004669189453,
+            "mean": 238.70968627929688,
+            "max": 303.5535583496094,
+            "minus_observed_mean": -24.519630432128906,
+            "fraction_at_or_colder_than_observed": 0.7243428917813063
+          },
+          "native_min_air_temperature_k": {
+            "n": 59667,
+            "min": 195.6764373779297,
+            "p01": 196.19427490234375,
+            "median": 197.73739624023438,
+            "mean": 197.7284393310547,
+            "max": 199.9174041748047,
+            "minus_observed_mean": -65.56509399414062,
+            "fraction_at_or_colder_than_observed": 0.999916201585466
+          }
+        },
+        "obs_le235": {
+          "n": 21695,
+          "observed": {
+            "n": 21695,
+            "min": 192.98655700683594,
+            "p01": 202.37777709960938,
+            "median": 220.8515167236328,
+            "mean": 220.68540954589844,
+            "max": 234.9989776611328
+          },
+          "baseline_bt": {
+            "n": 21695,
+            "min": 208.17507934570312,
+            "p01": 212.499755859375,
+            "median": 296.2845153808594,
+            "mean": 281.53607177734375,
+            "max": 317.0577697753906
+          },
+          "baseline_bias": 60.85065841674805,
+          "ctt": {
+            "n": 6697,
+            "min": 208.46249389648438,
+            "p01": 211.46249389648438,
+            "median": 247.66561889648438,
+            "mean": 251.5452880859375,
+            "max": 298.4312438964844,
+            "minus_observed_mean": 32.01023864746094,
+            "fraction_at_or_colder_than_observed": 0.1648499328057339
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 21406,
+            "min": 196.08749389648438,
+            "p01": 196.27499389648438,
+            "median": 209.83749389648438,
+            "mean": 216.51976013183594,
+            "max": 303.8843688964844,
+            "minus_observed_mean": -4.182390213012695,
+            "fraction_at_or_colder_than_observed": 0.7436699990656825
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 12516,
+            "min": 201.56265258789062,
+            "p01": 204.1473846435547,
+            "median": 218.88034057617188,
+            "mean": 231.1316680908203,
+            "max": 304.34259033203125,
+            "minus_observed_mean": 10.102640151977539,
+            "fraction_at_or_colder_than_observed": 0.5136625119846596
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 12516,
+            "min": 201.56265258789062,
+            "p01": 204.1473846435547,
+            "median": 218.88034057617188,
+            "mean": 231.1316680908203,
+            "max": 304.34259033203125,
+            "minus_observed_mean": 10.102642059326172,
+            "fraction_at_or_colder_than_observed": 0.5136625119846596
+          },
+          "native_min_air_temperature_k": {
+            "n": 21695,
+            "min": 195.95883178710938,
+            "p01": 196.1975860595703,
+            "median": 197.4771728515625,
+            "mean": 197.5242462158203,
+            "max": 199.68678283691406,
+            "minus_observed_mean": -23.16116714477539,
+            "fraction_at_or_colder_than_observed": 0.9996773450103711
+          }
+        },
+        "obs_le205": {
+          "n": 635,
+          "observed": {
+            "n": 635,
+            "min": 192.98655700683594,
+            "p01": 198.09625244140625,
+            "median": 203.10409545898438,
+            "mean": 202.8469696044922,
+            "max": 204.99600219726562
+          },
+          "baseline_bt": {
+            "n": 635,
+            "min": 231.15472412109375,
+            "p01": 254.86732482910156,
+            "median": 290.9923095703125,
+            "mean": 291.2203369140625,
+            "max": 315.48907470703125
+          },
+          "baseline_bias": 88.37336730957031,
+          "ctt": {
+            "n": 283,
+            "min": 216.74374389648438,
+            "p01": 238.82374572753906,
+            "median": 287.5093688964844,
+            "mean": 285.1002502441406,
+            "max": 296.8999938964844,
+            "minus_observed_mean": 82.54702758789062,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 635,
+            "min": 197.21249389648438,
+            "p01": 197.21249389648438,
+            "median": 239.49374389648438,
+            "mean": 238.3168487548828,
+            "max": 293.6499938964844,
+            "minus_observed_mean": 35.46988296508789,
+            "fraction_at_or_colder_than_observed": 0.11811023622047244
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 386,
+            "min": 208.5183563232422,
+            "p01": 208.67262268066406,
+            "median": 284.9337158203125,
+            "mean": 265.73480224609375,
+            "max": 299.2227478027344,
+            "minus_observed_mean": 63.00711441040039,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 386,
+            "min": 208.5183563232422,
+            "p01": 208.67262268066406,
+            "median": 284.9337158203125,
+            "mean": 265.73486328125,
+            "max": 299.2227478027344,
+            "minus_observed_mean": 63.00716018676758,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 635,
+            "min": 196.56727600097656,
+            "p01": 196.85475158691406,
+            "median": 198.03346252441406,
+            "mean": 197.93785095214844,
+            "max": 199.17431640625,
+            "minus_observed_mean": -4.909121513366699,
+            "fraction_at_or_colder_than_observed": 0.988976377952756
+          }
+        },
+        "both_cloudy_obs_le205": {
+          "n": 386,
+          "observed": {
+            "n": 386,
+            "min": 192.98655700683594,
+            "p01": 197.5654296875,
+            "median": 202.84652709960938,
+            "mean": 202.71554565429688,
+            "max": 204.97161865234375
+          },
+          "baseline_bt": {
+            "n": 386,
+            "min": 231.15472412109375,
+            "p01": 246.4056396484375,
+            "median": 286.181640625,
+            "mean": 285.30645751953125,
+            "max": 315.48907470703125
+          },
+          "baseline_bias": 82.59090423583984,
+          "ctt": {
+            "n": 283,
+            "min": 216.74374389648438,
+            "p01": 238.82374572753906,
+            "median": 287.5093688964844,
+            "mean": 285.1002502441406,
+            "max": 296.8999938964844,
+            "minus_observed_mean": 82.54702758789062,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 386,
+            "min": 197.21249389648438,
+            "p01": 197.21249389648438,
+            "median": 239.49374389648438,
+            "mean": 238.51918029785156,
+            "max": 293.5406188964844,
+            "minus_observed_mean": 35.803619384765625,
+            "fraction_at_or_colder_than_observed": 0.15544041450777202
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 385,
+            "min": 208.5183563232422,
+            "p01": 208.67251586914062,
+            "median": 284.8480529785156,
+            "mean": 265.6478271484375,
+            "max": 298.99981689453125,
+            "minus_observed_mean": 62.924922943115234,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 385,
+            "min": 208.5183563232422,
+            "p01": 208.67251586914062,
+            "median": 284.8480529785156,
+            "mean": 265.6478576660156,
+            "max": 298.99981689453125,
+            "minus_observed_mean": 62.92496871948242,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 386,
+            "min": 196.56727600097656,
+            "p01": 196.62295532226562,
+            "median": 197.95260620117188,
+            "mean": 197.88812255859375,
+            "max": 199.17431640625,
+            "minus_observed_mean": -4.82744836807251,
+            "fraction_at_or_colder_than_observed": 0.9870466321243523
+          }
+        },
+        "obs_le200": {
+          "n": 42,
+          "observed": {
+            "n": 42,
+            "min": 192.98655700683594,
+            "p01": 193.06539916992188,
+            "median": 199.42440795898438,
+            "mean": 198.7171173095703,
+            "max": 199.9647674560547
+          },
+          "baseline_bt": {
+            "n": 42,
+            "min": 269.2278137207031,
+            "p01": 272.3914489746094,
+            "median": 297.0165710449219,
+            "mean": 292.6695861816406,
+            "max": 302.912109375
+          },
+          "baseline_bias": 93.95247650146484,
+          "ctt": {
+            "n": 18,
+            "min": 278.3218688964844,
+            "p01": 278.7794189453125,
+            "median": 287.2320251464844,
+            "mean": 285.8359680175781,
+            "max": 288.9781188964844,
+            "minus_observed_mean": 87.45297241210938,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "brick_min_cloudy_voxel_k": {
+            "n": 42,
+            "min": 209.74374389648438,
+            "p01": 209.74374389648438,
+            "median": 236.41561889648438,
+            "mean": 234.86988830566406,
+            "max": 251.80624389648438,
+            "minus_observed_mean": 36.15272903442383,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_cloudy_k_1e-06": {
+            "n": 21,
+            "min": 222.4923553466797,
+            "p01": 222.4972381591797,
+            "median": 287.0389709472656,
+            "mean": 279.65789794921875,
+            "max": 290.0453796386719,
+            "minus_observed_mean": 81.44054412841797,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_highest_cloudy_k_1e-06": {
+            "n": 21,
+            "min": 222.4923553466797,
+            "p01": 222.4972381591797,
+            "median": 287.0389709472656,
+            "mean": 279.65789794921875,
+            "max": 290.0453796386719,
+            "minus_observed_mean": 81.44054412841797,
+            "fraction_at_or_colder_than_observed": 0.0
+          },
+          "native_min_air_temperature_k": {
+            "n": 42,
+            "min": 196.85069274902344,
+            "p01": 196.88160705566406,
+            "median": 198.02093505859375,
+            "mean": 198.0204620361328,
+            "max": 198.42845153808594,
+            "minus_observed_mean": -0.696652352809906,
+            "fraction_at_or_colder_than_observed": 0.8333333333333334
+          }
+        }
+      },
+      "cold_area": {
+        "193": {
+          "observed": 5.5518543193426606e-06,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.0,
+          "native_min_q1e6": 0.0
+        },
+        "200": {
+          "observed": 0.00023317788141239174,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.21491783255607372,
+          "native_min_q1e6": 0.002465023317788141
+        },
+        "205": {
+          "observed": 0.0035254274927825893,
+          "baseline": 0.0,
+          "ctt": 0.0,
+          "brick_min_cloudy": 0.4644181656673329,
+          "native_min_q1e6": 0.017604930046635575
+        },
+        "220": {
+          "observed": 0.056057073062402846,
+          "baseline": 0.026510104374861204,
+          "ctt": 0.01846546746613369,
+          "brick_min_cloudy": 0.7781923162336221,
+          "native_min_q1e6": 0.21386298023539863
+        },
+        "235": {
+          "observed": 0.12044747945813902,
+          "baseline": 0.06930379746835443,
+          "ctt": 0.07123584277148567,
+          "brick_min_cloudy": 0.8523539862314012,
+          "native_min_q1e6": 0.2691094825671774
+        }
+      },
+      "minima_locations": {
+        "observed": {
+          "north_first_row": 163,
+          "column": 152,
+          "lat": 14.613951683044434,
+          "lon": -91.2489242553711,
+          "observed": 192.98655700683594,
+          "baseline": 299.16082763671875,
+          "ctt": null,
+          "brick_min_cloudy": 239.46249389648438,
+          "native_min_q1e6": 290.0453796386719,
+          "native_highest_q1e6": 290.0453796386719,
+          "native_highest_height_q1e6": 1929.523193359375,
+          "native_min_air": 198.03770446777344
+        },
+        "baseline": {
+          "north_first_row": 361,
+          "column": 432,
+          "lat": 9.230854034423828,
+          "lon": -83.46550750732422,
+          "observed": 292.3144836425781,
+          "baseline": 206.4167938232422,
+          "ctt": 208.52499389648438,
+          "brick_min_cloudy": 200.89999389648438,
+          "native_min_q1e6": 204.465087890625,
+          "native_highest_q1e6": 204.465087890625,
+          "native_highest_height_q1e6": 14333.103515625,
+          "native_min_air": 198.61106872558594
+        },
+        "ctt": {
+          "north_first_row": 360,
+          "column": 431,
+          "lat": 9.258291244506836,
+          "lon": -83.4933090209961,
+          "observed": 291.702392578125,
+          "baseline": 207.7173614501953,
+          "ctt": 207.71249389648438,
+          "brick_min_cloudy": 201.71249389648438,
+          "native_min_q1e6": 204.78195190429688,
+          "native_highest_q1e6": 204.78195190429688,
+          "native_highest_height_q1e6": 14333.5986328125,
+          "native_min_air": 198.6168212890625
+        },
+        "brick_min_cloudy_voxel_k": {
+          "north_first_row": 324,
+          "column": 108,
+          "lat": 10.24454402923584,
+          "lon": -92.47203063964844,
+          "observed": 210.11334228515625,
+          "baseline": 296.9028015136719,
+          "ctt": null,
+          "brick_min_cloudy": 196.08749389648438,
+          "native_min_q1e6": 244.54867553710938,
+          "native_highest_q1e6": 244.54867553710938,
+          "native_highest_height_q1e6": 9730.337890625,
+          "native_min_air": 196.0754852294922
+        },
+        "native_min_cloudy_k_1e-06": {
+          "north_first_row": 375,
+          "column": 297,
+          "lat": 8.846517562866211,
+          "lon": -87.21822357177734,
+          "observed": 295.45562744140625,
+          "baseline": 243.38677978515625,
+          "ctt": null,
+          "brick_min_cloudy": 196.46249389648438,
+          "native_min_q1e6": 196.880615234375,
+          "native_highest_q1e6": 196.880615234375,
+          "native_highest_height_q1e6": 15969.49609375,
+          "native_min_air": 196.4917449951172
+        }
+      },
+      "executable_check": {
+        "command": [
+          "C:\\Users\\drew\\simsat\\target\\release\\simsat-render-ir.exe",
+          "input=C:\\Users\\drew\\soma-render-work\\out\\simsat-main\\cache\\wrfout_d01_2026_09_04_21_00_00\\run.json",
+          "derived=ctt",
+          "view=topdown",
+          "resolution=native",
+          "ts=0",
+          "threads=6",
+          "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\ctt-final\\ctt-check-21z.png"
+        ],
+        "stdout": "DERIVEDSUMMARY file=ctt-check-21z.png field=ctt units=K view=topdown dims=474x380 canvas=none res=Model_native_(one_pixel_per_source_grid_cell) sat=goese in_domain_frac=0.244 min=207.712 max=303.525 median=275.191 wall_s=0.158",
+        "passed": true
+      }
+    }
+  ]
+}
