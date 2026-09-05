@@ -8,6 +8,22 @@ interleaved f32le RGB reflectance dump written by ``render_frame
 bands-out=...``. ABI Band 13 input is the north-first scalar f32le Kelvin plane
 written by ``render_ir bt-out=...``.
 
+``--input-kind f32le-rgb-unclipped`` accepts raw gray RGB values above one
+(e.g. directional glint) and NaN no-data without clipping either simulation or
+observation. It is a gray-RGB luminance diagnostic, NOT per-band ABI radiometry.
+The default ``f32le-rgb`` retains its historical [0,1] validation and clipping.
+
+``--input-kind abi-c01-c02-c03`` is a separate future-operator input contract:
+an NPZ containing independent ``cmi_c01 cmi_c02 cmi_c03`` reflectance-factor
+planes (rho_f, no cosine-of-solar-zenith normalization) and a binary ``valid``
+mask, all on the exact north-first reference grid. Optional ``valid_c01`` etc.
+and ``dqf_c01`` etc. restrict each band independently; reference DQF==0 is used
+where available and missing band DQF is explicitly reported. Optional binary
+``glint_mask`` in the synthetic NPZ supplies a geometry-derived glint region.
+This mode does not form RGB or synthetic green. SimSat's gray renderer does NOT
+currently emit these independent instrument-band planes; RGB channels must never
+be renamed to satisfy the contract.
+
 ``--synthetic-cloud-mask`` optionally takes the north-first u8 plane written by
 ``render_ir cloud-mask-out=...`` (0 clear, 1 = the model column carries total
 hydrometeor mixing ratio above 1e-6 kg/kg, 255 no-data) and adds three regimes,
@@ -79,9 +95,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input-kind",
-        choices=("auto", "png", "f32le-rgb", "f32le-scalar"),
+        choices=("auto", "png", "f32le-rgb", "f32le-rgb-unclipped", "abi-c01-c02-c03", "f32le-scalar"),
         default="auto",
-        help="synthetic encoding (default: infer from product and suffix)",
+        help="synthetic encoding (default: infer legacy encoding from product/suffix; select f32le-rgb-unclipped explicitly for sensor-fast-gray)",
     )
     parser.add_argument(
         "--source-manifest",
@@ -123,10 +139,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fss-scales must contain positive odd integers")
     if args.fss_thresholds:
         if args.product == "visible" and any(
-            not math.isfinite(value) or value < 0.0 or value > 1.0
+            not math.isfinite(value) or value < 0.0
+            or (value > 1.0 and args.input_kind not in ("f32le-rgb-unclipped", "abi-c01-c02-c03"))
             for value in args.fss_thresholds
         ):
-            parser.error("visible --fss-thresholds must be finite values in [0, 1]")
+            parser.error("visible --fss-thresholds must be finite and nonnegative; legacy RGB/PNG thresholds must also be <= 1")
         if args.product == "abi-band13" and any(
             not math.isfinite(value) or value < 100.0 or value > 400.0
             for value in args.fss_thresholds
@@ -134,7 +151,7 @@ def parse_args() -> argparse.Namespace:
             parser.error("abi-band13 --fss-thresholds must be finite Kelvin values in [100, 400]")
     if args.product == "visible" and args.input_kind == "f32le-scalar":
         parser.error("visible product does not accept --input-kind f32le-scalar")
-    if args.product == "abi-band13" and args.input_kind in ("png", "f32le-rgb"):
+    if args.product == "abi-band13" and args.input_kind in ("png", "f32le-rgb", "f32le-rgb-unclipped", "abi-c01-c02-c03"):
         parser.error("abi-band13 product requires --input-kind auto|f32le-scalar")
     return args
 
@@ -264,6 +281,14 @@ def load_synthetic(
             f"expected {expected_bytes} for {width}x{height}x3"
         )
     pixels = np.fromfile(path, dtype="<f4").reshape(height, width, 3).astype(np.float64)
+    if kind == "f32le-rgb-unclipped":
+        if np.any(np.isinf(pixels)):
+            raise RuntimeError(f"unclipped f32le RGB input {path.name} contains infinite values")
+        if not np.any(np.all(np.isfinite(pixels), axis=-1)):
+            raise RuntimeError(f"unclipped f32le RGB input {path.name} has no finite RGB pixels")
+        # Reflectance factor is directional and can exceed one; retain finite
+        # values (including negative diagnostic values) and NaN no-data verbatim.
+        return pixels
     if not np.all(np.isfinite(pixels)):
         raise RuntimeError(f"f32le RGB input {path.name} contains non-finite values")
     low = float(np.min(pixels))
@@ -445,6 +470,19 @@ def cloud_mask_input_record(path: Path) -> dict[str, Any]:
 def observed_rgb(
     np: Any, arrays: dict[str, Any], kind: str
 ) -> tuple[Any, dict[str, Any]]:
+    if kind == "f32le-rgb-unclipped":
+        red = np.asarray(arrays["cmi_c02"], dtype=np.float64)
+        blue = np.asarray(arrays["cmi_c01"], dtype=np.float64)
+        green = 0.45 * red + 0.10 * np.asarray(arrays["cmi_c03"], dtype=np.float64) + 0.45 * blue
+        return np.stack((red, green, blue), axis=-1), {
+            "name": "unclipped-gray-rgb-reflectance-diagnostic",
+            "synthetic": "unclipped SimSat gray RGB reflectance factor; finite values retained, NaN no-data",
+            "observed": "[C02, 0.45*C02 + 0.10*C03 + 0.45*C01, C01], no clipping or exposure",
+            "luminance": "Rec.709 coefficients 0.2126/0.7152/0.0722 in linear reflectance-factor space",
+            "limitation": "gray RGB and synthetic green are not independently SRF-integrated ABI C01/C02/C03 bands",
+            "validity": "jointly finite RGB and reference valid>0; synthetic cloud-mask no-data excluded when supplied",
+            "previews": "RGB previews clip to [0,1] then square-root; joint histogram shows [0,1] only; metrics remain unclipped",
+        }
     red = np.clip(np.asarray(arrays["cmi_c02"], dtype=np.float64), 0.0, 1.0)
     blue = np.clip(np.asarray(arrays["cmi_c01"], dtype=np.float64), 0.0, 1.0)
     green = np.clip(
@@ -1345,15 +1383,21 @@ def validate(
     finite = np.all(np.isfinite(observed), axis=-1) & np.all(
         np.isfinite(synthetic_rgb), axis=-1
     )
+    cloud_mask = None
+    if cloud_mask_path is not None:
+        cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape)
+        if kind == "f32le-rgb-unclipped":
+            finite &= cloud_mask != CLOUD_MASK_NO_DATA
     regimes = regime_masks(np, arrays, finite)
+    if kind == "f32le-rgb-unclipped" and cloud_mask is not None:
+        regimes["valid"]["definition"] += " and synthetic cloud mask != 255"
     valid = regimes["valid"]["mask"]
     if not np.any(valid):
         raise RuntimeError(
             "aligned ABI reference and synthetic input have no jointly valid pixels"
         )
     cloud_mask_summary = None
-    if cloud_mask_path is not None:
-        cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape)
+    if cloud_mask is not None:
         cloud_mask_summary = add_synthetic_cloud_regimes(np, regimes, cloud_mask)
     thresholds = list(
         thresholds or (DISPLAY_THRESHOLDS if kind == "png" else RAW_THRESHOLDS)
@@ -1362,8 +1406,8 @@ def validate(
 
     artifacts: dict[str, Any] = {}
     image_specs = {
-        "observed": rgb_u8(np, observed, valid, raw=kind == "f32le-rgb"),
-        "synthetic": rgb_u8(np, synthetic_rgb, valid, raw=kind == "f32le-rgb"),
+        "observed": rgb_u8(np, observed, valid, raw=kind in ("f32le-rgb", "f32le-rgb-unclipped")),
+        "synthetic": rgb_u8(np, synthetic_rgb, valid, raw=kind in ("f32le-rgb", "f32le-rgb-unclipped")),
     }
     difference, difference_scale = difference_u8(np, observed_y, synthetic_y, valid)
     image_specs["difference"] = difference
@@ -1482,6 +1526,150 @@ def validate(
         "valid_count": valid_count,
         "metric_space": metric_space["name"],
     }
+
+
+ABI_VISIBLE_BANDS = ("c01", "c02", "c03")
+
+
+def load_abi_band_synthetic(np: Any, path: Path, shape: tuple[int, int]) -> dict[str, Any]:
+    """Independent band planes only; no conversion from gray RGB is provided."""
+    try:
+        with np.load(path, allow_pickle=False) as loaded:
+            arrays = {key: np.asarray(loaded[key]) for key in loaded.files}
+    except Exception as error:
+        raise RuntimeError(f"cannot read independent ABI-band NPZ {path.name}: {error}") from error
+    required = [*(f"cmi_{band}" for band in ABI_VISIBLE_BANDS), "valid"]
+    missing = [key for key in required if key not in arrays]
+    if missing:
+        raise RuntimeError("independent ABI-band NPZ missing: " + ", ".join(missing))
+    for name, values in arrays.items():
+        if values.shape != shape:
+            raise RuntimeError(f"synthetic ABI array {name} shape {values.shape} does not match {shape}")
+        if values.dtype.kind not in "biuf":
+            raise RuntimeError(f"synthetic ABI array {name} must be numeric")
+        if np.any(np.isinf(values)):
+            raise RuntimeError(f"synthetic ABI array {name} contains infinity")
+        if name == "valid" or name.startswith("valid_") or name == "glint_mask":
+            if not np.all((values == 0) | (values == 1)):
+                raise RuntimeError(f"synthetic ABI mask {name} requires binary 0/1 values")
+    return arrays
+
+
+def validate_abi_bands(
+    synthetic_path: Path,
+    reference_path: Path,
+    output_dir: Path,
+    thresholds: list[float] | None,
+    scales: list[int],
+    source_manifest: Path | None,
+    cloud_mask_path: Path | None = None,
+) -> dict[str, Any]:
+    """Score independent rho_f planes per band; never reinterpret gray RGB as ABI."""
+    np, Image, _ = require_dependencies()
+    reference = load_reference(np, reference_path)
+    shape = reference["cmi_c02"].shape
+    synthetic = load_abi_band_synthetic(np, synthetic_path, shape)
+    cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape) if cloud_mask_path else None
+    thresholds = list(thresholds or RAW_THRESHOLDS)
+    report = {
+        "schema_version": 1,
+        "command": "simsat-validate-goes",
+        "product": "abi-c01-c02-c03",
+        "interpretation": (
+            "Independent band reflectance-factor collocation diagnostics; this input contract does not "
+            "certify that an upstream renderer integrates official SRFs or uses the correct satellite geometry. "
+            "The current SimSat gray RGB output is not a valid source for these independent planes."
+        ),
+        "metric_space": {
+            "name": "abi-per-band-reflectance-factor",
+            "quantity": "rho_f; no clipping, exposure, synthetic green, luminance or solar-zenith normalization",
+            "common_validity_limitation": (
+                "The supplied reference valid mask is honored for every band. Legacy aligned bundles "
+                "may derive it from C02 finite/DQF, so valid C01/C03 pixels outside that shared mask "
+                "cannot be recovered here. Supply geometric common coverage plus independent band "
+                "validity/DQF to avoid this inherited C02 selection."
+            ),
+            "previews": "per-band grayscale, clipped [0,1] then square-root; quantitative metrics use original values",
+        },
+        "grid": {"width": int(shape[1]), "height": int(shape[0]), "rows": "north-first"},
+        "inputs": {
+            "synthetic": {"file": synthetic_path.name, "sha256": sha256_file(synthetic_path),
+                          "kind": "abi-c01-c02-c03", "variables": sorted(synthetic)},
+            "aligned_abi": {"file": reference_path.name, "sha256": sha256_file(reference_path),
+                            "variables": sorted(reference)},
+        },
+        "bands": {}, "artifacts": {},
+        "source": public_source_manifest(source_manifest),
+        "provenance": {"script_file": Path(__file__).name, "script_sha256": sha256_file(Path(__file__)),
+                       "python": sys.version.split()[0], "numpy": np.__version__,
+                       "fss_thresholds": thresholds, "fss_scales_pixels": scales},
+    }
+    if cloud_mask_path:
+        report["inputs"]["synthetic_cloud_mask"] = cloud_mask_input_record(cloud_mask_path)
+    for band in ABI_VISIBLE_BANDS:
+        observed = np.asarray(reference[f"cmi_{band}"], dtype=np.float64)
+        simulated = np.asarray(synthetic[f"cmi_{band}"], dtype=np.float64)
+        finite = np.isfinite(observed) & np.isfinite(simulated) & (synthetic["valid"] == 1)
+        valid_key, dqf_key = f"valid_{band}", f"dqf_{band}"
+        quality = {}
+        for label, arrays in (("reference", reference), ("synthetic", synthetic)):
+            if valid_key in arrays:
+                finite &= np.asarray(arrays[valid_key]) == 1
+            if dqf_key in arrays:
+                finite &= np.asarray(arrays[dqf_key]) == 0
+            quality[label] = {
+                "band_validity": valid_key if valid_key in arrays else "not supplied; common valid mask applies",
+                "dqf": f"{dqf_key} == 0" if dqf_key in arrays else "not supplied; band quality is not asserted",
+            }
+        if cloud_mask is not None:
+            finite &= cloud_mask != CLOUD_MASK_NO_DATA
+        regimes = regime_masks(np, reference, finite)
+        valid = regimes["valid"]["mask"]
+        valid_count = int(np.sum(valid))
+        if not valid_count:
+            raise RuntimeError(f"independent ABI {band.upper()} has no jointly valid pixels")
+        regimes["valid"]["definition"] = (
+            f"reference valid>0 and synthetic valid==1 and jointly finite {band.upper()}; "
+            "per-band valid==1 and DQF==0 where supplied; cloud-mask no-data excluded"
+        )
+        cloud_summary = add_synthetic_cloud_regimes(np, regimes, cloud_mask) if cloud_mask is not None else None
+        if cloud_mask is None:
+            for name in ("both_cloudy", "observed_only_cloudy", "synthetic_only_cloudy"):
+                regimes[name] = {"available": False, "definition": name,
+                                 "unavailable_reason": "--synthetic-cloud-mask was not supplied"}
+        if "glint_mask" in synthetic:
+            regimes["glint"] = {"available": True, "definition": "valid and supplied geometric glint_mask == 1",
+                                "mask": valid & (synthetic["glint_mask"] == 1)}
+        else:
+            regimes["glint"] = {"available": False, "definition": "geometric glint region",
+                                "unavailable_reason": "no geometry-derived glint_mask supplied in synthetic NPZ"}
+        records = {}
+        for name, spec in regimes.items():
+            record = {key: value for key, value in spec.items() if key != "mask"}
+            if spec["available"]:
+                mask = spec["mask"]
+                count = int(np.sum(mask))
+                record.update(count=count, fraction_of_valid=count / valid_count,
+                              reflectance_factor=comparison_metrics(np, observed, simulated, mask))
+            records[name] = record
+        fss = fractions_skill_scores(np, observed, simulated, valid, thresholds, scales)
+        fss["event"] = "reflectance factor >= threshold"
+        entry = {"quality": quality, "regimes": records, "fractions_skill_score": fss}
+        if cloud_summary is not None:
+            entry["synthetic_cloud_mask"] = cloud_summary
+        report["bands"][band] = entry
+        for label, values in (("observed", observed), ("synthetic", simulated)):
+            relative = Path(f"{band}-{label}.png")
+            pixels = rgb_u8(np, np.repeat(values[..., None], 3, axis=-1), valid, raw=True)
+            report["artifacts"][f"{band}_{label}"] = {
+                "file": relative.as_posix(),
+                "sha256": immutable_write(output_dir / relative, png_bytes(Image, pixels)),
+            }
+    report_path = output_dir / "validation.json"
+    digest = immutable_write(report_path, json_bytes(report))
+    return {"status": "complete", "report": str(report_path), "report_sha256": digest,
+            "metric_space": report["metric_space"]["name"],
+            "valid_counts": {band: entry["regimes"]["valid"]["count"] for band, entry in report["bands"].items()}}
 
 
 def validate_thermal(
@@ -1709,6 +1897,63 @@ def self_check() -> int:
             for scale in threshold["scales"]
         )
 
+        # The sensor diagnostic must neither saturate directional glint nor turn
+        # NaN/no-data into dark pixels; the original raw encoding still rejects it.
+        unclipped_arrays = {key: values.copy() for key, values in arrays.items()}
+        unclipped_arrays["cmi_c02"][5, 20] = 1.8
+        unclipped_arrays["cmi_c01"][5, 20] = 1.4
+        unclipped_reference = root / "unclipped-aligned.npz"
+        np.savez_compressed(unclipped_reference, **unclipped_arrays)
+        unclipped_observed, _ = observed_rgb(np, unclipped_arrays, "f32le-rgb-unclipped")
+        unclipped_pixels = unclipped_observed.copy()
+        unclipped_pixels[5, 20, 0] += 0.2
+        unclipped_pixels[4, 5, :] = np.nan
+        unclipped_raw = root / "unclipped.bin"
+        unclipped_pixels.astype("<f4").tofile(unclipped_raw)
+        unclipped_mask = np.where(bcm > 0.5, CLOUD_MASK_CLOUDY, CLOUD_MASK_CLEAR).astype(np.uint8)
+        unclipped_mask[4, 6] = CLOUD_MASK_NO_DATA
+        unclipped_mask_path = root / "unclipped-cloud-mask.bin"
+        unclipped_mask.tofile(unclipped_mask_path)
+        unclipped_result = validate(
+            unclipped_raw, unclipped_reference, root / "unclipped-out",
+            "f32le-rgb-unclipped", [0.1, 1.2], [1, 3], None, unclipped_mask_path,
+        )
+        unclipped_report = json.loads(Path(unclipped_result["report"]).read_text(encoding="utf-8"))
+        unclipped_metrics = unclipped_report["regimes"]["valid"]["luminance"]
+        assert unclipped_metrics["count"] == int(np.sum(valid)) - 2
+        assert unclipped_metrics["observed"]["max"] > 1.0
+        assert unclipped_metrics["synthetic"]["max"] > unclipped_metrics["observed"]["max"]
+        expected_bias = 0.2126 * 0.2 / unclipped_metrics["count"]
+        assert abs(unclipped_metrics["bias"] - expected_bias) < 1.0e-7
+        assert unclipped_report["regimes"]["both_cloudy"]["count"] > 0
+        assert unclipped_report["metric_space"]["name"] == "unclipped-gray-rgb-reflectance-diagnostic"
+        assert unclipped_report["synthetic_cloud_mask"]["counts"]["valid"] == unclipped_metrics["count"]
+        invalid_raw = root / "invalid-rgb.bin"
+        probe = np.full((height, width, 3), 1.8, dtype="<f4")
+        probe.tofile(invalid_raw)
+        try:
+            load_synthetic(np, Image, invalid_raw, "f32le-rgb", (height, width))
+        except RuntimeError as error:
+            assert "[0,1]" in str(error)
+        else:
+            raise AssertionError("legacy RGB accepted reflectance above one")
+        probe[0, 0, 0] = np.inf
+        probe.tofile(invalid_raw)
+        try:
+            load_synthetic(np, Image, invalid_raw, "f32le-rgb-unclipped", (height, width))
+        except RuntimeError as error:
+            assert "infinite" in str(error)
+        else:
+            raise AssertionError("unclipped RGB accepted infinity")
+        probe[:] = np.nan
+        probe.tofile(invalid_raw)
+        try:
+            load_synthetic(np, Image, invalid_raw, "f32le-rgb-unclipped", (height, width))
+        except RuntimeError as error:
+            assert "no finite RGB pixels" in str(error)
+        else:
+            raise AssertionError("all-no-data RGB accepted")
+
         display_observed, _ = observed_rgb(np, arrays, "png")
         png = root / "synthetic.png"
         Image.fromarray(
@@ -1807,6 +2052,62 @@ def self_check() -> int:
             baseline = thermal_report if metric == "brightness_temperature_kelvin" else raw_report
             for name, record in baseline["regimes"].items():
                 assert report["regimes"][name] == record, name
+        # Independent ABI band planes: unequal band errors, band-specific NaN,
+        # DQF and validity prove that no RGB mixing or cross-band mask is used.
+        band_reference_arrays = {key: values.copy() for key, values in arrays.items()}
+        band_reference_arrays["cmi_c01"][5, 20] = 1.4
+        band_reference_arrays["dqf_c02"] = np.zeros(shape=(height, width), dtype=np.uint8)
+        band_reference_arrays["dqf_c02"][3, 6] = 1
+        band_reference = root / "band-reference.npz"
+        np.savez_compressed(band_reference, **band_reference_arrays)
+        band_arrays = {f"cmi_{band}": band_reference_arrays[f"cmi_{band}"].astype(np.float64) + delta
+                       for band, delta in zip(ABI_VISIBLE_BANDS, (0.01, 0.02, 0.03))}
+        band_arrays["valid"] = np.ones((height, width), dtype=np.uint8)
+        band_arrays["cmi_c01"][3:5, 5] = np.nan
+        band_arrays["valid_c03"] = np.ones((height, width), dtype=np.uint8)
+        band_arrays["valid_c03"][3, 7] = 0
+        band_arrays["glint_mask"] = np.zeros((height, width), dtype=np.uint8)
+        band_arrays["glint_mask"][5, 20] = 1
+        band_synthetic = root / "independent-bands.npz"
+        np.savez_compressed(band_synthetic, **band_arrays)
+        band_cloud_mask = np.where(bcm > 0.5, CLOUD_MASK_CLOUDY, CLOUD_MASK_CLEAR).astype(np.uint8)
+        band_cloud_mask[3, 8] = CLOUD_MASK_NO_DATA
+        band_cloud_mask_path = root / "band-cloud-mask.bin"
+        band_cloud_mask.tofile(band_cloud_mask_path)
+        band_result = validate_abi_bands(
+            band_synthetic, band_reference, root / "band-out", [0.1, 1.2], [1, 3], None, band_cloud_mask_path,
+        )
+        band_report = json.loads(Path(band_result["report"]).read_text(encoding="utf-8"))
+        for band, expected_bias, lost_count in zip(ABI_VISIBLE_BANDS, (0.01, 0.02, 0.03), (3, 2, 2)):
+            entry = band_report["bands"][band]
+            metrics = entry["regimes"]["valid"]["reflectance_factor"]
+            assert abs(metrics["bias"] - expected_bias) < 1.0e-10
+            assert metrics["count"] == int(np.sum(valid)) - lost_count
+            assert "luminance" not in entry["regimes"]["valid"]
+            assert entry["regimes"]["both_cloudy"]["count"] > 0
+            assert entry["regimes"]["glint"]["count"] == 1
+            assert abs(entry["regimes"]["glint"]["reflectance_factor"]["bias"] - expected_bias) < 1.0e-10
+        assert band_report["bands"]["c01"]["regimes"]["valid"]["reflectance_factor"]["observed"]["max"] > 1.0
+        assert "not supplied" in band_report["bands"]["c01"]["quality"]["reference"]["dqf"]
+        assert band_report["bands"]["c02"]["quality"]["reference"]["dqf"] == "dqf_c02 == 0"
+        missing_band = root / "missing-band.npz"
+        np.savez_compressed(missing_band, cmi_c01=c01, cmi_c02=c02, valid=valid)
+        try:
+            load_abi_band_synthetic(np, missing_band, (height, width))
+        except RuntimeError as error:
+            assert "missing: cmi_c03" in str(error)
+        else:
+            raise AssertionError("incomplete band planes accepted")
+        bad_band_arrays = {key: values.copy() for key, values in band_arrays.items()}
+        bad_band_arrays["valid"][3, 5] = 255
+        np.savez_compressed(missing_band, **bad_band_arrays)
+        try:
+            load_abi_band_synthetic(np, missing_band, (height, width))
+        except RuntimeError as error:
+            assert "binary 0/1" in str(error)
+        else:
+            raise AssertionError("invalid band validity mask accepted")
+
         bad_mask = root / "bad-mask.bin"
         bad_mask.write_bytes(bytes([7]) * (height * width))
         try:
@@ -1844,6 +2145,10 @@ def self_check() -> int:
                 "self_check": "passed",
                 "png_exact_grid": "passed",
                 "f32le_layout_and_identity": "passed",
+                "unclipped_rgb_glint_nan_and_mask_intersection": "passed",
+                "unclipped_rgb_infinity_and_no_data_rejection": "passed",
+                "independent_abi_bands_quality_validity_and_cloud_regimes": "passed",
+                "independent_abi_bands_unclipped_glint_and_no_rgb_mixing": "passed",
                 "regime_masks": "passed",
                 "fss_identity": "passed",
                 "shape_mismatch_error": "passed",
@@ -1871,6 +2176,13 @@ def main() -> int:
                 args.output_dir.resolve(),
                 args.fss_thresholds,
                 args.fss_scales,
+                args.source_manifest.resolve() if args.source_manifest else None,
+                args.synthetic_cloud_mask.resolve() if args.synthetic_cloud_mask else None,
+            )
+        elif args.input_kind == "abi-c01-c02-c03":
+            result = validate_abi_bands(
+                args.synthetic.resolve(), args.reference.resolve(), args.output_dir.resolve(),
+                args.fss_thresholds, args.fss_scales,
                 args.source_manifest.resolve() if args.source_manifest else None,
                 args.synthetic_cloud_mask.resolve() if args.synthetic_cloud_mask else None,
             )
