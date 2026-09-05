@@ -220,6 +220,7 @@ struct Uniforms {
 @group(0) @binding(7) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(8) var multiscatter_lut: texture_2d<f32>;
 @group(0) @binding(9) var ambient_lut: texture_2d<f32>;
+@group(0) @binding(17) var linear_albedo_tex: texture_2d<f32>;
 @group(0) @binding(10) var volume: texture_3d<f32>;
 @group(0) @binding(11) var occupancy: texture_3d<f32>;
 @group(0) @binding(12) var sun_od: texture_2d<f32>;
@@ -1618,12 +1619,22 @@ fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_sha
     }
     normal = normalize(normal);
     var albedo = srgb_to_linear(base);
+    let albedo_coord = min(coord, vec2<i32>(textureDimensions(linear_albedo_tex)) - vec2<i32>(1));
+    let spectral = textureLoad(linear_albedo_tex, albedo_coord, 0);
+    if (spectral.a > 0.5) {
+        albedo = spectral.rgb;
+        is_water = false;
+    } else if (spectral.a < -0.5) {
+        is_water = true;
+    }
     if (is_water) {
         albedo = albedo * u.p1.y;
     } else {
         // True-color land vibrancy (refinement pass): luminance-preserving saturation.
         let y = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
-        albedo = max(vec3<f32>(y) + (albedo - vec3<f32>(y)) * LAND_VIBRANCY, vec3<f32>(0.0));
+        if (spectral.a <= 0.5) {
+            albedo = max(vec3<f32>(y) + (albedo - vec3<f32>(y)) * LAND_VIBRANCY, vec3<f32>(0.0));
+        }
     }
     let sun_enu = vec3<f32>(light.x, light.y, light.z);
     let sun_elev = light.w;

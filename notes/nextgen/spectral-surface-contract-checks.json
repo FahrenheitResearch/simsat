@@ -1,0 +1,32 @@
+[
+  {
+    "check": "valid-export-round-trip",
+    "passed": true,
+    "expected_rejection": null
+  },
+  {
+    "check": "changed-data-rejected",
+    "passed": true,
+    "expected_rejection": "checksum mismatch"
+  },
+  {
+    "check": "truncated-data-rejected",
+    "passed": true,
+    "expected_rejection": "size mismatch"
+  },
+  {
+    "check": "invalid-day-rejected",
+    "passed": true,
+    "expected_rejection": "invalid spectral surface contract"
+  },
+  {
+    "check": "out-of-range-reflectance-rejected",
+    "passed": true,
+    "expected_rejection": "invalid surface albedo"
+  },
+  {
+    "check": "missing-land-spectrum-rejected",
+    "passed": true,
+    "expected_rejection": "incomplete land spectrum"
+  }
+]

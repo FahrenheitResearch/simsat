@@ -1,0 +1,23 @@
+[
+  {
+    "band": "c01",
+    "checked_spectra": 193,
+    "max_absolute_error": 1.3863537956515515e-09,
+    "water_is_nan": true,
+    "land_count": 69469
+  },
+  {
+    "band": "c02",
+    "checked_spectra": 193,
+    "max_absolute_error": 2.7762132037700837e-09,
+    "water_is_nan": true,
+    "land_count": 69469
+  },
+  {
+    "band": "c03",
+    "checked_spectra": 193,
+    "max_absolute_error": 1.488958262241269e-08,
+    "water_is_nan": true,
+    "land_count": 69469
+  }
+]

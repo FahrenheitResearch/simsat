@@ -1,0 +1,48 @@
+{
+  "base_map": {
+    "observed_clear_land": {
+      "count": 19936,
+      "bias": 0.008871921278840738,
+      "mae": 0.06312744347765453,
+      "synthetic_mean": 0.07625184208154678,
+      "observed_mean": 0.06737991786831116
+    },
+    "observed_and_model_clear_land": {
+      "count": 12495,
+      "bias": -0.031702013782149326,
+      "mae": 0.0342816703253565,
+      "synthetic_mean": 0.034805212169885635,
+      "observed_mean": 0.06650722592073001
+    },
+    "observed_clear_water": {
+      "count": 30022,
+      "bias": -0.007700877496567997,
+      "mae": 0.038197813205286806,
+      "synthetic_mean": 0.040053557604551315,
+      "observed_mean": 0.047754437206165186
+    }
+  },
+  "spectral_land": {
+    "observed_clear_land": {
+      "count": 19936,
+      "bias": 0.01638520418472585,
+      "mae": 0.05612261599303135,
+      "synthetic_mean": 0.08376511931419373,
+      "observed_mean": 0.06737991786831116
+    },
+    "observed_and_model_clear_land": {
+      "count": 12495,
+      "bias": -0.022665319082679544,
+      "mae": 0.025439510921448954,
+      "synthetic_mean": 0.043841905891895294,
+      "observed_mean": 0.06650722592073001
+    },
+    "observed_clear_water": {
+      "count": 30022,
+      "bias": -0.007700877496567997,
+      "mae": 0.038197813205286806,
+      "synthetic_mean": 0.040053557604551315,
+      "observed_mean": 0.047754437206165186
+    }
+  }
+}

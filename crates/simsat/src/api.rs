@@ -590,6 +590,9 @@ pub struct RenderParams {
     pub cache: PathBuf,
     /// The ground-texture source (visible only).
     pub bluemarble: BlueMarble,
+    /// Exact-grid spectral black-sky land albedo, used as a Lambertian approximation.
+    /// The plain visible/RGB-reflectance paths share float CPU/GPU surface inputs.
+    pub spectral_surface: Option<PathBuf>,
     /// For the IR product: also produce a colored RGB via this enhancement (the raw Kelvin
     /// BT plane is always returned). `None` = BT only.
     pub ir_enhancement: Option<IrEnhancement>,
@@ -702,6 +705,7 @@ impl RenderParams {
             sun_override: None,
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
+            spectral_surface: None,
             ir_enhancement: None,
             thermal_sensor: ThermalSensor::FastGray,
             instrument_footprint: InstrumentFootprint::Off,
@@ -894,6 +898,8 @@ pub enum GroundSource {
     FlatAlbedo(String),
     /// Explicit seasonal NASA BMNG Base Map (no added topographic shading).
     SeasonalBaseMap,
+    /// Spectral land albedo with the configured base map retained for water.
+    SpectralLand,
     /// A user-named single-file ground texture ([`BlueMarble::SingleFile`]).
     SingleFile,
 }
@@ -908,6 +914,7 @@ impl GroundSource {
             Self::FlatAlbedo(_) => "flat-albedo",
             Self::SingleFile => "single-file",
             Self::SeasonalBaseMap => "seasonal-base-map",
+            Self::SpectralLand => "spectral-land-lambertian",
         }
     }
 }
@@ -996,6 +1003,13 @@ struct SceneSource {
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
     let product = product.canonical();
+    if params.spectral_surface.is_some()
+        && !matches!(product, Product::VisibleRgb | Product::RgbReflectance)
+    {
+        return Err(
+            "spectral-surface currently supports plain VisibleRgb/RgbReflectance only".into(),
+        );
+    }
     if params.perspective_terrain
         && (params.backend != RenderBackend::Cpu
             || !matches!(
@@ -1438,8 +1452,54 @@ fn render_visible_scene(
 
     // Ground texture (a SingleFile that fails to load is a HARD error; a seasonal
     // failure degrades to flat albedo but is REPORTED, never silent).
-    let (bluemarble, ground_source, ground_status) =
+    let (bluemarble, mut ground_source, mut ground_status) =
         resolve_bluemarble(params, &raster, time.month, time.day)?;
+    let linear_albedo = if let Some(path) = &params.spectral_surface {
+        let surface = crate::spectral_surface::SpectralSurface::load(path)?;
+        let days = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        if time.month == 2 && time.day == 29 {
+            return Err(
+                "spectral surface requires an explicit non-leap climatology date for February 29"
+                    .into(),
+            );
+        }
+        let doy = days[..(time.month - 1) as usize].iter().sum::<u32>() + time.day;
+        if surface.climatology_doy() != doy {
+            return Err(format!(
+                "spectral surface climatology day {} differs from frame day {doy}",
+                surface.climatology_doy()
+            ));
+        }
+        let (mut rgba, error) =
+            surface.raster_rgba(nx, ny, &brick.landmask, &raster, |la, lo| {
+                georef.forward(la, lo)
+            })?;
+        // Model snow overlays the climatological base in linear reflectance space.
+        if let Some(snowh) = &brick.snowh {
+            for (pixel, texel) in rgba.chunks_exact_mut(4).enumerate() {
+                if texel[3] > 0.5 {
+                    let i = (raster.grid_i[pixel] as f64)
+                        .round()
+                        .clamp(0.0, (nx - 1) as f64) as usize;
+                    let j = (raster.grid_j[pixel] as f64)
+                        .round()
+                        .clamp(0.0, (ny - 1) as f64) as usize;
+                    let snow = snow_fraction(snowh[j * nx + i] as f64) as f32;
+                    for (value, snow_srgb) in
+                        texel[..3].iter_mut().zip(crate::render::SNOW_ALBEDO_SRGB)
+                    {
+                        *value =
+                            *value * (1.0 - snow) + crate::render::srgb_to_linear(snow_srgb) * snow;
+                    }
+                }
+            }
+        }
+        ground_status.push(format!("spectral land: {}; climatology day={doy}; max registration error={error:.6} model cells; RGB=680/550/440nm; black-sky albedo used as Lambertian approximation; water source={}", path.display(), ground_source.slug()));
+        ground_source = GroundSource::SpectralLand;
+        Some(rgba)
+    } else {
+        None
+    };
 
     // Per-pixel LUTs (geo lookup + light); override the light plane for a synthetic sun.
     let (lut_geo, mut lut_light) = gpu::build_luts(&raster, bluemarble.as_ref(), nx, ny, &solar);
@@ -1590,6 +1650,7 @@ fn render_visible_scene(
         &lut_geo,
         &lut_light,
         bluemarble.as_ref(),
+        linear_albedo.as_deref(),
         &normals,
         &horizon_map,
         raster.nx,
@@ -1609,6 +1670,7 @@ fn render_visible_scene(
             georef,
             &raster,
             bluemarble.as_ref(),
+            linear_albedo.as_deref(),
             &lut_geo,
             &lut_light,
             &normals,
@@ -2004,6 +2066,7 @@ fn render_gpu_visible_frame(
     georef: &GridGeoref,
     raster: &SurfaceRaster,
     bluemarble: Option<&bluemarble::BlueMarbleCrop>,
+    linear_albedo: Option<&[f32]>,
     lut_geo: &[f32],
     lut_light: &[f32],
     normals: &[[f32; 3]],
@@ -2075,6 +2138,7 @@ fn render_gpu_visible_frame(
         normals_rgba: &normals_rgba,
         landmask_r8: &landmask_r8,
         bluemarble,
+        linear_albedo,
         transmittance_lut: &luts.transmittance.data,
         multiscatter_lut: &luts.multiscatter.data,
         ambient_lut: &ambient_lut,
@@ -3075,6 +3139,7 @@ fn render_perspective_scene(
         &lut_geo,
         &lut_light,
         bluemarble.as_ref(),
+        None,
         &normals,
         &horizon_map,
         raster.nx,
@@ -3501,6 +3566,7 @@ fn make_assemble<'a>(
     lut_geo: &'a [f32],
     lut_light: &'a [f32],
     bm: Option<&'a bluemarble::BlueMarbleCrop>,
+    linear_albedo: Option<&'a [f32]>,
     normals: &'a [[f32; 3]],
     horizon_map: &'a HorizonMap,
     rnx: usize,
@@ -3567,6 +3633,9 @@ fn make_assemble<'a>(
         SurfacePixel {
             on_earth: true,
             base_srgb: base,
+            linear_albedo: linear_albedo.and_then(|v| {
+                (v[idx * 4 + 3] > 0.5).then(|| [v[idx * 4], v[idx * 4 + 1], v[idx * 4 + 2]])
+            }),
             normal_enu,
             sun_enu,
             sun_elev_deg: l[3],

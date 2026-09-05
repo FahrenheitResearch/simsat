@@ -438,6 +438,8 @@ pub struct SurfaceFrameInputs<'a> {
     pub landmask_r8: &'a [u8],
     /// The Blue Marble crop, or `None` to render with the flat albedo.
     pub bluemarble: Option<&'a BlueMarbleCrop>,
+    /// Per-output-pixel linear RGB albedo and land/water validity (+1/-1/0).
+    pub linear_albedo: Option<&'a [f32]>,
     /// Transmittance LUT, `256*64*4` f32 RGBA (optics config).
     pub transmittance_lut: &'a [f32],
     /// Multiple-scattering LUT, `32*32*4` f32 RGBA (optics config).
@@ -447,6 +449,22 @@ pub struct SurfaceFrameInputs<'a> {
     pub ambient_n: u32,
     /// The packed per-frame uniform.
     pub uniforms: SurfaceUniforms,
+}
+
+fn upload_linear_albedo(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    values: Option<&[f32]>,
+) -> wgpu::Texture {
+    match values {
+        Some(values) => {
+            assert_eq!(values.len(), width as usize * height as usize * 4);
+            upload_rgba32f(device, queue, width, height, values, "linear-land-albedo")
+        }
+        None => upload_rgba32f(device, queue, 1, 1, &[0.0; 4], "linear-albedo-disabled"),
+    }
 }
 
 impl SurfaceResources {
@@ -533,6 +551,10 @@ impl SurfaceResources {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
+                    ..non_filterable
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
                     ..non_filterable
                 },
             ],
@@ -642,6 +664,7 @@ impl SurfaceResources {
         );
 
         // Blue Marble crop (or a 1x1 gray dummy when absent).
+        let linear_albedo_tex = upload_linear_albedo(device, queue, w, h, inputs.linear_albedo);
         let bm_tex = match inputs.bluemarble {
             Some(bm) => upload_rgba8(device, queue, bm.width, bm.height, &bm.rgba, "bluemarble"),
             None => {
@@ -694,6 +717,10 @@ impl SurfaceResources {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(&view(&ambient_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&view(&linear_albedo_tex)),
                 },
             ],
         });
@@ -1761,6 +1788,7 @@ impl CloudPassResources {
                 tex2d(14, false), // sh_ambient (Rgba32Float)
                 tex2d(15, false), // sun_od_dist (R32Float)
                 tex2d(16, false), // per-pixel Top-down local-up ray LUT (Rgba32Float)
+                tex2d(17, false), // per-output linear land albedo (Rgba32Float)
             ],
         });
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1977,6 +2005,7 @@ impl CloudPassResources {
         );
         let normal_tex = upload_rgba8(device, queue, s.nx, s.ny, s.normals_rgba, "normals");
         let landmask_tex = upload_r8(device, queue, s.nx, s.ny, s.landmask_r8, "landmask");
+        let linear_albedo_tex = upload_linear_albedo(device, queue, w, h, s.linear_albedo);
         let bm_tex = match s.bluemarble {
             Some(bm) => upload_rgba8(device, queue, bm.width, bm.height, &bm.rgba, "bluemarble"),
             None => {
@@ -2129,6 +2158,10 @@ impl CloudPassResources {
                 wgpu::BindGroupEntry {
                     binding: 16,
                     resource: wgpu::BindingResource::TextureView(&view(&ray_lut_tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: wgpu::BindingResource::TextureView(&view(&linear_albedo_tex)),
                 },
             ],
         });
@@ -2762,6 +2795,7 @@ mod tests {
             normals_rgba: &normals,
             landmask_r8: &landmask,
             bluemarble: None,
+            linear_albedo: None,
             transmittance_lut: &transmittance,
             multiscatter_lut: &multiscatter,
             ambient_lut: &ambient,
@@ -2892,6 +2926,7 @@ mod tests {
                 normals_rgba: &[],
                 landmask_r8: &[],
                 bluemarble: None,
+                linear_albedo: None,
                 transmittance_lut: &[],
                 multiscatter_lut: &[],
                 ambient_lut: &[],

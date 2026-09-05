@@ -221,3 +221,5 @@ mod tests {
         assert!(SSB_MAGIC.iter().all(u8::is_ascii));
     }
 }
+
+pub mod spectral_surface;

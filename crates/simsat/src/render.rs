@@ -620,6 +620,8 @@ pub struct SurfacePixel {
     pub on_earth: bool,
     /// Base surface colour (sRGB `[0,1]`): the Blue Marble texel or flat albedo.
     pub base_srgb: [f32; 3],
+    /// Optional linear spectral land albedo; bypasses image gamma decoding.
+    pub linear_albedo: Option<[f32; 3]>,
     /// Terrain normal in the local ENU basis (up if flat / outside the domain).
     pub normal_enu: [f32; 3],
     /// Unit sun direction in the local ENU basis.
@@ -659,6 +661,7 @@ impl Default for SurfacePixel {
         Self {
             on_earth: false,
             base_srgb: [0.0, 0.0, 0.0],
+            linear_albedo: None,
             normal_enu: [0.0, 0.0, 1.0],
             sun_enu: [0.0, 0.0, 1.0],
             sun_elev_deg: 0.0,
@@ -1514,9 +1517,18 @@ pub fn surface_toa_radiance_at_distance(
         srgb_to_linear(base[1]) as f64 * scale,
         srgb_to_linear(base[2]) as f64 * scale,
     ];
+    if !px.is_water
+        && let Some(value) = px.linear_albedo
+    {
+        albedo = value.map(f64::from);
+    }
     // True-color land vibrancy (refinement pass): boost the LAND albedo saturation so
     // vegetation reads vivid green. Water is excluded (dark ocean must stay dark).
-    if ctx.params.display_calibration && !px.is_water && LAND_VIBRANCY != 1.0 {
+    if ctx.params.display_calibration
+        && !px.is_water
+        && px.linear_albedo.is_none()
+        && LAND_VIBRANCY != 1.0
+    {
         albedo = scale_saturation(albedo, LAND_VIBRANCY);
     }
 

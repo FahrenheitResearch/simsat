@@ -1,0 +1,49 @@
+[
+  {
+    "name": "basemap-control-final",
+    "command": [
+      "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+      "input=C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_21_00_00",
+      "timestep=0",
+      "cache=C:\\Users\\drew\\soma-render-work\\out\\simsat-nextgen-realism-geo\\21z\\cache",
+      "sat=goes-east",
+      "resolution=native",
+      "threads=6",
+      "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\hamster-engine-band-audit\\21Z-basemap-control-final.png",
+      "intent=display",
+      "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+      "view=geo",
+      "raster=model-grid",
+      "geo-navigation=goes-r-abi",
+      "output-transform=srgb"
+    ],
+    "seconds": 113.13588419998996,
+    "binary_sha256": "b9aac831a4b0fc42e385195596952f07b8eff6456387ac6448d2034b2ec28009",
+    "png_sha256": "e1600ad20044cfd37bf754d1b026c8695fd29f7a2dac8303bfab8014c99a9eae",
+    "byte_identical_to": "previous committed Earth daylight image"
+  },
+  {
+    "name": "spectral-land-final",
+    "command": [
+      "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+      "input=C:\\Users\\drew\\soma-render-work\\data\\d01v\\wrfout_d01_2026-09-04_21_00_00",
+      "timestep=0",
+      "cache=C:\\Users\\drew\\soma-render-work\\out\\simsat-nextgen-realism-geo\\21z\\cache",
+      "sat=goes-east",
+      "resolution=native",
+      "threads=6",
+      "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\hamster-engine-band-audit\\21Z-spectral-land-final.png",
+      "intent=display",
+      "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+      "view=geo",
+      "raster=model-grid",
+      "geo-navigation=goes-r-abi",
+      "output-transform=srgb",
+      "spectral-surface=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\hamster-engine-surface\\surface.json"
+    ],
+    "seconds": 114.37048570002662,
+    "binary_sha256": "b9aac831a4b0fc42e385195596952f07b8eff6456387ac6448d2034b2ec28009",
+    "png_sha256": "7e9f52d5d6501d1c2004d87c6664644ef25c109fd581ab901db9ecc8781251e5",
+    "byte_identical_to": "spectral pilot"
+  }
+]

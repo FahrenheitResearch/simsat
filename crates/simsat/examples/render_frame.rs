@@ -77,6 +77,7 @@
 //!   twilight-surface-recovery-max-gain=<f> bounded gain (default 4.0).
 //!   cache=<dir>        Brick cache root + seasonal Blue Marble cache.
 //!   bluemarble=<path>  OPTIONAL single-file Blue Marble override (default seasonal pack).
+//!   spectral-surface=<surface.json>  Exact-grid float land spectra; Lambertian approximation.
 //!   bluemarble-base-map=<dir>  Explicit unshaded NASA monthly base maps (strict local loading).
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
 //!   bluemarble-download=<b>  on|off lazy month fetch (default on).
@@ -246,6 +247,7 @@ struct Opts {
     cache: PathBuf,
     bluemarble: Option<PathBuf>,
     bluemarble_base_map: Option<PathBuf>,
+    spectral_surface: Option<PathBuf>,
     bluemarble_month: Option<u32>,
     bluemarble_download: bool,
     view: ViewMode,
@@ -1050,6 +1052,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         // Visible products never carry the thermal-only condensate cloud mask.
         condensate_cloud_mask_kg_kg: None,
         raster_override: None,
+        spectral_surface: opts.spectral_surface.clone(),
         ground_gain: opts.ground_gain,
         cloud_softclip: opts.cloud_softclip,
         cloud_highlight_max: opts.cloud_highlight_max,
@@ -1217,6 +1220,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut cache = ingest::default_cache_dir();
     let mut bluemarble: Option<PathBuf> = None;
     let mut bluemarble_base_map: Option<PathBuf> = None;
+    let mut spectral_surface: Option<PathBuf> = None;
     let mut bluemarble_month: Option<u32> = None;
     let mut bluemarble_download = true;
     let mut view = ViewMode::Geostationary;
@@ -1497,6 +1501,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "cache" => cache = PathBuf::from(v),
             "bluemarble" | "bm" => bluemarble = Some(PathBuf::from(v)),
             "bluemarble-base-map" => bluemarble_base_map = Some(PathBuf::from(v)),
+            "spectral-surface" => spectral_surface = Some(PathBuf::from(v)),
             "bluemarble-month" | "bm-month" | "month" => {
                 let m: u32 = v
                     .parse()
@@ -1685,6 +1690,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         cache,
         bluemarble,
         bluemarble_base_map,
+        spectral_surface,
         bluemarble_month,
         bluemarble_download,
         view,
@@ -1917,6 +1923,7 @@ fn print_usage() {
          \x20 cache=<dir>        brick cache root + seasonal Blue Marble cache\n\
          \x20 bluemarble=<path>  single-file Blue Marble override (default: seasonal pack)\n\
          \x20 output-transform=<name>  abi-reflectance (default) | srgb (display only)\n\
+         \x20 spectral-surface=<surface.json>  float spectral land albedo; Lambertian approximation\n\
          \x20 bluemarble-base-map=<dir>  unshaded NASA monthly base maps (strict local loading)\n\
          \x20 bluemarble-month=<MM>  force month 1..=12 (default: day-of-year blend)\n\
          \x20 bluemarble-download=<b>  on|off lazy month fetch (default on)\n\

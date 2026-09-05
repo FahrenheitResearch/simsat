@@ -792,6 +792,7 @@ fn surface_inputs(prep: &PreparedRender) -> SurfaceFrameInputs<'_> {
         normals_rgba: &prep.normals_rgba,
         landmask_r8: &prep.landmask_r8,
         bluemarble: prep.bluemarble.as_ref().map(|a| &a.0),
+        linear_albedo: None,
         transmittance_lut: &prep.transmittance_lut,
         multiscatter_lut: &prep.multiscatter_lut,
         ambient_lut: &prep.ambient_lut,
@@ -7400,6 +7401,7 @@ fn prepare_render(
             SurfacePixel {
                 on_earth: true,
                 base_srgb: base,
+                linear_albedo: None,
                 normal_enu,
                 sun_enu,
                 sun_elev_deg: l[3],
