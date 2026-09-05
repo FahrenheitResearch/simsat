@@ -1795,6 +1795,150 @@ pub fn build_perspective_raster(
     raster
 }
 
+/// Native bilinear HGT intersection for the opt-in CPU perspective path.
+/// Returns eye-to-ground distances (NaN for sky). Outside the model footprint
+/// the fallback is sea level; negative HGT is clamped to the atmosphere sphere.
+/// Numerical tracing uses at most 1/8 horizontal grid pitch, with slope-guided
+/// refinement near ground and 1 cm bisection. These are integration tolerances,
+/// not physics/appearance parameters. Sub-centimetre grazing relief is unresolved.
+pub fn build_perspective_terrain_raster(
+    basis: &PerspectiveBasis,
+    georef: &GridGeoref,
+    nx: usize,
+    ny: usize,
+    hgt: &[f32],
+    horizontal_pitch_m: f64,
+) -> Result<(SurfaceRaster, Vec<f64>), String> {
+    use rayon::prelude::*;
+    if nx < 2
+        || ny < 2
+        || hgt.len() != nx * ny
+        || hgt.iter().any(|v| !v.is_finite())
+        || !horizontal_pitch_m.is_finite()
+        || horizontal_pitch_m < 1.0
+    {
+        return Err(
+            "terrain perspective requires finite native HGT and horizontal spacing >= 1 m".into(),
+        );
+    }
+    let height = |i: f64, j: f64| -> f64 {
+        if !(0.0..=(nx - 1) as f64).contains(&i) || !(0.0..=(ny - 1) as f64).contains(&j) {
+            return 0.0;
+        }
+        let x = (i.floor() as usize).min(nx - 2);
+        let y = (j.floor() as usize).min(ny - 2);
+        let (fx, fy) = (i - x as f64, j - y as f64);
+        let a = (hgt[y * nx + x] as f64).max(0.0) * (1.0 - fx)
+            + (hgt[y * nx + x + 1] as f64).max(0.0) * fx;
+        let b = (hgt[(y + 1) * nx + x] as f64).max(0.0) * (1.0 - fx)
+            + (hgt[(y + 1) * nx + x + 1] as f64).max(0.0) * fx;
+        a * (1.0 - fy) + b * fy
+    };
+    let sample = |p: [f64; 3]| {
+        let r = len3(p);
+        let lat = (p[2] / r).clamp(-1.0, 1.0).asin().to_degrees();
+        let lon = p[1].atan2(p[0]).to_degrees();
+        let (i, j) = georef.forward(lat, lon);
+        (r - R_EARTH - height(i, j), lat, lon, i, j)
+    };
+    if sample(basis.eye).0 <= 0.01 {
+        return Err(
+            "perspective eye must be above the native HGT terrain (eye altitude is metres MSL)"
+                .into(),
+        );
+    }
+    let max_h = hgt.iter().copied().fold(0.0f32, f32::max) as f64;
+    let (mut max_di, mut max_dj) = (0.0f64, 0.0f64);
+    for j in 0..ny {
+        for i in 0..nx {
+            if i + 1 < nx {
+                max_di = max_di.max((hgt[j * nx + i + 1] - hgt[j * nx + i]).abs() as f64);
+            }
+            if j + 1 < ny {
+                max_dj = max_dj.max((hgt[(j + 1) * nx + i] - hgt[j * nx + i]).abs() as f64);
+            }
+        }
+    }
+    let slope = max_di.hypot(max_dj) / horizontal_pitch_m;
+    let max_step = horizontal_pitch_m / 8.0;
+    let distances: Vec<f64> = (0..basis.width * basis.height)
+        .into_par_iter()
+        .map(|idx| {
+            let view = basis.pixel_ray(idx % basis.width, idx / basis.width);
+            let radius = R_EARTH + max_h + 0.02;
+            let b = dot3(basis.eye, view);
+            let disc = b * b - (dot3(basis.eye, basis.eye) - radius * radius);
+            if disc < 0.0 {
+                return f64::NAN;
+            }
+            let t0 = (-b - disc.sqrt()).max(0.0);
+            let t1 = -b + disc.sqrt();
+            if t1 <= t0 {
+                return f64::NAN;
+            }
+            let end = ray_sphere_first_hit(basis.eye, view, R_EARTH)
+                .unwrap_or(t1)
+                .min(t1);
+            let mut t = t0;
+            let mut prev = t;
+            while t <= end {
+                let p = madd3(basis.eye, view, t);
+                let clearance = sample(p).0;
+                if clearance <= 0.0 {
+                    let (mut lo, mut hi) = (prev, t);
+                    while hi - lo > 0.01 {
+                        let mid = 0.5 * (lo + hi);
+                        if sample(madd3(basis.eye, view, mid)).0 > 0.0 {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    return 0.5 * (lo + hi);
+                }
+                if clearance <= 0.01 {
+                    return t;
+                }
+                if t >= end {
+                    break;
+                }
+                // Retain the sub-cell cap because map scale varies with projection.
+                let radial_rate = (dot3(p, view) / len3(p)).abs();
+                let step =
+                    (0.5 * clearance / (radial_rate + slope).max(1.0e-9)).clamp(0.05, max_step);
+                prev = t;
+                t = (t + step).min(end);
+            }
+            f64::NAN
+        })
+        .collect();
+    let mut raster = SurfaceRaster::empty(ScanGrid {
+        nx: basis.width,
+        ny: basis.height,
+        x_min: 0.0,
+        y_max: 0.0,
+        pitch_x: VISIBLE_PITCH_RAD,
+        pitch_y: VISIBLE_PITCH_RAD,
+    });
+    for (idx, &d) in distances.iter().enumerate() {
+        if !d.is_finite() {
+            continue;
+        }
+        let (_, lat, lon, i, j) = sample(madd3(
+            basis.eye,
+            basis.pixel_ray(idx % basis.width, idx / basis.width),
+            d,
+        ));
+        raster.lat[idx] = lat as f32;
+        raster.lon[idx] = lon as f32;
+        if (0.0..=(nx - 1) as f64).contains(&i) && (0.0..=(ny - 1) as f64).contains(&j) {
+            raster.grid_i[idx] = i as f32;
+            raster.grid_j[idx] = j as f32;
+        }
+    }
+    Ok((raster, distances))
+}
+
 /// The nearest POSITIVE ray/sphere intersection distance, or `None` (miss, or the
 /// sphere is entirely behind the origin). `dir` unit; origin outside the sphere for
 /// the validated camera (eye altitude > 0).
@@ -3198,5 +3342,106 @@ mod tests {
         c = good;
         c.eye_lat_deg = 91.0;
         assert!(c.validate().is_err(), "latitude out of range");
+    }
+    #[test]
+    fn terrain_perspective_matches_elevated_sphere_and_rejects_buried_eye() {
+        let georef = GridGeoref::new(
+            MapProjection::lambert(30.0, 60.0, -97.5),
+            20.0,
+            20.0,
+            39.0,
+            -97.5,
+            333.0,
+            333.0,
+        );
+        let mut camera = PerspectiveCamera {
+            eye_lat_deg: 39.0,
+            eye_lon_deg: -97.5,
+            eye_alt_m: 302.0,
+            look_lat_deg: 39.0,
+            look_lon_deg: -97.5,
+            look_alt_m: 100.0,
+            fov_deg: 50.0,
+            width: 5,
+            height: 5,
+        };
+        let hgt = vec![300.0; 41 * 41];
+        let basis = camera.basis().unwrap();
+        let (raster, distances) =
+            build_perspective_terrain_raster(&basis, &georef, 41, 41, &hgt, 333.0).unwrap();
+        for (idx, &distance) in distances.iter().enumerate() {
+            let expected = ray_sphere_first_hit(
+                basis.eye,
+                basis.pixel_ray(idx % 5, idx / 5),
+                R_EARTH + 300.0,
+            )
+            .unwrap();
+            assert!(
+                (distance - expected).abs() < 0.02,
+                "{distance} vs {expected}"
+            );
+            assert!(raster.grid_i[idx].is_finite());
+        }
+        camera.eye_alt_m = 299.0;
+        assert!(
+            build_perspective_terrain_raster(
+                &camera.basis().unwrap(),
+                &georef,
+                41,
+                41,
+                &hgt,
+                333.0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terrain_perspective_hits_foreground_ridge_before_distant_target() {
+        let georef = GridGeoref::new(
+            MapProjection::lambert(30.0, 60.0, -97.5),
+            20.0,
+            20.0,
+            39.0,
+            -97.5,
+            333.0,
+            333.0,
+        );
+        let (la, lo) = georef.inverse(10.0, 20.0).unwrap();
+        let (ta, to) = georef.inverse(30.0, 20.0).unwrap();
+        let cam = PerspectiveCamera {
+            eye_lat_deg: la,
+            eye_lon_deg: lo,
+            eye_alt_m: 302.0,
+            look_lat_deg: ta,
+            look_lon_deg: to,
+            look_alt_m: 400.0,
+            fov_deg: 40.0,
+            width: 3,
+            height: 3,
+        };
+        let mut hgt = vec![300.0; 41 * 41];
+        for j in 0..41 {
+            hgt[j * 41 + 18] = 500.0;
+            hgt[j * 41 + 19] = 500.0;
+        }
+        let (raster, d) =
+            build_perspective_terrain_raster(&cam.basis().unwrap(), &georef, 41, 41, &hgt, 333.0)
+                .unwrap();
+        assert!(
+            (17.0..18.0).contains(&raster.grid_i[4]),
+            "ridge hit {}",
+            raster.grid_i[4]
+        );
+        assert!(d[4] > 2000.0 && d[4] < 3000.0, "distance {}", d[4]);
+        let (_, fine) =
+            build_perspective_terrain_raster(&cam.basis().unwrap(), &georef, 41, 41, &hgt, 166.5)
+                .unwrap();
+        assert!(
+            (d[4] - fine[4]).abs() < 0.1,
+            "step halving: {} vs {}",
+            d[4],
+            fine[4]
+        );
     }
 }

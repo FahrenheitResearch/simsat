@@ -110,6 +110,7 @@
 //!                      our Blue Marble ground; sky rays composite the limb/space).
 //!   fov=<deg>          Perspective HORIZONTAL field of view (default 40).
 //!   camsize=<WxH>      Perspective image dims (default 1280x720).
+//!   perspective-terrain=on  Native HGT intersections + foreground air (CPU; default off).
 //!   perspective-layer=<b>  on | off (default off): render the CLOUD FIELD ONLY through the
 //!                      perspective camera; `out` becomes a straight-alpha RGBA PNG (for
 //!                      compositing over a host 3-D map with a matching camera).
@@ -276,6 +277,7 @@ struct Opts {
     fov: f64,
     /// Perspective image dims `camsize=WxH` (default 1280x720).
     camsize: (usize, usize),
+    perspective_terrain: bool,
     /// Perspective CLOUD-LAYER-ONLY mode: `out` becomes a straight-alpha RGBA PNG of
     /// the cloud field alone (for compositing over a host 3-D map).
     perspective_layer: bool,
@@ -584,6 +586,31 @@ fn run(args: &[String]) -> Result<(), String> {
             geometry.model_orbit_radius_m,
             path.display()
         );
+    }
+    if opts.perspective_terrain {
+        let camera = result
+            .georef
+            .camera_pose
+            .ok_or("terrain perspective missing camera provenance")?;
+        let metadata = serde_json::json!({
+            "schema_version":1,"product":"perspective-terrain",
+            "eye_lat_lon_alt_msl_m":[camera.eye_lat_deg,camera.eye_lon_deg,camera.eye_alt_m],
+            "look_lat_lon_alt_msl_m":[camera.look_lat_deg,camera.look_lon_deg,camera.look_alt_m],
+            "horizontal_fov_deg":camera.fov_deg,"width":result.nx,"height":result.ny,
+            "terrain":"native bilinear HGT on WRF sphere; sea-level fallback outside source domain",
+            "foreground_atmosphere":"direct actual-eye march to cloud optical centroid; approximate coupled composition",
+            "input":opts.input,"source_timestep":opts.timestep,
+            "cloud_optical_depth_scale":intent_effective.cloud_optical_depth_scale,
+            "exposure":intent_effective.exposure,
+            "limitations":["native model resolution; no invented debris or buildings", "gray RGB cloud optics; approximate multiple scattering"]
+        });
+        let path = opts.out.with_extension("geometry.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&metadata).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write terrain geometry {}: {e}", path.display()))?;
+        println!("GEOMETRY perspective_terrain=true file={}", path.display());
     }
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
@@ -1007,6 +1034,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         synthetic_green: opts.synthetic_green,
         topdown_cloud_norm: opts.topdown_cloud_norm,
         perspective: perspective_camera_of(opts),
+        perspective_terrain: opts.perspective_terrain,
     }
 }
 
@@ -1182,6 +1210,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut look: Option<(f64, f64, f64)> = None;
     let mut fov = 40.0f64;
     let mut camsize = (1280usize, 720usize);
+    let mut perspective_terrain = false;
     let mut perspective_layer = false;
     let mut product_perspective = false;
     let mut ground_gain: Option<f64> = None;
@@ -1480,6 +1509,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "look" | "lookat" | "look-at" => look = Some(parse_triple(v)?),
             "fov" => fov = v.parse().map_err(|_| format!("bad fov '{v}'"))?,
             "camsize" | "cam-size" | "cam_size" => camsize = parse_canvas(v)?,
+            "perspective-terrain" => perspective_terrain = parse_bool(v)?,
             "perspective-layer" | "perspective_layer" | "persplayer" => {
                 perspective_layer = parse_bool(v)?
             }
@@ -1530,6 +1560,19 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "sensor=goes-r-abi-band13-fm4 applies to product=geocolor or product=sandwich"
                 .to_string(),
         );
+    }
+    if perspective_terrain
+        && (eye.is_none()
+            || backend != RenderBackend::Cpu
+            || perspective_layer
+            || cloud_layer
+            || geocolor
+            || sandwich
+            || store.is_some()
+            || bands_out.is_some()
+            || model_grid_raster)
+    {
+        return Err("perspective-terrain=on requires eye/look, backend=cpu, and a plain full-composite perspective PNG".to_string());
     }
     if model_grid_raster {
         if view != ViewMode::Geostationary
@@ -1618,6 +1661,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         look,
         fov,
         camsize,
+        perspective_terrain,
         perspective_layer,
         ground_gain,
         cloud_softclip,
@@ -2327,5 +2371,21 @@ mod tests {
                 "0.1235".to_string()
             )
         );
+    }
+    #[test]
+    fn terrain_perspective_is_opt_in_and_rejects_nonperspective_products() {
+        assert!(!render_params(&opts_with(&[])).perspective_terrain);
+        let opts = opts_with(&[
+            "eye=39,-85,302",
+            "look=39.05,-85,1300",
+            "perspective-terrain=on",
+        ]);
+        assert!(render_params(&opts).perspective_terrain);
+        let args = vec![
+            "input=missing.nc".to_string(),
+            "out=unused.png".to_string(),
+            "perspective-terrain=on".to_string(),
+        ];
+        assert!(parse_opts(&args).is_err());
     }
 }

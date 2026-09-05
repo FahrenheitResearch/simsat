@@ -3222,10 +3222,23 @@ pub fn sun_horizon_disk_fraction(r: f64, mu_sun: f64) -> f64 {
 /// This also applies to GPU preview: correctness can cost more than its nominal
 /// frame budget. Twin of the WGSL `march_cloud`.
 pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMarch {
+    march_cloud_clipped(scene, cam, view, f64::INFINITY)
+}
+
+/// CPU-only terrain perspective boundary. The transport kernel remains the WGSL
+/// twin; this supplies the finite opaque-surface endpoint of the volume integral
+/// (PBRT v4, Volume Scattering / Transmittance). No GPU perspective path exists.
+pub fn march_cloud_clipped(
+    scene: &CloudScene,
+    cam: [f64; 3],
+    view: [f64; 3],
+    max_distance_m: f64,
+) -> CloudMarch {
     let vol = scene.vol;
     let Some((t_enter, t_exit)) = ray_shell_segment(cam, view, vol.r_bottom(), vol.r_top()) else {
         return CloudMarch::CLEAR;
     };
+    let t_exit = t_exit.min(max_distance_m);
     let seg = t_exit - t_enter;
     if seg <= 0.0 {
         return CloudMarch::CLEAR;
@@ -8015,5 +8028,28 @@ mod tests {
             differs,
             "the warp should displace the octave field somewhere"
         );
+    }
+    #[test]
+    fn terrain_clip_hides_cloud_behind_opaque_surface() {
+        let vol = build_volume(24, 16, 40, 250.0, 333.0, |i, _, _| {
+            if i >= 12 {
+                (1.0e-3, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        });
+        let georef = test_georef(24, 16, 333.0);
+        let eye = brick_to_ecef(&georef, 4.0, 8.0, 4.0, 0.0, 250.0).unwrap();
+        let target = brick_to_ecef(&georef, 18.0, 8.0, 4.0, 0.0, 250.0).unwrap();
+        let view = norm3([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
+        let sun = norm3(eye);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
+        let (luts, sky_sh) = shared_luts();
+        let scene = scene_ref(&vol, &mip, &sun_od, &georef, luts, sky_sh, sun);
+        assert!(march_cloud(&scene, eye, view).transmittance < 0.99);
+        let clipped = march_cloud_clipped(&scene, eye, view, 500.0);
+        assert_eq!(clipped.transmittance, 1.0);
+        assert_eq!(clipped.inscatter, [0.0; 3]);
     }
 }

@@ -944,6 +944,22 @@ pub fn render_perspective_frame_rgba(
     basis: &crate::camera::PerspectiveBasis,
     assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
 ) -> Vec<u8> {
+    render_perspective_frame_rgba_with_terrain(surf, scene, basis, None, assemble)
+}
+
+/// Opt-in CPU terrain path. Finite distances are opaque ground hits; NaN means
+/// sky. Foreground air is integrated along the actual pinhole ray, using the
+/// existing optical-centroid approximation (not full coupled cloud/air transport).
+pub fn render_perspective_frame_rgba_with_terrain(
+    surf: &FrameContext,
+    scene: Option<&CloudScene>,
+    basis: &crate::camera::PerspectiveBasis,
+    terrain_distances_m: Option<&[f64]>,
+    assemble: impl Fn(usize, usize) -> SurfacePixel + Sync,
+) -> Vec<u8> {
+    if let Some(distances) = terrain_distances_m {
+        assert_eq!(distances.len(), basis.width * basis.height);
+    }
     let (nx, ny) = (basis.width, basis.height);
     let ground_lift = scene
         .map(|s| s.cfg.ground_day_lift)
@@ -962,18 +978,51 @@ pub fn render_perspective_frame_rgba(
                 let view = basis.pixel_ray(px, py);
                 let mut pixel = assemble(px, py);
                 pixel.view_dir = view;
+                let distance = terrain_distances_m
+                    .map(|d| d[py * nx + px])
+                    .filter(|d| d.is_finite());
                 let shadow = match scene {
+                    Some(sc) if distance.is_some() => {
+                        let d = distance.unwrap();
+                        let p = std::array::from_fn(|c| basis.eye[c] + view[c] * d);
+                        sc.sun_od.penumbral_shadow_scaled_antialiased(
+                            p,
+                            sc.cfg.cloud_optical_depth_scale,
+                            sc.cfg.topdown_shadow_antialias,
+                        )
+                    }
                     Some(sc) => ground_cloud_shadow(sc, basis.eye, view),
                     None => 1.0,
                 };
-                let rgba = match surface_toa_radiance(surf, &pixel, shadow, ground_lift) {
+                let rgba = match crate::render::surface_toa_radiance_at_distance(
+                    surf,
+                    &pixel,
+                    shadow,
+                    ground_lift,
+                    distance,
+                ) {
                     None => [0.0, 0.0, 0.0, 0.0], // space beyond the atmosphere
                     Some(l_toa) => {
                         let l = match scene {
                             Some(sc) => {
-                                let m = march_cloud(sc, basis.eye, view);
+                                let m = crate::clouds::march_cloud_clipped(
+                                    sc,
+                                    basis.eye,
+                                    view,
+                                    distance.unwrap_or(f64::INFINITY),
+                                );
                                 if m.transmittance >= 1.0 && m.inscatter == [0.0; 3] {
                                     l_toa
+                                } else if terrain_distances_m.is_some() {
+                                    let (air, trans) =
+                                        topdown_front_column(surf, basis.eye, view, m.mean_t_m);
+                                    composite_topdown_front_column(
+                                        l_toa,
+                                        m.inscatter,
+                                        m.transmittance,
+                                        air,
+                                        trans,
+                                    )
                                 } else {
                                     // No froxel front airlight (see the fn doc); the
                                     // cloud radiance is the geo product's neutral one

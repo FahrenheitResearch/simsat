@@ -1461,6 +1461,20 @@ pub fn surface_toa_radiance(
     cloud_shadow: f64,
     ground_lift: f64,
 ) -> Option<[f64; 3]> {
+    surface_toa_radiance_at_distance(ctx, px, cloud_shadow, ground_lift, None)
+}
+
+/// CPU-only terrain perspective: integrate atmosphere to the actual HGT ray hit.
+/// The default wrapper and the shared CPU/WGSL lighting kernel are unchanged.
+/// A terrain point is not a concentric sphere around the camera: another hill
+/// can be higher than the eye without enclosing the eye in solid ground.
+pub fn surface_toa_radiance_at_distance(
+    ctx: &FrameContext,
+    px: &SurfacePixel,
+    cloud_shadow: f64,
+    ground_lift: f64,
+    terrain_distance_m: Option<f64>,
+) -> Option<[f64; 3]> {
     let cam = ctx.cam.camera;
     let view = px.view_dir;
     let sun = ctx.sun_ecef;
@@ -1560,7 +1574,12 @@ pub fn surface_toa_radiance(
 
     // The atmosphere shell segment (reused for the water surface-up and the aerial
     // march). For an on-earth pixel `t_exit` is the ground intersection.
-    let seg = atmosphere::ray_atmosphere_segment_to_surface(cam, view, surface_elevation_m);
+    let seg = if let Some(distance) = terrain_distance_m {
+        atmosphere::ray_atmosphere_segment(cam, view)
+            .map(|(enter, exit)| (enter, exit.min(distance).max(enter)))
+    } else {
+        atmosphere::ray_atmosphere_segment_to_surface(cam, view, surface_elevation_m)
+    };
 
     let mut l_surf = [0.0; 3];
     if px.is_water {

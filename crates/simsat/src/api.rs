@@ -638,6 +638,10 @@ pub struct RenderParams {
     /// The free-perspective camera (eye / look-at / fov / dims) — REQUIRED by (and only
     /// read by) [`Product::Perspective`]. `None` (the default) for every other product.
     pub perspective: Option<PerspectiveCamera>,
+    /// Opt-in CPU ground camera: intersect native bilinear HGT, clip surface/cloud
+    /// paths at that intersection, and integrate camera-to-cloud foreground air.
+    /// Outside the model terrain footprint the surface remains sea level.
+    pub perspective_terrain: bool,
 }
 
 impl RenderParams {
@@ -699,6 +703,7 @@ impl RenderParams {
             synthetic_green: false,
             topdown_cloud_norm: None,
             perspective: None,
+            perspective_terrain: false,
         }
     }
 }
@@ -977,6 +982,19 @@ struct SceneSource {
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
     let product = product.canonical();
+    if params.perspective_terrain
+        && (params.backend != RenderBackend::Cpu
+            || !matches!(
+                product,
+                Product::Perspective {
+                    cloud_layer_only: false
+                }
+            )
+            || params.perspective.is_none()
+            || params.raster_override.is_some())
+    {
+        return Err("perspective-terrain requires a CPU full-composite perspective camera without a raster override".to_string());
+    }
     if params
         .raster_override
         .as_ref()
@@ -2889,7 +2907,23 @@ fn render_perspective_scene(
         .ok_or_else(|| "Product::Perspective requires RenderParams::perspective".to_string())?;
     let basis = camera.basis()?;
     crate::log_line!("simsat api: PERSPECTIVE camera {}", camera.label());
-    let raster = build_perspective_raster(&basis, georef, nx, ny);
+    let (raster, terrain_distance) = if params.perspective_terrain {
+        let (dx, dy) = dx_dy_metres(proj);
+        let (raster, distances) = crate::camera::build_perspective_terrain_raster(
+            &basis,
+            georef,
+            nx,
+            ny,
+            &brick.hgt,
+            dx.min(dy),
+        )?;
+        crate::log_line!(
+            "simsat api: perspective-terrain ON: native bilinear HGT; sea-level fallback outside domain; foreground atmosphere uses optical-centroid approximation"
+        );
+        (raster, Some(distances))
+    } else {
+        (build_perspective_raster(&basis, georef, nx, ny), None)
+    };
 
     // Solar geometry + the ECEF sun (the sun override honored, as everywhere).
     let (time, time_is_fallback) = resolve_frame_time(time_iso.as_deref());
@@ -3080,12 +3114,24 @@ fn render_perspective_scene(
                 params.exposure,
             )
         } else {
-            crate::topdown::render_perspective_frame_rgba(&surf, Some(&scene), &basis, assemble)
+            crate::topdown::render_perspective_frame_rgba_with_terrain(
+                &surf,
+                Some(&scene),
+                &basis,
+                terrain_distance.as_deref(),
+                assemble,
+            )
         }
     } else if cloud_layer_only {
         vec![0; raster.nx * raster.ny * 4]
     } else {
-        crate::topdown::render_perspective_frame_rgba(&surf, None, &basis, assemble)
+        crate::topdown::render_perspective_frame_rgba_with_terrain(
+            &surf,
+            None,
+            &basis,
+            terrain_distance.as_deref(),
+            assemble,
+        )
     };
     let rgb = rgba_to_rgb_black_space(&rgba, raster.nx, raster.ny);
 
