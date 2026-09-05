@@ -1512,7 +1512,19 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
         }
         // Sun source: Wrenninge multi-scatter octaves (M5) over the single depth-
         // resolved cloud sun optical depth (octaves=1 == fix2 single scatter).
-        let tau_cloud_sun = cloud_sun_optical_depth(pm, sun);
+        let r = length(pm);
+        let up = pm / r;
+        let mu_sun = dot(up, sun);
+        let rr = clamp(R_GROUND / r, -1.0, 1.0);
+        let dip = acos(rr);
+        let disk_sun = disk_fraction(asin(clamp(mu_sun, -1.0, 1.0)) + dip);
+        // Exact zero direct solar contribution below the whole finite disk.
+        // Ambient and every partially visible disk sample remain unchanged.
+        // CPU twin: clouds.rs::march_cloud_clipped.
+        var tau_cloud_sun = 0.0;
+        if (disk_sun > 0.0) {
+            tau_cloud_sun = cloud_sun_optical_depth(pm, sun);
+        }
         // Smooth vertical column OD preserves the higher-order buildup at a thick
         // cloud's sunlit top. The coarse sun-aligned map is primarily a ground-shadow
         // raster; using max(real_column, map) imprinted its texel lattice on HRRR cloud
@@ -1535,17 +1547,11 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
             u.m1.z > 0.5,
             support_tau,
         );
-        let r = length(pm);
-        let up = pm / r;
-        let mu_sun = dot(up, sun);
         // FINITE-DISK EARTH-SHADOW FADE (WS1, twin of clouds.rs::
         // sun_horizon_disk_fraction): the solar-disk fraction above the sample's
         // local geometric horizon replaces the binary ray_hits_ground gate (the hard
         // lit/unlit line across dusk anvils); the transmittance sample clamps mu to
         // the horizon so the fading disk is attenuated by the defined grazing path.
-        let rr = clamp(R_GROUND / r, -1.0, 1.0);
-        let dip = acos(rr);
-        let disk_sun = disk_fraction(asin(clamp(mu_sun, -1.0, 1.0)) + dip);
         var t_atmo = vec3<f32>(0.0);
         if (disk_sun > 0.0) {
             let mu_h = -sqrt(max(1.0 - rr * rr, 0.0));

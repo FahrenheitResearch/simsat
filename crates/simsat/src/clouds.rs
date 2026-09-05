@@ -3324,7 +3324,18 @@ pub fn march_cloud_clipped(
         // octaves=DEFAULT_OCTAVES adds the deep-penetration + back-scatter buildup that
         // makes a thick anvil brilliant. Beer-powder (OFF by default in M5) applies per
         // octave when on.
-        let tau_cloud_sun = cloud_sun_optical_depth(scene, pm);
+        let up = scl3(pm, 1.0 / rm);
+        let mu_sun = dot3(up, scene.sun_ecef);
+        let disk_sun = sun_horizon_disk_fraction(rm, mu_sun);
+        // Below the finite solar disk's geometric horizon, t_atmo_sun is exactly
+        // zero below. No cloud optical-depth query can change that zero direct
+        // contribution. Skip only this unused march; keep sky ambient and all
+        // partially visible disk samples unchanged (CPU/WGSL twin).
+        let tau_cloud_sun = if disk_sun > 0.0 {
+            cloud_sun_optical_depth(scene, pm)
+        } else {
+            0.0
+        };
         // The smooth vertical whole-column OD is the best support measure for whether
         // multiple scattering is possible (including at a thick cloud's sunlit top).
         // The 512-texel sun-aligned map is a ground-shadow raster: taking its maximum
@@ -3339,8 +3350,6 @@ pub fn march_cloud_clipped(
             scene.sun_od.sample(pm) * od_scale
         };
         let multiscatter_support_tau = column_support_tau.max(tau_cloud_sun).max(sigma_eff * pitch);
-        let up = scl3(pm, 1.0 / rm);
-        let mu_sun = dot3(up, scene.sun_ecef);
         let sun_src = match scene.cfg.multiscatter_mode {
             CloudMultiscatterMode::LegacyOctaves => octave_sun_source_thin_gated(
                 cos_vs,
@@ -3425,7 +3434,6 @@ pub fn march_cloud_clipped(
         // (which drew a hard lit/unlit line across dusk anvils). The transmittance-LUT
         // sample clamps mu to the horizon so the fading disk is attenuated by the
         // (defined) grazing path rather than an undefined below-horizon sample.
-        let disk_sun = sun_horizon_disk_fraction(rm, mu_sun);
         let t_atmo_sun = if disk_sun <= 0.0 {
             [0.0; 3]
         } else {
