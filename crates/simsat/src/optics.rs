@@ -834,8 +834,9 @@ pub fn fresnel_reflectance_unpolarized(cos_incidence: f64, n_rel: f64) -> f64 {
     (0.5 * (rs + rp)).clamp(0.0, 1.0)
 }
 
-/// The Cox-Munk sea-surface sun-glint REFLECTANCE FACTOR `rho = pi L / E_perp`
-/// (dimensionless, the same reflectance quantity the render pipeline compares to),
+/// The Cox-Munk sea-surface directional kernel `pi * BRDF` (dimensionless).
+/// The legacy function name is retained. To obtain `rho_f = pi L / E_perp`
+/// for a direct collimated Sun, multiply this kernel by the solar cosine once.
 /// for a sun direction `to_sun`, a surface->viewer direction `to_camera`, the local
 /// surface `up`, and the mean-square slope `mss` (from [`cox_munk_mean_square_slope`]).
 /// All directions are unit vectors in ANY consistent basis (the caller uses ECEF with

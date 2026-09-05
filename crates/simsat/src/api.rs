@@ -1313,6 +1313,67 @@ pub fn render_abi_first_order(
     Ok((frame, raster, src.time_iso.ok_or("missing frame time")?))
 }
 
+/// Explicit all-order scalar Monte Carlo ABI reference. Separate from all shipped products and
+/// display intent. Configuration and omitted physics must accompany the result.
+pub fn render_abi_monte_carlo(
+    params: &RenderParams,
+    config: &crate::abi_monte_carlo::MonteCarloConfig,
+) -> Result<
+    (
+        crate::abi_monte_carlo::MonteCarloFrame,
+        SurfaceRaster,
+        String,
+    ),
+    String,
+> {
+    validate_model_grid_satellite_params(params)?;
+    config.validate()?;
+    if params.intent != RenderIntent::SensorFastGray
+        || params.sun_override.is_some()
+        || params.nbar_surface.is_some()
+    {
+        return Err(
+            "ABI Monte Carlo requires sensor-fast-gray, actual Sun and spectral surface input"
+                .into(),
+        );
+    }
+    let path = params
+        .spectral_surface
+        .as_ref()
+        .ok_or("ABI Monte Carlo requires spectral-surface")?;
+    let surface = crate::spectral_surface::SpectralSurface::load(path)?;
+    let src = resolve_source(params)?;
+    let raster = model_grid_satellite_raster_for_source(&src, params)?;
+    let (time, fallback) = resolve_frame_time(src.time_iso.as_deref());
+    if fallback || (time.month == 2 && time.day == 29) {
+        return Err("ABI Monte Carlo requires a known non-leap-climatology frame date".into());
+    }
+    let days = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let doy = days[..(time.month - 1) as usize].iter().sum::<u32>() + time.day;
+    if surface.climatology_doy() != doy {
+        return Err("spectral land day differs from frame".into());
+    }
+    let solar = SolarFrame::new(time.year, time.month, time.day, time.ut);
+    let (sun, _) = resolve_frame_sun(params, &raster, &solar, &src.params);
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
+    let cam = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
+    crate::log_line!(
+        "ABI Monte Carlo: unscaled gray conservative clouds; all scattering orders and diffuse surface reflection; reference exponential dry air; NO gases, aerosols, native air profiles, spectral particles, finite Sun or PSF; sampled statistical uncertainty is reported"
+    );
+    let frame = crate::abi_monte_carlo::render(
+        &src.brick,
+        &src.georef,
+        &raster,
+        &cam,
+        sun,
+        &surface,
+        horiz_pitch_m(&src.params),
+        config,
+    )?;
+    Ok((frame, raster, src.time_iso.ok_or("missing frame time")?))
+}
+
 /// Resolve an output intent on a clone, preserving the caller request exactly.
 ///
 /// Display is an exact no-op. Sensor Fast Gray keeps the physical/model controls

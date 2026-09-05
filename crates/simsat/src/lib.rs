@@ -226,3 +226,7 @@ pub mod abi_first_order;
 pub mod nbar_surface;
 pub mod spectral_surface;
 mod surface_grid;
+
+pub mod spectral_path;
+
+pub mod abi_monte_carlo;

@@ -66,3 +66,7 @@ path = "examples/render_ir.rs"
 [[bin]]
 name = "simsat-render-abi-first-order"
 path = "examples/render_abi_first_order.rs"
+
+[[bin]]
+name = "simsat-render-abi-monte-carlo"
+path = "examples/render_abi_monte_carlo.rs"

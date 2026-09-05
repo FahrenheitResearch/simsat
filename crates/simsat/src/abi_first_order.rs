@@ -32,8 +32,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const R: f64 = optics::EARTH_RADIUS_M;
-const TOP: f64 = R + crate::atmosphere::ATMOSPHERE_HEIGHT_M;
+pub(crate) const R: f64 = optics::EARTH_RADIUS_M;
+pub(crate) const TOP: f64 = R + crate::atmosphere::ATMOSPHERE_HEIGHT_M;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,22 +158,22 @@ struct PreparedRay {
     glint_core: bool,
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-fn add(p: [f64; 3], v: [f64; 3], t: f64) -> [f64; 3] {
+pub(crate) fn add(p: [f64; 3], v: [f64; 3], t: f64) -> [f64; 3] {
     [p[0] + v[0] * t, p[1] + v[1] * t, p[2] + v[2] * t]
 }
 fn unit(p: [f64; 3]) -> [f64; 3] {
     let r = dot(p, p).sqrt();
     p.map(|v| v / r)
 }
-fn sphere(p: [f64; 3], v: [f64; 3], radius: f64) -> Option<(f64, f64)> {
+pub(crate) fn sphere(p: [f64; 3], v: [f64; 3], radius: f64) -> Option<(f64, f64)> {
     let b = dot(p, v);
     let d = b * b - dot(p, p) + radius * radius;
     (d >= 0.0).then(|| (-b - d.sqrt(), -b + d.sqrt()))
 }
-fn dry_density(p: [f64; 3], n0: f64, h: f64) -> f64 {
+pub(crate) fn dry_density(p: [f64; 3], n0: f64, h: f64) -> f64 {
     let z = dot(p, p).sqrt() - R;
     if !(0.0..=TOP - R).contains(&z) {
         0.0
@@ -181,7 +181,7 @@ fn dry_density(p: [f64; 3], n0: f64, h: f64) -> f64 {
         n0 * (-z / h).exp()
     }
 }
-fn dry_column(p: [f64; 3], v: [f64; 3], n0: f64, cfg: &FirstOrderConfig) -> Option<f64> {
+pub(crate) fn dry_column(p: [f64; 3], v: [f64; 3], n0: f64, cfg: &FirstOrderConfig) -> Option<f64> {
     // A point Sun is blocked by solid Earth; no hidden twilight fill.
     if sphere(p, v, R)
         .is_some_and(|(a, b)| a > 1.0e-5 || (a >= -1.0e-5 && b > 1.0e-5 && dot(p, v) < 0.0))
@@ -207,10 +207,10 @@ fn dry_column(p: [f64; 3], v: [f64; 3], n0: f64, cfg: &FirstOrderConfig) -> Opti
     }
     Some(sum * ds / 3.0)
 }
-fn outside(fi: f64, fj: f64, vol: &DecodedVolume) -> bool {
+pub(crate) fn outside(fi: f64, fj: f64, vol: &DecodedVolume) -> bool {
     fi < 0.0 || fj < 0.0 || fi > (vol.nx - 1) as f64 || fj > (vol.ny - 1) as f64
 }
-fn cloud_sun_depth(
+pub(crate) fn cloud_sun_depth(
     vol: &DecodedVolume,
     mip: &OccupancyMip,
     georef: &GridGeoref,

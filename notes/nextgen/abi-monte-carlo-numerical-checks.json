@@ -1,0 +1,110 @@
+{
+  "final_source_preservation": {
+    "passed": true,
+    "byte_identical_files": [
+      "rho-c01-c02-c03.bin",
+      "first-order-rho-c01-c02-c03.bin",
+      "higher-order-rho-c01-c02-c03.bin",
+      "standard-error-rho.bin",
+      "first-order-standard-error-rho.bin",
+      "higher-order-standard-error-rho.bin",
+      "mean-events.bin",
+      "path-exterior-fraction.bin",
+      "sun-exterior-fraction.bin",
+      "surface-exterior-fraction.bin",
+      "latitude.bin",
+      "longitude.bin",
+      "support-flags.bin",
+      "glint-mask.bin",
+      "c01-rho.bin",
+      "c02-rho.bin",
+      "c03-rho.bin",
+      "c01-monte-carlo-preview.png",
+      "c02-monte-carlo-preview.png",
+      "c03-monte-carlo-preview.png"
+    ]
+  },
+  "detail_vs_sparse_identical": {
+    "passed": true,
+    "sampled_pixels": 720,
+    "scientific_planes": [
+      "rho-c01-c02-c03.bin",
+      "first-order-rho-c01-c02-c03.bin",
+      "higher-order-rho-c01-c02-c03.bin",
+      "standard-error-rho.bin",
+      "first-order-standard-error-rho.bin",
+      "higher-order-standard-error-rho.bin",
+      "mean-events.bin",
+      "path-exterior-fraction.bin",
+      "sun-exterior-fraction.bin",
+      "surface-exterior-fraction.bin"
+    ]
+  },
+  "numerical_refinement": {
+    "sampled_pixels": 720,
+    "before_config": {
+      "air_column_intervals": 128,
+      "air_step_m": 1000.0,
+      "co2_ppm": 360.0,
+      "collision_step_optical_depth": 0.25,
+      "dry_pressure_pa": 101325.0,
+      "dry_scale_height_m": 8000.0,
+      "path": {
+        "event_safety_limit": 1000000,
+        "roulette_start_order": 16,
+        "roulette_weight_threshold": 0.95
+      },
+      "reference_temperature_k": 288.15,
+      "sample_stride": 16,
+      "samples_per_band": 64,
+      "seed": 198271,
+      "sun_step_m": 125.0,
+      "view_step_m": 125.0
+    },
+    "after_config": {
+      "air_column_intervals": 256,
+      "air_step_m": 500.0,
+      "co2_ppm": 360.0,
+      "collision_step_optical_depth": 0.125,
+      "dry_pressure_pa": 101325.0,
+      "dry_scale_height_m": 8000.0,
+      "path": {
+        "event_safety_limit": 1000000,
+        "roulette_start_order": 16,
+        "roulette_weight_threshold": 0.95
+      },
+      "reference_temperature_k": 288.15,
+      "sample_stride": 16,
+      "samples_per_band": 64,
+      "seed": 198271,
+      "sun_step_m": 62.5,
+      "view_step_m": 62.5
+    },
+    "mean_change": [
+      -0.0019226454793372088,
+      -0.000676481430693659,
+      0.00022813547915979547
+    ],
+    "mean_absolute_change": [
+      0.005993155216694706,
+      0.003962084258819232,
+      0.0047201113572252025
+    ],
+    "p95_absolute_change": [
+      0.037634484469890546,
+      0.021822939813137043,
+      0.023161876201629628
+    ],
+    "max_absolute_change": [
+      0.139609694480896,
+      0.20628690719604492,
+      0.3013833165168762
+    ],
+    "conservative_standard_error_bound_for_mean": [
+      0.004473772731327501,
+      0.0047582682437431545,
+      0.004933372700214971
+    ],
+    "warning": "Common random streams can diverge after numerical changes. These low-sample differences mix quadrature sensitivity with stochastic path changes; they are not an all-pixel numerical error bound or a passed physics-accuracy gate. The sum of per-pixel SEMs gives a conservative covariance allowance, but empirical SEM itself may miss rare tails."
+  }
+}
