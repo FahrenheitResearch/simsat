@@ -2,6 +2,8 @@
 
 Preview v0.3.0-rc.1 is a Windows Studio release candidate. Source is tagged on the reviewed release branch; prereleases do not replace the stable v0.2.1 release.
 
+The v0.3.0-rc.1 Windows release compiler is Rust 1.94.0. CI pins the same toolchain for workspace checks and native builds; the Python wheel smoke remains a separate portability check. Rust 1.98 introduced additional Clippy style warnings, so following an unpinned stable channel did not reproduce the reviewed gate. Upgrade the release compiler in a separate reviewed change.
+
 Run from the repository root so `.cargo/config.toml` applies the static MSVC runtime. Keep six build jobs.
 
 ```

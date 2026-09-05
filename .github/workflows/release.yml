@@ -28,7 +28,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       # The committed .cargo/config.toml already carries
       # `-C target-feature=+crt-static` for x86_64-pc-windows-msvc, so this exe
@@ -54,7 +56,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       # simsat-render-frame + simsat-render-ir: the [[bin]] targets pointing at
       # the identically-bodied example files (crates/simsat/Cargo.toml).

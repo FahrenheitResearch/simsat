@@ -40,8 +40,9 @@ jobs:
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.94.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -74,7 +75,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
 
       - uses: Swatinem/rust-cache@v2
 
