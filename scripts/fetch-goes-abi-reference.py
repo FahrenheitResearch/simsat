@@ -56,6 +56,14 @@ class S3Object:
         return self.scan_start + (self.scan_end - self.scan_start) / 2
 
 
+def products_for_sector(sector: str) -> list[str]:
+    # NOAA PUG Vol 5: imagery/mask have C, F, M1 and M2 sectors. COD is
+    # distributed for Full Disk and CONUS, not Meso (NOAA COMP README).
+    suffix = {"conus": "C", "full-disk": "F", "meso1": "M", "meso2": "M"}[sector]
+    return [f"ABI-L2-MCMIP{suffix}", f"ABI-L2-ACM{suffix}",
+            "ABI-L2-CODF" if suffix == "M" else f"ABI-L2-COD{suffix}"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -71,9 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--products",
         nargs="+",
-        default=list(DEFAULT_PRODUCTS),
-        help="ABI S3 product prefixes",
+        default=None,
+        help="override ABI S3 product prefixes chosen by --sector",
     )
+    parser.add_argument("--sector", choices=("conus", "full-disk", "meso1", "meso2"),
+                        default="conus", help="scan sector; Meso COD uses Full Disk")
     parser.add_argument(
         "--max-offset-seconds",
         type=float,
@@ -134,6 +144,10 @@ def parse_args() -> argparse.Namespace:
         help="network timeout in seconds (default: 60)",
     )
     args = parser.parse_args()
+    if args.products is None:
+        args.products = products_for_sector(args.sector)
+    if any(product.endswith("M") for product in args.products) and not args.sector.startswith("meso"):
+        parser.error("mesoscale products require explicit --sector meso1 or meso2")
     if (args.download or args.align) and args.output_dir is None:
         parser.error("--output-dir is required with --download or --align")
     if args.align and args.target_grid is None and args.target_grib is None:
@@ -240,6 +254,7 @@ def choose_objects(
     max_offset: float,
     timeout: float,
     selection_time: str,
+    sector: str = "conus",
 ) -> list[S3Object]:
     selected: list[S3Object] = []
     platform_token = f"_{platform.upper()}_"
@@ -248,7 +263,9 @@ def choose_objects(
         for delta_hours in (-1, 0, 1):
             hour = target + dt.timedelta(hours=delta_hours)
             for item in list_prefix(bucket, product, hour, timeout):
-                if platform_token in item.key:
+                region_ok = (not product.endswith("M") or
+                             f"{product}{sector[-1]}-" in Path(item.key).name)
+                if platform_token in item.key and region_ok:
                     candidates[item.key] = item
         if not candidates:
             raise RuntimeError(f"no {product} objects found near {target.isoformat()}")
@@ -610,8 +627,17 @@ def sample_regular(
     return np.where(inside, result, np.nan).astype(np.float32)
 
 
-def find_selected(selected: list[S3Object], product: str) -> S3Object | None:
-    return next((item for item in selected if item.product == product), None)
+def find_selected(selected: list[S3Object], family: str) -> S3Object | None:
+    matches = [item for item in selected if re.fullmatch(re.escape(family) + r"[CFM]", item.product)]
+    if len(matches) > 1:
+        raise RuntimeError(f"alignment requires exactly one {family} sector, got {[m.product for m in matches]}")
+    return matches[0] if matches else None
+
+
+def coordinates_for_dataset(np: Any, dataset: Any, lat: Any, lon: Any) -> tuple[Any, Any]:
+    projection = dataset.variables["goes_imager_projection"]
+    attrs = {name: getattr(projection, name) for name in projection.ncattrs()}
+    return geos_forward_numpy(np, lon, lat, attrs)
 
 
 def align_reference(
@@ -622,9 +648,9 @@ def align_reference(
     lat, lon, landmask, target_metadata = load_target_grid(np, eccodes, args)
     output_dir = args.output_dir
 
-    mcm_item = find_selected(selected, "ABI-L2-MCMIPC")
+    mcm_item = find_selected(selected, "ABI-L2-MCMIP")
     if mcm_item is None:
-        raise RuntimeError("--align requires ABI-L2-MCMIPC in --products")
+        raise RuntimeError("--align requires one ABI-L2-MCMIP C/F/M sector in --products")
     mcm_path = output_dir / Path(mcm_item.key).name
     with Dataset(mcm_path) as dataset:
         projection = dataset.variables["goes_imager_projection"]
@@ -665,29 +691,30 @@ def align_reference(
         x_axis = np.asarray(dataset.variables["x"][:], dtype=np.float64)
         y_axis = np.asarray(dataset.variables["y"][:], dtype=np.float64)
         aligned: dict[str, Any] = {}
+        # A finite flagged neighbour must not enter a DQF==0 bilinear product.
+        # sample_regular conservatively requires all four support pixels, even
+        # an exact-zero-weight corner; nearest DQF is retained as provenance.
         for name in ("CMI_C01", "CMI_C02", "CMI_C03", "CMI_C13"):
             aligned[name.lower()] = sample_regular(
                 np,
-                dataset.variables[name][:],
+                np.where(masked_float(np, dataset.variables["DQF_" + name[4:]][:]) == 0,
+                         masked_float(np, dataset.variables[name][:]), np.nan),
                 x_axis,
                 y_axis,
                 target_x,
                 target_y,
             )
-        dqf = sample_regular(
-            np,
-            dataset.variables["DQF_C02"][:],
-            x_axis,
-            y_axis,
-            target_x,
-            target_y,
-            nearest=True,
-        )
-        aligned["dqf_c02"] = dqf
+        for band in ("c01", "c02", "c03", "c13"):
+            aligned[f"dqf_{band}"] = sample_regular(
+                np, dataset.variables[f"DQF_{band.upper()}"][:], x_axis, y_axis,
+                target_x, target_y, nearest=True)
+            aligned[f"valid_{band}"] = (np.isfinite(aligned[f"cmi_{band}"]) &
+                                         (aligned[f"dqf_{band}"] == 0)).astype(np.uint8)
 
-    acm_item = find_selected(selected, "ABI-L2-ACMC")
+    acm_item = find_selected(selected, "ABI-L2-ACM")
     if acm_item is not None:
         with Dataset(output_dir / Path(acm_item.key).name) as dataset:
+            target_x, target_y = coordinates_for_dataset(np, dataset, lat, lon)
             x_axis = np.asarray(dataset.variables["x"][:], dtype=np.float64)
             y_axis = np.asarray(dataset.variables["y"][:], dtype=np.float64)
             for source, destination in (
@@ -705,9 +732,10 @@ def align_reference(
                     nearest=source in ("BCM", "ACM"),
                 )
 
-    cod_item = find_selected(selected, "ABI-L2-CODC")
+    cod_item = find_selected(selected, "ABI-L2-COD")
     if cod_item is not None:
         with Dataset(output_dir / Path(cod_item.key).name) as dataset:
+            target_x, target_y = coordinates_for_dataset(np, dataset, lat, lon)
             x_axis = np.asarray(dataset.variables["x"][:], dtype=np.float64)
             y_axis = np.asarray(dataset.variables["y"][:], dtype=np.float64)
             aligned["cod"] = sample_regular(
@@ -719,9 +747,12 @@ def align_reference(
                 target_y,
             )
 
-    aligned["valid"] = (
-        np.isfinite(aligned["cmi_c02"]) & (aligned["dqf_c02"] == 0)
-    ).astype(np.uint8)
+    # Common coverage must not gate nighttime IR on an unilluminated C02.
+    # Each scoring product also applies its own band quality masks.
+    aligned["valid"] = np.logical_or.reduce(
+        [aligned[f"valid_{b}"] for b in ("c01", "c02", "c03", "c13")]).astype(np.uint8)
+    aligned["valid_visible"] = np.logical_and.reduce(
+        [aligned[f"valid_{b}"] for b in ("c01", "c02", "c03")]).astype(np.uint8)
     aligned["lat"] = lat.astype(np.float32)
     aligned["lon"] = lon.astype(np.float32)
     if landmask is not None:
@@ -772,9 +803,10 @@ def align_reference(
         "sha256": aligned_sha,
         "target_grid": target_metadata,
         "variables": sorted(aligned),
+        "validity": "valid is union of finite DQF==0 bands; valid_visible intersects C01/C02/C03; valid_c13 is independent of sunlight",
         "method": {
             "projection": "pure NumPy GOES-R PUG ellipsoidal forward fixed-grid equations",
-            "continuous": "bilinear on ABI fixed-grid scan coordinates",
+            "continuous": "bilinear on ABI fixed-grid scan coordinates; CMI requires finite DQF==0 at all four support pixels",
             "categorical": "nearest on ABI fixed-grid scan coordinates",
             "synthetic_green": "0.45*C02 + 0.10*C03 + 0.45*C01",
         },
@@ -821,6 +853,7 @@ def main() -> int:
             args.max_offset_seconds,
             args.timeout,
             args.selection_time,
+            args.sector,
         )
         manifest: dict[str, Any] = {
             "schema_version": 1,
@@ -830,6 +863,7 @@ def main() -> int:
             "platform": platform,
             "target_time": target.isoformat().replace("+00:00", "Z"),
             "selection_time": args.selection_time,
+            "sector": args.sector,
             "objects": [public_record(bucket, item, target) for item in selected],
         }
         if not args.download and not args.align:

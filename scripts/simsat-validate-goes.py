@@ -694,10 +694,14 @@ def thermal_regime_masks(
     stratifiers, not a claim that the synthetic forecast should match each pixel.
     """
     valid = (np.asarray(arrays["valid"]) > 0) & jointly_finite
+    if "valid_c13" in arrays:
+        valid &= np.asarray(arrays["valid_c13"]) == 1
+    if "dqf_c13" in arrays:
+        valid &= np.asarray(arrays["dqf_c13"]) == 0
     result: dict[str, dict[str, Any]] = {
         "valid": {
             "available": True,
-            "definition": "aligned valid>0 and finite observed/synthetic Band 13 BT",
+            "definition": "aligned valid>0 and finite observed/synthetic Band 13 BT; valid_c13==1 and DQF_C13==0 when supplied",
             "mask": valid,
         }
     }
@@ -1383,6 +1387,8 @@ def validate(
     finite = np.all(np.isfinite(observed), axis=-1) & np.all(
         np.isfinite(synthetic_rgb), axis=-1
     )
+    if "valid_visible" in arrays:
+        finite &= np.asarray(arrays["valid_visible"]) == 1
     cloud_mask = None
     if cloud_mask_path is not None:
         cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape)
