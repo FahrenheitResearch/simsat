@@ -1642,26 +1642,7 @@ fn render_visible_scene(
         None
     };
     if let Some(rgba) = &mut linear_albedo {
-        // Model snow overlays the climatological base in linear reflectance space.
-        if let Some(snowh) = &brick.snowh {
-            for (pixel, texel) in rgba.chunks_exact_mut(4).enumerate() {
-                if texel[3] > 0.5 && texel[3] < 1.5 {
-                    let i = (raster.grid_i[pixel] as f64)
-                        .round()
-                        .clamp(0.0, (nx - 1) as f64) as usize;
-                    let j = (raster.grid_j[pixel] as f64)
-                        .round()
-                        .clamp(0.0, (ny - 1) as f64) as usize;
-                    let snow = snow_fraction(snowh[j * nx + i] as f64) as f32;
-                    for (value, snow_srgb) in
-                        texel[..3].iter_mut().zip(crate::render::SNOW_ALBEDO_SRGB)
-                    {
-                        *value =
-                            *value * (1.0 - snow) + crate::render::srgb_to_linear(snow_srgb) * snow;
-                    }
-                }
-            }
-        }
+        crate::nbar_surface::apply_model_snow(rgba, &raster, brick);
     }
 
     // Per-pixel LUTs (geo lookup + light); override the light plane for a synthetic sun.

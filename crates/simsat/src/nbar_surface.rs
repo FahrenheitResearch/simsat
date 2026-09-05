@@ -240,6 +240,36 @@ impl NbarSurface {
     }
 }
 
+/// Overlay model snow on measured land in linear reflectance space. Fallback
+/// land and water retain their separately configured surface source.
+pub fn apply_model_snow(
+    rgba: &mut [f32],
+    raster: &SurfaceRaster,
+    brick: &crate::bricks::VolumeBrick,
+) {
+    let nx = brick.nx;
+    let ny = brick.ny;
+    // Model snow overlays the climatological base in linear reflectance space.
+    if let Some(snowh) = &brick.snowh {
+        for (pixel, texel) in rgba.chunks_exact_mut(4).enumerate() {
+            if texel[3] > 0.5 && texel[3] < 1.5 {
+                let i = (raster.grid_i[pixel] as f64)
+                    .round()
+                    .clamp(0.0, (nx - 1) as f64) as usize;
+                let j = (raster.grid_j[pixel] as f64)
+                    .round()
+                    .clamp(0.0, (ny - 1) as f64) as usize;
+                let snow = crate::render::snow_fraction(snowh[j * nx + i] as f64);
+                for (value, snow_srgb) in texel[..3].iter_mut().zip(crate::render::SNOW_ALBEDO_SRGB)
+                {
+                    *value =
+                        *value * (1.0 - snow) + crate::render::srgb_to_linear(snow_srgb) * snow;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

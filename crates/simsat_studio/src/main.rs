@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
 
+mod earth;
 mod pipeline;
 mod presets;
 mod settings;
@@ -485,6 +486,7 @@ struct PreparedRender {
     normals_rgba: Vec<u8>,
     landmask_r8: Vec<u8>,
     bluemarble: Option<BmGround>,
+    linear_albedo: Option<Vec<f32>>,
     bm_status: BmStatus,
     /// Seasonal ground status, e.g. `"Blue Marble: Dec/Jan blend (65% Jan)"` (M7).
     /// Empty in IR mode / flat-albedo.
@@ -792,7 +794,7 @@ fn surface_inputs(prep: &PreparedRender) -> SurfaceFrameInputs<'_> {
         normals_rgba: &prep.normals_rgba,
         landmask_r8: &prep.landmask_r8,
         bluemarble: prep.bluemarble.as_ref().map(|a| &a.0),
-        linear_albedo: None,
+        linear_albedo: prep.linear_albedo.as_deref(),
         transmittance_lut: &prep.transmittance_lut,
         multiscatter_lut: &prep.multiscatter_lut,
         ambient_lut: &prep.ambient_lut,
@@ -941,6 +943,12 @@ struct BatchState {
 }
 
 struct SimSatStudioApp {
+    /// Explicit --case ... --render-and-save ... run through the real GUI pipeline.
+    /// Batch runs never persist their settings into the interactive user profile.
+    batch_output: Option<PathBuf>,
+    batch_started: bool,
+    batch_export_started: bool,
+    batch_finished: bool,
     gpu: Option<GpuCtx>,
     gpu_error: Option<String>,
     store_root: PathBuf,
@@ -1134,6 +1142,7 @@ struct SimSatStudioApp {
     /// 1..=12 = force that month for a what-if) and whether to lazily download months.
     bm_month_override: u32,
     bm_allow_download: bool,
+    earth: earth::EarthSettings,
     /// Full-year-pack download worker: a simple status-string channel drained in `ui`.
     pack_rx: Option<Receiver<String>>,
     pack_busy: bool,
@@ -1190,6 +1199,10 @@ impl SimSatStudioApp {
         let mut app = Self {
             gpu,
             gpu_error,
+            batch_output: None,
+            batch_started: false,
+            batch_export_started: false,
+            batch_finished: false,
             store_root: default_store_root(),
             preset: SatellitePreset::GoesEast,
             geo_navigation: GeoNavigation::ModelSphere,
@@ -1301,6 +1314,7 @@ impl SimSatStudioApp {
             // Seasonal ground: auto (day-of-year blend) by default; lazy download on.
             bm_month_override: 0,
             bm_allow_download: true,
+            earth: earth::EarthSettings::default(),
             pack_rx: None,
             pack_busy: false,
             export_rx: None,
@@ -1315,12 +1329,29 @@ impl SimSatStudioApp {
         // Drop recent entries whose files vanished since last session; the next
         // autosave persists the pruned list.
         settings::prune_recent(&mut app.recent, &|p: &str| Path::new(p).exists());
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if args.len() == 4 && args[0] == "--case" && args[2] == "--render-and-save" {
+            app.batch_output = Some(PathBuf::from(&args[3]));
+            app.open_test_case(PathBuf::from(&args[1]));
+        } else if args.len() == 2 && args[0] == "--case" {
+            app.open_test_case(PathBuf::from(&args[1]));
+        } else if args.len() == 1 && !args[0].to_string_lossy().starts_with('-') {
+            app.open_wrfout(PathBuf::from(&args[0]));
+        } else if !args.is_empty() {
+            eprintln!(
+                "Usage: simsat_studio [input | --case case.json [--render-and-save output.png]]"
+            );
+            std::process::exit(2);
+        }
         app
     }
 
     /// Append an INFO line to the log ring and mirror it into the status bar.
     fn logline(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
+        if self.batch_output.is_some() {
+            eprintln!("{msg}");
+        }
         self.status = msg.clone();
         self.log.info(msg);
     }
@@ -1414,6 +1445,7 @@ impl SimSatStudioApp {
         self.cloud_highlight_max = s.cloud_highlight_max;
         self.bm_month_override = s.bm_month_override;
         self.bm_allow_download = s.bm_allow_download;
+        self.earth = s.earth.clone();
         self.play_fps = s.play_fps;
         self.frame_cap = s.frame_cap;
         self.recent = s.recent.clone();
@@ -1481,6 +1513,7 @@ impl SimSatStudioApp {
             cloud_highlight_max: self.cloud_highlight_max,
             bm_month_override: self.bm_month_override,
             bm_allow_download: self.bm_allow_download,
+            earth: self.earth.clone(),
             play_fps: self.play_fps,
             frame_cap: self.frame_cap,
             orbit_az_deg: self.orbit_az_deg,
@@ -1497,6 +1530,9 @@ impl SimSatStudioApp {
     /// hundreds), called once per UI frame; `on_exit` calls `save_settings_now`
     /// as the crash-conscious backstop.
     fn tick_settings_autosave(&mut self, ctx: &egui::Context) {
+        if self.batch_output.is_some() {
+            return;
+        }
         let snap = self.settings_snapshot();
         if snap == self.last_saved {
             self.settings_dirty_since = None;
@@ -1519,6 +1555,9 @@ impl SimSatStudioApp {
 
     /// Immediate settings save (the on-exit backstop).
     fn save_settings_now(&mut self) {
+        if self.batch_output.is_some() {
+            return;
+        }
         let snap = self.settings_snapshot();
         if snap != self.last_saved {
             let _ = settings::save(&self.settings_path, &snap);
@@ -1614,6 +1653,13 @@ impl SimSatStudioApp {
         else {
             return;
         };
+        self.start_export_to(ctx, path);
+    }
+
+    fn start_export_to(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let Some(state) = &self.rendered else {
+            return;
+        };
         let rgba = state.rendered.rgba.clone();
         let (w, h) = (state.rendered.width, state.rendered.height);
         let (tx, rx) = channel::<ExportMsg>();
@@ -1654,7 +1700,10 @@ impl SimSatStudioApp {
         }
         for m in msgs {
             match m {
-                ExportMsg::Ok(s) => self.logline(s),
+                ExportMsg::Ok(s) => {
+                    self.logline(s);
+                    self.batch_finished = true;
+                }
                 ExportMsg::Err(e) => self.logerr(e),
             }
         }
@@ -1662,6 +1711,39 @@ impl SimSatStudioApp {
             self.export_rx = None;
             self.export_busy = false;
         }
+    }
+
+    fn open_test_case(&mut self, path: PathBuf) {
+        let case = match earth::TestCase::load(&path) {
+            Ok(case) => case,
+            Err(e) => {
+                self.logerr(e);
+                return;
+            }
+        };
+        let recent = self.recent.clone();
+        let store = self.store_root.clone();
+        self.apply_settings(&case.settings);
+        self.recent = recent;
+        self.store_root = store;
+        self.sun_override = false;
+        self.gpu_clouds = false;
+        self.source = None;
+        if case.input.file_name().and_then(|n| n.to_str()) == Some("run.json") {
+            self.open_cached_run(case.input);
+        } else {
+            self.open_wrfout(case.input);
+        }
+        if let Some(Source::Wrfout { cache_dir, .. }) = &mut self.source
+            && let Some(cache) = case.cache
+        {
+            *cache_dir = cache;
+        }
+        self.selected_ts = case.timestep.min(self.timesteps.len().saturating_sub(1));
+        self.logline(format!(
+            "Test case: {}. Click Render; settings are editable.",
+            case.name
+        ));
     }
 
     fn open_wrfout(&mut self, path: PathBuf) {
@@ -2524,6 +2606,7 @@ impl SimSatStudioApp {
                 .contains(&self.bm_month_override)
                 .then_some(self.bm_month_override),
             bm_allow_download: self.bm_allow_download,
+            earth: self.earth.clone(),
         };
         configure_render_intent(&mut atmo);
         atmo
@@ -3261,6 +3344,25 @@ impl SimSatStudioApp {
                     ui.close();
                     self.dialog_open_sequence_files();
                 }
+                ui.separator();
+                ui.menu_button("Test cases", |ui| {
+                    if ui.button("Open case JSON...").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("SimSat test case")
+                            .add_filter("SimSat case", &["json"])
+                            .pick_file()
+                        {
+                            self.open_test_case(path);
+                        }
+                    }
+                    for (label, path) in earth::bundled_cases() {
+                        if ui.button(label).clicked() {
+                            ui.close();
+                            self.open_test_case(path);
+                        }
+                    }
+                });
                 // Recent open actions (newest first, capped, pruned on load).
                 if !self.recent.is_empty() {
                     ui.separator();
@@ -4920,9 +5022,33 @@ impl SimSatStudioApp {
                 });
 
             // Ground / Blue Marble.
-            egui::CollapsingHeader::new("Ground / Blue Marble")
+            egui::CollapsingHeader::new("Earth colors / ground")
                 .default_open(false)
                 .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Choose unshaded Earth maps...").clicked()
+                            && let Some(path) = rfd::FileDialog::new().set_title("NASA BMNG Base Map monthly folder").pick_folder() {
+                                self.earth.base_map=Some(path);
+                            }
+                        if ui.button("Use bundled Earth maps").clicked() {
+                            let path = std::env::current_exe().ok().and_then(|p|p.parent().map(|d|d.join("earth-basemap")));
+                            if path.as_ref().is_some_and(|p|p.is_dir()) { self.earth.base_map=path; }
+                            else { self.logerr("Extract the Earth-map asset pack beside SimSat Studio first."); }
+                        }
+                        if ui.button("Legacy maps").clicked() { self.earth=earth::EarthSettings::default(); }
+                    });
+                    if let Some(path)=&self.earth.base_map { ui.label(format!("Earth base map: {}",path.display())); }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Choose measured land JSON...").clicked()
+                            && let Some(path)=rfd::FileDialog::new().set_title("MODIS NBAR surface.json").add_filter("Measured land", &["json"]).pick_file() {
+                                self.earth.nbar_surface=Some(path);
+                            }
+                        if ui.button("Clear measured land").clicked() { self.earth.nbar_surface=None; }
+                        if ui.button("Natural color (sRGB)").clicked() { self.output_transform=OutputTransform::DebugSrgb; }
+                        if ui.button("ABI display colors").clicked() { self.output_transform=OutputTransform::AbiReflectance; }
+                    });
+                    if let Some(path)=&self.earth.nbar_surface { ui.label(format!("Measured land: {}",path.display())); }
+                    ui.small("Measured land: Visible + Display, matching original WRF grid/date; MODIS nadir/noon display proxy. Render to apply changes.");
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Ground month:");
                         let month_label = if self.bm_month_override == 0 {
@@ -5333,6 +5459,29 @@ impl eframe::App for SimSatStudioApp {
         self.drain_worker(&ctx);
         self.drain_pack();
         self.drain_export();
+        if let Some(path) = self.batch_output.clone() {
+            if let Some(err) = self.log.last_error() {
+                eprintln!("Batch render failed: {err}");
+                std::process::exit(1);
+            }
+            if self.batch_finished {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if !self.batch_started {
+                // The explicit batch command is the ingest request, as with the render CLI.
+                if let Some(Source::Wrfout { confirmed, .. }) = &mut self.source {
+                    *confirmed = true;
+                }
+                if !self.can_render() {
+                    eprintln!("Batch case cannot render");
+                    std::process::exit(1);
+                }
+                self.batch_started = true;
+                self.start_render(&ctx);
+            } else if !self.busy && self.rendered.is_some() && !self.batch_export_started {
+                self.batch_export_started = true;
+                self.start_export_to(&ctx, path);
+            }
+        }
         if self.busy || self.pack_busy || self.export_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -5857,6 +6006,7 @@ struct AtmoSettings {
     /// Lazily download missing Blue Marble months (GitHub asset URL -> NASA URL, SHA-256
     /// gated) on the render worker; `false` = cached 2 km or the vendored 8 km fallback only.
     bm_allow_download: bool,
+    earth: earth::EarthSettings,
 }
 
 /// Apply the strict Sensor Fast Gray contract to a per-render copy. Display is an
@@ -6161,6 +6311,18 @@ fn prepare_render(
     };
 
     validate_studio_instrument_footprint(&atmo, preset, resolution)?;
+    if atmo.earth.nbar_surface.is_some()
+        && !atmo.render_mode.is_thermal()
+        && (atmo.render_intent != RenderIntent::Display || atmo.render_mode != RenderMode::Visible)
+    {
+        return Err("Measured Earth colors require Visible + Display intent. Clear the measured land input for other products.".into());
+    }
+    let earth_input = match &job {
+        JobKind::Wrfout { path, ts_index, .. } if !ingest_grib::is_grib_input(path) => {
+            Some((path.clone(), *ts_index))
+        }
+        _ => None,
+    };
     if atmo.instrument_footprint != InstrumentFootprint::Off {
         status(&format!(
             "Instrument footprint {}: complete FM4 radiance on exact global 56-urad ABI lattice \
@@ -6577,6 +6739,16 @@ fn prepare_render(
     {
         // Thermal AND derived products are pure column computations — no ground albedo needed.
         Some(_) if ir_mode || derived_mode.is_some() => (None, BmStatus::Missing, String::new()),
+        Some(_) if atmo.earth.base_map.is_some() => {
+            let blend = atmo.bm_month_override.map_or_else(
+                || bluemarble::month_blend(month, day),
+                bluemarble::MonthBlend::single,
+            );
+            // Explicit local maps are re-read; changed files can never hit the legacy pack cache.
+            let (crop, line) = atmo.earth.base_crop(raster, blend, BM_MAX_DIM)?;
+            status(&line);
+            (Some(Arc::new((crop, line.clone()))), BmStatus::Loaded, line)
+        }
         Some((la_min, la_max, lo_min, lo_max)) => {
             // The 21600x10800 global JPEG decode(s) — up to TWO per season blend —
             // are the single largest recoverable per-frame cost of a sequence
@@ -6645,6 +6817,24 @@ fn prepare_render(
             status("No on-earth pixels; rendering flat albedo.");
             (None, BmStatus::Missing, String::new())
         }
+    };
+
+    let (linear_albedo, nbar_line) = if !ir_mode && derived_mode.is_none() {
+        if atmo.earth.nbar_surface.is_some()
+            && time_iso.as_deref().and_then(solar::parse_iso_utc).is_none()
+        {
+            return Err("Measured land requires a known model timestamp".into());
+        }
+        atmo.earth
+            .nbar_rgba(earth_input.as_ref(), (year, month, day), &brick, raster)?
+    } else {
+        (None, String::new())
+    };
+    let season_line = if nbar_line.is_empty() {
+        season_line
+    } else {
+        status(&nbar_line);
+        format!("{season_line}; {nbar_line}")
     };
 
     // Terrain normals + landmask from the brick.
@@ -7084,6 +7274,7 @@ fn prepare_render(
                 SurfacePixel {
                     on_earth: true,
                     base_srgb: base,
+                    linear_albedo: earth::measured_pixel(linear_albedo.as_deref(), idx),
                     normal_enu,
                     sun_enu: [l[0], l[1], l[2]],
                     sun_elev_deg: l[3],
@@ -7401,7 +7592,7 @@ fn prepare_render(
             SurfacePixel {
                 on_earth: true,
                 base_srgb: base,
-                linear_albedo: None,
+                linear_albedo: earth::measured_pixel(linear_albedo.as_deref(), idx),
                 normal_enu,
                 sun_enu,
                 sun_elev_deg: l[3],
@@ -7656,6 +7847,7 @@ fn prepare_render(
         normals_rgba,
         landmask_r8,
         bluemarble,
+        linear_albedo,
         bm_status,
         season_line,
         lat: raster.lat.clone(),
@@ -8381,6 +8573,7 @@ mod tests {
             sun_override: None,
             bm_month_override: None,
             bm_allow_download: false,
+            earth: earth::EarthSettings::default(),
         }
     }
 

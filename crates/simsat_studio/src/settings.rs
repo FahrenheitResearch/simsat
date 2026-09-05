@@ -205,6 +205,7 @@ pub struct StudioSettings {
     pub cloud_highlight_max: f32,
     pub bm_month_override: u32,
     pub bm_allow_download: bool,
+    pub earth: crate::earth::EarthSettings,
     pub play_fps: f32,
     pub frame_cap: usize,
     /// Perspective (3-D) orbit camera: azimuth / tilt / range / fov + output dims
@@ -282,6 +283,7 @@ impl Default for StudioSettings {
             cloud_highlight_max: simsat::render::RHO_HIGHLIGHT_MAX as f32,
             bm_month_override: 0,
             bm_allow_download: true,
+            earth: crate::earth::EarthSettings::default(),
             play_fps: 8.0,
             frame_cap: 120,
             // Orbit defaults: from the south at a 30-deg oblique, 300 km out, a

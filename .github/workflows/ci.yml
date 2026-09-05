@@ -19,6 +19,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 6
 
 jobs:
   linux-gate:

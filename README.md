@@ -10,6 +10,16 @@ true-Kelvin enhancement pipeline the real GOES/Himawari products use. It ships
 as a desktop app (`simsat_studio`, Rust/egui/wgpu), a headless CLI, and a
 numpy-returning Python binding (`import simsat`).
 
+## v0.3.0 release candidate
+
+The preview adds selectable unshaded Earth maps, measured MODIS land colors,
+and a local Studio case menu with automatic render/save. See the
+[release notes](notes/releases/v0.3.0-rc.1.md) and
+[Earth colors and cases guide](docs/STUDIO-CASES.md).
+The per-band Monte Carlo renderer remains an experimental research CLI;
+its numerical checks and known limits are in
+[the transport notes](notes/nextgen/ABI-MONTE-CARLO-LIGHTING.md).
+
 ## Gallery
 
 All frames below are real SimSat renders of real WRF output (a North Dakota

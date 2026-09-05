@@ -18,6 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 6
 
 jobs:
   windows-exe:
@@ -65,6 +66,8 @@ jobs:
           path: |
             target/release/simsat-render-frame
             target/release/simsat-render-ir
+            target/release/simsat-render-abi-first-order
+            target/release/simsat-render-abi-monte-carlo
           if-no-files-found: error
 
   python-wheel:

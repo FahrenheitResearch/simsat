@@ -491,9 +491,9 @@ impl LogBuffer {
 
 /// Worker-thread count for the global rayon pool: all cores MINUS ONE spare (the
 /// machine-stability discipline — the owner's box has hard-crashed under all-core
-/// load; one core stays free for the UI/desktop), floored at 1.
+/// load; one core stays free for the UI/desktop), floored at 1 and capped at 6.
 pub fn pool_threads_leaving_spare(available: usize) -> usize {
-    available.saturating_sub(1).max(1)
+    available.saturating_sub(1).clamp(1, 6)
 }
 
 // ── PNG-export filename (WS4 item 4) ──────────────────────────────────────────
@@ -1028,8 +1028,8 @@ mod tests {
         assert_eq!(pool_threads_leaving_spare(0), 1);
         assert_eq!(pool_threads_leaving_spare(1), 1);
         assert_eq!(pool_threads_leaving_spare(2), 1);
-        assert_eq!(pool_threads_leaving_spare(8), 7);
-        assert_eq!(pool_threads_leaving_spare(24), 23);
+        assert_eq!(pool_threads_leaving_spare(8), 6);
+        assert_eq!(pool_threads_leaving_spare(24), 6);
     }
 
     #[test]
