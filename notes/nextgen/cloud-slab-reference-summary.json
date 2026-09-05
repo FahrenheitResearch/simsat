@@ -1,0 +1,177 @@
+{
+  "reference": "official cdisort 2.1.3 standalone; scalar plane-parallel one layer",
+  "reference_source": {
+    "url": "https://www.libradtran.org/lib/exe/fetch.php?media=download%3Acdisort-2.1.3.tar.gz",
+    "sha256": "7d90ad5fefe155e62729505d5b24271a77adbd15d5800d85a290a94146314ad5",
+    "bytes": 144524,
+    "retrieved_utc": "2026-09-05T05:33:38.011369+00:00"
+  },
+  "reference_exe_sha256": "7dbe3306ad40fa3907d9a22abece9f67126942314dbb67078c1b07f152a282f3",
+  "simulated_source_json_sha256": "674d3974b6675f22409f502bff4ebff1078d9c7be144ab19daf4d2c5294b11c0",
+  "seconds": 11.447169599996414,
+  "rows": 1728,
+  "radiance_convergence_absolute_tolerance": 2e-05,
+  "radiance_convergence_relative_tolerance": 0.001,
+  "unconverged_ids": [],
+  "max_conservative_flux_residual_68": 1.2933787374436179e-09,
+  "groups": {
+    "all_converged": {
+      "count": 864,
+      "scores": {
+        "delta_v1_old_geometry": {
+          "bias": -0.0064500884086886486,
+          "mae": 0.07871555752035451,
+          "rmse": 0.12089254877067178
+        },
+        "delta_v1_vertical_column": {
+          "bias": -0.007874804239220958,
+          "mae": 0.07779873403774058,
+          "rmse": 0.12080127454260757
+        },
+        "delta_v2_old_geometry": {
+          "bias": 0.005232052402611892,
+          "mae": 0.08253297138590367,
+          "rmse": 0.12253636164850742
+        },
+        "delta_v2_vertical_column": {
+          "bias": 0.003910651908002384,
+          "mae": 0.08170272004816422,
+          "rmse": 0.12264301671527869
+        },
+        "delta_v3_old_geometry": {
+          "bias": -0.02577435229953961,
+          "mae": 0.0689358512766767,
+          "rmse": 0.11631392674796348
+        },
+        "delta_v3_vertical_column": {
+          "bias": -0.027546091240352802,
+          "mae": 0.0679513120259601,
+          "rmse": 0.11598910869136259
+        },
+        "legacy_beer": {
+          "bias": 0.06712410839496746,
+          "mae": 0.12212292126967422,
+          "rmse": 0.1791663562802286
+        },
+        "legacy_powder": {
+          "bias": -0.15646197711602158,
+          "mae": 0.16686548708504834,
+          "rmse": 0.28039021095339106
+        }
+      }
+    },
+    "in_lut_domain_converged": {
+      "count": 324,
+      "scores": {
+        "delta_v1_old_geometry": {
+          "bias": -0.0034794428785973725,
+          "mae": 0.050704044806246754,
+          "rmse": 0.07216485377612834
+        },
+        "delta_v1_vertical_column": {
+          "bias": -0.004215134981535025,
+          "mae": 0.05016393172421591,
+          "rmse": 0.07201082344533351
+        },
+        "delta_v2_old_geometry": {
+          "bias": 0.009080593930019747,
+          "mae": 0.05781169975947436,
+          "rmse": 0.08065755296669984
+        },
+        "delta_v2_vertical_column": {
+          "bias": 0.008370395688884662,
+          "mae": 0.057292182487008764,
+          "rmse": 0.080578723024985
+        },
+        "delta_v3_old_geometry": {
+          "bias": -0.034607559528750505,
+          "mae": 0.04050949325529006,
+          "rmse": 0.06769871504310257
+        },
+        "delta_v3_vertical_column": {
+          "bias": -0.03531159846861326,
+          "mae": 0.0404093625970267,
+          "rmse": 0.06772104360937897
+        },
+        "legacy_beer": {
+          "bias": 0.06546504903872807,
+          "mae": 0.09341851865114162,
+          "rmse": 0.13560385121991994
+        },
+        "legacy_powder": {
+          "bias": -0.17612579163355502,
+          "mae": 0.17612579163355502,
+          "rmse": 0.2577858846885931
+        }
+      }
+    },
+    "outside_lut_domain_converged": {
+      "count": 540,
+      "scores": {
+        "delta_v1_old_geometry": {
+          "bias": -0.008232475726743408,
+          "mae": 0.09552246514881915,
+          "rmse": 0.1423353564119359
+        },
+        "delta_v1_vertical_column": {
+          "bias": -0.010070605793832512,
+          "mae": 0.09437961542585539,
+          "rmse": 0.14225815081683202
+        },
+        "delta_v2_old_geometry": {
+          "bias": 0.0029229274861671778,
+          "mae": 0.09736573436176126,
+          "rmse": 0.14184805734073516
+        },
+        "delta_v2_vertical_column": {
+          "bias": 0.0012348056394730113,
+          "mae": 0.0963490425848575,
+          "rmse": 0.14202231133112947
+        },
+        "delta_v3_old_geometry": {
+          "bias": -0.020474427962013073,
+          "mae": 0.08599166608950869,
+          "rmse": 0.13746424145121036
+        },
+        "delta_v3_vertical_column": {
+          "bias": -0.02288678690339653,
+          "mae": 0.08447648168332011,
+          "rmse": 0.13701778529629177
+        },
+        "legacy_beer": {
+          "bias": 0.0681195440087111,
+          "mae": 0.13934556284079375,
+          "rmse": 0.20081805316497217
+        },
+        "legacy_powder": {
+          "bias": -0.14466368840550153,
+          "mae": 0.16130930435594432,
+          "rmse": 0.2931172721467827
+        }
+      }
+    }
+  },
+  "limitations": [
+    "source-only cloud slab, not a full image",
+    "SSA=1 reference and direct source; LUT source retains its original SSA=0.999",
+    "32/68 unconverged references are explicitly excluded from scores pending refinement",
+    "independent slab physics benchmark, not forecast or ABI-image skill"
+  ],
+  "source_quadrature_convergence": {
+    "intervals": [
+      512,
+      1024
+    ],
+    "max_absolute_rho_difference": {
+      "delta_v1_old_geometry": 4.3726809476618556e-06,
+      "delta_v1_vertical_column": 4.3726809476618556e-06,
+      "delta_v2_old_geometry": 4.675748031146565e-06,
+      "delta_v2_vertical_column": 4.675747958982068e-06,
+      "delta_v3_old_geometry": 4.37345493564667e-06,
+      "delta_v3_vertical_column": 4.37345927195576e-06,
+      "legacy_beer": 4.391603323217197e-07,
+      "legacy_powder": 6.3590643186173246e-06
+    }
+  },
+  "independent_reference_csv_sha256": "89b25e563ad64630b7576bb96f51eb1863d1d0a45afcb00c9c67dbc3b802725a"
+}

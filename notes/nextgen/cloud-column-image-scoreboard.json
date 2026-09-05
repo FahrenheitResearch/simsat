@@ -1,0 +1,358 @@
+{
+  "schema": "simsat-cloud-column-geometry-image-ab-v1",
+  "before": "legacy octaves",
+  "after": "opt-in DeltaFlux V2 with corrected vertical-column coordinate",
+  "intent": "display",
+  "view": "topdown",
+  "model_cloud_extinction_scale": 0.15,
+  "png_exposure": 1.5,
+  "metric_space": "historical f32le-rgb gray-composite validator, values clipped to [0,1]; not independent ABI radiometry",
+  "frozen_exe_sha256": "2d951298debde059bbd101d0702860044d3f8891649bc1f236b8e2adf1de71fa",
+  "rows": [
+    {
+      "hour_utc": "12",
+      "before_validation_sha256": "ab72add749fdaac2ab3e46f178250844f6c2c459b5110bb5d6c11eedc2213018",
+      "after_validation_sha256": "2da59cbeea29557b3dd17cc5051689b83081f059013802ab0121b9d451da27b4",
+      "metrics": {
+        "strict_clear": {
+          "bias": {
+            "before": 0.0013521659188883539,
+            "after": 0.0018593488904018322
+          },
+          "mae": {
+            "before": 0.009827625088728987,
+            "after": 0.010352804148475163
+          },
+          "rmse": {
+            "before": 0.01923941422958335,
+            "after": 0.020401072300234784
+          },
+          "correlation": {
+            "before": 0.333561731929105,
+            "after": 0.31706916779786315
+          }
+        },
+        "both_cloudy": {
+          "bias": {
+            "before": -0.0011704959787881765,
+            "after": -0.0005925865709730289
+          },
+          "mae": {
+            "before": 0.014517929785422302,
+            "after": 0.015385526204477043
+          },
+          "rmse": {
+            "before": 0.027217867532423466,
+            "after": 0.028324510727599284
+          },
+          "correlation": {
+            "before": 0.5389392685340384,
+            "after": 0.5327474445275052
+          }
+        },
+        "valid": {
+          "bias": {
+            "before": -0.003906389496082638,
+            "after": -0.003490147894062533
+          },
+          "mae": {
+            "before": 0.014000817716902812,
+            "after": 0.014552171940433895
+          },
+          "rmse": {
+            "before": 0.02562656743798138,
+            "after": 0.026460791244035404
+          },
+          "correlation": {
+            "before": 0.4009512278552955,
+            "after": 0.39463275315914065
+          }
+        },
+        "synthetic_only_cloudy": {
+          "bias": {
+            "before": 0.010955921933314407,
+            "after": 0.012007274521654615
+          },
+          "mae": {
+            "before": 0.01621881611714075,
+            "after": 0.017327684788235313
+          },
+          "rmse": {
+            "before": 0.02883680292542917,
+            "after": 0.030625762578571202
+          },
+          "correlation": {
+            "before": 0.49344230365891306,
+            "after": 0.4803073356103157
+          }
+        }
+      }
+    },
+    {
+      "hour_utc": "15",
+      "before_validation_sha256": "45660df4dffdbee6b701c6a403420c397107e6b69e45fbae5c76a84728d0b394",
+      "after_validation_sha256": "5279a1c850d2349dfdb283b7c3d024865c28d7481a953ef1092ca0de37e6a067",
+      "metrics": {
+        "strict_clear": {
+          "bias": {
+            "before": -0.02789614598499113,
+            "after": -0.01906613501707259
+          },
+          "mae": {
+            "before": 0.04639026802248772,
+            "after": 0.0506253607119187
+          },
+          "rmse": {
+            "before": 0.06210946783871583,
+            "after": 0.07450254556202277
+          },
+          "correlation": {
+            "before": 0.12696221113082967,
+            "after": 0.10364351066416548
+          }
+        },
+        "both_cloudy": {
+          "bias": {
+            "before": -0.1377094659848745,
+            "after": -0.10355050391741913
+          },
+          "mae": {
+            "before": 0.17161988755985927,
+            "after": 0.1630170938056929
+          },
+          "rmse": {
+            "before": 0.2160997988695895,
+            "after": 0.20687584157007677
+          },
+          "correlation": {
+            "before": 0.20357937739535106,
+            "after": 0.22916198769849622
+          }
+        },
+        "valid": {
+          "bias": {
+            "before": -0.10600525900004093,
+            "after": -0.09126210273007769
+          },
+          "mae": {
+            "before": 0.12529558248462971,
+            "after": 0.12465937941479857
+          },
+          "rmse": {
+            "before": 0.1787047720315954,
+            "after": 0.17762801856620383
+          },
+          "correlation": {
+            "before": 0.20515184086527521,
+            "after": 0.2205430591046459
+          }
+        },
+        "synthetic_only_cloudy": {
+          "bias": {
+            "before": -0.010658690814588027,
+            "after": 0.014250396987047546
+          },
+          "mae": {
+            "before": 0.06068311691551851,
+            "after": 0.07113235121982753
+          },
+          "rmse": {
+            "before": 0.08764430440259993,
+            "after": 0.1090994840244516
+          },
+          "correlation": {
+            "before": 0.3362171622190214,
+            "after": 0.34089610653435864
+          }
+        }
+      }
+    },
+    {
+      "hour_utc": "18",
+      "before_validation_sha256": "0d5fb643a11f266ab7051d2f6e2d43801a5e894653ef263aac3121166931fd85",
+      "after_validation_sha256": "be71153a571c73a951cf0c78a0e9529277eca4ea88564b0c19cd53f4cfbb6a31",
+      "metrics": {
+        "strict_clear": {
+          "bias": {
+            "before": 0.036242110168186445,
+            "after": 0.046100752917663336
+          },
+          "mae": {
+            "before": 0.076350840434194,
+            "after": 0.08434852159399787
+          },
+          "rmse": {
+            "before": 0.10278434767657045,
+            "after": 0.11969730439868266
+          },
+          "correlation": {
+            "before": -0.32418661951988237,
+            "after": -0.24258447863500096
+          }
+        },
+        "both_cloudy": {
+          "bias": {
+            "before": -0.13853483552738738,
+            "after": -0.09434573994992122
+          },
+          "mae": {
+            "before": 0.20603204622101298,
+            "after": 0.2098894069958364
+          },
+          "rmse": {
+            "before": 0.2834727130453309,
+            "after": 0.2813091780289455
+          },
+          "correlation": {
+            "before": 0.06993568620043776,
+            "after": 0.09837154407375935
+          }
+        },
+        "valid": {
+          "bias": {
+            "before": -0.07721573685442991,
+            "after": -0.059046947787994485
+          },
+          "mae": {
+            "before": 0.15589248332275893,
+            "after": 0.16038454602142793
+          },
+          "rmse": {
+            "before": 0.2288578430087629,
+            "after": 0.23163398900434057
+          },
+          "correlation": {
+            "before": 0.07535265118584866,
+            "after": 0.11044513706846237
+          }
+        },
+        "synthetic_only_cloudy": {
+          "bias": {
+            "before": 0.05510217510943582,
+            "after": 0.08763910026808983
+          },
+          "mae": {
+            "before": 0.10654515075364146,
+            "after": 0.12980570362376168
+          },
+          "rmse": {
+            "before": 0.1360199453749789,
+            "after": 0.17353706363156782
+          },
+          "correlation": {
+            "before": -0.08106012735782107,
+            "after": 0.021577008409838182
+          }
+        }
+      }
+    },
+    {
+      "hour_utc": "21",
+      "before_validation_sha256": "9ef5999e694551c4050c61a15817c5b363bd48f7851b7471d2138e5f623c003d",
+      "after_validation_sha256": "53f7175f5fe7decddf5f4f3d076d359afe426a01495d3a3741db6742de141170",
+      "metrics": {
+        "strict_clear": {
+          "bias": {
+            "before": -0.005305112194698686,
+            "after": 0.004881129345286565
+          },
+          "mae": {
+            "before": 0.04787214736229109,
+            "after": 0.05628189743511003
+          },
+          "rmse": {
+            "before": 0.07927547934810461,
+            "after": 0.09782491260877908
+          },
+          "correlation": {
+            "before": 0.13624809554755873,
+            "after": 0.1142725727841828
+          }
+        },
+        "both_cloudy": {
+          "bias": {
+            "before": -0.13946496070426417,
+            "after": -0.10155530520315455
+          },
+          "mae": {
+            "before": 0.20114251436155461,
+            "after": 0.19797106856694935
+          },
+          "rmse": {
+            "before": 0.261133862284532,
+            "after": 0.2575130207289351
+          },
+          "correlation": {
+            "before": 0.16845069156502018,
+            "after": 0.17872707475816438
+          }
+        },
+        "valid": {
+          "bias": {
+            "before": -0.11355025097928131,
+            "after": -0.09732648732024586
+          },
+          "mae": {
+            "before": 0.14965629248832943,
+            "after": 0.15150863008950766
+          },
+          "rmse": {
+            "before": 0.21696392359251976,
+            "after": 0.21829337698389137
+          },
+          "correlation": {
+            "before": 0.18197884892141347,
+            "after": 0.19437632097141816
+          }
+        },
+        "synthetic_only_cloudy": {
+          "bias": {
+            "before": 0.04425168395756568,
+            "after": 0.0742798721335167
+          },
+          "mae": {
+            "before": 0.08415079249215676,
+            "after": 0.10794094961176182
+          },
+          "rmse": {
+            "before": 0.13125027482811308,
+            "after": 0.16451815260907787
+          },
+          "correlation": {
+            "before": 0.22574954630912453,
+            "after": 0.21532072388043969
+          }
+        }
+      }
+    }
+  ],
+  "default_21z_byte_checks": {
+    "png": {
+      "before_sha256": "cf0a170fa3b77709a5236a3c6804ae72fe4f5304f12a67f0ee3a83ee82f5e275",
+      "after_sha256": "cf0a170fa3b77709a5236a3c6804ae72fe4f5304f12a67f0ee3a83ee82f5e275",
+      "identical_bytes": true
+    },
+    "bin": {
+      "before_sha256": "33e2ede45e80964af3086552ba65fbf65a82a0974e787bf74ca78b6425dfc7d8",
+      "after_sha256": "33e2ede45e80964af3086552ba65fbf65a82a0974e787bf74ca78b6425dfc7d8",
+      "identical_bytes": true
+    }
+  },
+  "clear_bias_21z_gate": {
+    "allowed_absolute_bias_deterioration": 0.02,
+    "actual_absolute_bias_deterioration": -0.0004239828494121212,
+    "passed": true
+  },
+  "thermal_gate": {
+    "status": "unchanged thermal path; not rerun in display-only experiment",
+    "reason": "runtime mutation is confined to the opt-in visible DeltaFlux closure; existing IR baseline and code remain unchanged"
+  },
+  "decision": "not promoted",
+  "reason": "mixed four-time errors, degraded 12Z/18Z both-cloudy MAE and 12Z/18Z/21Z all-valid MAE; flattened/contoured 1974 anvil at low sun",
+  "limitations": [
+    "gray composite display-intent scores are not per-band ABI validation",
+    "original observational references preserved",
+    "1974 comparison lacks contemporaneous satellite truth",
+    "no attempt to tune the case"
+  ]
+}

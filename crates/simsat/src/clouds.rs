@@ -3381,17 +3381,27 @@ pub fn march_cloud_clipped(
                     1,
                     multiscatter_support_tau,
                 );
-                let fractional_depth = if col_total.is_finite() && col_total > 0.0 {
-                    (sample.tau_up / col_total).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                };
+                // The LUT coordinate is vertical whole-column optical depth.
+                // Slanted sample-to-sun depth and a ground-shadow raster cannot
+                // replace it: they change with illumination and would inflate
+                // the slab while leaving its fractional depth unchanged. A
+                // missing vertical channel disables this experimental higher
+                // source (tau=0); the directly marched single source remains.
+                let (vertical_column_tau, fractional_depth) =
+                    if col_total.is_finite() && col_total > 0.0 {
+                        (
+                            col_total * od_scale,
+                            (sample.tau_up / col_total).clamp(0.0, 1.0),
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
                 let higher = match scene.cfg.multiscatter_mode {
                     CloudMultiscatterMode::DeltaFluxV2 => {
                         // `view` points camera -> sample; the outgoing direction toward
                         // the camera is `-view`. `up` is the slab upper-boundary normal.
                         crate::cloud_delta_flux::stage2_higher_order_source_p1(
-                            multiscatter_support_tau,
+                            vertical_column_tau,
                             fractional_depth,
                             mu_sun,
                             scene.cfg.ground_albedo,
@@ -3402,7 +3412,7 @@ pub fn march_cloud_clipped(
                     }
                     CloudMultiscatterMode::DeltaFluxV3 => {
                         crate::cloud_delta_flux::stage2_higher_order_source_order_memory(
-                            multiscatter_support_tau,
+                            vertical_column_tau,
                             fractional_depth,
                             mu_sun,
                             scene.cfg.ground_albedo,
@@ -3413,7 +3423,7 @@ pub fn march_cloud_clipped(
                     }
                     CloudMultiscatterMode::DeltaFluxV1 => {
                         crate::cloud_delta_flux::stage2_higher_order_source(
-                            multiscatter_support_tau,
+                            vertical_column_tau,
                             fractional_depth,
                             mu_sun,
                             scene.cfg.ground_albedo,
@@ -6001,6 +6011,99 @@ mod tests {
             opaque > clear * 1.25,
             "missing tau_up must retain sun-OD support fallback: {opaque} vs {clear}"
         );
+    }
+
+    #[test]
+    fn delta_flux_vertical_slab_source_is_independent_of_lateral_sun_occluders() {
+        // A remote sunward cloud changes the directly marched beam, but not the
+        // local vertical slab used by this column approximation. Subtracting
+        // the single-scatter march isolates its higher-order source. The old
+        // max(column_tau, sun_tau) argument incorrectly changed that source.
+        let (nx, ny, nz) = (48, 16, 24);
+        let dz = 250.0;
+        let mut clear = build_volume(nx, ny, nz, dz, 1000.0, |_, _, _| (5.0e-5, 0.0, 0.0));
+        let mut blocked = build_volume(nx, ny, nz, dz, 1000.0, |i, _, k| {
+            (
+                if (24..32).contains(&i) && k >= 12 {
+                    1.0e-2
+                } else {
+                    5.0e-5
+                },
+                0.0,
+                0.0,
+            )
+        });
+        rebuild_test_tau_up(&mut clear);
+        rebuild_test_tau_up(&mut blocked);
+        let georef = test_georef(nx, ny, 1000.0);
+        let ground = brick_to_ecef(&georef, 16.0, 8.0, 0.0, 0.0, dz).unwrap();
+        let up = norm3(ground);
+        let cam = madd3(ground, up, 500_000.0);
+        let view = scl3(up, -1.0);
+        let target = brick_to_ecef(&georef, 28.0, 8.0, 24.0, 0.0, dz).unwrap();
+        let sun = norm3([
+            target[0] - ground[0],
+            target[1] - ground[1],
+            target[2] - ground[2],
+        ]);
+        let (luts, sky_sh) = shared_luts();
+        let march_with = |vol: &DecodedVolume, mode| {
+            let mip = OccupancyMip::build(vol, OCCUPANCY_MIP_FACTOR);
+            let sun_od = accumulate_sun_od(vol, &georef, sun, 8);
+            let scene = CloudScene {
+                vol,
+                mip: &mip,
+                sun_od: &sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef: sun,
+                cfg: MarchConfig {
+                    cloud_optical_depth_scale: 1.0,
+                    sun_march_jitter_amp: 0.0,
+                    multiscatter_mode: mode,
+                    ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+                },
+            };
+            march_cloud(&scene, cam, view)
+                .sun_inscatter
+                .iter()
+                .sum::<f64>()
+        };
+        let single_clear = march_with(&clear, CloudMultiscatterMode::SingleScatter);
+        let single_blocked = march_with(&blocked, CloudMultiscatterMode::SingleScatter);
+        assert!(
+            single_blocked < 0.9 * single_clear,
+            "occluder must change beam: {single_clear} vs {single_blocked}"
+        );
+        for mode in [
+            CloudMultiscatterMode::DeltaFluxV1,
+            CloudMultiscatterMode::DeltaFluxV2,
+            CloudMultiscatterMode::DeltaFluxV3,
+        ] {
+            let higher_clear = march_with(&clear, mode) - single_clear;
+            let higher_blocked = march_with(&blocked, mode) - single_blocked;
+            assert!(higher_clear > 0.0);
+            assert!(
+                (higher_clear - higher_blocked).abs() < 1.0e-10 * higher_clear.max(1.0),
+                "remote slant OD must not change local slab source ({mode:?}): {higher_clear} vs {higher_blocked}"
+            );
+        }
+        // Without a real vertical channel, the experimental closure must not
+        // reinterpret the sun map as vertical geometry. Direct light survives.
+        let missing = build_volume(nx, ny, nz, dz, 1000.0, |_, _, _| (5.0e-5, 0.0, 0.0));
+        let single_missing = march_with(&missing, CloudMultiscatterMode::SingleScatter);
+        assert!(single_missing > 0.0);
+        for mode in [
+            CloudMultiscatterMode::DeltaFluxV1,
+            CloudMultiscatterMode::DeltaFluxV2,
+            CloudMultiscatterMode::DeltaFluxV3,
+        ] {
+            assert_eq!(
+                march_with(&missing, mode).to_bits(),
+                single_missing.to_bits()
+            );
+        }
     }
 
     #[test]
