@@ -77,6 +77,7 @@
 //!   twilight-surface-recovery-max-gain=<f> bounded gain (default 4.0).
 //!   cache=<dir>        Brick cache root + seasonal Blue Marble cache.
 //!   bluemarble=<path>  OPTIONAL single-file Blue Marble override (default seasonal pack).
+//!   bluemarble-base-map=<dir>  Explicit unshaded NASA monthly base maps (strict local loading).
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
 //!   bluemarble-download=<b>  on|off lazy month fetch (default on).
 //!   view=<mode>        geo | topdown  (default geo). topdown = the map-registered view.
@@ -128,6 +129,7 @@
 //!                      GOES-R true-color green arithmetic (khaki/mauve casts are
 //!                      impossible in it by construction). A/B judgment flag; applies
 //!                      to the whole process (all products rendered by this run).
+//!   output-transform=<name>  abi-reflectance (default) | srgb (standard display transfer).
 //!   rgb-reflectance-out=<path.bin>  QA/diagnostic: ALSO render the SAME scene through
 //!                      `Product::RgbReflectance` and write the RAW pre-tonemap,
 //!                      pre-exposure reflectance (`nx*ny*3` little-endian f32, row 0 =
@@ -159,7 +161,7 @@ use simsat::api::{
     self, BlueMarble, FractionalCloudMode, FrameData, Product, RenderBackend, RenderIntent,
     RenderParams, SunOverride,
 };
-use simsat::atmosphere::DEFAULT_AOD;
+use simsat::atmosphere::{DEFAULT_AOD, OutputTransform};
 use simsat::bricks::StorageProfile;
 use simsat::camera::{GeoNavigation, PerspectiveCamera, ResolutionMode, SatellitePreset, ViewMode};
 use simsat::clouds::{
@@ -197,6 +199,7 @@ struct Opts {
     out: PathBuf,
     backend: RenderBackend,
     intent: RenderIntent,
+    output_transform: OutputTransform,
     sat: SatellitePreset,
     geo_navigation: GeoNavigation,
     /// Opt-in satellite rays aimed at the native model-grid ground points.
@@ -242,6 +245,7 @@ struct Opts {
     exposure: f64,
     cache: PathBuf,
     bluemarble: Option<PathBuf>,
+    bluemarble_base_map: Option<PathBuf>,
     bluemarble_month: Option<u32>,
     bluemarble_download: bool,
     view: ViewMode,
@@ -439,6 +443,16 @@ fn run(args: &[String]) -> Result<(), String> {
     for limitation in result.intent.limitations() {
         eprintln!("render_frame: sensor limitation: {limitation}");
     }
+    if let Some(source) = &result.ground_source {
+        eprintln!("render_frame: ground-source={}", source.slug());
+    }
+    for status in &result.ground_status {
+        eprintln!("render_frame: ground: {status}");
+    }
+    eprintln!(
+        "render_frame: output-transform={:?} (display only)",
+        opts.output_transform
+    );
     for warning in &result.science_warnings {
         eprintln!("render_frame: SCIENCE WARNING: {warning}");
     }
@@ -953,12 +967,19 @@ fn product_label(opts: &Opts) -> &'static str {
 
 /// Build the shared [`RenderParams`] from the CLI options.
 fn render_params(opts: &Opts) -> RenderParams {
-    let bluemarble = match &opts.bluemarble {
-        Some(path) => BlueMarble::SingleFile(path.clone()),
-        None => BlueMarble::Seasonal {
+    let bluemarble = if let Some(directory) = &opts.bluemarble_base_map {
+        BlueMarble::SeasonalBaseMap {
+            directory: directory.clone(),
             month_override: opts.bluemarble_month,
-            download: opts.bluemarble_download,
-        },
+        }
+    } else {
+        match &opts.bluemarble {
+            Some(path) => BlueMarble::SingleFile(path.clone()),
+            None => BlueMarble::Seasonal {
+                month_override: opts.bluemarble_month,
+                download: opts.bluemarble_download,
+            },
+        }
     };
     let sun_override = if opts.sun_elev_override.is_some() || opts.sun_az_override.is_some() {
         Some(SunOverride {
@@ -973,6 +994,7 @@ fn render_params(opts: &Opts) -> RenderParams {
         storage_profile: opts.storage_profile,
         backend: opts.backend,
         intent: opts.intent,
+        output_transform: opts.output_transform,
         satellite: opts.sat,
         geo_navigation: opts.geo_navigation,
         timestep: opts.timestep,
@@ -1146,6 +1168,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut backend = RenderBackend::Cpu;
     let mut storage_profile = StorageProfile::CompactU8;
     let mut intent = RenderIntent::Display;
+    let mut output_transform = OutputTransform::AbiReflectance;
     let mut sat = SatellitePreset::GoesEast;
     let mut geo_navigation = GeoNavigation::ModelSphere;
     let mut model_grid_raster = false;
@@ -1193,6 +1216,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut exposure = DEFAULT_EXPOSURE;
     let mut cache = ingest::default_cache_dir();
     let mut bluemarble: Option<PathBuf> = None;
+    let mut bluemarble_base_map: Option<PathBuf> = None;
     let mut bluemarble_month: Option<u32> = None;
     let mut bluemarble_download = true;
     let mut view = ViewMode::Geostationary;
@@ -1458,9 +1482,21 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "sun-az" | "sun_az" | "sunaz" => {
                 sun_az_override = Some(v.parse().map_err(|_| format!("bad sun-az '{v}'"))?)
             }
+            "output-transform" => {
+                output_transform = match v {
+                    "abi-reflectance" => OutputTransform::AbiReflectance,
+                    "srgb" | "debug-srgb" => OutputTransform::DebugSrgb,
+                    _ => {
+                        return Err(format!(
+                            "bad output-transform '{v}'; use abi-reflectance|srgb"
+                        ));
+                    }
+                };
+            }
             "exposure" | "ev" => exposure = v.parse().map_err(|_| format!("bad exposure '{v}'"))?,
             "cache" => cache = PathBuf::from(v),
             "bluemarble" | "bm" => bluemarble = Some(PathBuf::from(v)),
+            "bluemarble-base-map" => bluemarble_base_map = Some(PathBuf::from(v)),
             "bluemarble-month" | "bm-month" | "month" => {
                 let m: u32 = v
                     .parse()
@@ -1595,12 +1631,16 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             return Err("raster=model-grid supports plain visible/RGB-reflectance output only; no composites, perspective, instrument footprint or fixed-grid store".to_string());
         }
     }
+    if bluemarble.is_some() && bluemarble_base_map.is_some() {
+        return Err("bluemarble and bluemarble-base-map are mutually exclusive".to_string());
+    }
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
         storage_profile,
         out: out.ok_or("missing required out=<file.png>")?,
         backend,
         intent,
+        output_transform,
         sat,
         geo_navigation,
         model_grid_raster,
@@ -1644,6 +1684,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         exposure,
         cache,
         bluemarble,
+        bluemarble_base_map,
         bluemarble_month,
         bluemarble_download,
         view,
@@ -1875,6 +1916,8 @@ fn print_usage() {
          \x20 exposure=<f>       display gain before the ABI stretch (default {DEFAULT_EXPOSURE})\n\
          \x20 cache=<dir>        brick cache root + seasonal Blue Marble cache\n\
          \x20 bluemarble=<path>  single-file Blue Marble override (default: seasonal pack)\n\
+         \x20 output-transform=<name>  abi-reflectance (default) | srgb (display only)\n\
+         \x20 bluemarble-base-map=<dir>  unshaded NASA monthly base maps (strict local loading)\n\
          \x20 bluemarble-month=<MM>  force month 1..=12 (default: day-of-year blend)\n\
          \x20 bluemarble-download=<b>  on|off lazy month fetch (default on)\n\
          \x20 view=<mode>        geo | topdown  (default geo)\n\

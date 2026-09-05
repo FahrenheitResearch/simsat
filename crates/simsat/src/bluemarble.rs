@@ -48,6 +48,12 @@ pub fn month_file_2km(month: u32) -> String {
     format!("world.topo.2004{:02}.3x21600x10800.jpg", month.clamp(1, 12))
 }
 
+/// NASA BMNG Base Map 2 km monthly composite, without added topographic shading.
+/// Kept separate from the shaded pack's cache names and checksums.
+pub fn base_map_month_file_2km(month: u32) -> String {
+    format!("world.2004{:02}.3x21600x10800.jpg", month.clamp(1, 12))
+}
+
 /// 8 km emergency-fallback file name for `month` in `1..=12`. This is the NASA
 /// 8 km (5400x2700) monthly composite downscaled to 3600x1800 and vendored in the
 /// repo (see `asset_pack::fallback_8k_bytes`); the renderer never hard-fails offline.

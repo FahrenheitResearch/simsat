@@ -8,4 +8,3 @@ fn liquid_population_phase_add(accumulated_sr1: f32, particle_phase_sr1: f32, sc
 fn liquid_population_volume_coefficients(mass_coefficients: vec3<f32>, liquid_kg_m3: f32) -> vec3<f32> {
     return mass_coefficients * liquid_kg_m3;
 }
-

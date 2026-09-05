@@ -1,0 +1,94 @@
+{
+  "source_page": "https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/base-map/",
+  "product": "NASA BMNG 2004 Base Map without added topographic shading",
+  "dimensions": [
+    21600,
+    10800
+  ],
+  "assets": [
+    {
+      "month": 1,
+      "filename": "world.200401.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/january/world.200401.3x21600x10800.jpg",
+      "bytes": 23716627,
+      "sha256": "c2f2c80a352518cfea23d462dad6f6e778375ddd74bbec5786bcfc85cc49c61d"
+    },
+    {
+      "month": 2,
+      "filename": "world.200402.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/february/world.200402.3x21600x10800.jpg",
+      "bytes": 23369623,
+      "sha256": "8800081f38b53bfa1e3f0c2fa17be694b7646942fe5add009ea0dcd64c03e70b"
+    },
+    {
+      "month": 3,
+      "filename": "world.200403.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/march/world.200403.3x21600x10800.jpg",
+      "bytes": 22848375,
+      "sha256": "af37f61a9715c59dc86763df19f588a20c9d92b3d0a8034a0b00acd6b97ccb7d"
+    },
+    {
+      "month": 4,
+      "filename": "world.200404.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/april/world.200404.3x21600x10800.jpg",
+      "bytes": 22209925,
+      "sha256": "3bd13f173555eb24451c45d3a83ca177baca02e9a8bdd9fa3e4989f7b496ce6b"
+    },
+    {
+      "month": 5,
+      "filename": "world.200405.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/may/world.200405.3x21600x10800.jpg",
+      "bytes": 21829549,
+      "sha256": "0de40c868680ab9e86fef42406d76386b243b32444ff50edfd406b296638c206"
+    },
+    {
+      "month": 6,
+      "filename": "world.200406.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/june/world.200406.3x21600x10800.jpg",
+      "bytes": 21793655,
+      "sha256": "282608580a290723655bfbe917e69ea2f93f4da068dfa96ff4a152b1c6ec36be"
+    },
+    {
+      "month": 7,
+      "filename": "world.200407.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/july/world.200407.3x21600x10800.jpg",
+      "bytes": 21125326,
+      "sha256": "dea8b4dc8a4f93f5f8bce0c8c85a508a178e7901e9ed8e6bf86e6ce7ef6d61e2"
+    },
+    {
+      "month": 8,
+      "filename": "world.200408.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/august/world.200408.3x21600x10800.jpg",
+      "bytes": 21206743,
+      "sha256": "926be7253be90a1fd57071a33afbfe7a712a2dfe0d5b5b4602bc5dfbcfdc2c89"
+    },
+    {
+      "month": 9,
+      "filename": "world.200409.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/september/world.200409.3x21600x10800.jpg",
+      "bytes": 22359549,
+      "sha256": "7cf788e13a3a7b4a926b524f8f71d635c56a18c48ba0bfe35695b05a305db3f3"
+    },
+    {
+      "month": 10,
+      "filename": "world.200410.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/october/world.200410.3x21600x10800.jpg",
+      "bytes": 22853895,
+      "sha256": "bf568ceca2ad55e9c8dd7bcedfd0e419201d03bb560206a7bfa2cc57c1e04c64"
+    },
+    {
+      "month": 11,
+      "filename": "world.200411.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/november/world.200411.3x21600x10800.jpg",
+      "bytes": 23766556,
+      "sha256": "1959bbe72897d3e9526c440dae3ec04cfdbdc4080c8ff0b14632925ae31167b1"
+    },
+    {
+      "month": 12,
+      "filename": "world.200412.3x21600x10800.jpg",
+      "url": "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/december/world.200412.3x21600x10800.jpg",
+      "bytes": 23931114,
+      "sha256": "b0ffc9d12205689aeaec66116bbae2c4c263fcd98a0cbadba8d5488567b53278"
+    }
+  ]
+}

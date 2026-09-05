@@ -406,6 +406,13 @@ pub enum BlueMarble {
         month_override: Option<u32>,
         download: bool,
     },
+    /// Explicit NASA BMNG Base Map directory, without added topographic shading.
+    /// Files are named `world.2004MM.3x21600x10800.jpg`. Uses the same date blend
+    /// as Seasonal, but every requested month must load; no silent fallback.
+    SeasonalBaseMap {
+        directory: PathBuf,
+        month_override: Option<u32>,
+    },
     /// A single-file Blue Marble override (one JPEG for the whole frame).
     SingleFile(PathBuf),
     /// No ground texture — flat albedo (fast; no I/O; used by tests + a plain option).
@@ -498,6 +505,9 @@ pub struct RenderParams {
     pub twilight_surface_recovery: TwilightSurfaceRecoveryConfig,
     /// Display exposure gain (visible only). [`DEFAULT_EXPOSURE`] is the shipped default.
     pub exposure: f64,
+    /// Display transfer for visible PNGs (shared CPU/WGSL implementation).
+    /// Raw RgbReflectance values are independent of this selection.
+    pub output_transform: OutputTransform,
     /// M5 Wrenninge multi-scatter octaves (visible only).
     pub multiscatter: bool,
     /// Explicit higher-order cloud-transport mode. `None` preserves the established
@@ -673,6 +683,7 @@ impl RenderParams {
             surface_postlight_toe: SurfacePostlightToeConfig::default(),
             twilight_surface_recovery: TwilightSurfaceRecoveryConfig::shipped(),
             exposure: DEFAULT_EXPOSURE,
+            output_transform: OutputTransform::AbiReflectance,
             multiscatter: true,
             cloud_multiscatter: None,
             beer_powder: false,
@@ -881,6 +892,8 @@ pub enum GroundSource {
     /// No ground texture — the flat-albedo constant. The string says WHY (requested,
     /// or the seasonal load failure that degraded to it).
     FlatAlbedo(String),
+    /// Explicit seasonal NASA BMNG Base Map (no added topographic shading).
+    SeasonalBaseMap,
     /// A user-named single-file ground texture ([`BlueMarble::SingleFile`]).
     SingleFile,
 }
@@ -894,6 +907,7 @@ impl GroundSource {
             Self::EightKmFallback => "8km-fallback",
             Self::FlatAlbedo(_) => "flat-albedo",
             Self::SingleFile => "single-file",
+            Self::SeasonalBaseMap => "seasonal-base-map",
         }
     }
 }
@@ -1541,7 +1555,7 @@ fn render_visible_scene(
         sky_sh: &sky_sh,
         cam: cam_geo,
         sun_ecef,
-        output_transform: OutputTransform::AbiReflectance,
+        output_transform: params.output_transform,
         bm_present: bluemarble.is_some(),
         water_scale: WATER_ALBEDO_SCALE as f64,
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
@@ -2038,7 +2052,7 @@ fn render_gpu_visible_frame(
         bm_present: if bluemarble.is_some() { 1.0 } else { 0.0 },
         water_scale: WATER_ALBEDO_SCALE,
         flat_albedo: FLAT_ALBEDO_SRGB,
-        output_transform: OutputTransform::AbiReflectance.code(),
+        output_transform: params.output_transform.code(),
         ambient_elev_min: sky_sh.elev_min_deg as f32,
         ambient_elev_max: sky_sh.elev_max_deg as f32,
         ambient_n: sky_sh.entries.len() as f32,
@@ -2769,7 +2783,7 @@ fn render_cloud_layer_scene(
         // 1. The native cloud layer + shadow on the Lambert map raster.
         let native = crate::topdown::render_cloud_layer_frame(
             &scene,
-            OutputTransform::AbiReflectance,
+            params.output_transform,
             params.exposure,
             &raster.lat,
             &raster.lon,
@@ -3028,7 +3042,7 @@ fn render_perspective_scene(
         sky_sh: &sky_sh,
         cam: cam_geo,
         sun_ecef,
-        output_transform: OutputTransform::AbiReflectance,
+        output_transform: params.output_transform,
         bm_present: bluemarble.is_some(),
         water_scale: WATER_ALBEDO_SCALE as f64,
         flat_albedo_srgb: FLAT_ALBEDO_SRGB as f64,
@@ -3110,7 +3124,7 @@ fn render_perspective_scene(
             crate::topdown::render_perspective_cloud_layer(
                 &scene,
                 &basis,
-                OutputTransform::AbiReflectance,
+                params.output_transform,
                 params.exposure,
             )
         } else {
@@ -3408,6 +3422,35 @@ fn resolve_bluemarble(
             let crop = bluemarble::load_crop(path, la0, la1, lo0, lo1, 1.0, BLUEMARBLE_MAX_AXIS)
                 .map_err(|e| format!("blue marble file {}: {e}", path.display()))?;
             Ok((Some(crop), GroundSource::SingleFile, Vec::new()))
+        }
+        BlueMarble::SeasonalBaseMap {
+            directory,
+            month_override,
+        } => {
+            let blend = month_override.map_or_else(
+                || bluemarble::month_blend(month, day),
+                bluemarble::MonthBlend::single,
+            );
+            let load = |m| {
+                let path = directory.join(bluemarble::base_map_month_file_2km(m));
+                bluemarble::load_crop(&path, la0, la1, lo0, lo1, 1.0, BLUEMARBLE_MAX_AXIS)
+                    .map_err(|e| format!("seasonal base map {}: {e}", path.display()))
+            };
+            let a = load(blend.month_a)?;
+            let crop = if blend.is_single() {
+                a
+            } else {
+                bluemarble::blend_crops(&a, &load(blend.month_b)?, blend.weight_b)
+            };
+            Ok((
+                Some(crop),
+                GroundSource::SeasonalBaseMap,
+                vec![format!(
+                    "NASA BMNG Base Map (without added terrain shading): {}; directory={}",
+                    blend.label(),
+                    directory.display()
+                )],
+            ))
         }
         BlueMarble::Seasonal {
             month_override,
@@ -4733,6 +4776,22 @@ mod tests {
     }
 
     #[test]
+    fn srgb_transfer_changes_visible_display_without_changing_scene_geometry() {
+        let src = synthetic_source(16, 16, 16, 3000.0);
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        let original = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        p.output_transform = OutputTransform::DebugSrgb;
+        let srgb = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert_eq!((original.nx, original.ny), (srgb.nx, srgb.ny));
+        match (&original.data, &srgb.data) {
+            (FrameData::Visible { rgb: a, .. }, FrameData::Visible { rgb: b, .. }) => {
+                assert_ne!(a, b, "the selected transfer must reach the finished image");
+            }
+            _ => panic!("expected visible frames"),
+        }
+    }
+
+    #[test]
     fn visible_bands_reflectance_is_finite_in_zero_one() {
         let src = synthetic_source(24, 24, 24, 3000.0);
         let p = synthetic_params(ViewMode::TopDownMap);
@@ -4764,6 +4823,7 @@ mod tests {
 
         let mut adjusted_params = baseline_params;
         adjusted_params.exposure = 4.0;
+        adjusted_params.output_transform = OutputTransform::DebugSrgb;
         adjusted_params.ground_gain = Some(0.5);
         adjusted_params.cloud_softclip = Some(0.4);
         adjusted_params.cloud_highlight_max = Some(2.0);
@@ -5777,6 +5837,41 @@ mod tests {
             err.contains("blue marble file"),
             "error should name the ground file: {err}"
         );
+    }
+
+    #[test]
+    fn seasonal_base_map_requires_both_months_and_reports_the_blend() {
+        let dir = api_temp_dir("base-map-strict");
+        let src = synthetic_source(16, 16, 12, 3000.0);
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        p.bluemarble = BlueMarble::SeasonalBaseMap {
+            directory: dir.clone(),
+            month_override: None,
+        };
+        // Synthetic scene's documented fallback date is June 21: June/July blend.
+        let june = dir.join(bluemarble::base_map_month_file_2km(6));
+        let july = dir.join(bluemarble::base_map_month_file_2km(7));
+        let texture = image::RgbImage::from_pixel(360, 180, image::Rgb([80u8, 120, 40]));
+        texture.save(&june).unwrap();
+        let err = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap_err();
+        assert!(
+            err.contains("world.200407."),
+            "missing partner must fail: {err}"
+        );
+        texture.save(&july).unwrap();
+        let r = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert_eq!(r.ground_source, Some(GroundSource::SeasonalBaseMap));
+        assert!(r.ground_status.iter().any(|s| s.contains("Jun/Jul blend")));
+        assert_eq!(r.ground_source.unwrap().slug(), "seasonal-base-map");
+        std::fs::remove_file(&july).unwrap();
+        p.bluemarble = BlueMarble::SeasonalBaseMap {
+            directory: dir.clone(),
+            month_override: Some(6),
+        };
+        // An explicit single month must not require its unused partner.
+        let r = render_visible_scene(&src, &p, Product::VisibleRgb).unwrap();
+        assert!(r.ground_status.iter().any(|s| s.contains(": Jun;")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

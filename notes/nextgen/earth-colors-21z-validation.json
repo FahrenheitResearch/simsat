@@ -1,0 +1,48 @@
+{
+  "metric": "existing raw gray RGB luminance diagnostic; not per-band ABI radiometry",
+  "cases": [
+    {
+      "label": "current",
+      "source": "C:\\Users\\drew\\soma-render-work\\out\\simsat-nextgen-realism-geo\\21z\\validate-vis\\validation.json",
+      "regimes": {
+        "both_cloudy": {
+          "bias": -0.12412790960995275,
+          "mae": 0.1939245606658261,
+          "rmse": 0.252568736318038
+        },
+        "strict_clear": {
+          "bias": -0.001198906721875449,
+          "mae": 0.04825108713200781,
+          "rmse": 0.08294704264417563
+        },
+        "valid": {
+          "bias": -0.10474538730431511,
+          "mae": 0.1453819545584909,
+          "rmse": 0.2114999049430588
+        }
+      }
+    },
+    {
+      "label": "unshaded-base-map",
+      "source": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap-validation\\21z\\validation.json",
+      "regimes": {
+        "both_cloudy": {
+          "bias": -0.1240620937439536,
+          "mae": 0.19386332954818017,
+          "rmse": 0.2524878433392976
+        },
+        "strict_clear": {
+          "bias": -0.0010874159580069509,
+          "mae": 0.04814611205818836,
+          "rmse": 0.08290672242309861
+        },
+        "valid": {
+          "bias": -0.10463582582124421,
+          "mae": 0.14527628819763325,
+          "rmse": 0.21141426705939975
+        }
+      }
+    }
+  ],
+  "caution": "The raw diagnostic deliberately disables display-only land brightness controls. It cannot establish that the no-land-toe or sRGB presentation is more radiometrically accurate. Only the ground-source change is scored here. All four acceptance times must be checked before any new default is promoted."
+}
