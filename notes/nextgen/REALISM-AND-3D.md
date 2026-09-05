@@ -1,5 +1,7 @@
 # SimSat realism and 3D progress
 
+Historical milestone; active work is satellite-only support for meteorologists on cloud-seeding missions. See [SATELLITE-ONLY.md](SATELLITE-ONLY.md).
+
 Worktree: `C:\Users\drew\simsat-wt-nextgen-abi`, branch `codex/nextgen-abi`. Main is untouched; nothing merged or pushed. Cargo jobs remains 6.
 
 Images are mirrored to `C:\Users\drew\Downloads\SimSat-Cloud-Renders`. The wide 1974 cloud scene is the strongest current 3D output. Ground tornado images are diagnostic experiments; they do not yet resolve a convincing visible funnel.
@@ -15,13 +17,13 @@ All four original topdown cases completed. Both declared gates pass against orig
 | 18Z | -1.1228 | +10.8027 | +0.35502 / +0.03634 / +0.03624 | +0.07990 / +0.07969 |
 | 21Z | -1.8241 | +8.9589 | -0.00551 / -0.00515 / -0.00531 | +0.04510 / +0.04411 |
 
-All four thermal planes are byte-identical to the first increment. The +7.6 to +10.8 K collocated-cloud warm residual remains. The native CTT audit previously found minima 207.7–214.2 K, far warmer than the coldest observed pixels. No global cloud-cooling offset was introduced.
+All four thermal planes are byte-identical to the first increment. The +7.6 to +10.8 K collocated-cloud warm residual remains. The native CTT audit previously found minima 207.7â€“214.2 K, far warmer than the coldest observed pixels. No global cloud-cooling offset was introduced.
 
 ## Geometry and case library
 
 Satellite model-grid rays now use the physical satellite viewpoint and preserve the trusted target grid. The official C01/C02/C03 response registry is present, but an independent per-band transport/surface operator is still unfinished: current visible scores are gray RGB diagnostics. Do not call these ABI band-reflectance acceptance results.
 
-Independent Texas daytime and tropical night cases completed using verified aligned GOES-19 references. Texas is HRRR-prepared WRF, not a native GRIB ingest test. Its clear IR bias is +9.02 K and both-cloudy bias +22.44 K; native skin temperatures over observed-clear pixels average 320.05 K versus ABI 305.11 K and lowest model air 306.59 K. Night clear IR bias is -13.35 K, both-cloudy -3.76 K; these holdouts reveal unresolved forecast/operator differences. The satellite-view 12Z expanded case is still running; other original hours are complete.
+Independent Texas daytime and tropical night cases completed using verified aligned GOES-19 references. Texas is HRRR-prepared WRF, not a native GRIB ingest test. Its clear IR bias is +9.02 K and both-cloudy bias +22.44 K; native skin temperatures over observed-clear pixels average 320.05 K versus ABI 305.11 K and lowest model air 306.59 K. Night clear IR bias is -13.35 K, both-cloudy -3.76 K; these holdouts reveal unresolved forecast/operator differences. All four satellite-view expanded cases are now complete; current results are in SATELLITE-ONLY.md.
 
 ## Actual 3D clouds and the tornado
 

@@ -83,3 +83,19 @@ Case ID: `1c464b1ed50b1c3de4aa`. Output: `C:\Users\drew\soma-render-work\out\sim
 GOES19 official FM4 C13 response
 
 Provenance: `C:\Users\drew\soma-render-work\out\simsat-nextgen-realism-geo\15z/run.json` (input/tool/binary hashes, commands, reference scans and stage timing).
+
+<!-- simsat-case:5498e155401a564e11ec scores:efd3935c585cc76b4b3a8b9ca22fc6854d5216dc837461ad5f3dd5543e6a3e69 -->
+## 2026-09-04T12:00:00Z / Original 12Z satellite-view model grid
+
+Input kind: wrf-netcdf. wrf-netcdf
+Case ID: `5498e155401a564e11ec`. Output: `C:\Users\drew\soma-render-work\out\simsat-nextgen-realism-geo\12z`. Satellite/sector: goes19/full-disk.
+
+| Product / sampling | Clear bias | Both-cloudy bias | Observed-cloudy bias | All-valid bias | Correlation |
+|---|---:|---:|---:|---:|---:|
+| IR C13 K / topdown | -2.985027 | +7.596553 | +11.212738 | +6.301522 | +0.180188 |
+| Display gray RGB / satellite model-grid | +0.002281 | -0.001010 | -0.006300 | -0.003270 | +0.413800 |
+| Sensor gray RGB / satellite model-grid | +0.013846 | +0.015953 | +0.005817 | +0.008708 | +0.404227 |
+
+GOES19 official FM4 C13 response
+
+Provenance: `C:\Users\drew\soma-render-work\out\simsat-nextgen-realism-geo\12z/run.json` (input/tool/binary hashes, commands, reference scans and stage timing).
