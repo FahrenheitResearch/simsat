@@ -609,8 +609,10 @@ pub struct RenderParams {
     /// product. Non-thermal products ignore it.
     pub condensate_cloud_mask_kg_kg: Option<f64>,
     /// An explicit raster to render at instead of the one built from `view`/`resolution`
-    /// (the `render_frame` supersample QA path; geostationary visible only). `None` =
-    /// build it. NEVER set this from the Python binding.
+    /// (geostationary visible only). `None` builds the ordinary raster. The
+    /// opt-in `native_model_grid_satellite_raster` helper supplies direct satellite
+    /// rays on model-grid ground points without changing this request's view.
+    /// NEVER set this from the Python binding.
     pub raster_override: Option<SurfaceRaster>,
     /// Optional display-only GROUND LIFT override ([`crate::render::GROUND_DAY_LIFT`]).
     /// `None` (default) = the baked constant; `1.0` is neutral. Visible RGB-family
@@ -975,6 +977,33 @@ struct SceneSource {
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
     let product = product.canonical();
+    if params
+        .raster_override
+        .as_ref()
+        .is_some_and(SurfaceRaster::is_model_grid_satellite)
+    {
+        validate_model_grid_satellite_params(params)?;
+        if !matches!(product, Product::VisibleRgb | Product::RgbReflectance) {
+            return Err(
+                "raster=model-grid currently supports plain visible/RGB-reflectance products only"
+                    .to_string(),
+            );
+        }
+        let geometry = params
+            .raster_override
+            .as_ref()
+            .unwrap()
+            .navigation_geometry
+            .unwrap();
+        let requested_camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+            .map_err(str::to_string)?;
+        if geometry.model_sub_lon_deg != requested_camera.model_sub_lon_deg
+            || geometry.navigation != requested_camera.navigation
+            || geometry.sub_lon_deg != requested_camera.sub_lon_deg
+        {
+            return Err("model-grid satellite raster camera does not match the requested satellite/navigation".to_string());
+        }
+    }
     if params.instrument_footprint != InstrumentFootprint::Off {
         if !matches!(product, Product::Ir | Product::GeoColor | Product::Sandwich) {
             return Err(format!(
@@ -1111,6 +1140,48 @@ pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, S
     result.observation_operator = params.intent.observation_operator();
     result.intent_adjustments = intent_adjustments;
     Ok(result)
+}
+
+/// Build native model-grid ground-point samples for an opt-in satellite view.
+/// Set the returned raster on `RenderParams::raster_override` and render the
+/// ordinary visible/RGB-reflectance product. Resolves the input once to obtain
+/// its georeference; the render reuses the resulting cache. All ray physics and
+/// platform presets remain unchanged. This is not instrument lattice sampling.
+pub fn native_model_grid_satellite_raster(params: &RenderParams) -> Result<SurfaceRaster, String> {
+    validate_model_grid_satellite_params(params)?;
+    let source = resolve_source(params)?;
+    model_grid_satellite_raster_for_source(&source, params)
+}
+
+fn validate_model_grid_satellite_params(params: &RenderParams) -> Result<(), String> {
+    if params.view != ViewMode::Geostationary || params.backend != RenderBackend::Cpu {
+        return Err("raster=model-grid requires view=geo and backend=cpu".to_string());
+    }
+    if params.resolution != ResolutionMode::Native || params.margin_frac != 0.0 {
+        return Err("raster=model-grid requires resolution=native and margin=0 for exact model-grid registration".to_string());
+    }
+    if params.perspective.is_some() || params.instrument_footprint != InstrumentFootprint::Off {
+        return Err("raster=model-grid is direct satellite ground-point sampling, incompatible with perspective/ABI footprint integration".to_string());
+    }
+    Ok(())
+}
+
+fn model_grid_satellite_raster_for_source(
+    src: &SceneSource,
+    params: &RenderParams,
+) -> Result<SurfaceRaster, String> {
+    let (nx, ny) = (src.brick.nx, src.brick.ny);
+    if nx > MAX_AXIS || ny > MAX_AXIS {
+        return Err(format!(
+            "native model grid {nx}x{ny} exceeds {MAX_AXIS}; refusing to silently coarsen the scoring grid"
+        ));
+    }
+    let camera = GeoCamera::for_navigation(params.satellite, params.geo_navigation)
+        .map_err(str::to_string)?;
+    let (dx, dy) = dx_dy_metres(&src.params);
+    build_map_raster_mode(&src.georef, nx, ny, dx, dy, ResolutionMode::Native, 0.0)
+        .and_then(|map| map.as_satellite_surface_raster(&camera))
+        .ok_or_else(|| "model-grid satellite raster requires a nondegenerate grid with every ground point visible from the satellite".to_string())
 }
 
 /// Resolve an output intent on a clone, preserving the caller request exactly.
@@ -3194,7 +3265,15 @@ fn build_georef(
     margin_frac: f64,
 ) -> Georef {
     let (nx, ny) = (raster.nx, raster.ny);
-    let (extent, extent_kind) = match view {
+    // A satellite camera can sample the model's map grid directly. Keep the
+    // physical view geostationary, but report the map pixel-edge extent instead
+    // of pretending those irregular ray samples form a rectangular scan raster.
+    let extent_view = if raster.is_model_grid_satellite() {
+        ViewMode::TopDownMap
+    } else {
+        view
+    };
+    let (extent, extent_kind) = match extent_view {
         ViewMode::TopDownMap => {
             // imshow pixel-edge extent = the plane coord at the raster's OUTER half-pixel
             // edges, in WRF grid-index space. With a zoom-out margin the raster spans
@@ -4190,6 +4269,115 @@ mod tests {
             az_deg: Some(180.0),
         });
         p
+    }
+
+    #[test]
+    fn model_grid_satellite_override_keeps_projection_extent_and_camera_view() {
+        let src = synthetic_source(9, 7, 4, 3000.0);
+        let params = synthetic_params(ViewMode::Geostationary);
+        let raster = model_grid_satellite_raster_for_source(&src, &params).unwrap();
+        let map = build_map_raster_mode(
+            &src.georef,
+            9,
+            7,
+            3000.0,
+            3000.0,
+            ResolutionMode::Native,
+            0.0,
+        )
+        .unwrap()
+        .as_surface_raster();
+        let satellite_georef = build_georef(
+            ViewMode::Geostationary,
+            &src.params,
+            &src.georef,
+            &raster,
+            9,
+            7,
+            0.0,
+        );
+        let map_georef = build_georef(
+            ViewMode::TopDownMap,
+            &src.params,
+            &src.georef,
+            &map,
+            9,
+            7,
+            0.0,
+        );
+        assert_eq!(satellite_georef.view, ViewMode::Geostationary);
+        assert_eq!(satellite_georef.extent_kind, ExtentKind::ProjectionMeters);
+        assert_eq!(satellite_georef.extent, map_georef.extent);
+        assert_eq!(satellite_georef.lat, map_georef.lat);
+        assert_eq!(satellite_georef.lon, map_georef.lon);
+        assert!(satellite_georef.geo_navigation.is_some());
+        // The ordinary geostationary path still has its lon/lat bbox extent.
+        let ordinary = build_surface_raster_mode(
+            &GeoCamera::new(params.satellite),
+            &src.georef,
+            9,
+            7,
+            ResolutionMode::Native,
+            0.0,
+            MAX_AXIS,
+        )
+        .unwrap();
+        assert_eq!(
+            build_georef(
+                ViewMode::Geostationary,
+                &src.params,
+                &src.georef,
+                &ordinary,
+                9,
+                7,
+                0.0
+            )
+            .extent_kind,
+            ExtentKind::LonLatDegrees
+        );
+    }
+
+    #[test]
+    fn model_grid_satellite_rejects_incompatible_requests_before_io() {
+        let src = synthetic_source(7, 5, 2, 3000.0);
+        let mut params = synthetic_params(ViewMode::Geostationary);
+        params.raster_override =
+            Some(model_grid_satellite_raster_for_source(&src, &params).unwrap());
+        for product in [Product::Ir, Product::GeoColor, Product::Sandwich] {
+            assert!(
+                render(&params, product)
+                    .unwrap_err()
+                    .contains("plain visible")
+            );
+        }
+        let mut gpu = params.clone();
+        gpu.backend = RenderBackend::GpuPreview;
+        assert!(
+            render(&gpu, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("backend=cpu")
+        );
+        let mut topdown = params.clone();
+        topdown.view = ViewMode::TopDownMap;
+        assert!(
+            render(&topdown, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("view=geo")
+        );
+        let mut coarse = params.clone();
+        coarse.resolution = ResolutionMode::Abi2km;
+        assert!(
+            render(&coarse, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("resolution=native")
+        );
+        let mut wrong_satellite = params.clone();
+        wrong_satellite.satellite = SatellitePreset::GoesWest;
+        assert!(
+            render(&wrong_satellite, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("does not match")
+        );
     }
 
     #[test]

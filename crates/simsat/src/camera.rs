@@ -132,10 +132,35 @@ impl GeoNavigation {
     }
 }
 
+/// Where geostationary rays are sampled. This is independent of the platform
+/// longitude and of the navigation reference used by an instrument fixed grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoRasterSampling {
+    /// The ordinary rectangular scan-angle raster (legacy default).
+    ScanAngleGrid,
+    /// Direct rays from the satellite to native model-grid ground points.
+    /// Not an official instrument lattice, resampling kernel, or PSF integral.
+    ModelGridPoints,
+}
+
+impl GeoRasterSampling {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::ScanAngleGrid => "scan-angle-grid",
+            Self::ModelGridPoints => "model-grid-points",
+        }
+    }
+}
+
 /// Numeric geometry recorded with a geostationary render.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoNavigationGeometry {
     pub navigation: GeoNavigation,
+    /// Sampling geometry; model-grid points do not lie on an ABI fixed lattice.
+    pub raster_sampling: GeoRasterSampling,
+    /// Sphere and satellite orbit actually consumed by the ray marcher (metres).
+    pub model_earth_radius_m: f64,
+    pub model_orbit_radius_m: f64,
     pub perspective_point_height_m: f64,
     pub semi_major_axis_m: f64,
     pub semi_minor_axis_m: f64,
@@ -578,6 +603,9 @@ impl GeoCamera {
     pub fn geometry(&self) -> GeoNavigationGeometry {
         GeoNavigationGeometry {
             navigation: self.navigation,
+            raster_sampling: GeoRasterSampling::ScanAngleGrid,
+            model_earth_radius_m: R_EARTH,
+            model_orbit_radius_m: GEO_ORBIT_RADIUS_M,
             perspective_point_height_m: self.perspective_point_height_m,
             semi_major_axis_m: self.semi_major_axis_m,
             semi_minor_axis_m: self.semi_minor_axis_m,
@@ -600,6 +628,14 @@ impl GeoCamera {
             semi_major_axis_m: R_EARTH,
             semi_minor_axis_m: R_EARTH,
         }
+    }
+
+    /// Ground-point scan angles for the physical ray camera on the WRF sphere.
+    /// In ABI navigation mode this uses the platform subpoint, not the distinct
+    /// fixed-grid projection origin. The existing CGMS sweep-y ray convention is
+    /// shared with `atmosphere::CameraGeometry::view_dir`.
+    pub fn model_forward(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+        self.model_sphere().forward(lat_deg, lon_deg)
     }
 
     /// Forward: geodetic `(lat, lon)` -> scan angles `(x, y)` (rad), spherical.
@@ -898,8 +934,9 @@ pub struct SurfaceRaster {
     pub grid_j: Vec<f32>,
     /// Optional per-pixel scan angles on SimSat's existing spherical physics
     /// camera.  `None` is the byte-for-byte historical path where sensor and
-    /// physics scans are identical.  ABI ellipsoid navigation fills this after
-    /// ellipsoid scan -> geodetic -> model-sphere conversion.
+    /// physics scans are identical. ABI ellipsoid navigation fills this after
+    /// ellipsoid scan -> geodetic -> model-sphere conversion; direct model-grid
+    /// satellite sampling fills it from each map ground point instead.
     pub model_scan: Option<Vec<[f32; 2]>>,
     /// Sensor-navigation metadata for geostationary rasters; `None` for top-down
     /// and free-perspective rasters.
@@ -920,6 +957,12 @@ impl SurfaceRaster {
             model_scan: None,
             navigation_geometry: None,
         }
+    }
+
+    /// Whether this raster directly samples model-grid ground points from space.
+    pub fn is_model_grid_satellite(&self) -> bool {
+        self.navigation_geometry
+            .is_some_and(|g| g.raster_sampling == GeoRasterSampling::ModelGridPoints)
     }
 
     /// Ray scan angles for the existing spherical model physics at one pixel.
@@ -1447,6 +1490,53 @@ pub fn build_map_raster(
 }
 
 impl MapRaster {
+    /// Keep this map's exact north-first ground-point layout, but look at every
+    /// point from `camera` using the existing spherical geostationary ray march.
+    /// This gives physical slant paths, surface view angles and cloud parallax on
+    /// a model target grid. No official ABI lattice/footprint is integrated.
+    ///
+    /// The scan rectangle only bounds atmosphere/froxel work; `model_scan` is the
+    /// authoritative ray for every pixel. All target points must be visible, so
+    /// an off-limb point cannot silently fall back to a rectangular-grid ray.
+    /// The map builder's existing small boundary inset is preserved exactly.
+    pub fn as_satellite_surface_raster(&self, camera: &GeoCamera) -> Option<SurfaceRaster> {
+        let count = self.nx.checked_mul(self.ny)?;
+        if self.nx < 2
+            || self.ny < 2
+            || self.nx > MAX_AXIS
+            || self.ny > MAX_AXIS
+            || [
+                self.lat.len(),
+                self.lon.len(),
+                self.grid_i.len(),
+                self.grid_j.len(),
+            ]
+            .iter()
+            .any(|&len| len != count)
+        {
+            return None;
+        }
+        let angles: Vec<(f64, f64)> = self
+            .lat
+            .iter()
+            .zip(&self.lon)
+            .map(|(&lat, &lon)| camera.model_forward(lat as f64, lon as f64))
+            .collect::<Option<_>>()?;
+        let rect = scan_angle_rect(&angles, |x, y| Some((x, y)))?;
+        let mut raster = self.as_surface_raster();
+        raster.scan = ScanGrid::native(rect, self.nx, self.ny, MAX_AXIS);
+        raster.model_scan = Some(
+            angles
+                .into_iter()
+                .map(|(x, y)| [x as f32, y as f32])
+                .collect(),
+        );
+        let mut geometry = camera.geometry();
+        geometry.raster_sampling = GeoRasterSampling::ModelGridPoints;
+        raster.navigation_geometry = Some(geometry);
+        Some(raster)
+    }
+
     /// Adapt this map raster to a [`SurfaceRaster`] so the shared per-pixel LUT builder
     /// (`gpu::build_luts`) and the studio's / CLI's assemble closure work UNCHANGED for
     /// both view modes. The [`ScanGrid`] is a benign PLACEHOLDER: the top-down render
@@ -2350,6 +2440,101 @@ mod tests {
             let dlon = (glon - lon + 180.0).rem_euclid(360.0) - 180.0;
             assert!(dlon.abs() < 1e-6, "lon {lon} -> {glon}");
         }
+    }
+
+    #[test]
+    fn model_grid_satellite_rays_land_on_the_original_ground_points() {
+        use crate::atmosphere::CameraGeometry;
+        let (nx, ny) = (24, 18);
+        let georef = GridGeoref::new(
+            MapProjection::lambert(10.0, 20.0, -88.5),
+            (nx - 1) as f64 / 2.0,
+            (ny - 1) as f64 / 2.0,
+            13.5,
+            -88.5,
+            3000.0,
+            3000.0,
+        );
+        let map = build_map_raster(&georef, nx, ny, nx, ny, 0.0).unwrap();
+        let camera = GeoCamera::new(SatellitePreset::GoesEast);
+        let raster = map.as_satellite_surface_raster(&camera).unwrap();
+        assert_eq!((raster.nx, raster.ny), (nx, ny));
+        assert_eq!(raster.lat, map.lat);
+        assert_eq!(raster.lon, map.lon);
+        assert_eq!(raster.grid_i, map.grid_i);
+        assert_eq!(raster.grid_j, map.grid_j);
+        assert!(raster.is_model_grid_satellite());
+        let physical = CameraGeometry::from_sub_lon(camera.model_sub_lon_deg);
+        let dot = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        for py in 0..ny {
+            for px in 0..nx {
+                let index = py * nx + px;
+                let target = geodetic_to_ecef(map.lat[index] as f64, map.lon[index] as f64, 0.0);
+                let (sx, sy) = raster.model_scan_angle(px, py);
+                let direction = physical.view_dir(sx, sy);
+                // Independent ray/sphere intersection, not camera.inverse: the
+                // actual march direction must meet the intended model ground point.
+                let b = dot(physical.camera, direction);
+                let c = dot(physical.camera, physical.camera) - R_EARTH * R_EARTH;
+                let distance = -b - (b * b - c).sqrt();
+                let error = (0..3)
+                    .map(|axis| {
+                        let hit = physical.camera[axis] + distance * direction[axis];
+                        (hit - target[axis]).powi(2)
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                // Per-pixel scan storage is f32; 2 m bounds that quantization
+                // independently of the model's 3 km pixel sampling.
+                assert!(error < 2.0, "pixel {px},{py}: ground miss {error} m");
+                let up = target.map(|value| value / R_EARTH);
+                let view_cosine = -dot(direction, up);
+                assert!(
+                    view_cosine > 0.7 && view_cosine < 0.99,
+                    "satellite ray must have a non-nadir surface angle: {view_cosine}"
+                );
+            }
+        }
+        let legacy = map.as_surface_raster();
+        assert!(legacy.model_scan.is_none());
+        assert!(legacy.navigation_geometry.is_none());
+        assert_eq!(legacy.scan.pitch_x, VISIBLE_PITCH_RAD);
+    }
+
+    #[test]
+    fn model_grid_rays_separate_physical_subpoint_from_abi_grid_origin() {
+        let (nx, ny) = (7, 5);
+        let georef = GridGeoref::new(
+            MapProjection::lambert(30.0, 60.0, -97.5),
+            3.0,
+            2.0,
+            39.0,
+            -97.5,
+            3000.0,
+            3000.0,
+        );
+        let map = build_map_raster(&georef, nx, ny, nx, ny, 0.0).unwrap();
+        let legacy_camera = GeoCamera::new(SatellitePreset::GoesEast);
+        let abi_camera =
+            GeoCamera::for_navigation(SatellitePreset::GoesEast, GeoNavigation::GoesRAbiFixedGrid)
+                .unwrap();
+        let sphere = map.as_satellite_surface_raster(&legacy_camera).unwrap();
+        let abi = map.as_satellite_surface_raster(&abi_camera).unwrap();
+        assert_eq!(sphere.model_scan, abi.model_scan);
+        let geometry = abi.navigation_geometry.unwrap();
+        assert_eq!(geometry.sub_lon_deg, GOES_R_EAST_SUB_LON_DEG);
+        assert_eq!(geometry.model_sub_lon_deg, GOES_EAST_SUB_LON_DEG);
+        assert_eq!(geometry.model_earth_radius_m, R_EARTH);
+        assert_eq!(geometry.model_orbit_radius_m, GEO_ORBIT_RADIUS_M);
+        assert_eq!(geometry.raster_sampling, GeoRasterSampling::ModelGridPoints);
+        assert!(
+            map.as_satellite_surface_raster(&GeoCamera::new(SatellitePreset::Himawari))
+                .is_none()
+        );
+        assert_eq!(
+            legacy_camera.geometry().raster_sampling,
+            GeoRasterSampling::ScanAngleGrid
+        );
     }
 
     #[test]

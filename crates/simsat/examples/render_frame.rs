@@ -45,6 +45,7 @@
 //!   fractional-clouds=<mode> off | on | effective-od | deterministic-2 | deterministic-4 | deterministic-8 | deterministic-16.
 //!                      Default is deterministic-2; `on` remains the backward-compatible
 //!                      alias of effective-od. Deterministic modes are fixed-stratified CPU references.
+//!                      Perspective defaults to effective-od (subcolumns unsupported there).
 //!   cloud-optical-depth-scale=<f>  cloud OD calibration, 0.0..=4.0 (shipped default 0.15;
 //!                      1.0 = unscaled model extinction).
 //!   cloud-optics=<mode> fixed | nssl-native | hrrr-thompson-native (default fixed). Native modes are explicit
@@ -79,6 +80,13 @@
 //!   bluemarble-month=<MM>  Force month 1..=12 (what-if; default day-of-year blend).
 //!   bluemarble-download=<b>  on|off lazy month fetch (default on).
 //!   view=<mode>        geo | topdown  (default geo). topdown = the map-registered view.
+//!   raster=<mode>      default | model-grid (default default). model-grid requires
+//!                      view=geo, backend=cpu, resolution=native, margin=0 and plain visible.
+//!                      Direct satellite rays through native model-grid ground points:
+//!                      satellite surface angles/cloud parallax on the same north-first
+//!                      grid as topdown. No ABI fixed lattice, resampling kernel or PSF.
+//!                      The preset's physical subpoint stays distinct from the ABI grid
+//!                      origin (-75.2 vs -75.0 for GOES-East). Writes <stem>.geometry.json.
 //!   canvas=<WxH>       OPTIONAL letterbox into a fixed figure size (black pad).
 //!   threads=<N>        OPTIONAL rayon thread cap (else honor RAYON_NUM_THREADS).
 //!   store=<dir>        ALSO write the visible frame to this sat-store root (geo only).
@@ -190,6 +198,8 @@ struct Opts {
     intent: RenderIntent,
     sat: SatellitePreset,
     geo_navigation: GeoNavigation,
+    /// Opt-in satellite rays aimed at the native model-grid ground points.
+    model_grid_raster: bool,
     timestep: usize,
     resolution: ResolutionMode,
     /// Zoom-out / domain margin as a FRACTION added on each side (0.0 = edge-to-edge).
@@ -372,7 +382,13 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 
     // ── the one shared render assembly ──
-    let params = render_params(&opts);
+    let mut params = render_params(&opts);
+    if opts.model_grid_raster {
+        params.raster_override = Some(api::native_model_grid_satellite_raster(&params)?);
+        eprintln!(
+            "render_frame: raster=model-grid uses direct satellite rays at model ground points; no official ABI lattice/resampling/PSF integration"
+        );
+    }
     // The web-map cloud layer is a different delivery (RGBA + shadow + sidecar, not one
     // RGB PNG) — its own output path.
     if opts.cloud_layer && opts.backend == RenderBackend::Cpu {
@@ -528,9 +544,50 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(|(x0, x1, y0, y1)| format!("x{x0}:{x1},y{y0}:{y1}"))
         .unwrap_or_else(|| "none".to_string());
 
+    if opts.model_grid_raster {
+        let geometry = result
+            .georef
+            .geo_navigation
+            .ok_or("model-grid raster missing geometry provenance")?;
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "sampling": geometry.raster_sampling.slug(),
+            "interpretation": "Direct satellite rays through native model-grid ground points; not an official ABI lattice, resampling kernel or PSF integration",
+            "navigation_reference": geometry.navigation.slug(),
+            "navigation_projection_origin_longitude_deg": geometry.sub_lon_deg,
+            "physical_satellite_subpoint_longitude_deg": geometry.model_sub_lon_deg,
+            "physical_satellite_longitude_source": "existing SatellitePreset, camera.rs; no ephemeris adjustment",
+            "model_earth_radius_m": geometry.model_earth_radius_m,
+            "model_orbit_radius_m": geometry.model_orbit_radius_m,
+            "width": result.nx,
+            "height": result.ny,
+            "rows": "north-first",
+            "extent": result.georef.extent,
+            "extent_kind": "model projection plane",
+            "projection": result.georef.proj4(),
+            "boundary_sample_inset_cells": simsat::camera::MAP_EDGE_INSET_CELLS,
+            "instrument_lattice": false,
+            "instrument_psf_integrated": false,
+        });
+        let path = opts.out.with_extension("geometry.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&metadata).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write geometry {}: {e}", path.display()))?;
+        println!(
+            "GEOMETRY raster={} model_sub_lon_deg={:.3} navigation_origin_lon_deg={:.3} model_earth_radius_m={:.1} model_orbit_radius_m={:.1} official_lattice=false psf_integrated=false file={}",
+            geometry.raster_sampling.slug(),
+            geometry.model_sub_lon_deg,
+            geometry.sub_lon_deg,
+            geometry.model_earth_radius_m,
+            geometry.model_orbit_radius_m,
+            path.display()
+        );
+    }
     eprintln!("render_frame: wrote {}", opts.out.display());
     println!(
-        "SUMMARY file={} backend={} intent={} observation_operator={} intent_adjustments={} view={} geo_navigation={} geo_fixed_grid_lon={} geo_model_lon={} abi_lattice_crop={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
+        "SUMMARY file={} backend={} intent={} observation_operator={} intent_adjustments={} view={} raster={} geo_navigation={} geo_fixed_grid_lon={} geo_model_lon={} abi_lattice_crop={} dims={}x{} canvas={} render_dims={}x{} res={}{} sat={} \
          sun_elev={:.1} exposure={:.3} aod={:.3} rh_aerosol_swelling={} \
          atmosphere_correction={} terrain_atmosphere={} \
          surface_postlight_toe={}({:.3}/{:.2}/{:.2}) twilight_surface_recovery={}({:.3}/{:.2}/{:.2}) \
@@ -547,6 +604,11 @@ fn run(args: &[String]) -> Result<(), String> {
         result.observation_operator,
         result.intent_adjustments.len(),
         opts.view.slug(),
+        if opts.model_grid_raster {
+            "model-grid"
+        } else {
+            "default"
+        },
         result
             .georef
             .geo_navigation
@@ -1058,6 +1120,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut intent = RenderIntent::Display;
     let mut sat = SatellitePreset::GoesEast;
     let mut geo_navigation = GeoNavigation::ModelSphere;
+    let mut model_grid_raster = false;
     let mut timestep = 0usize;
     let mut resolution = ResolutionMode::Native;
     let mut margin = 0.0f64;
@@ -1088,6 +1151,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut clouds = true;
     let mut fractional_clouds = true;
     let mut fractional_cloud_mode = FractionalCloudMode::Deterministic2;
+    let mut fractional_cloud_mode_explicit = false;
     let mut cloud_optical_depth_scale = DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
     let mut cloud_optics = CloudOpticsMode::Fixed;
     let mut feather_exposed_domain_edges = true;
@@ -1139,6 +1203,13 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "sat" | "satellite" => sat = parse_sat(v)?,
             "geo-navigation" | "geo_navigation" | "navigation" => {
                 geo_navigation = parse_geo_navigation(v)?
+            }
+            "raster" => {
+                model_grid_raster = match v {
+                    "default" => false,
+                    "model-grid" => true,
+                    _ => return Err(format!("raster must be default|model-grid, got '{v}'")),
+                };
             }
             "timestep" | "ts" => timestep = v.parse().map_err(|_| format!("bad timestep '{v}'"))?,
             "resolution" | "res" => resolution = parse_resolution(v)?,
@@ -1310,7 +1381,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "beer-powder" | "beer_powder" | "beerpowder" => beer_powder = parse_bool(v)?,
             "clouds" => clouds = parse_bool(v)?,
             "fractional-clouds" | "fractional_clouds" | "model-cloud-fraction" => {
-                (fractional_clouds, fractional_cloud_mode) = parse_fractional_cloud_mode(v)?
+                (fractional_clouds, fractional_cloud_mode) = parse_fractional_cloud_mode(v)?;
+                fractional_cloud_mode_explicit = true;
             }
             "cloud-optical-depth-scale" | "cloud_optical_depth_scale" | "cloud-od-scale" => {
                 cloud_optical_depth_scale = v
@@ -1447,11 +1519,38 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     if (product_perspective || perspective_layer) && eye.is_none() {
         return Err("product=perspective / perspective-layer= require eye= and look=".to_string());
     }
+    // Perspective has no deterministic subcolumn path. Choose its supported
+    // effective-OD closure only when the caller left the mode unspecified;
+    // explicitly requested modes remain subject to the API capability guard.
+    if eye.is_some() && !fractional_cloud_mode_explicit {
+        fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+    }
     if thermal_sensor != ThermalSensor::FastGray && !(geocolor || sandwich) {
         return Err(
             "sensor=goes-r-abi-band13-fm4 applies to product=geocolor or product=sandwich"
                 .to_string(),
         );
+    }
+    if model_grid_raster {
+        if view != ViewMode::Geostationary
+            || backend != RenderBackend::Cpu
+            || resolution != ResolutionMode::Native
+            || margin != 0.0
+        {
+            return Err(
+                "raster=model-grid requires view=geo backend=cpu resolution=native margin=0"
+                    .to_string(),
+            );
+        }
+        if geocolor
+            || sandwich
+            || cloud_layer
+            || eye.is_some()
+            || store.is_some()
+            || instrument_footprint != InstrumentFootprint::Off
+        {
+            return Err("raster=model-grid supports plain visible/RGB-reflectance output only; no composites, perspective, instrument footprint or fixed-grid store".to_string());
+        }
     }
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
@@ -1461,6 +1560,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         intent,
         sat,
         geo_navigation,
+        model_grid_raster,
         timestep,
         resolution,
         margin,
@@ -1717,7 +1817,7 @@ fn print_usage() {
          \x20 cloud-multiscatter=<mode> legacy-octaves|single-scatter|delta-flux-v1|delta-flux-v2b|delta-flux-v3-memory (opt-in)\n\
          \x20 beer-powder=<b>    on | off  direct-sun shaping       (default off)\n\
          \x20 clouds=<b>         on | off  (off = surface only)     (default on)\n\
-         \x20 fractional-clouds=<mode> off|on|effective-od|deterministic-2|deterministic-4|deterministic-8|deterministic-16 (default deterministic-2; on=effective-od alias)\n\
+         \x20 fractional-clouds=<mode> off|on|effective-od|deterministic-2|deterministic-4|deterministic-8|deterministic-16 (default deterministic-2, perspective effective-od; on=effective-od alias)\n\
          \x20 cloud-optical-depth-scale=<f>  cloud OD scale, 0.0..=4.0 (default {DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE}; 1.0 = unscaled)\n\
          \x20 cloud-optics=<mode> fixed|nssl-native|hrrr-thompson-native source-specific particle optics (default fixed; visible only)\n\
          \x20 feather-exposed-domain-edges=<b> on|off fade finished clouds at visible WRF boundaries (default on)\n\
@@ -1734,6 +1834,7 @@ fn print_usage() {
          \x20 bluemarble-month=<MM>  force month 1..=12 (default: day-of-year blend)\n\
          \x20 bluemarble-download=<b>  on|off lazy month fetch (default on)\n\
          \x20 view=<mode>        geo | topdown  (default geo)\n\
+         \x20 raster=<mode>      default | model-grid (default default); model-grid requires CPU geo native margin=0 visible; direct ground-point sampling, no ABI lattice/PSF\n\
          \x20 canvas=<WxH>       letterbox into a fixed figure size, black pad (e.g. 1100x850)\n\
          \x20 threads=<N>        rayon thread cap (else honor RAYON_NUM_THREADS)\n\
          \x20 store=<dir>        ALSO write the visible frame to this sat-store root (geo only)\n\
@@ -1763,6 +1864,65 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perspective_default_uses_supported_fractional_closure_and_preserves_explicit_modes() {
+        let pose = ["eye=38.55,-85.65,24000", "look=39.23,-85.78,8500"];
+        let opts = opts_with(&pose);
+        assert_eq!(opts.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
+        assert_eq!(
+            opts_with(&[]).fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
+        let mut explicit = pose.to_vec();
+        explicit.push("fractional-clouds=deterministic-4");
+        assert_eq!(
+            opts_with(&explicit).fractional_cloud_mode,
+            FractionalCloudMode::Deterministic4
+        );
+        explicit.pop();
+        explicit.push("fractional-clouds=off");
+        assert!(!opts_with(&explicit).fractional_clouds);
+    }
+
+    #[test]
+    fn model_grid_raster_is_opt_in_and_keeps_satellite_view() {
+        assert!(!opts_with(&[]).model_grid_raster);
+        assert!(!opts_with(&["raster=default", "view=topdown"]).model_grid_raster);
+        let opts = opts_with(&["raster=model-grid", "view=geo", "geo-navigation=goes-r-abi"]);
+        assert!(opts.model_grid_raster);
+        assert_eq!(opts.view, ViewMode::Geostationary);
+        assert_eq!(opts.geo_navigation, GeoNavigation::GoesRAbiFixedGrid);
+        assert_eq!(render_params(&opts).satellite, SatellitePreset::GoesEast);
+    }
+
+    #[test]
+    fn model_grid_raster_rejects_modes_that_cannot_share_its_ground_grid() {
+        for incompatible in [
+            "view=topdown",
+            "backend=gpu-preview",
+            "resolution=abi2km",
+            "margin=0.1",
+            "geocolor=on",
+            "sandwich=on",
+            "product=cloud-layer",
+            "store=test-store",
+        ] {
+            let args = vec![
+                "input=input".to_string(),
+                "out=out.png".to_string(),
+                "raster=model-grid".to_string(),
+                incompatible.to_string(),
+            ];
+            assert!(parse_opts(&args).is_err(), "must reject {incompatible}");
+        }
+        let args = vec![
+            "input=input".to_string(),
+            "out=out.png".to_string(),
+            "raster=fake-abi".to_string(),
+        ];
+        assert!(parse_opts(&args).is_err());
+    }
 
     fn opts_with(extra: &[&str]) -> Opts {
         let mut args = vec!["input=input".to_string(), "out=out.png".to_string()];
