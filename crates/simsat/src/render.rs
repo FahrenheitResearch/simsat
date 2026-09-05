@@ -1502,7 +1502,7 @@ pub fn surface_toa_radiance(
     ];
     // True-color land vibrancy (refinement pass): boost the LAND albedo saturation so
     // vegetation reads vivid green. Water is excluded (dark ocean must stay dark).
-    if !px.is_water && LAND_VIBRANCY != 1.0 {
+    if ctx.params.display_calibration && !px.is_water && LAND_VIBRANCY != 1.0 {
         albedo = scale_saturation(albedo, LAND_VIBRANCY);
     }
 
@@ -1610,7 +1610,9 @@ pub fn surface_toa_radiance(
         );
         // Effective daylight albedo rescale relative to the already-applied
         // ctx.water_scale: 1.0 at/below the horizon -> DAY_SCALE/water_scale by 12 deg.
-        let scale_ratio = if ctx.water_scale > 0.0 {
+        let scale_ratio = if !ctx.params.display_calibration {
+            1.0
+        } else if ctx.water_scale > 0.0 {
             1.0 + surface_t * (WATER_ALBEDO_DAY_SCALE / ctx.water_scale - 1.0)
         } else {
             1.0
@@ -1653,7 +1655,7 @@ pub fn surface_toa_radiance(
     // aerial-perspective veil, so only the ground signal brightens (not the additive
     // haze). A true-color display gain, distinct from the global exposure. See
     // [`LAND_DAY_GAIN`] / [`land_day_gain`].
-    if !px.is_water && LAND_DAY_GAIN != 1.0 {
+    if ctx.params.display_calibration && !px.is_water && LAND_DAY_GAIN != 1.0 {
         let g = land_day_gain(px.sun_elev_deg as f64);
         for v in &mut l_surf {
             *v *= g;
@@ -1831,8 +1833,8 @@ pub fn radiance_to_rgba_softclip_with_synthetic_green(
 /// Python binding's `render_rgb_reflectance` returns for building custom RGB / operating
 /// on bands. This is the SAME `rho` [`radiance_to_rgba`] computes internally, but WITHOUT
 /// the display exposure gain and WITHOUT the ABI sqrt stretch / highlight desaturation:
-/// a linear reflectance in `[0, 1]` (real ABI visible bands are reflectance factors in
-/// this range; a bright sunlit cloud top saturates at 1.0). The RGB product path is
+/// a legacy bounded diagnostic. Real ABI reflectance factors can exceed 1; scientific
+/// output uses [`reflectance_from_radiance_unclipped`] instead. The RGB product path is
 /// unchanged — this is an additional, independent conversion for the raw-bands product.
 pub fn reflectance_from_radiance(l_toa: [f64; 3]) -> [f32; 3] {
     let e_sun = SOLAR_IRRADIANCE_RGB;
@@ -1841,6 +1843,28 @@ pub fn reflectance_from_radiance(l_toa: [f64; 3]) -> [f32; 3] {
         *out = (std::f64::consts::PI * l_toa[c] / e_sun[c]).clamp(0.0, 1.0) as f32;
     }
     rho
+}
+
+/// Broad-RGB reflectance factor before any clipping or display shaping.
+/// NOAA CMIP ATBD section 3.4.1.2 defines rho_f = pi L / E at the current solar
+/// distance (no division by solar-zenith cosine). Directional reflectance factors
+/// can exceed one, e.g. Cox-Munk glint; this is not hemispheric albedo.
+/// https://www.star.nesdis.noaa.gov/goesr/documents/ATBDs/Enterprise/ATBD_Enterprise_Cloud_and_Moisture_Imagery_Product_v4_2021-01-13.pdf
+/// The denominator remains SimSat's broad RGB irradiance, NOT an ABI channel SRF.
+/// Non-finite inputs stay non-finite for validity masking, rather than becoming zero.
+pub fn reflectance_from_radiance_unclipped(l_toa: [f64; 3]) -> [f32; 3] {
+    std::array::from_fn(|c| (std::f64::consts::PI * l_toa[c] / SOLAR_IRRADIANCE_RGB[c]) as f32)
+}
+
+impl FrameContext<'_> {
+    /// The display contract remains bounded; sensor radiometry retains raw values.
+    pub fn raw_reflectance(&self, radiance: [f64; 3]) -> [f32; 3] {
+        if self.params.display_calibration {
+            reflectance_from_radiance(radiance)
+        } else {
+            reflectance_from_radiance_unclipped(radiance)
+        }
+    }
 }
 
 /// Shade one surface pixel with the M2 atmosphere. Returns display-ready `rgba` in
@@ -2367,6 +2391,25 @@ mod tests {
             let out = radiance_to_rgba(l, OutputTransform::AbiReflectance, bad);
             assert_eq!(out, anchor, "bad exposure {bad} should fall back to 1.0");
         }
+    }
+
+    #[test]
+    fn sensor_reflectance_preserves_glint_above_one_and_missing_values() {
+        let expected = [1.7, 0.2, 2.3];
+        let l =
+            std::array::from_fn(|c| expected[c] * SOLAR_IRRADIANCE_RGB[c] / std::f64::consts::PI);
+        let (mut ctx, _) = nadir_surface_pixel(90.0);
+        assert_eq!(ctx.raw_reflectance(l), [1.0, 0.2, 1.0]);
+        let sensor_params = AtmosphereParams {
+            display_calibration: false,
+            ..*ctx.params
+        };
+        ctx.params = &sensor_params;
+        let sensor = ctx.raw_reflectance(l);
+        for c in 0..3 {
+            assert!((sensor[c] as f64 - expected[c]).abs() < 1e-6);
+        }
+        assert!(reflectance_from_radiance_unclipped([f64::NAN, 0.0, 0.0])[0].is_nan());
     }
 
     #[test]

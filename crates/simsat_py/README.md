@@ -48,14 +48,16 @@ source, or a missing GPU adapter is an error.
 
 Visible-family functions also accept `intent="display"` (the unchanged default)
 or `intent="sensor-fast-gray"`. The latter selects the explicitly limited
-`simsat-fast-gray-v1` operator: unscaled cloud extinction, neutral display
+`simsat-fast-gray-v2` operator: unscaled cloud extinction, neutral display
 shaping, full modeled path airlight, and no edge feather/granulation/stratiform
 reconstruction/synthetic green. Model fractional clouds are retained. Exact
 substitutions and limitations ride on `geo.intent`,
 `geo.observation_operator`, `geo.intent_adjustments`, and
 `geo.intent_limitations` and are also raised as `UserWarning`s. It is not yet an
 instrument-SRF-integrated ABI/AHI channel; use `render_rgb_reflectance` for the
-pre-tonemap broad-RGB reflectance output. Sensor Fast Gray currently requires
+pre-tonemap broad-RGB reflectance output; sensor output preserves values above one.
+The fixed diffuse cloud-shadow floor and Blue Marble water/snow albedo proxies
+remain approximations, explicitly reported in the limitations. Sensor Fast Gray currently requires
 `backend="cpu"` because GPU preview cannot preserve this strict contract.
 
 Common keyword args (all optional): `sat` (`goes-east`/`goes-west`/`himawari`), `view`

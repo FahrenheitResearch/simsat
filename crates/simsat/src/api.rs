@@ -15,7 +15,7 @@
 //!   3 u8) — byte-identical to what the studio/`render_frame` PNG shows, because it calls
 //!   the same shipped [`crate::clouds::render_cloud_frame_rgba`] /
 //!   [`crate::topdown::render_topdown_frame_rgba`]; `RgbReflectance` = the RAW three-channel
-//!   reflectance (H x W x 3 f32, pre-tonemap, in `[0, 1]`); `Ir` = the RAW brightness
+//!   reflectance (H x W x 3 f32, pre-tonemap; sensor intent is unclipped); `Ir` = the RAW brightness
 //!   temperature in KELVIN (H x W f32) plus an optional colored RGB enhancement.
 //! - a [`Georef`]: the projection params + an `extent` (for `imshow`) AND the H x W lat/lon
 //!   mesh (for `pcolormesh`), so the array can be placed on a cartopy map.
@@ -59,8 +59,7 @@ use crate::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, FLAT_ALBEDO_SRGB, FrameContext, LandAppearanceConfig,
     RHO_HIGHLIGHT_MAX, SurfacePixel, SurfacePostlightToeConfig, TwilightSurfaceRecoveryConfig,
     WATER_ALBEDO_SCALE, apply_low_sun_illuminant, blend_snow, normals_from_hgt,
-    radiance_to_rgba_softclip, reflectance_from_radiance, shade_surface, snow_fraction,
-    surface_toa_radiance,
+    radiance_to_rgba_softclip, shade_surface, snow_fraction, surface_toa_radiance,
 };
 use crate::sandwich;
 use crate::solar::{SolarFrame, frame_sun_ecef, sun_enu_and_elevation};
@@ -81,7 +80,8 @@ const BLUEMARBLE_MAX_AXIS: u32 = 4096;
 pub enum Product {
     /// The finished true-color RGB (H x W x 3 u8): the tonemapped display frame.
     VisibleRgb,
-    /// The RAW broad-RGB reflectance (H x W x 3 f32, pre-tonemap, `[0, 1]`).
+    /// The RAW broad-RGB reflectance (H x W x 3 f32, pre-tonemap).
+    /// Display intent retains legacy [0,1] bounds; sensor intent is unclipped.
     ///
     /// These are SimSat's current broad red/green/blue channels, not spectral-response-
     /// integrated ABI visible bands. [`Product::VisibleBands`] remains as a deprecated
@@ -183,7 +183,7 @@ pub enum RenderBackend {
 ///
 /// [`Display`](Self::Display) preserves SimSat's shipped, owner-reviewed appearance.
 /// [`SensorFastGray`](Self::SensorFastGray) selects the explicitly limited
-/// `simsat-fast-gray-v1` observation operator: display-only shaping is neutralized,
+/// `simsat-fast-gray-v2` observation operator: display-only shaping is neutralized,
 /// cloud extinction is unscaled, and every automatic substitution is returned on the
 /// [`RenderResult`]. It is not yet a spectral-response-integrated ABI/AHI simulator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -212,7 +212,7 @@ impl RenderIntent {
     pub fn observation_operator(self) -> &'static str {
         match self {
             Self::Display => "simsat-display-v1",
-            Self::SensorFastGray => "simsat-fast-gray-v1",
+            Self::SensorFastGray => "simsat-fast-gray-v2",
         }
     }
 
@@ -225,7 +225,10 @@ impl RenderIntent {
                 "fast compact brick; not the planned pressure/interface-level science brick",
                 "fixed-radius cloud optics unless the source path explicitly supplies scheme-aware optics",
                 "no instrument PSF/MTF or temporal footprint integration",
-                "finished RGB remains an inspection transform; use visible reflectance bands for quantitative comparison",
+                "finished RGB remains an inspection transform; raw output is unclipped broad RGB, not ABI channels",
+                "base Hillaire ozone and unit multiple-scattering gain; land vibrancy/day gain and water daylight rescaling disabled",
+                "Blue Marble sRGB surface proxy has no calibrated NIR spectral albedo; cloud and aerosol optics remain gray",
+                "retained approximations: diffuse cloud-shadow floor 0.45, Blue Marble water proxy scaled 0.55, and display-derived snow-albedo blend",
             ],
         }
     }
@@ -250,6 +253,8 @@ pub enum RenderIntentAdjustment {
     AtmosphereCorrectionOff,
     HighlightShoulderIdentity,
     SyntheticGreenOff,
+    UpstreamDisplayCalibrationOff,
+    ReflectanceFactorUnclipped,
 }
 
 impl RenderIntentAdjustment {
@@ -274,6 +279,10 @@ impl RenderIntentAdjustment {
             }
             Self::HighlightShoulderIdentity => "highlight shoulder -> identity/hard clamp",
             Self::SyntheticGreenOff => "synthetic green -> off",
+            Self::UpstreamDisplayCalibrationOff => {
+                "base ozone and multiple scattering; land saturation/day gain and water daylight rescaling -> identity"
+            }
+            Self::ReflectanceFactorUnclipped => "raw reflectance factor -> unclipped",
         }
     }
 }
@@ -354,6 +363,8 @@ pub enum GpuPreviewAdjustment {
     LegacyCloudTransport,
     ShippedHighlights,
     SyntheticGreenOff,
+    UpstreamDisplayCalibrationOff,
+    ReflectanceFactorUnclipped,
     InteractiveSteps,
     ShippedTopdownCloudNorm,
 }
@@ -375,6 +386,10 @@ impl GpuPreviewAdjustment {
             Self::LegacyCloudTransport => "cloud transport -> legacy octaves",
             Self::ShippedHighlights => "highlight knee/ceiling -> shipped values",
             Self::SyntheticGreenOff => "synthetic green -> off",
+            Self::UpstreamDisplayCalibrationOff => {
+                "base ozone and multiple scattering; land saturation/day gain and water daylight rescaling -> identity"
+            }
+            Self::ReflectanceFactorUnclipped => "raw reflectance factor -> unclipped",
             Self::InteractiveSteps => "cloud steps -> interactive",
             Self::ShippedTopdownCloudNorm => "top-down cloud normalization -> shipped value",
         }
@@ -431,7 +446,7 @@ pub struct RenderParams {
     pub backend: RenderBackend,
     /// Output intent. [`RenderIntent::Display`] is the unchanged shipped default;
     /// [`RenderIntent::SensorFastGray`] applies the strict, provenance-bearing
-    /// `simsat-fast-gray-v1` parameter plan on a clone before rendering.
+    /// `simsat-fast-gray-v2` parameter plan on a clone before rendering.
     pub intent: RenderIntent,
     /// The satellite preset (geostationary view only; ignored for top-down).
     pub satellite: SatellitePreset,
@@ -805,7 +820,8 @@ pub enum FrameData {
     /// The finished true-color display: `rgb` = `nx*ny*3` u8 (space = black), plus the raw
     /// `rgba` = `nx*ny*4` u8 (space alpha 0) the store writer / supersample downsample use.
     Visible { rgb: Vec<u8>, rgba: Vec<u8> },
-    /// The RAW per-channel reflectance factor: `nx*ny*3` f32 in `[0, 1]` (space = 0).
+    /// The RAW broad-RGB reflectance factor: `nx*ny*3` f32 (space = 0).
+    /// Display intent is bounded [0,1]; Sensor Fast Gray preserves values above one.
     Bands { reflectance: Vec<f32> },
     /// The RAW brightness temperature (`nx*ny` f32, KELVIN; `NaN` off-domain) plus an
     /// optional colored `rgb` = `nx*ny*3` u8 (present iff an enhancement was requested).
@@ -916,7 +932,7 @@ pub struct RenderResult {
     /// Intent actually used for this frame.
     pub intent: RenderIntent,
     /// Stable observation-operator provenance slug. This is
-    /// `simsat-fast-gray-v1` for Sensor Fast Gray, never the name of a real ABI/AHI
+    /// `simsat-fast-gray-v2` for Sensor Fast Gray, never the name of a real ABI/AHI
     /// channel simulation.
     pub observation_operator: &'static str,
     /// Exact strict-intent substitutions made on a cloned request. Empty for Display.
@@ -1114,10 +1130,6 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
         p.cloud_optical_depth_scale = 1.0;
         changes.push(RenderIntentAdjustment::CloudOpticalDepthUnscaled);
     }
-    if p.fractional_cloud_mode != FractionalCloudMode::EffectiveOd {
-        p.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
-        changes.push(RenderIntentAdjustment::FractionalCloudEffectiveOd);
-    }
     if (p.exposure - 1.0).abs() > f64::EPSILON {
         p.exposure = 1.0;
         changes.push(RenderIntentAdjustment::ExposureNeutral);
@@ -1173,6 +1185,8 @@ pub fn plan_render_intent(params: &RenderParams) -> (RenderParams, Vec<RenderInt
         p.synthetic_green = false;
         changes.push(RenderIntentAdjustment::SyntheticGreenOff);
     }
+    changes.push(RenderIntentAdjustment::UpstreamDisplayCalibrationOff);
+    changes.push(RenderIntentAdjustment::ReflectanceFactorUnclipped);
     (p, changes)
 }
 
@@ -1343,6 +1357,7 @@ fn render_visible_scene(
         pw_ratio,
         aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
+        display_calibration: params.intent == RenderIntent::Display,
     };
     let luts = AtmosphereLuts::build(&atmo_params);
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
@@ -1400,7 +1415,8 @@ fn render_visible_scene(
     };
     // Appearance-pass wiring: Off preserves the exact pre-v0.1.5 margin-gated edge feather.
     // The exposed-edge control is finished-display only; raw RGB reflectance keeps
-    // the existing margin behavior even if the same RenderParams is reused for an RGB A/B.
+    // the existing margin behavior for display intent. Sensor rays keep extinction
+    // unscaled even when an output margin exposes the model boundary.
     cfg.edge_feather_cells = clouds::edge_feather_cells_for_raster(
         margin,
         nx,
@@ -1409,6 +1425,9 @@ fn render_visible_scene(
         &raster.grid_i,
         &raster.grid_j,
     );
+    if params.intent == RenderIntent::SensorFastGray {
+        cfg.edge_feather_cells = 0.0;
+    }
     // Display-only appearance defaults and overrides are deliberately ignored by
     // RgbReflectance. That product remains the stable pre-tonemap diagnostic even when
     // the shipped ground calibration is non-neutral or the same RenderParams is reused
@@ -1569,7 +1588,11 @@ fn render_visible_scene(
                 georef,
                 sun_ecef,
                 SUN_OD_RESOLUTION,
-                clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+                if params.intent == RenderIntent::Display {
+                    clouds::SUN_OD_EDGE_FEATHER_TEXELS
+                } else {
+                    0.0
+                },
                 granulation,
             );
             let scene = CloudScene {
@@ -1669,7 +1692,7 @@ fn render_visible_scene(
                     if alpha[idx] == 0 {
                         continue;
                     }
-                    let rho = reflectance_from_radiance([
+                    let rho = surf.raw_reflectance([
                         radiance_sum[idx * 3] / members,
                         radiance_sum[idx * 3 + 1] / members,
                         radiance_sum[idx * 3 + 2] / members,
@@ -1729,7 +1752,11 @@ fn render_visible_scene(
             georef,
             sun_ecef,
             SUN_OD_RESOLUTION,
-            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            if params.intent == RenderIntent::Display {
+                clouds::SUN_OD_EDGE_FEATHER_TEXELS
+            } else {
+                0.0
+            },
             granulation,
         );
         let scan_rect = raster.model_scan_rect();
@@ -2555,6 +2582,7 @@ fn render_cloud_layer_scene(
             pw_ratio,
             aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
             ground_albedo: atmosphere::GROUND_ALBEDO,
+            display_calibration: params.intent == RenderIntent::Display,
         };
         let luts = AtmosphereLuts::build(&atmo_params);
         let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
@@ -2594,7 +2622,11 @@ fn render_cloud_layer_scene(
             georef,
             sun_ecef,
             SUN_OD_RESOLUTION,
-            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            if params.intent == RenderIntent::Display {
+                clouds::SUN_OD_EDGE_FEATHER_TEXELS
+            } else {
+                0.0
+            },
             granulation,
         );
         let mut cfg = MarchConfig {
@@ -2622,6 +2654,9 @@ fn render_cloud_layer_scene(
             &raster.grid_i,
             &raster.grid_j,
         );
+        if params.intent == RenderIntent::SensorFastGray {
+            cfg.edge_feather_cells = 0.0;
+        }
         if let Some(k) = params.cloud_softclip {
             cfg.cloud_softclip_knee = k;
         }
@@ -2821,6 +2856,7 @@ fn render_perspective_scene(
         pw_ratio,
         aerosol_swelling: if params.rh_aerosol_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
+        display_calibration: params.intent == RenderIntent::Display,
     };
     let luts = AtmosphereLuts::build(&atmo_params);
     let sky_sh = SkyShTable::build(&luts, &atmo_params, 48);
@@ -2866,6 +2902,9 @@ fn render_perspective_scene(
         &raster.grid_i,
         &raster.grid_j,
     );
+    if params.intent == RenderIntent::SensorFastGray {
+        cfg.edge_feather_cells = 0.0;
+    }
     if let Some(k) = params.cloud_softclip {
         cfg.cloud_softclip_knee = k;
     }
@@ -2945,7 +2984,11 @@ fn render_perspective_scene(
             georef,
             sun_ecef,
             SUN_OD_RESOLUTION,
-            clouds::SUN_OD_EDGE_FEATHER_TEXELS,
+            if params.intent == RenderIntent::Display {
+                clouds::SUN_OD_EDGE_FEATHER_TEXELS
+            } else {
+                0.0
+            },
             granulation,
         );
         let scene = CloudScene {
@@ -3422,7 +3465,7 @@ fn render_geo_surface_reflectance(
                 // whole-surface display lift neutral even when the shipped RGB default
                 // is non-neutral.
                 let reflectance = surface_toa_radiance(surf, &pixel, 1.0, 1.0)
-                    .map(reflectance_from_radiance)
+                    .map(|radiance| surf.raw_reflectance(radiance))
                     .unwrap_or([0.0; 3]);
                 row.extend_from_slice(&reflectance);
             }
@@ -3847,13 +3890,12 @@ mod tests {
         );
         assert_eq!(
             effective.fractional_cloud_mode,
-            FractionalCloudMode::EffectiveOd
+            FractionalCloudMode::Deterministic2
         );
         assert_eq!(
             changes,
             vec![
                 RenderIntentAdjustment::CloudOpticalDepthUnscaled,
-                RenderIntentAdjustment::FractionalCloudEffectiveOd,
                 RenderIntentAdjustment::ExposureNeutral,
                 RenderIntentAdjustment::GroundLiftNeutral,
                 RenderIntentAdjustment::LandAppearanceIdentity,
@@ -3867,13 +3909,34 @@ mod tests {
                 RenderIntentAdjustment::AtmosphereCorrectionOff,
                 RenderIntentAdjustment::HighlightShoulderIdentity,
                 RenderIntentAdjustment::SyntheticGreenOff,
+                RenderIntentAdjustment::UpstreamDisplayCalibrationOff,
+                RenderIntentAdjustment::ReflectanceFactorUnclipped,
             ]
         );
         assert_eq!(
             effective.intent.observation_operator(),
-            "simsat-fast-gray-v1"
+            "simsat-fast-gray-v2"
         );
         assert!(!effective.intent.limitations().is_empty());
+    }
+
+    #[test]
+    fn sensor_intent_preserves_each_requested_cloud_overlap_closure() {
+        for mode in [
+            FractionalCloudMode::Off,
+            FractionalCloudMode::EffectiveOd,
+            FractionalCloudMode::Deterministic2,
+            FractionalCloudMode::Deterministic4,
+            FractionalCloudMode::Deterministic8,
+            FractionalCloudMode::Deterministic16,
+        ] {
+            let mut p = RenderParams::new(PathBuf::from("unused"));
+            p.intent = RenderIntent::SensorFastGray;
+            p.fractional_cloud_mode = mode;
+            let (effective, adjustments) = plan_render_intent(&p);
+            assert_eq!(effective.fractional_cloud_mode, mode);
+            assert!(!adjustments.contains(&RenderIntentAdjustment::FractionalCloudEffectiveOd));
+        }
     }
 
     #[test]

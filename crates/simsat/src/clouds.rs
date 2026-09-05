@@ -3839,8 +3839,8 @@ pub fn render_cloud_frame_rgba(
     rows.into_iter().flatten().collect()
 }
 
-/// Render a full cloud-composited frame to row-major RAW REFLECTANCE (`nx*ny*3` f32 in
-/// `[0, 1]`, row 0 = north; space pixels are `0`) — the PRE-TONEMAP per-band product the
+/// Render a full cloud-composited frame to row-major RAW REFLECTANCE (`nx*ny*3` f32,
+/// unclipped for sensor intent, bounded [0,1] for display; row 0 = north; space pixels are `0`) — the PRE-TONEMAP per-band product the
 /// Python binding's `render_rgb_reflectance` returns (`render_visible_bands` is the
 /// deprecated compatibility alias). Identical assembly to
 /// [`render_cloud_frame_rgba`] (same [`composite_cloud_radiance`], same `assemble`, same
@@ -3867,7 +3867,7 @@ pub fn render_cloud_frame_reflectance(
                 if let Some(l) =
                     composite_cloud_radiance(scene, surf, &pixel, froxel, scan_rect, sx, sy)
                 {
-                    let rho = crate::render::reflectance_from_radiance(l);
+                    let rho = surf.raw_reflectance(l);
                     row[px * 3..px * 3 + 3].copy_from_slice(&rho);
                 }
             }

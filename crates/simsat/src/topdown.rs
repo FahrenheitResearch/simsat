@@ -44,7 +44,7 @@ use crate::render::{CLOUD_SOFTCLIP_KNEE, GROUND_DAY_LIFT};
 use crate::render::{
     FrameContext, SurfacePixel, apply_low_sun_illuminant, day_lerp_ramp,
     effective_cloud_shadow_layer, radiance_to_rgba_softclip_with_synthetic_green,
-    reflectance_from_radiance, surface_toa_radiance,
+    surface_toa_radiance,
 };
 
 /// TOP-DOWN CLOUD NORMALIZATION — a sun-gated multiplier on the top-down (near-nadir)
@@ -582,13 +582,13 @@ fn residual_sum(values: &[[f64; 3]], valid: &[bool]) -> [f64; 3] {
         })
 }
 
-/// Render a full TOP-DOWN VISIBLE frame to row-major RAW REFLECTANCE (`nx*ny*3` f32 in
-/// `[0, 1]`, row 0 = north; space/padding pixels are `0`) — the PRE-TONEMAP per-band
+/// Render a full TOP-DOWN VISIBLE frame to row-major RAW REFLECTANCE (`nx*ny*3` f32,
+/// unclipped for sensor intent, bounded [0,1] for display; row 0 = north; space/padding pixels are `0`) — the PRE-TONEMAP per-band
 /// product the Python binding's `render_rgb_reflectance` returns for the top-down view
 /// (`render_visible_bands` is the deprecated compatibility alias).
 /// Identical assembly to [`render_topdown_frame_rgba`] (same per-pixel nadir ray, same
 /// composite via [`topdown_pixel_radiance`]); each pixel's composited radiance is converted
-/// to the reflectance factor ([`reflectance_from_radiance`]) instead of the display
+/// to the reflectance factor ([`crate::render::reflectance_from_radiance`]) instead of the display
 /// transform. Rows in parallel (rayon).
 pub fn render_topdown_frame_reflectance(
     surf: &FrameContext,
@@ -612,7 +612,7 @@ pub fn render_topdown_frame_reflectance(
                 if let Some((l, _sun_elev)) =
                     topdown_pixel_radiance(surf, scene, lat, lon, nx, px, py, &assemble, 1.0)
                 {
-                    let rho = reflectance_from_radiance(l);
+                    let rho = surf.raw_reflectance(l);
                     row[px * 3..px * 3 + 3].copy_from_slice(&rho);
                 }
             }
@@ -676,7 +676,7 @@ pub fn render_topdown_frame_linear_radiance(
 /// the RGB display seam). `None` for a non-finite/padding pixel or a ray that misses the
 /// shell. The shared numerator of BOTH the top-down RGB product (->
 /// [`radiance_to_rgba_softclip`]) and the raw-bands product (->
-/// [`reflectance_from_radiance`]); a pure extraction of the former per-pixel body, so the
+/// [`crate::render::reflectance_from_radiance`]); a pure extraction of the former per-pixel body, so the
 /// RGB output is byte-identical.
 #[allow(clippy::too_many_arguments)]
 fn topdown_pixel_radiance(

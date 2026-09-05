@@ -1009,7 +1009,7 @@ struct SimSatStudioApp {
     frame_cap: usize,
     /// Render mode: Visible (the M1-M5 physically-based path) or IR (M6, band 13).
     render_mode: RenderMode,
-    /// Display (shipped appearance) or the strict `simsat-fast-gray-v1` operator.
+    /// Display (shipped appearance) or the strict `simsat-fast-gray-v2` operator.
     /// Session-scoped so startup remains the familiar Display mode.
     render_intent: RenderIntent,
     /// The IR enhancement (colour curve) applied to the BT plane in IR mode.
@@ -3364,7 +3364,7 @@ impl SimSatStudioApp {
                         .response
                         .on_hover_text(
                             "Display preserves the shipped reviewed appearance. Sensor Fast Gray \
-                             uses simsat-fast-gray-v1: unscaled cloud extinction and neutral \
+                             uses simsat-fast-gray-v2: unscaled cloud extinction and neutral \
                              display shaping on a temporary render copy, with every adjustment \
                              logged. It is not yet an SRF-integrated ABI/AHI channel simulator.",
                         );
@@ -6729,6 +6729,7 @@ fn prepare_render(
         pw_ratio,
         aerosol_swelling: if atmo.rh_swelling { 1.5 } else { 1.0 },
         ground_albedo: atmosphere::GROUND_ALBEDO,
+        display_calibration: true,
     };
     // Cached under EVERY AtmosphereParams field (raw f64 bits) — `pw_ratio` comes
     // from the brick, so a timestep whose domain-mean moisture moved rebuilds (a
@@ -8425,7 +8426,7 @@ mod tests {
         );
         assert_eq!(
             atmo.render_intent.observation_operator(),
-            "simsat-fast-gray-v1"
+            "simsat-fast-gray-v2"
         );
     }
 

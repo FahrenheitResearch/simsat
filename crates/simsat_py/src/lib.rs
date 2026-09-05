@@ -15,7 +15,7 @@
 //!   true-color base + color-enhanced band-13 IR overlaid on the cold cloud tops) — the
 //!   classic severe-convection view; a daytime-convection product.
 //! - [`render_rgb_reflectance`] -> `(H x W x 3 float32, Georef)` RAW broad-RGB reflectance
-//!   (pre-tonemap, `[0, 1]`), for custom RGB / reflectance math. The deprecated
+//!   (pre-tonemap, unclipped with sensor intent), for custom RGB / reflectance math. The deprecated
 //!   [`render_visible_bands`] name remains as a compatibility alias.
 //! - [`render_ir`] -> `(H x W float32, Georef)` RAW brightness temperature in KELVIN; with
 //!   `enhancement=` it instead returns `(H x W float32, H x W x 3 uint8, Georef)`.
@@ -111,7 +111,7 @@ use simsat_engine::wv::WvBand;
 ///       Marble download / fallback progress); empty when nothing noteworthy happened.
 ///   intent (str): `display` or `sensor-fast-gray`.
 ///   observation_operator (str): stable provenance slug (`simsat-display-v1` or
-///       `simsat-fast-gray-v1`).
+///       `simsat-fast-gray-v2`).
 ///   intent_adjustments (list[str]): every automatic strict-intent substitution.
 ///   intent_limitations (list[str]): explicit scientific limitations of that operator.
 ///   thermal_sensor (str | None): selected response for IR or an IR-containing composite.
@@ -147,7 +147,7 @@ pub struct Georef {
     /// Requested render intent (`display` or `sensor-fast-gray`).
     #[pyo3(get)]
     intent: String,
-    /// Stable operator provenance (`simsat-display-v1` or `simsat-fast-gray-v1`).
+    /// Stable operator provenance (`simsat-display-v1` or `simsat-fast-gray-v2`).
     #[pyo3(get)]
     observation_operator: String,
     /// Exact automatic strict-intent substitutions, in application order.
@@ -726,7 +726,8 @@ fn render_sandwich<'py>(
 /// Render raw broad-RGB reflectance (pre-tonemap) for custom RGB or reflectance math.
 ///
 /// Returns `(reflectance, georef)` where `reflectance` is a numpy `H x W x 3` float32
-/// array in `[0, 1]` (broad R, G, B reflectance factors; row 0 = north). These channels
+/// array (broad R, G, B reflectance factors; row 0 = north). Display intent is
+/// bounded [0,1]; sensor intent is unclipped. These channels
 /// are not yet sensor-response-integrated ABI visible bands.
 #[pyfunction]
 #[pyo3(signature = (
@@ -815,7 +816,8 @@ fn render_rgb_reflectance<'py>(
 /// available for existing code. New code should use `render_rgb_reflectance`; the old name
 /// could be mistaken for discrete, sensor-response-integrated visible bands.
 ///
-/// Returns `(bands, georef)` where `bands` is a numpy `H x W x 3` float32 array in `[0, 1]`
+/// Returns `(bands, georef)` where `bands` is a numpy `H x W x 3` float32 array
+/// (bounded [0,1] for display intent, unclipped for sensor intent)
 /// (R, G, B reflectance factors; row 0 = north).
 #[pyfunction]
 #[pyo3(signature = (
@@ -2327,7 +2329,7 @@ fn parse_storage_profile(v: &str) -> PyResult<StorageProfile> {
 fn parse_intent(v: &str) -> PyResult<RenderIntent> {
     match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
         "display" => Ok(RenderIntent::Display),
-        "sensor" | "sensor-fast-gray" | "fast-gray" | "simsat-fast-gray-v1" => {
+        "sensor" | "sensor-fast-gray" | "fast-gray" | "simsat-fast-gray-v1" | "simsat-fast-gray-v2" => {
             Ok(RenderIntent::SensorFastGray)
         }
         _ => Err(value_err(format!(
@@ -2499,7 +2501,7 @@ mod tests {
             RenderIntent::SensorFastGray
         );
         assert_eq!(
-            parse_intent("simsat-fast-gray-v1").unwrap(),
+            parse_intent("simsat-fast-gray-v2").unwrap(),
             RenderIntent::SensorFastGray
         );
         assert!(parse_intent("abi-band-2").is_err());

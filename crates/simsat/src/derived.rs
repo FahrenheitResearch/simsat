@@ -318,13 +318,14 @@ pub fn condensate_mixing_ratio_kg_kg(ext_vis_per_m: f64, class: HydrometeorClass
 /// which OVERSTATES the mass of any snow in that channel (1 mm vs 150 um, 6.7x), i.e.
 /// errs toward "cloudy" for the mixed channel; documented, and moot for SSB v6 bricks.
 ///
-/// Floor honesty: the compact brick log-quantizes each channel over five decades below
-/// its per-volume peak (`bricks::QUANT_DYNAMIC_RANGE`), so condensate below
-/// `peak_ext / 1e5` decodes as zero. For a real convective brick (liquid peak ~0.1-0.3
-/// m^-1) that floor is ~1e-8 kg kg^-1 — two decades under the default threshold — so
-/// the quantization does not move the mask; a brick with an extreme peak could raise
-/// the effective floor and is not detected here. Below-terrain levels are zero by
-/// construction (the ingest extrapolates extinction with `Extrap::Zero`).
+/// Floor honesty: the compact brick log-quantizes each channel over five decades
+/// below its per-volume peak (`bricks::QUANT_DYNAMIC_RANGE`). Finite positive
+/// values below `peak_ext / 1e5` encode as code 1 and decode to that positive floor;
+/// only zero/nonpositive inputs encode as zero. Tiny tails can therefore be raised,
+/// not discarded. The mass proxy and threshold must be sensitivity-tested against
+/// native condensate for each case; compact quantization cannot guarantee an
+/// unchanged cloud mask. Below-terrain extinction is zero by construction
+/// (`Extrap::Zero`). See scripts/simsat-ctt-audit.py for a native-state cross-check.
 pub fn condensate_cloud_mask_field(brick: &VolumeBrick, threshold_kg_kg: f64) -> Vec<u8> {
     let (nx, ny, nz) = (brick.nx, brick.ny, brick.nz);
     let ql = brick.quant.get("ext_liquid");

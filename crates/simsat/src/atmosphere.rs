@@ -227,6 +227,11 @@ pub struct AtmosphereParams {
     pub aerosol_swelling: f64,
     /// Ground albedo for the multi-scatter bounce.
     pub ground_albedo: f64,
+    /// Retain the shipped ozone and twilight multiple-scattering appearance gains.
+    /// False uses the base Hillaire coefficients and unit multiple-scattering gain.
+    /// The spectral coefficients remain broad RGB gray approximations. GPU preview
+    /// supports the display profile only; the sensor CPU path disables these gains.
+    pub display_calibration: bool,
 }
 
 impl Default for AtmosphereParams {
@@ -236,11 +241,21 @@ impl Default for AtmosphereParams {
             pw_ratio: 1.0,
             aerosol_swelling: 1.0,
             ground_albedo: GROUND_ALBEDO,
+            display_calibration: true,
         }
     }
 }
 
 impl AtmosphereParams {
+    /// Unit gain is the unstyled Hillaire multiple-scattering source function.
+    pub fn multiscatter_gain(&self) -> f64 {
+        if self.display_calibration {
+            MULTISCATTER_GAIN
+        } else {
+            1.0
+        }
+    }
+
     /// Mie EXTINCTION at the surface (m^-1) from the AOD (and swelling): the
     /// exponential profile integrates to `ext_ground * H_M`, so `ext_ground =
     /// AOD / H_M`.
@@ -300,7 +315,11 @@ pub fn sample_medium(h: f64, params: &AtmosphereParams) -> MediumSample {
     let mut extinction = [0.0; 3];
     for c in 0..3 {
         let ray_s = RAYLEIGH_SCATTERING[c] * rayleigh_density;
-        let ozone_a = OZONE_ABSORPTION[c] * ozone_density;
+        let ozone_a = if params.display_calibration {
+            OZONE_ABSORPTION[c]
+        } else {
+            OZONE_ABSORPTION[c] / OZONE_STRENGTH
+        } * ozone_density;
         let wv_a = WATER_VAPOR_ABSORPTION[c] * wv_density * params.pw_ratio;
         rayleigh_scattering[c] = ray_s;
         scattering[c] = ray_s + mie_s;
@@ -734,7 +753,7 @@ pub fn integrate_scattered_luminance(
                 t_sun[c] * (m.rayleigh_scattering[c] * rayleigh_ph + m.mie_scattering * mie_ph);
             // Multiple scattering: fills the earth shadow (no sun-visibility gate).
             // MULTISCATTER_GAIN modestly boosts this below-horizon twilight fill.
-            let multi = MULTISCATTER_GAIN * m.scattering[c] * ms[c];
+            let multi = params.multiscatter_gain() * m.scattering[c] * ms[c];
             let s = sun_irradiance[c] * (single + multi);
             let s_int = (s - s * sample_t) / ext;
             l[c] += throughput * s_int;
@@ -1378,7 +1397,7 @@ pub fn build_aerial_froxel(
                     let sample_t = (-ext * dt).exp();
                     let single = t_sun[c]
                         * (m.rayleigh_scattering[c] * rayleigh_ph + m.mie_scattering * mie_ph);
-                    let multi = MULTISCATTER_GAIN * m.scattering[c] * ms[c];
+                    let multi = params.multiscatter_gain() * m.scattering[c] * ms[c];
                     let s = SOLAR_IRRADIANCE_RGB[c] * (single + multi);
                     l[c] += throughput * (s - s * sample_t) / ext;
                     od[c] += ext * dt;
@@ -1668,6 +1687,30 @@ mod tests {
     fn small_luts() -> AtmosphereLuts {
         // Full-size transmittance (cheap) + full multiscatter (32x32, cheap).
         AtmosphereLuts::build(&AtmosphereParams::default())
+    }
+
+    #[test]
+    fn sensor_profile_removes_only_ozone_stylization_from_medium() {
+        let display = AtmosphereParams::default();
+        let sensor = AtmosphereParams {
+            display_calibration: false,
+            ..display
+        };
+        // At the ozone peak, extinction differs by the documented 1.45x
+        // appearance gain; molecular/aerosol scattering is bit-identical.
+        let a = sample_medium(OZONE_CENTER_M, &display);
+        let b = sample_medium(OZONE_CENTER_M, &sensor);
+        assert_eq!(a.scattering, b.scattering);
+        for c in 0..3 {
+            let expected = OZONE_ABSORPTION[c] * (1.0 - 1.0 / OZONE_STRENGTH);
+            assert!((a.extinction[c] - b.extinction[c] - expected).abs() < 1e-18);
+        }
+        assert_eq!(
+            sample_medium(0.0, &display).extinction,
+            sample_medium(0.0, &sensor).extinction
+        );
+        assert_eq!(display.multiscatter_gain(), MULTISCATTER_GAIN);
+        assert_eq!(sensor.multiscatter_gain(), 1.0);
     }
 
     #[test]

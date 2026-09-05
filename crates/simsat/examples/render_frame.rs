@@ -20,7 +20,7 @@
 //!   backend=<mode>     cpu | gpu-preview (default cpu). GPU preview temporarily selects
 //!                      a compatible Visible/clouds-on configuration and reports every change.
 //!   intent=<intent>    display | sensor-fast-gray (default display). Sensor Fast Gray
-//!                      selects the explicitly limited simsat-fast-gray-v1 operator,
+//!                      selects the explicitly limited simsat-fast-gray-v2 operator,
 //!                      neutralizes display shaping, and reports every substitution.
 //!   sat=<preset>       goes-east | goes-west | himawari   (default goes-east)
 //!   geo-navigation=<mode> model-sphere | goes-r-abi (default model-sphere).
@@ -1570,9 +1570,11 @@ fn parse_backend(v: &str) -> Result<RenderBackend, String> {
 fn parse_intent(v: &str) -> Result<RenderIntent, String> {
     match v.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
         "display" => Ok(RenderIntent::Display),
-        "sensor" | "sensor-fast-gray" | "fast-gray" | "simsat-fast-gray-v1" => {
-            Ok(RenderIntent::SensorFastGray)
-        }
+        "sensor"
+        | "sensor-fast-gray"
+        | "fast-gray"
+        | "simsat-fast-gray-v1"
+        | "simsat-fast-gray-v2" => Ok(RenderIntent::SensorFastGray),
         _ => Err(format!(
             "unknown intent '{v}' (expected display|sensor-fast-gray)"
         )),
