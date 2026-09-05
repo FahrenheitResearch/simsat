@@ -1,0 +1,118 @@
+{
+  "workspace_tests": {
+    "passed": 716,
+    "failed": 0,
+    "ignored": 3,
+    "finished": true
+  },
+  "clippy": true,
+  "workspace_build": true,
+  "registration": {
+    "coordinate_matches": 360000,
+    "fallback": 4367,
+    "full": 188861,
+    "grid": [
+      600,
+      600
+    ],
+    "land_mask_mismatch_rejected": true,
+    "magnitude": 165356,
+    "max_ideal_projection_rounding_cells": 0.006341401430631777,
+    "shifted_coordinate_rejected": true,
+    "source_date": "2024-04-03"
+  },
+  "direct_gpu": "SURFACE_FLOAT_GPU adapter=NVIDIA GeForce RTX 3080 pixels=4 max_display_code_error=0 disabled_byte_identical=true nbar_fallback_byte_identical=true",
+  "python_exporter_tests_passed": 2,
+  "render_manifest": [
+    {
+      "scene": "01-1974-2229-current",
+      "command": [
+        "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+        "input=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\wrfout_d05_1974-04-03_22_29_00",
+        "timestep=0",
+        "cache=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\cache",
+        "sat=goes-east",
+        "resolution=native",
+        "threads=6",
+        "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\outputs\\SimSat-Finer-Earth-2026-09-05\\01-1974-2229-current.png",
+        "intent=display",
+        "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+        "view=topdown",
+        "output-transform=srgb"
+      ],
+      "seconds": 159.44002860004548,
+      "binary_sha256": "b062fe79bd8bedd974ec3c3121987b3dc1c1d2a049aa64a9978ea03f0747518e",
+      "image_sha256": "90b07248a48175100e2a9f3de15e4531faee75117baf52cbb93e7dc5eba40473"
+    },
+    {
+      "scene": "02-1974-2229-measured-earth",
+      "command": [
+        "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+        "input=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\wrfout_d05_1974-04-03_22_29_00",
+        "timestep=0",
+        "cache=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\cache",
+        "sat=goes-east",
+        "resolution=native",
+        "threads=6",
+        "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\outputs\\SimSat-Finer-Earth-2026-09-05\\02-1974-2229-measured-earth.png",
+        "intent=display",
+        "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+        "view=topdown",
+        "output-transform=srgb",
+        "nbar-surface=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\nbar-engine-1974-2229\\surface.json"
+      ],
+      "seconds": 157.89319909998449,
+      "binary_sha256": "c8917ac9c4c9be67e8e9650fb3939f9336dcd057e5c9ce7250504a4c5cb0f5f7",
+      "image_sha256": "25d3e797f2505c92e96124750ca2989cb52938af9778e1a8cb29a3425e990fbe"
+    },
+    {
+      "scene": "03-1974-2229-measured-earth-solar-light",
+      "command": [
+        "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+        "input=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\wrfout_d05_1974-04-03_22_29_00",
+        "timestep=0",
+        "cache=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\cache",
+        "sat=goes-east",
+        "resolution=native",
+        "threads=6",
+        "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\outputs\\SimSat-Finer-Earth-2026-09-05\\03-1974-2229-measured-earth-solar-light.png",
+        "intent=display",
+        "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+        "view=topdown",
+        "output-transform=srgb",
+        "nbar-surface=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\nbar-engine-1974-2229\\surface.json",
+        "land-sza-normalization=off",
+        "land-dark-toe=off"
+      ],
+      "seconds": 141.6619690999505,
+      "binary_sha256": "c8917ac9c4c9be67e8e9650fb3939f9336dcd057e5c9ce7250504a4c5cb0f5f7",
+      "image_sha256": "258aad7ffa59f8912a5865ed3e4c7d71bbfc03e51f8ebbc74255c7e5a59f1dd7"
+    },
+    {
+      "scene": "diagnostics/1974-2229-measured-surface-only",
+      "command": [
+        "C:\\Users\\drew\\simsat-wt-nextgen-abi\\target\\release\\simsat-render-frame.exe",
+        "input=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\wrfout_d05_1974-04-03_22_29_00",
+        "timestep=0",
+        "cache=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\cases\\real74-333m-2229\\cache",
+        "sat=goes-east",
+        "resolution=native",
+        "threads=6",
+        "out=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\outputs\\SimSat-Finer-Earth-2026-09-05\\diagnostics\\1974-2229-measured-surface-only.png",
+        "intent=display",
+        "bluemarble-base-map=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\earth-basemap",
+        "view=topdown",
+        "output-transform=srgb",
+        "nbar-surface=C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\nbar-engine-1974-2229\\surface.json",
+        "clouds=off"
+      ],
+      "seconds": 2.1733049000031315,
+      "binary_sha256": "c8917ac9c4c9be67e8e9650fb3939f9336dcd057e5c9ce7250504a4c5cb0f5f7",
+      "image_sha256": "7b0c2ebb9e22f7c80196f319cff7abae24423370582cf5c288adf34054b8d776"
+    }
+  ],
+  "default_control_byte_identical": true,
+  "new_images_visually_inspected": true,
+  "four_hour_NBAR_accuracy": "not measured; different historical source and no aligned 1974 observations",
+  "additional_catalog_query": "blocked by automatic approval review; user permission question pending; no egress sent"
+}

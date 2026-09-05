@@ -438,7 +438,7 @@ pub struct SurfaceFrameInputs<'a> {
     pub landmask_r8: &'a [u8],
     /// The Blue Marble crop, or `None` to render with the flat albedo.
     pub bluemarble: Option<&'a BlueMarbleCrop>,
-    /// Per-output-pixel linear RGB albedo and land/water validity (+1/-1/0).
+    /// Per-output-pixel RGB: alpha +1 measured land, +2 base-map fallback land,\n    /// -1 model water, 0 legacy.
     pub linear_albedo: Option<&'a [f32]>,
     /// Transmittance LUT, `256*64*4` f32 RGBA (optics config).
     pub transmittance_lut: &'a [f32],
@@ -2966,6 +2966,14 @@ mod tests {
             max_error <= 1,
             "float albedo/CPU-decoded sRGB upload mismatch: {max_error} display codes"
         );
+        // Missing NBAR uses +2: force land despite the conflicting mask, but
+        // ignore all RGB values and retain the existing base-map lighting.
+        let fallback = [0.99f32, 0.01, 0.99, 2.0].repeat(4);
+        inputs.linear_albedo = Some(&fallback);
+        assert_eq!(
+            reference.rgba,
+            resources.render(&device, &queue, &inputs).rgba
+        );
         let disabled = [0.0f32; 16];
         inputs.linear_albedo = Some(&disabled);
         inputs.landmask_r8 = &land;
@@ -2974,7 +2982,7 @@ mod tests {
             resources.render(&device, &queue, &inputs).rgba
         );
         eprintln!(
-            "SURFACE_FLOAT_GPU adapter={} pixels=4 max_display_code_error={max_error} disabled_byte_identical=true",
+            "SURFACE_FLOAT_GPU adapter={} pixels=4 max_display_code_error={max_error} disabled_byte_identical=true nbar_fallback_byte_identical=true",
             adapter.get_info().name
         );
     }

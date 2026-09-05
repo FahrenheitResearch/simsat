@@ -12,7 +12,6 @@ use std::{collections::BTreeMap, path::Path};
 
 pub const RGB_WAVELENGTHS_UM: [f64; 3] = [0.680, 0.550, 0.440];
 const MAX_DATA_BYTES: usize = 512 * 1024 * 1024;
-const MAX_GRID_ERROR_CELLS: f64 = 0.005;
 
 #[derive(Deserialize)]
 struct FileRecord {
@@ -234,64 +233,32 @@ impl SpectralSurface {
         raster: &SurfaceRaster,
         forward: impl Fn(f64, f64) -> (f64, f64),
     ) -> Result<(Vec<f32>, f64), String> {
-        let n = nx.checked_mul(ny).ok_or("model dimensions overflow")?;
-        if n != self.cell_count()
-            || model_land.len() != n
-            || (nx, ny) != (self.header.nx, self.header.ny)
-        {
+        if (nx, ny) != (self.header.nx, self.header.ny) {
             return Err("spectral surface and model grid dimensions differ".into());
         }
-        let mut native = vec![[0.0f32; 4]; n];
-        let mut seen = vec![false; n];
-        let mut max_error = 0.0f64;
-        for (cell, &[lat, lon]) in self.coordinates.iter().enumerate() {
-            let (i, j) = forward(lat, lon);
-            let (ii, jj) = (i.round(), j.round());
-            let error = (i - ii).abs().max((j - jj).abs());
-            if !i.is_finite()
-                || !j.is_finite()
-                || error > MAX_GRID_ERROR_CELLS
-                || ii < 0.0
-                || jj < 0.0
-                || ii >= nx as f64
-                || jj >= ny as f64
-            {
-                return Err(format!(
-                    "spectral surface coordinate does not match a model cell: {cell}, ({i},{j})"
-                ));
-            }
-            let idx = jj as usize * nx + ii as usize;
-            if seen[idx]
-                || !model_land[idx].is_finite()
-                || (model_land[idx] >= 0.5) != self.is_land(cell)
-            {
-                return Err(format!(
-                    "spectral surface grid assignment or land-mask mismatch at {cell}"
-                ));
-            }
-            seen[idx] = true;
-            max_error = max_error.max(error);
+        let mut colors = vec![[0.0f32; 4]; self.cell_count()];
+        for (cell, color) in colors.iter_mut().enumerate() {
             if self.is_land(cell) {
                 for (c, wavelength) in RGB_WAVELENGTHS_UM.into_iter().enumerate() {
-                    native[idx][c] = self
+                    color[c] = self
                         .sample(cell, wavelength)
                         .ok_or("surface spectrum does not cover RGB wavelengths")?
                         as f32;
                 }
-                native[idx][3] = 1.0;
+                color[3] = 1.0;
             } else {
-                native[idx][3] = -1.0;
+                color[3] = -1.0;
             }
         }
-        let mut rgba = vec![0.0f32; raster.nx * raster.ny * 4];
-        for (pixel, (&i, &j)) in raster.grid_i.iter().zip(&raster.grid_j).enumerate() {
-            if i.is_finite() && j.is_finite() {
-                let ii = (i as f64).round().clamp(0.0, (nx - 1) as f64) as usize;
-                let jj = (j as f64).round().clamp(0.0, (ny - 1) as f64) as usize;
-                rgba[pixel * 4..pixel * 4 + 4].copy_from_slice(&native[jj * nx + ii]);
-            }
-        }
-        Ok((rgba, max_error))
+        crate::surface_grid::raster_rgba(
+            (nx, ny),
+            &self.coordinates,
+            &self.land,
+            &colors,
+            model_land,
+            raster,
+            forward,
+        )
     }
 }
 

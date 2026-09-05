@@ -593,6 +593,9 @@ pub struct RenderParams {
     /// Exact-grid spectral black-sky land albedo, used as a Lambertian approximation.
     /// The plain visible/RGB-reflectance paths share float CPU/GPU surface inputs.
     pub spectral_surface: Option<PathBuf>,
+    /// Measured MODIS RGB with explicit quality and base-map fallback policies.
+    /// Display-only Lambertian proxy; no angular correction or ABI-band claim.
+    pub nbar_surface: Option<PathBuf>,
     /// For the IR product: also produce a colored RGB via this enhancement (the raw Kelvin
     /// BT plane is always returned). `None` = BT only.
     pub ir_enhancement: Option<IrEnhancement>,
@@ -706,6 +709,7 @@ impl RenderParams {
             cache: ingest::default_cache_dir(),
             bluemarble: BlueMarble::default(),
             spectral_surface: None,
+            nbar_surface: None,
             ir_enhancement: None,
             thermal_sensor: ThermalSensor::FastGray,
             instrument_footprint: InstrumentFootprint::Off,
@@ -900,6 +904,8 @@ pub enum GroundSource {
     SeasonalBaseMap,
     /// Spectral land albedo with the configured base map retained for water.
     SpectralLand,
+    /// MODIS NBAR display proxy with reported source quality and fallback counts.
+    NbarLand,
     /// A user-named single-file ground texture ([`BlueMarble::SingleFile`]).
     SingleFile,
 }
@@ -915,6 +921,7 @@ impl GroundSource {
             Self::SingleFile => "single-file",
             Self::SeasonalBaseMap => "seasonal-base-map",
             Self::SpectralLand => "spectral-land-lambertian",
+            Self::NbarLand => "modis-nbar-display-proxy",
         }
     }
 }
@@ -1003,6 +1010,21 @@ struct SceneSource {
 /// assembles the scene, marches the requested product, and returns the frame data + georef.
 pub fn render(params: &RenderParams, product: Product) -> Result<RenderResult, String> {
     let product = product.canonical();
+    if params.nbar_surface.is_some() {
+        if params.spectral_surface.is_some() {
+            return Err("nbar-surface and spectral-surface are mutually exclusive".into());
+        }
+        if params.intent != RenderIntent::Display
+            || !matches!(product, Product::VisibleRgb | Product::RgbReflectance)
+        {
+            return Err("nbar-surface is a display-only VisibleRgb/RgbReflectance proxy".into());
+        }
+        if !matches!(params.bluemarble, BlueMarble::SeasonalBaseMap { .. }) {
+            return Err(
+                "nbar-surface requires an explicit bluemarble-base-map for its fallback".into(),
+            );
+        }
+    }
     if params.spectral_surface.is_some()
         && !matches!(product, Product::VisibleRgb | Product::RgbReflectance)
     {
@@ -1454,7 +1476,7 @@ fn render_visible_scene(
     // failure degrades to flat albedo but is REPORTED, never silent).
     let (bluemarble, mut ground_source, mut ground_status) =
         resolve_bluemarble(params, &raster, time.month, time.day)?;
-    let linear_albedo = if let Some(path) = &params.spectral_surface {
+    let mut linear_albedo = if let Some(path) = &params.spectral_surface {
         let surface = crate::spectral_surface::SpectralSurface::load(path)?;
         let days = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         if time.month == 2 && time.day == 29 {
@@ -1470,14 +1492,38 @@ fn render_visible_scene(
                 surface.climatology_doy()
             ));
         }
-        let (mut rgba, error) =
-            surface.raster_rgba(nx, ny, &brick.landmask, &raster, |la, lo| {
-                georef.forward(la, lo)
-            })?;
+        let (rgba, error) = surface.raster_rgba(nx, ny, &brick.landmask, &raster, |la, lo| {
+            georef.forward(la, lo)
+        })?;
+        ground_status.push(format!("spectral land: {}; climatology day={doy}; max registration error={error:.6} model cells; RGB=680/550/440nm; black-sky albedo used as Lambertian approximation; water source={}", path.display(), ground_source.slug()));
+        ground_source = GroundSource::SpectralLand;
+        Some(rgba)
+    } else if let Some(path) = &params.nbar_surface {
+        if time_is_fallback {
+            return Err("nbar-surface requires a known frame date".into());
+        }
+        let surface = crate::nbar_surface::NbarSurface::load(path)?;
+        surface.validate_frame_date(time.year, time.month, time.day)?;
+        // Exact XLAT/XLONG identity avoids widening the spectral registration
+        // tolerance for fine WRF grids. Cached bricks still supply cloud fields.
+        let geometry = crate::ingest::read_grid_geometry(&params.input, params.timestep)
+            .map_err(|e| format!("nbar-surface currently requires the original WRF input for exact coordinate verification: {e}"))?;
+        let (rgba, error) = surface.raster_rgba(&geometry, &brick.landmask, &raster)?;
+        ground_status.push(format!(
+            "MODIS NBAR: {}; source date={}; frame date={:04}-{:02}-{:02}; quality={}; full={} magnitude={} fallback={}; every coordinate matches source WRF exactly; native-to-ideal-projection rounding={error:.6} model cells; RGB=MODIS 1/4/3; nadir/noon reflectance used as Lambertian DISPLAY proxy with no arbitrary-angle BRDF correction; fallback and water source={}",
+            path.display(), surface.source_date(), time.year, time.month, time.day,
+            surface.quality_policy(), surface.full_count, surface.magnitude_count,
+            surface.fallback_count, ground_source.slug()));
+        ground_source = GroundSource::NbarLand;
+        Some(rgba)
+    } else {
+        None
+    };
+    if let Some(rgba) = &mut linear_albedo {
         // Model snow overlays the climatological base in linear reflectance space.
         if let Some(snowh) = &brick.snowh {
             for (pixel, texel) in rgba.chunks_exact_mut(4).enumerate() {
-                if texel[3] > 0.5 {
+                if texel[3] > 0.5 && texel[3] < 1.5 {
                     let i = (raster.grid_i[pixel] as f64)
                         .round()
                         .clamp(0.0, (nx - 1) as f64) as usize;
@@ -1494,12 +1540,7 @@ fn render_visible_scene(
                 }
             }
         }
-        ground_status.push(format!("spectral land: {}; climatology day={doy}; max registration error={error:.6} model cells; RGB=680/550/440nm; black-sky albedo used as Lambertian approximation; water source={}", path.display(), ground_source.slug()));
-        ground_source = GroundSource::SpectralLand;
-        Some(rgba)
-    } else {
-        None
-    };
+    }
 
     // Per-pixel LUTs (geo lookup + light); override the light plane for a synthetic sun.
     let (lut_geo, mut lut_light) = gpu::build_luts(&raster, bluemarble.as_ref(), nx, ny, &solar);
@@ -3634,7 +3675,8 @@ fn make_assemble<'a>(
             on_earth: true,
             base_srgb: base,
             linear_albedo: linear_albedo.and_then(|v| {
-                (v[idx * 4 + 3] > 0.5).then(|| [v[idx * 4], v[idx * 4 + 1], v[idx * 4 + 2]])
+                (v[idx * 4 + 3] > 0.5 && v[idx * 4 + 3] < 1.5)
+                    .then(|| [v[idx * 4], v[idx * 4 + 1], v[idx * 4 + 2]])
             }),
             normal_enu,
             sun_enu,
@@ -4174,6 +4216,40 @@ mod tests {
             assert_eq!(effective.fractional_cloud_mode, mode);
             assert!(!adjustments.contains(&RenderIntentAdjustment::FractionalCloudEffectiveOd));
         }
+    }
+
+    #[test]
+    fn nbar_rejects_sensor_unsupported_product_missing_fallback_and_conflicting_sources_before_io()
+    {
+        let mut p = RenderParams::new(PathBuf::from("missing-input"));
+        p.nbar_surface = Some(PathBuf::from("missing-nbar"));
+        assert!(
+            render(&p, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("bluemarble-base-map")
+        );
+        p.bluemarble = BlueMarble::SeasonalBaseMap {
+            directory: PathBuf::from("missing-map"),
+            month_override: None,
+        };
+        p.intent = RenderIntent::SensorFastGray;
+        assert!(
+            render(&p, Product::RgbReflectance)
+                .unwrap_err()
+                .contains("display-only")
+        );
+        p.intent = RenderIntent::Display;
+        assert!(
+            render(&p, Product::CloudLayer)
+                .unwrap_err()
+                .contains("display-only")
+        );
+        p.spectral_surface = Some(PathBuf::from("missing-spectra"));
+        assert!(
+            render(&p, Product::VisibleRgb)
+                .unwrap_err()
+                .contains("mutually exclusive")
+        );
     }
 
     #[test]

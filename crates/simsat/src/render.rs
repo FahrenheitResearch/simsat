@@ -620,7 +620,7 @@ pub struct SurfacePixel {
     pub on_earth: bool,
     /// Base surface colour (sRGB `[0,1]`): the Blue Marble texel or flat albedo.
     pub base_srgb: [f32; 3],
-    /// Optional linear spectral land albedo; bypasses image gamma decoding.
+    /// Optional linear land RGB (spectral albedo or declared measured display proxy);\n    /// bypasses image gamma decoding.
     pub linear_albedo: Option<[f32; 3]>,
     /// Terrain normal in the local ENU basis (up if flat / outside the domain).
     pub normal_enu: [f32; 3],

@@ -1621,8 +1621,11 @@ fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_sha
     var albedo = srgb_to_linear(base);
     let albedo_coord = min(coord, vec2<i32>(textureDimensions(linear_albedo_tex)) - vec2<i32>(1));
     let spectral = textureLoad(linear_albedo_tex, albedo_coord, 0);
+    // +1 measured land RGB; +2 model land using the declared base-map fallback.
+    // -1 model water; 0 keeps the legacy path. CPU: api.rs surface-pixel assembly.
+    let measured_land = spectral.a > 0.5 && spectral.a < 1.5;
     if (spectral.a > 0.5) {
-        albedo = spectral.rgb;
+        if (measured_land) { albedo = spectral.rgb; }
         is_water = false;
     } else if (spectral.a < -0.5) {
         is_water = true;
@@ -1632,7 +1635,7 @@ fn surface_radiance(coord: vec2<i32>, cam: vec3<f32>, view: vec3<f32>, cloud_sha
     } else {
         // True-color land vibrancy (refinement pass): luminance-preserving saturation.
         let y = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
-        if (spectral.a <= 0.5) {
+        if (!measured_land) {
             albedo = max(vec3<f32>(y) + (albedo - vec3<f32>(y)) * LAND_VIBRANCY, vec3<f32>(0.0));
         }
     }

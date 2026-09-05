@@ -222,4 +222,6 @@ mod tests {
     }
 }
 
+pub mod nbar_surface;
 pub mod spectral_surface;
+mod surface_grid;
