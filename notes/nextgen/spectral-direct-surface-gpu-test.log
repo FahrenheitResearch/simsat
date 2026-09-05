@@ -1,0 +1,45 @@
+warning: C:\Users\drew\simsat-wt-nextgen-abi\crates\simsat\Cargo.toml: file `C:\Users\drew\simsat-wt-nextgen-abi\crates\simsat\examples\render_frame.rs` found to be present in multiple build targets:
+  * `bin` target `simsat-render-frame`
+  * `example` target `render_frame`
+warning: C:\Users\drew\simsat-wt-nextgen-abi\crates\simsat\Cargo.toml: file `C:\Users\drew\simsat-wt-nextgen-abi\crates\simsat\examples\render_ir.rs` found to be present in multiple build targets:
+  * `bin` target `simsat-render-ir`
+  * `example` target `render_ir`
+   Compiling simsat v0.2.1 (C:\Users\drew\simsat-wt-nextgen-abi\crates\simsat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.31s
+     Running unittests src\lib.rs (target\debug\deps\simsat-b63bf721bfe214ae.exe)
+
+running 1 test
+SURFACE_FLOAT_GPU adapter=NVIDIA GeForce RTX 3080 pixels=4 max_display_code_error=0 disabled_byte_identical=true
+test gpu::tests::surface_gpu_linear_albedo_matches_equivalent_srgb_texture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 625 filtered out; finished in 1.30s
+
+     Running unittests examples\render_frame.rs (target\debug\deps\simsat_render_frame-725b8e131a7d5fe1.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.00s
+
+     Running unittests examples\render_ir.rs (target\debug\deps\simsat_render_ir-02eaa68eaa1fcfca.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests\fixture_ingest.rs (target\debug\deps\fixture_ingest-710a8e50ec8ca372.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests\fixture_ingest_grib.rs (target\debug\deps\fixture_ingest_grib-769d0faa06fd946b.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests\fixture_staleness.rs (target\debug\deps\fixture_staleness-c19de7aed4d04a26.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

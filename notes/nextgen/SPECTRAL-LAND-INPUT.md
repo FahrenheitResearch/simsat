@@ -53,4 +53,23 @@ A land/water check with coordinate arrays agreeing within 1e-6 degrees finds tha
 
 The final release renderer reproduces both the previous committed 21Z unshaded-map sRGB image and the spectral pilot image byte-for-byte. Final binary SHA-256: b9aac831a4b0fc42e385195596952f07b8eff6456387ac6448d2034b2ec28009. A separate CLI clouds-off GPU attempt is not counted as a surface-only test: the headless preview explicitly forces clouds on. The standalone surface WGSL is parsed and validated by the workspace tests; the real-data GPU execution evidence covers the cloud pass.
 
-The additional 12Z/15Z/18Z candidate renders and old-harness comparisons were launched sequentially with six threads. Their results are pending at this code checkpoint, especially the expensive dawn case. The four-time promotion gates have not been declared passed.
+## Completed four-hour follow-up
+
+All four current geostationary model-grid-point cases have now been rendered and scored. The reference and cloud-mask SHA-256 values are identical before and after at each hour. This table compares the accepted default topographic NASA appearance source with spectral land plus unshaded-map water. The separate 21Z controlled source comparison above holds the unshaded water source fixed.
+
+| UTC | Clear bias before / after | Clear MAE before / after | All-valid MAE before / after | Both-cloudy MAE before / after |
+|---|---:|---:|---:|---:|
+| 12Z | +0.002281 / +0.002404 | 0.008934 / 0.008848 | 0.013030 / 0.012938 | 0.013610 / 0.013562 |
+| 15Z | -0.026755 / -0.024197 | 0.043952 / 0.041427 | 0.122305 / 0.119506 | 0.167875 / 0.165288 |
+| 18Z | -0.032228 / -0.028459 | 0.051774 / 0.048062 | 0.163240 / 0.159212 | 0.221744 / 0.218907 |
+| 21Z | -0.001199 / +0.001911 | 0.048251 / 0.045351 | 0.145382 / 0.143092 | 0.193925 / 0.192836 |
+
+Clear, all-valid and both-cloudy MAE improve at every hour. Absolute clear mean bias increases slightly at dawn and 21Z; the 21Z deterioration is 0.000711892, below 0.02 in this current gray-RGB harness. This is not independent ABI band validation or a rerun of the original nadir raster. Thermal code/defaults are unchanged; these runs do not add a new IR measurement. The source remains opt-in because spatial coarseness and the Lambertian/climatology assumptions are not resolved. No cloud parameters were tuned.
+
+The expensive dawn display took 1177.1 seconds; display plus raw scoring took 2381.2 seconds. The 15Z and 18Z pairs took 199.7 and 146.1 seconds. Each used six threads and the same final release binary.
+
+A follow-up direct SurfaceResources test now executes the standalone surface shader on the RTX 3080. Four distinct gray float inputs decoded with the CPU sRGB function match equivalent texture inputs with zero display-code difference. The explicit float mask correctly overrides a conflicting legacy water mask; all-zero/disabled float input is byte-identical to the old path. This verifies the new input contract, not whole-scene CPU/GPU radiative-transfer parity. The test is opt-in on machines without a GPU; run:
+
+    cargo test --locked --offline -j 6 -p simsat surface_gpu_linear_albedo_matches_equivalent_srgb_texture -- --ignored --nocapture
+
+The direct test and strict all-target Clippy pass. The prior 714-test workspace pass and full GUI build still apply to unchanged production code; this follow-up adds one GPU-dependent test (three tests are now ignored by default). Its runtime log accompanies this note.

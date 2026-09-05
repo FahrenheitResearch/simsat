@@ -1,0 +1,18 @@
+[
+  {
+    "check": "fresh preparation matches all original arrays; tile labels compared by source granule ID",
+    "passed": true
+  },
+  {
+    "check": "fractional/ambiguous target land mask rejected",
+    "passed": true
+  },
+  {
+    "check": "overlapping STAC date interval cannot substitute another daily center",
+    "passed": true
+  },
+  {
+    "check": "identical-request resume succeeds using cached georeferenced windows",
+    "passed": true
+  }
+]

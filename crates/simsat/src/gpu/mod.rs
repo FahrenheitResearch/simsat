@@ -2869,6 +2869,116 @@ mod tests {
         assert_eq!(align_up(800 * 4, 256), 3328);
     }
 
+    #[test]
+    #[ignore = "requires a local wgpu adapter; run on the Windows release machine"]
+    fn surface_gpu_linear_albedo_matches_equivalent_srgb_texture() {
+        let instance = wgpu::Instance::default();
+        let adapter = block_on_wgpu(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("local surface-test adapter");
+        let (device, queue) =
+            block_on_wgpu(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("surface-test device");
+        let resources = SurfaceResources::init(&device);
+        let codes = [60u8, 90, 125, 160];
+        let bm = BlueMarbleCrop {
+            width: 2,
+            height: 2,
+            rgba: codes.into_iter().flat_map(|v| [v, v, v, 255]).collect(),
+            lat_min: -1.0,
+            lat_max: 1.0,
+            lon_min: -1.0,
+            lon_max: 1.0,
+        };
+        // CPU decoding of each exact source texel supplies the float reference.
+        // Gray texels make the legacy saturation boost an identity, so no display
+        // curve or atmosphere needs to be copied into this upload-contract test.
+        let linear: Vec<f32> = codes
+            .into_iter()
+            .flat_map(|v| {
+                let a = crate::render::srgb_to_linear(v as f32 / 255.0);
+                [a, a, a, 1.0]
+            })
+            .collect();
+        let geo = [
+            0.25f32, 0.25, 0.25, 0.25, 0.75, 0.25, 0.75, 0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.75,
+            0.75, 0.75,
+        ];
+        let light = [0.5f32, 0.0, 0.8660254, 60.0].repeat(4);
+        let normals = [128u8, 128, 255, 255].repeat(4);
+        let land = [255u8; 4];
+        let water = [0u8; 4];
+        let transmittance = [1.0f32; 4].repeat(256 * 64);
+        let multiscatter = [0.0f32, 0.0, 0.0, 1.0].repeat(32 * 32);
+        let ambient = [0.0f32, 0.0, 0.0, 1.0].repeat(2);
+        let mut u = test_surface_uniforms();
+        u.cam = [EARTH_RADIUS_M as f32 + 90_000.0, 0.0, 0.0];
+        u.sun = [0.8660254, 0.5, 0.0];
+        u.ex = [0.0, 1.0, 0.0];
+        u.ey = [0.0, 0.0, 1.0];
+        u.ez = [-1.0, 0.0, 0.0];
+        u.x_min = -0.0001;
+        u.y_max = 0.0001;
+        u.pitch_x = 0.0001;
+        u.pitch_y = 0.0001;
+        u.ambient_n = 2.0;
+        u.output_transform = crate::atmosphere::OutputTransform::DebugSrgb.code();
+        u.surface_postlight_toe.enabled = false;
+        u.twilight_surface_recovery.enabled = false;
+        let mut inputs = SurfaceFrameInputs {
+            width: 2,
+            height: 2,
+            lut_geo: &geo,
+            lut_light: &light,
+            nx: 2,
+            ny: 2,
+            normals_rgba: &normals,
+            landmask_r8: &land,
+            bluemarble: Some(&bm),
+            linear_albedo: None,
+            transmittance_lut: &transmittance,
+            multiscatter_lut: &multiscatter,
+            ambient_lut: &ambient,
+            ambient_n: 2,
+            uniforms: u,
+        };
+        let reference = resources.render(&device, &queue, &inputs);
+        inputs.linear_albedo = Some(&linear);
+        // The explicit spectral mask must override the legacy mask too.
+        inputs.landmask_r8 = &water;
+        let actual = resources.render(&device, &queue, &inputs);
+        assert!(reference.rgba.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(
+            reference.rgba[12] > reference.rgba[0] + 15,
+            "four distinct gray surface inputs must remain distinct"
+        );
+        let max_error = reference
+            .rgba
+            .iter()
+            .zip(&actual.rgba)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(
+            max_error <= 1,
+            "float albedo/CPU-decoded sRGB upload mismatch: {max_error} display codes"
+        );
+        let disabled = [0.0f32; 16];
+        inputs.linear_albedo = Some(&disabled);
+        inputs.landmask_r8 = &land;
+        assert_eq!(
+            reference.rgba,
+            resources.render(&device, &queue, &inputs).rgba
+        );
+        eprintln!(
+            "SURFACE_FLOAT_GPU adapter={} pixels=4 max_display_code_error={max_error} disabled_byte_identical=true",
+            adapter.get_info().name
+        );
+    }
+
     /// A test-fixture `SurfaceUniforms` with recognizable values.
     fn test_surface_uniforms() -> SurfaceUniforms {
         SurfaceUniforms {

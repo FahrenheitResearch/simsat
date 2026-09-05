@@ -1,0 +1,184 @@
+{
+  "scope": "Current geostationary model-grid-point gray-RGB diagnostic; not independent ABI bands or original nadir raster",
+  "baseline": "Accepted default NASA topographic appearance source",
+  "candidate": "Spectral land plus unshaded seasonal base map for water",
+  "display": "Native candidate PNGs use standard sRGB; raw values do not include output transfer",
+  "same_reference_and_cloud_mask_hashes": true,
+  "all_clear_mae_improved": true,
+  "all_valid_mae_improved": true,
+  "all_both_cloudy_mae_improved": true,
+  "clear_21z_absolute_bias_deterioration": 0.0007118919819126023,
+  "clear_21z_0p02_gate_in_this_harness": true,
+  "thermal": "No thermal code or default changed. These runs are visible-only and do not add a new IR measurement.",
+  "promotion": "Not promoted: coarse climatology and Lambertian assumption remain; true per-band operator unfinished",
+  "rows": [
+    {
+      "time": "12Z",
+      "metric_space": {
+        "luminance": "Rec.709 coefficients 0.2126/0.7152/0.0722 in linear reflectance space",
+        "name": "raw-visible-reflectance",
+        "observed": "clip([C02, 0.45*C02 + 0.10*C03 + 0.45*C01, C01], 0, 1)",
+        "synthetic": "SimSat RgbReflectance north-first interleaved f32le RGB reflectance"
+      },
+      "baseline_report_sha256": "fa8ded31edc1deb1807402f5b0f9257386145fec512cabd4fb56a5b54083d030",
+      "candidate_report_sha256": "0c29a7591b806a68c46f936d5af331c532ca373828c2c4d983d041e051debd9e",
+      "metrics": {
+        "strict_clear": {
+          "count": 49345,
+          "bias_before": 0.0022812680399495397,
+          "bias_after": 0.0024038573697983553,
+          "mae_before": 0.0089341037681228,
+          "mae_after": 0.00884840932528452,
+          "rmse_before": 0.01818821959101152,
+          "rmse_after": 0.01817468968562155
+        },
+        "valid": {
+          "count": 180120,
+          "bias_before": -0.003270133533005476,
+          "bias_after": -0.0031403771873900867,
+          "mae_before": 0.013029891199793135,
+          "mae_after": 0.01293757304897574,
+          "rmse_before": 0.02450513328695178,
+          "rmse_after": 0.02441798657325732
+        },
+        "both_cloudy": {
+          "count": 77990,
+          "bias_before": -0.0010103103016205314,
+          "bias_after": -0.0009184112928097199,
+          "mae_before": 0.013610429806353182,
+          "mae_after": 0.013561971736218472,
+          "rmse_before": 0.025918974253732595,
+          "rmse_after": 0.02587311546034679
+        }
+      },
+      "reference_sha256": "b15fd5dff3b1a9ee2639fe473129c33ce87bada9cbd8844ff37f989ee8291a7a",
+      "cloud_mask_sha256": "3600096b480accbc0dadf6a0c8e31b08716ebf2e0ec3d34390652161a1a6ccf3"
+    },
+    {
+      "time": "15Z",
+      "metric_space": {
+        "luminance": "Rec.709 coefficients 0.2126/0.7152/0.0722 in linear reflectance space",
+        "name": "raw-visible-reflectance",
+        "observed": "clip([C02, 0.45*C02 + 0.10*C03 + 0.45*C01, C01], 0, 1)",
+        "synthetic": "SimSat RgbReflectance north-first interleaved f32le RGB reflectance"
+      },
+      "baseline_report_sha256": "be16d9538ac119988b44395f3797a63a537f87295f94d88fae94c5f88db07cad",
+      "candidate_report_sha256": "3b39ac37c1a7bc3166d34c51238af841393824221bf1a1d964e6c2f20bde9fd3",
+      "metrics": {
+        "strict_clear": {
+          "count": 65568,
+          "bias_before": -0.0267549097896037,
+          "bias_after": -0.024196521624686603,
+          "mae_before": 0.04395248215885461,
+          "mae_after": 0.04142665211709763,
+          "rmse_before": 0.05847309634803819,
+          "rmse_after": 0.05650603787024167
+        },
+        "valid": {
+          "count": 180120,
+          "bias_before": -0.10480432568159202,
+          "bias_after": -0.10197085150810979,
+          "mae_before": 0.12230524994584245,
+          "mae_after": 0.11950631944723039,
+          "rmse_before": 0.17586439466297435,
+          "rmse_after": 0.17352845855028942
+        },
+        "both_cloudy": {
+          "count": 53568,
+          "bias_before": -0.13756331645802217,
+          "bias_after": -0.13493674296818092,
+          "mae_before": 0.1678753409610353,
+          "mae_after": 0.16528769509898025,
+          "rmse_before": 0.21250357240098264,
+          "rmse_after": 0.20995479919001928
+        }
+      },
+      "reference_sha256": "3a29eeea41245df042294ecd44dcfca740a4f9f3bcd45f9bef2629c2886e0b1f",
+      "cloud_mask_sha256": "b582c738833c2b9ad62cd432629a5009ae13d121225243a7d685457baab3e61a"
+    },
+    {
+      "time": "18Z",
+      "metric_space": {
+        "luminance": "Rec.709 coefficients 0.2126/0.7152/0.0722 in linear reflectance space",
+        "name": "raw-visible-reflectance",
+        "observed": "clip([C02, 0.45*C02 + 0.10*C03 + 0.45*C01, C01], 0, 1)",
+        "synthetic": "SimSat RgbReflectance north-first interleaved f32le RGB reflectance"
+      },
+      "baseline_report_sha256": "be663acb0a7880945e00149441339a0ee7ed991f000e0f08f786542d2de5f3d5",
+      "candidate_report_sha256": "ca5a256667ec0f8c8d42596337c99b5e6c93ac8ffde0970a2930af4fda7ba5ad",
+      "metrics": {
+        "strict_clear": {
+          "count": 53756,
+          "bias_before": -0.03222775654072832,
+          "bias_after": -0.02845881309437427,
+          "mae_before": 0.05177432065731401,
+          "mae_after": 0.04806168712615825,
+          "rmse_before": 0.06687886963041861,
+          "rmse_after": 0.06341082761062644
+        },
+        "valid": {
+          "count": 180115,
+          "bias_before": -0.14420709707348983,
+          "bias_after": -0.14013744334797243,
+          "mae_before": 0.16324037703867433,
+          "mae_after": 0.15921176761745795,
+          "rmse_before": 0.24756596920760743,
+          "rmse_after": 0.24468511032499266
+        },
+        "both_cloudy": {
+          "count": 55180,
+          "bias_before": -0.1890233086001332,
+          "bias_after": -0.18614232267737177,
+          "mae_before": 0.22174428950219235,
+          "mae_after": 0.21890745823794086,
+          "rmse_before": 0.3031005273652144,
+          "rmse_after": 0.30072400019759166
+        }
+      },
+      "reference_sha256": "54f7c4ca255656f88ab478651e359fb70dc6030277a0919fc046f2569d66c5a8",
+      "cloud_mask_sha256": "7234ca41946d4c5197bfc0f0841b29255c2e25d353a447c77dc62e2385a41757"
+    },
+    {
+      "time": "21Z",
+      "metric_space": {
+        "luminance": "Rec.709 coefficients 0.2126/0.7152/0.0722 in linear reflectance space",
+        "name": "raw-visible-reflectance",
+        "observed": "clip([C02, 0.45*C02 + 0.10*C03 + 0.45*C01, C01], 0, 1)",
+        "synthetic": "SimSat RgbReflectance north-first interleaved f32le RGB reflectance"
+      },
+      "baseline_report_sha256": "336d9f34b090cfed50521dd7916e3523351b32ace201b32f9a4b2521c8c29aad",
+      "candidate_report_sha256": "51b6e7a98d468c37ee229c24e1177b37c0c8f9bc6700a87a704ecad63d71e2d9",
+      "metrics": {
+        "strict_clear": {
+          "count": 49958,
+          "bias_before": -0.001198906721875449,
+          "bias_after": 0.0019107987037880513,
+          "mae_before": 0.04825108713200781,
+          "mae_after": 0.04535079914537217,
+          "rmse_before": 0.08294704264417563,
+          "rmse_after": 0.08191882492595445
+        },
+        "valid": {
+          "count": 180120,
+          "bias_before": -0.10474538730431511,
+          "bias_after": -0.1023553670596646,
+          "mae_before": 0.1453819545584909,
+          "mae_after": 0.1430918777934928,
+          "rmse_before": 0.2114999049430588,
+          "rmse_after": 0.21011141197883615
+        },
+        "both_cloudy": {
+          "count": 59667,
+          "bias_before": -0.12412790960995275,
+          "bias_after": -0.1229552802701149,
+          "mae_before": 0.1939245606658261,
+          "mae_after": 0.19283609908929075,
+          "rmse_before": 0.252568736318038,
+          "rmse_after": 0.2515536955691464
+        }
+      },
+      "reference_sha256": "04618a8a528bd15c8bec94f3dae1d34a6caaa0d9f74f44e14fe2402a8177f20d",
+      "cloud_mask_sha256": "afe2695f0613e1e094ebb2f2bba44b553f8134b36965cda484d6850c601b759e"
+    }
+  ]
+}

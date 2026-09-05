@@ -1,0 +1,87 @@
+{
+  "quantity": "MODIS_7_band_nadir_BRDF_adjusted_surface_reflectance",
+  "date": "2024-04-03",
+  "tiles": [
+    {
+      "index": 1,
+      "granule_id": "MCD43A4.A2024094.h11v04.061.2024103050833"
+    },
+    {
+      "index": 2,
+      "granule_id": "MCD43A4.A2024094.h11v05.061.2024103050904"
+    }
+  ],
+  "grid_sha256": "0f942c73b0f62d3811964160923bc7a407ab6b5d86a866384d46a2d7d1cf7afe",
+  "sampling": "nearest source pixel; no spatial, spectral or missing-data filling",
+  "shape": [
+    600,
+    600,
+    7
+  ],
+  "land_count": 358584,
+  "covered_land": 358584,
+  "bands": [
+    {
+      "band": 1,
+      "valid_land": 354268,
+      "full_inversion_land": 199039,
+      "magnitude_inversion_land": 155229,
+      "maximum": 0.25130000710487366
+    },
+    {
+      "band": 2,
+      "valid_land": 354267,
+      "full_inversion_land": 210820,
+      "magnitude_inversion_land": 143447,
+      "maximum": 0.49869999289512634
+    },
+    {
+      "band": 3,
+      "valid_land": 354224,
+      "full_inversion_land": 191403,
+      "magnitude_inversion_land": 162821,
+      "maximum": 0.13840000331401825
+    },
+    {
+      "band": 4,
+      "valid_land": 354261,
+      "full_inversion_land": 197545,
+      "magnitude_inversion_land": 156716,
+      "maximum": 0.20789998769760132
+    },
+    {
+      "band": 5,
+      "valid_land": 353303,
+      "full_inversion_land": 203064,
+      "magnitude_inversion_land": 150239,
+      "maximum": 0.4359999895095825
+    },
+    {
+      "band": 6,
+      "valid_land": 349973,
+      "full_inversion_land": 66298,
+      "magnitude_inversion_land": 283675,
+      "maximum": 0.5985000133514404
+    },
+    {
+      "band": 7,
+      "valid_land": 354262,
+      "full_inversion_land": 190521,
+      "magnitude_inversion_land": 163741,
+      "maximum": 0.4138000011444092
+    }
+  ],
+  "joint_rgb_full_inversion": 188861,
+  "joint_rgb_valid": 354217,
+  "source_doi": "10.5067/MODIS/MCD43A4.061",
+  "source_spec": "https://ladsweb.modaps.eosdis.nasa.gov/filespec/MODIS/61/MCD43A4_c61.fs",
+  "limitations": [
+    "Source date is explicit; these observations do not reconstruct a different historical year.",
+    "NBAR is evaluated at nadir/local solar noon, not at arbitrary view or illumination.",
+    "Seven band reflectances, not a hyperspectral albedo curve.",
+    "QA==0 is full inversion; QA==1 is magnitude inversion. Both are retained separately, never silently promoted.",
+    "Scaled directional reflectance can exceed 1; it is not silently clipped to albedo bounds.",
+    "Source date selected from the granule ID; STAC interval metadata are not treated as the daily center date."
+  ],
+  "output_sha256": "ecab4318f4b9ab4531bacd08c36f9524d432ead5ef8d756152cb13e884e4aec6"
+}
