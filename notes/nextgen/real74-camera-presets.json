@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "source_time_utc": "1974-04-03T21:00:00Z",
+  "input": "User-provided real74-storm333 wrfout_d05_1974-04-03_21_00_00 from weather-node-2; see local verified source manifest",
+  "kind": "Fixed-time volumetric render from WRF condensate; not a satellite observation or recovered photograph",
+  "source_grid": [
+    600,
+    600,
+    76
+  ],
+  "renderer_brick_grid": [
+    600,
+    600,
+    80
+  ],
+  "brick_vertical_spacing_m": 250,
+  "common_arguments": [
+    "intent=display",
+    "fractional-clouds=effective-od",
+    "threads=6"
+  ],
+  "sun": "Computed from model valid time; no override",
+  "cameras": [
+    {
+      "name": "wide",
+      "eye": [
+        38.4,
+        -85.1,
+        90000
+      ],
+      "look": [
+        39.45,
+        -85.68,
+        6000
+      ],
+      "fov_deg": 45,
+      "size": [
+        1280,
+        720
+      ],
+      "purpose": "Broad cloud and ground structure; preferred overview"
+    },
+    {
+      "name": "upper-flank",
+      "eye": [
+        39.58,
+        -85.92,
+        12500
+      ],
+      "look": [
+        39.2,
+        -85.75,
+        10500
+      ],
+      "fov_deg": 40,
+      "size": [
+        1280,
+        720
+      ],
+      "purpose": "Above local anvil top; native profiles verify clear eye and initial sightline"
+    },
+    {
+      "name": "interior-under-anvil",
+      "eye": [
+        39.58,
+        -85.92,
+        6500
+      ],
+      "look": [
+        39.2,
+        -85.75,
+        8500
+      ],
+      "fov_deg": 40,
+      "size": [
+        640,
+        360
+      ],
+      "purpose": "Diagnostic under-anvil view, not recommended for clear tower illustration"
+    }
+  ],
+  "interpretation": "Camera placement is an artistic framing choice. Condensate and sunlight are unchanged. The 1 km and 333 m outputs are separate simulations, not a downsampling-only A/B."
+}
