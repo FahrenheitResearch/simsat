@@ -1,0 +1,131 @@
+{
+  "archives": [
+    {
+      "url": "https://www.libradtran.org/lib/exe/fetch.php?media=download%3Aoptprop_v2.1.tar.gz",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\optprop_v2.1.tar.gz",
+      "bytes": 743391266,
+      "sha256": "11daa1f1f4be0fd4ddf7e881ec2005498049674a1540d37b4b1e8f5e16052c7e",
+      "headers": {
+        "ETag": "\"08ac698bd2b8a563cc08f8923dbb8667\"",
+        "Last-Modified": "Thu, 16 Jan 2025 23:31:57 GMT",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": null
+      },
+      "seconds": 37.877846299961675
+    },
+    {
+      "url": "https://www.libradtran.org/lib/exe/fetch.php?media=download%3Areptran_2024_all.tar.gz",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\reptran_2024_all.tar.gz",
+      "bytes": 698709957,
+      "sha256": "55893c80bcc999651bac3bf014ee64aaf602653ba640eb5bebe787a5d8eacce7",
+      "headers": {
+        "ETag": "\"c0346af1b515abd5b140c0ba1d02fb9b\"",
+        "Last-Modified": "Thu, 22 Jan 2026 23:14:55 GMT",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": null
+      },
+      "seconds": 37.121407600003295
+    }
+  ],
+  "extracted": [
+    {
+      "archive": "optprop_v2.1.tar.gz",
+      "member": "data/wc/mie/wc.sol.mie.cdf",
+      "bytes": 167096808,
+      "sha256": "f1c0231e58c00e39d537c3972fd15c380a52cb27163906e5227097debfd4a627",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\wc.sol.mie.cdf"
+    },
+    {
+      "archive": "optprop_v2.1.tar.gz",
+      "member": "data/ic/baum_v3.6/ic.agg.baum.cdf",
+      "bytes": 276185920,
+      "sha256": "0531323be66abec1670cc2091936d827a554103f4d922f5473299c28e6a43b14",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\ic.agg.baum.cdf"
+    },
+    {
+      "archive": "optprop_v2.1.tar.gz",
+      "member": "data/ic/baum_v3.6/ic.col.baum.cdf",
+      "bytes": 276185920,
+      "sha256": "15ecdbebf4db4ce27263b09c42442e45fa7067cf0d212418962cfbe595de9360",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\ic.col.baum.cdf"
+    },
+    {
+      "archive": "optprop_v2.1.tar.gz",
+      "member": "data/ic/baum_v3.6/ic.ghm.baum.cdf",
+      "bytes": 276185920,
+      "sha256": "92d704d6837fe892eaeb486f95b0d5bb3883fb811968578c6c1dd1b43bf9cd6f",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\ic.ghm.baum.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.cdf",
+      "bytes": 7888,
+      "sha256": "331752c8e14df10a98bcb6dca05bd6dcfacc97c41146644400f0ef7e35b04dd3",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.CH4.cdf",
+      "bytes": 30876,
+      "sha256": "eb8059da6df99cf88188a0204bc792ab11ff2d5948a24a4c7752e4aa0b6a3f8b",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.CH4.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.CO2.cdf",
+      "bytes": 30876,
+      "sha256": "cde95d1c2f7ab7965a843afaaf5c23124a229a24af17a4b13eda6e3e8a25b79c",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.CO2.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.CO.cdf",
+      "bytes": 4092,
+      "sha256": "d723923c21ed1e7f262554bf329cc63e37e118ef5a188e6e100b0bf1dba36b90",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.CO.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.H2O.cdf",
+      "bytes": 143124,
+      "sha256": "7004d34812d072031c0dca55cd051ddd3ad3d29edcf833eb6110b651f488508a",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.H2O.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.N2.cdf",
+      "bytes": 14508,
+      "sha256": "63db66759a31bdf268d3a66a889f2356c2bee3f60957d86e3832006c1c6183cd",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.N2.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.N2O.cdf",
+      "bytes": 27900,
+      "sha256": "592db7c6ce2a0c915b5b9fb6ad6ac1a34b63d2ccea29d9e8c383b8d7f5c3d169",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.N2O.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.O2.cdf",
+      "bytes": 4092,
+      "sha256": "42ed2d383f95487f45f782a3206313b2607ed674f6ed31d56cca16cd25c610f0",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.O2.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/reptran_solar_goes-u.lookup.O3.cdf",
+      "bytes": 14508,
+      "sha256": "cc660e68c53c099ee25e25b7c7a736cf1920f0c0e95be6c474333d005f39c690",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\reptran_solar_goes-u.lookup.O3.cdf"
+    },
+    {
+      "archive": "reptran_2024_all.tar.gz",
+      "member": "data/correlated_k/reptran/channel_list.txt",
+      "bytes": 10114,
+      "sha256": "203abc1f325dac5cc6836e171fc8dab19faf9f469296ba6e7934db6f9923d68a",
+      "file": "C:\\Users\\drew\\Documents\\Codex\\2026-09-04\\ta\\work\\libradtran-optics\\spectral-selected\\channel_list.txt"
+    }
+  ],
+  "integration_status": "Downloaded and inspected only; not connected to rendering. GOES-U REPTRAN is created 20170727 and its channel/SRF compatibility must be audited against current official FM4 inputs. Ice bulk effective-radius coverage is 5 to 60 um; do not silently clamp larger frozen precipitation."
+}

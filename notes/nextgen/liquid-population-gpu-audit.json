@@ -1,0 +1,21 @@
+{
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 3660,
+  "check": "liquid-population-cpu-wgsl",
+  "coefficient_tolerance": {
+    "absolute_m_inv": 1e-15,
+    "relative": 0.00002
+  },
+  "contract": "Same host-prepared particle coefficients, scattering weights and bulk cross sections; GPU evaluates angular phase and model-mass conversion. No GPU Bessel solver or default PSD.",
+  "driver_info": "610.74",
+  "failures": [],
+  "max_mass_coefficient_relative_error": 8.154752717080037e-8,
+  "max_phase_relative_error": 7.669016521596298e-6,
+  "passed": true,
+  "phase_tolerance": {
+    "absolute_sr1": 1e-7,
+    "relative": 0.002
+  },
+  "populations": 20
+}

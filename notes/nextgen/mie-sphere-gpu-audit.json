@@ -1,0 +1,20 @@
+{
+  "absolute_tolerance_sr1": 1e-7,
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 4575,
+  "check": "scalar-mie-angular-cpu-wgsl",
+  "contract": "shared CPU-prepared sphere coefficients; GPU evaluates angular amplitude sum and normalized scalar phase; not an independent GPU Bessel solver",
+  "driver": "NVIDIA",
+  "driver_info": "610.74",
+  "failures": [],
+  "max_absolute_error_sr1": 0.1425995495810639,
+  "max_relative_error_when_phase_gt_1e_minus7_sr1": 0.00002616872500867544,
+  "passed": true,
+  "relative_tolerance": 0.002,
+  "size_parameter_range": [
+    1,
+    2048
+  ],
+  "spheres": 25
+}

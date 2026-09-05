@@ -1,0 +1,129 @@
+{
+  "absolute_tolerance_sr1": 1e-7,
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 4575,
+  "check": "scalar-mie-angular-cpu-wgsl",
+  "contract": "shared CPU-prepared sphere coefficients; GPU evaluates angular amplitude sum and normalized scalar phase; not an independent GPU Bessel solver",
+  "driver": "NVIDIA",
+  "driver_info": "610.74",
+  "failures": [
+    {
+      "actual": 0.018904512748122215,
+      "expected": 0.019146013347215936,
+      "mu": -0.9999989867210388,
+      "sphere": 15
+    },
+    {
+      "actual": 9266.0908203125,
+      "expected": 9329.481869858342,
+      "mu": 0.9999989867210388,
+      "sphere": 15
+    },
+    {
+      "actual": 0.060830257833004,
+      "expected": 0.061408487152760864,
+      "mu": -0.9999989867210388,
+      "sphere": 16
+    },
+    {
+      "actual": 9188.951171875,
+      "expected": 9252.083732579576,
+      "mu": 0.9999989867210388,
+      "sphere": 16
+    },
+    {
+      "actual": 0.07929432392120361,
+      "expected": 0.08054680776446152,
+      "mu": -0.9999989867210388,
+      "sphere": 17
+    },
+    {
+      "actual": 9254.849609375,
+      "expected": 9318.290757764955,
+      "mu": 0.9999989867210388,
+      "sphere": 17
+    },
+    {
+      "actual": 0.0021015056408941746,
+      "expected": 0.002229802982574295,
+      "mu": -0.9999989867210388,
+      "sphere": 18
+    },
+    {
+      "actual": 23263.037109375,
+      "expected": 23970.86814859784,
+      "mu": 0.9999989867210388,
+      "sphere": 18
+    },
+    {
+      "actual": 0.03539378568530083,
+      "expected": 0.03715606635654546,
+      "mu": -0.9999989867210388,
+      "sphere": 19
+    },
+    {
+      "actual": 23349.265625,
+      "expected": 24057.451273374325,
+      "mu": 0.9999989867210388,
+      "sphere": 19
+    },
+    {
+      "actual": 0.018380144611001015,
+      "expected": 0.018340444986355776,
+      "mu": -0.9999989867210388,
+      "sphere": 20
+    },
+    {
+      "actual": 23452.021484375,
+      "expected": 24160.507652554712,
+      "mu": 0.9999989867210388,
+      "sphere": 20
+    },
+    {
+      "actual": 0.014563358388841152,
+      "expected": 0.01440843838205446,
+      "mu": -0.9999989867210388,
+      "sphere": 21
+    },
+    {
+      "actual": 8563.9951171875,
+      "expected": 10633.062433281413,
+      "mu": 0.9999989867210388,
+      "sphere": 21
+    },
+    {
+      "actual": 0.05449916794896126,
+      "expected": 0.05161805879982954,
+      "mu": -0.9999989867210388,
+      "sphere": 22
+    },
+    {
+      "actual": 8590.5556640625,
+      "expected": 10662.569571518281,
+      "mu": 0.9999989867210388,
+      "sphere": 22
+    },
+    {
+      "actual": 0.13072355091571808,
+      "expected": 0.12578402509418557,
+      "mu": -0.9999989867210388,
+      "sphere": 23
+    },
+    {
+      "actual": 8458.587890625,
+      "expected": 10519.15643990668,
+      "mu": 0.9999989867210388,
+      "sphere": 23
+    }
+  ],
+  "max_absolute_error_sr1": 2072.013907455781,
+  "max_relative_error_when_phase_gt_1e7_inverse": 0.19588724258006754,
+  "passed": false,
+  "relative_tolerance": 0.002,
+  "size_parameter_range": [
+    1,
+    2048
+  ],
+  "spheres": 25
+}
