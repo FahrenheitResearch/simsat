@@ -38,7 +38,7 @@
 
 use crate::bricks::{StorageProfile, VolumeBrick, decode_log2_f16, decode_temperature_kelvin};
 use crate::ir_enhance::{IrEnhancement, bt_to_rgba};
-use crate::optics::standard_air_density_kg_m3;
+use crate::optics::{HydrometeorClass, RHO_W, standard_air_density_kg_m3};
 
 /// The cumulative VISIBLE optical depth at which the effective cloud top is placed (the
 /// level a satellite sees; design section 2). Marching down from the brick top, the first
@@ -257,6 +257,156 @@ pub fn cloud_optical_depth_field(brick: &VolumeBrick) -> Vec<f32> {
             }
             out[j * nx + i] = tau as f32;
         }
+    }
+    out
+}
+
+// ── synthetic condensate cloud mask (validator regime support) ───────────────────
+
+/// Default condensate mixing-ratio threshold (kg kg^-1) above which a column is
+/// "cloudy" for the synthetic cloud mask. 1e-6 kg kg^-1 is the customary minimum
+/// condensate floor of model cloud diagnostics (the order used by UPP / WRF cloud-
+/// fraction and cloud-top routines to separate cloud from numerical trace
+/// condensate; e.g. `qc + qi > 1e-6` in NCEP UPP `CALCLDFRA`-style tests). It is a
+/// DEFINITION for a categorical mask, not a radiative quantity: a column at exactly
+/// this floor is optically negligible at 10.3 um (see [`condensate_mixing_ratio_kg_kg`]
+/// for the inverse optics that recover kg kg^-1 from the brick).
+pub const CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG: f64 = 1.0e-6;
+
+/// Cloud-mask code: the column carries no condensate above the threshold.
+pub const CLOUD_MASK_CLEAR: u8 = 0;
+/// Cloud-mask code: the column carries condensate above the threshold.
+pub const CLOUD_MASK_CLOUDY: u8 = 1;
+/// Cloud-mask code: no data (an output pixel outside the model domain).
+pub const CLOUD_MASK_NO_DATA: u8 = 255;
+
+/// Hydrometeor mixing ratio (kg kg^-1) of one class recovered from the brick's stored
+/// VISIBLE geometric-optics extinction (m^-1) at MSL height `z_m`. This is the EXACT
+/// algebraic inverse of the ingest's forward conversion
+/// [`crate::optics::extinction_coefficient`], `beta = (3/2) rho_air q / (rho_w r_e)`:
+///
+/// `q = beta * rho_w * r_e / ((3/2) * rho_air(z))`
+///
+/// with the class's rho_w-normalized effective radius `r_e`
+/// ([`HydrometeorClass::effective_radius_m`]: liquid 10 um, ice 40 um, snow 150 um,
+/// rain/graupel 1 mm — the SAME table the ingest used to build the brick) and
+/// [`RHO_W`] = 1000 kg m^-3. The brick carries no pressure, so `rho_air` is the
+/// standard-atmosphere exponential [`standard_air_density_kg_m3`] — the same density
+/// kernel `precipitable_water_field` and the IR water-vapor continuum use — whereas
+/// the ingest used the WRF ideal-gas density (`optics::air_density`). The two differ
+/// by up to ~10 % in a real column, so a recovered mixing ratio is the ingest's to
+/// that tolerance (a documented approximation; it moves the mask threshold, not the
+/// physics).
+#[inline]
+pub fn condensate_mixing_ratio_kg_kg(ext_vis_per_m: f64, class: HydrometeorClass, z_m: f64) -> f64 {
+    if ext_vis_per_m <= 0.0 {
+        return 0.0;
+    }
+    let rho_air = standard_air_density_kg_m3(z_m);
+    ext_vis_per_m * RHO_W * class.effective_radius_m() / (1.5 * rho_air)
+}
+
+/// Per-column synthetic CLOUD MASK (`nx*ny` u8, grid orientation `j*nx + i`, `j = 0`
+/// south): [`CLOUD_MASK_CLOUDY`] where ANY voxel of the column carries total condensate
+/// mixing ratio `q_c + q_i + q_s + q_(r+g)` above `threshold_kg_kg`, else
+/// [`CLOUD_MASK_CLEAR`]. Each class is recovered from its own extinction channel by
+/// [`condensate_mixing_ratio_kg_kg`]: `ext_liquid` -> cloud liquid, `ext_ice` -> cloud
+/// ice, the snow-only auxiliary `ext_snow` -> snow, and the remainder
+/// `ext_precip - ext_snow` -> rain/graupel (both at the shared 1 mm radius, so the
+/// mixed channel inverts without ambiguity). A brick whose `ext_snow` scale is zero (a
+/// pre-SSB-v6 or programmatic brick) inverts all of `ext_precip` at the rain radius —
+/// which OVERSTATES the mass of any snow in that channel (1 mm vs 150 um, 6.7x), i.e.
+/// errs toward "cloudy" for the mixed channel; documented, and moot for SSB v6 bricks.
+///
+/// Floor honesty: the compact brick log-quantizes each channel over five decades below
+/// its per-volume peak (`bricks::QUANT_DYNAMIC_RANGE`), so condensate below
+/// `peak_ext / 1e5` decodes as zero. For a real convective brick (liquid peak ~0.1-0.3
+/// m^-1) that floor is ~1e-8 kg kg^-1 — two decades under the default threshold — so
+/// the quantization does not move the mask; a brick with an extreme peak could raise
+/// the effective floor and is not detected here. Below-terrain levels are zero by
+/// construction (the ingest extrapolates extinction with `Extrap::Zero`).
+pub fn condensate_cloud_mask_field(brick: &VolumeBrick, threshold_kg_kg: f64) -> Vec<u8> {
+    let (nx, ny, nz) = (brick.nx, brick.ny, brick.nz);
+    let ql = brick.quant.get("ext_liquid");
+    let qi = brick.quant.get("ext_ice");
+    let qs = brick.quant.get("ext_snow");
+    let qp = brick.quant.get("ext_precip");
+    let dz = brick.dz_m;
+    let z0 = brick.z_min_m;
+    let science = (brick.storage_profile == StorageProfile::ScienceCloudF16)
+        .then_some(brick.science_cloud_f16.as_ref())
+        .flatten();
+    let mut out = vec![CLOUD_MASK_CLEAR; nx * ny];
+    for j in 0..ny {
+        for i in 0..nx {
+            let mut cloudy = false;
+            for k in 0..nz {
+                let c = cell3(nx, ny, i, j, k);
+                let (liquid, ice, snow, precip) = science.map_or_else(
+                    || {
+                        (
+                            ql.decode(brick.ext_liquid[c]) as f64,
+                            qi.decode(brick.ext_ice[c]) as f64,
+                            qs.decode(brick.ext_snow[c]) as f64,
+                            qp.decode(brick.ext_precip[c]) as f64,
+                        )
+                    },
+                    |payload| {
+                        (
+                            decode_log2_f16(payload.ext_liquid[c]) as f64,
+                            decode_log2_f16(payload.ext_ice[c]) as f64,
+                            decode_log2_f16(payload.ext_snow[c]) as f64,
+                            decode_log2_f16(payload.ext_precip[c]) as f64,
+                        )
+                    },
+                );
+                if liquid <= 0.0 && ice <= 0.0 && precip <= 0.0 {
+                    continue;
+                }
+                let z = z0 + k as f64 * dz;
+                let q = condensate_mixing_ratio_kg_kg(liquid, HydrometeorClass::CloudLiquid, z)
+                    + condensate_mixing_ratio_kg_kg(ice, HydrometeorClass::Ice, z)
+                    + condensate_mixing_ratio_kg_kg(snow, HydrometeorClass::Snow, z)
+                    + condensate_mixing_ratio_kg_kg(
+                        (precip - snow).max(0.0),
+                        HydrometeorClass::Rain,
+                        z,
+                    );
+                if q > threshold_kg_kg {
+                    cloudy = true;
+                    break;
+                }
+            }
+            if cloudy {
+                out[j * nx + i] = CLOUD_MASK_CLOUDY;
+            }
+        }
+    }
+    out
+}
+
+/// Resample a native per-column u8 mask (`nx*ny`, grid orientation) onto an output raster
+/// (`out_nx*out_ny`, row 0 = north) exactly like [`resample_field`] (nearest via the
+/// raster's fractional WRF indices; exact `grid_i == px`, `grid_j == ny-1-py` for the
+/// top-down native map), with [`CLOUD_MASK_NO_DATA`] where the grid index is non-finite.
+pub fn resample_mask(
+    mask: &[u8],
+    nx: usize,
+    ny: usize,
+    grid_i: &[f32],
+    grid_j: &[f32],
+    out_nx: usize,
+    out_ny: usize,
+) -> Vec<u8> {
+    let mut out = vec![CLOUD_MASK_NO_DATA; out_nx * out_ny];
+    for idx in 0..out_nx * out_ny {
+        let (gi, gj) = (grid_i[idx], grid_j[idx]);
+        if !gi.is_finite() || !gj.is_finite() {
+            continue;
+        }
+        let i = (gi.round() as i64).clamp(0, nx as i64 - 1) as usize;
+        let j = (gj.round() as i64).clamp(0, ny as i64 - 1) as usize;
+        out[idx] = mask[j * nx + i];
     }
     out
 }
@@ -656,6 +806,118 @@ mod tests {
             "thicker COD {} not ~2x {}",
             cod2[0],
             cod[0]
+        );
+    }
+
+    #[test]
+    fn condensate_mixing_ratio_inverts_the_ingest_extinction_kernel() {
+        // Round trip through the ingest's forward kernel at the SAME density: q -> beta ->
+        // q must be exact (to f64 slop) for every class, including the 1 mm rain/graupel
+        // pair and 150 um snow.
+        use crate::optics::extinction_coefficient;
+        for class in [
+            HydrometeorClass::CloudLiquid,
+            HydrometeorClass::Ice,
+            HydrometeorClass::Snow,
+            HydrometeorClass::Rain,
+            HydrometeorClass::Graupel,
+        ] {
+            for z in [0.0, 3000.0, 9000.0] {
+                let q = 2.5e-4;
+                let beta = extinction_coefficient(
+                    standard_air_density_kg_m3(z),
+                    q,
+                    class.effective_radius_m(),
+                );
+                let back = condensate_mixing_ratio_kg_kg(beta, class, z);
+                assert!(
+                    (back - q).abs() < 1e-12,
+                    "{class:?} at z={z}: {back} != {q}"
+                );
+            }
+        }
+        assert_eq!(
+            condensate_mixing_ratio_kg_kg(0.0, HydrometeorClass::Ice, 0.0),
+            0.0
+        );
+        assert_eq!(
+            condensate_mixing_ratio_kg_kg(-1.0, HydrometeorClass::Ice, 0.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn condensate_cloud_mask_flags_only_columns_above_the_threshold() {
+        // Three columns: clear (0); a THIN liquid layer whose recovered mixing ratio sits a
+        // decade UNDER the 1e-6 kg/kg floor; a THICK liquid layer a decade OVER it. Only
+        // the thick column is cloudy. The extinctions are set from the forward kernel at
+        // the exact mixing ratios so the test is about the threshold, not the optics.
+        use crate::optics::extinction_coefficient;
+        let (nx, ny, nz, dz) = (3usize, 2usize, 20usize, 250.0f64);
+        let r_e = HydrometeorClass::CloudLiquid.effective_radius_m();
+        let k_cloud = 8usize;
+        let z = k_cloud as f64 * dz;
+        let thin = extinction_coefficient(standard_air_density_kg_m3(z), 1.0e-7, r_e) as f32;
+        let thick = extinction_coefficient(standard_air_density_kg_m3(z), 1.0e-5, r_e) as f32;
+        let brick = build_brick(nx, ny, nz, dz, move |i, _, k| {
+            let l = if k == k_cloud {
+                match i {
+                    1 => thin,
+                    2 => thick,
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
+            (l, 0.0, 0.0, 0.0, 280.0)
+        });
+        let mask = condensate_cloud_mask_field(&brick, CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG);
+        assert_eq!(mask.len(), nx * ny);
+        for j in 0..ny {
+            assert_eq!(mask[j * nx], CLOUD_MASK_CLEAR, "clear column j={j}");
+            assert_eq!(mask[j * nx + 1], CLOUD_MASK_CLEAR, "thin column j={j}");
+            assert_eq!(mask[j * nx + 2], CLOUD_MASK_CLOUDY, "thick column j={j}");
+        }
+        // Lowering the threshold below the thin column's 1e-7 kg/kg flags it too; the
+        // clear column never flags.
+        let low = condensate_cloud_mask_field(&brick, 1.0e-8);
+        assert_eq!(low[1], CLOUD_MASK_CLOUDY);
+        assert_eq!(low[0], CLOUD_MASK_CLEAR);
+
+        // Precip-only column (rain radius 1 mm): the SAME extinction as the thick liquid
+        // column carries 100x the mass (r_e ratio 1e-3 / 1e-5), so it is cloudy as well —
+        // and an ice column at 40 um carries 4x, cloudy too.
+        let precip_brick = build_brick(nx, ny, nz, dz, move |i, _, k| {
+            if k == k_cloud && i == 0 {
+                (0.0, 0.0, thick, 0.0, 280.0)
+            } else if k == k_cloud && i == 1 {
+                (0.0, thick, 0.0, 0.0, 280.0)
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 280.0)
+            }
+        });
+        let pm = condensate_cloud_mask_field(&precip_brick, CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG);
+        assert_eq!(pm[0], CLOUD_MASK_CLOUDY);
+        assert_eq!(pm[1], CLOUD_MASK_CLOUDY);
+        assert_eq!(pm[2], CLOUD_MASK_CLEAR);
+    }
+
+    #[test]
+    fn resample_mask_maps_native_grid_and_marks_off_domain() {
+        // A 2x2 native mask; three output pixels: exact (1,0), rounded (0.4,1.4)->(0,1), and
+        // an off-domain NaN pixel -> NO_DATA.
+        let mask = [
+            CLOUD_MASK_CLEAR,
+            CLOUD_MASK_CLOUDY,
+            CLOUD_MASK_CLOUDY,
+            CLOUD_MASK_CLEAR,
+        ];
+        let gi = [1.0f32, 0.4, f32::NAN];
+        let gj = [0.0f32, 1.4, 0.0];
+        let out = resample_mask(&mask, 2, 2, &gi, &gj, 3, 1);
+        assert_eq!(
+            out,
+            vec![CLOUD_MASK_CLOUDY, CLOUD_MASK_CLOUDY, CLOUD_MASK_NO_DATA]
         );
     }
 

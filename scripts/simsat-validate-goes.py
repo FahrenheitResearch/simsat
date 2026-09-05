@@ -8,6 +8,14 @@ interleaved f32le RGB reflectance dump written by ``render_frame
 bands-out=...``. ABI Band 13 input is the north-first scalar f32le Kelvin plane
 written by ``render_ir bt-out=...``.
 
+``--synthetic-cloud-mask`` optionally takes the north-first u8 plane written by
+``render_ir cloud-mask-out=...`` (0 clear, 1 = the model column carries total
+hydrometeor mixing ratio above 1e-6 kg/kg, 255 no-data) and adds three regimes,
+``both_cloudy`` / ``observed_only_cloudy`` / ``synthetic_only_cloudy``, with the
+same statistics as the official-mask regimes.  ``both_cloudy`` is the one regime
+that isolates the radiative observation operator from forecast cloud placement.
+Without the option the report is unchanged.
+
 The resulting pixel statistics and FSS values are collocation diagnostics, not
 forecast-skill claims.  Forecast displacement, timing, and model-state error
 can dominate an exact-grid comparison even when the observation operator is
@@ -35,6 +43,13 @@ QUANTILES = (0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
 THERMAL_THRESHOLDS_K = (260.0, 235.0, 220.0, 205.0)
 THERMAL_ENHANCEMENT_K = (180.0, 320.0)
 THERMAL_DIFFERENCE_CLIP_K = 40.0
+# render_ir cloud-mask-out= codes (simsat::derived::CLOUD_MASK_*).
+CLOUD_MASK_CLEAR = 0
+CLOUD_MASK_CLOUDY = 1
+CLOUD_MASK_NO_DATA = 255
+# simsat::derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG, reported for provenance only;
+# the mask file already carries the decision.
+CLOUD_MASK_THRESHOLD_KG_KG = 1.0e-6
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         help="aligned ABI NPZ from fetch-goes-abi-reference.py",
     )
     parser.add_argument("--output-dir", type=Path, help="immutable output directory")
+    parser.add_argument(
+        "--synthetic-cloud-mask",
+        type=Path,
+        help=(
+            "north-first u8 condensate cloud mask from render_ir cloud-mask-out= "
+            "(adds both_cloudy / observed_only_cloudy / synthetic_only_cloudy regimes)"
+        ),
+    )
     parser.add_argument(
         "--input-kind",
         choices=("auto", "png", "f32le-rgb", "f32le-scalar"),
@@ -282,6 +305,141 @@ def load_synthetic_scalar(
             f"[100,400] K or NaN no-data; observed finite range is [{low:.3f}, {high:.3f}]"
         )
     return values
+
+
+def load_synthetic_cloud_mask(np: Any, path: Path, shape: tuple[int, int]) -> Any:
+    """Load the documented north-first u8 cloud-mask plane exactly on the ABI grid."""
+    if not path.is_file():
+        raise RuntimeError(f"synthetic cloud mask is not a file: {path.name}")
+    height, width = shape
+    expected_bytes = height * width
+    actual_bytes = path.stat().st_size
+    if actual_bytes != expected_bytes:
+        raise RuntimeError(
+            f"u8 cloud-mask size mismatch for {path.name}: got {actual_bytes} bytes, "
+            f"expected {expected_bytes} for north-first {width}x{height}"
+        )
+    values = np.fromfile(path, dtype=np.uint8).reshape(height, width)
+    allowed = (CLOUD_MASK_CLEAR, CLOUD_MASK_CLOUDY, CLOUD_MASK_NO_DATA)
+    if not np.all(np.isin(values, allowed)):
+        bad = sorted(int(v) for v in np.unique(values) if int(v) not in allowed)
+        raise RuntimeError(
+            f"u8 cloud mask {path.name} contains codes outside {allowed}: {bad}"
+        )
+    return values
+
+
+def add_synthetic_cloud_regimes(
+    np: Any, regimes: dict[str, dict[str, Any]], cloud_mask: Any
+) -> dict[str, Any]:
+    """Add the forecast-vs-operator cloud regimes and return their agreement summary.
+
+    ``both_cloudy`` = official ABI cloud AND synthetic condensate column;
+    ``observed_only_cloudy`` = official cloud but a clear model column (forecast
+    missed or displaced the cloud); ``synthetic_only_cloudy`` = model condensate
+    where ABI is clear (forecast false cloud).  The three are disjoint and sum to
+    the cloudy UNION.  All are restricted to ``valid``; a no-data mask code never
+    enters (``valid`` already requires finite synthetic data, and the observed-only
+    regime is defined as cloudy AND NOT synthetic-cloudy so the union identity
+    holds even if a no-data pixel were valid).
+    """
+    valid = regimes["valid"]["mask"]
+    synthetic_cloudy = valid & (cloud_mask == CLOUD_MASK_CLOUDY)
+    definitions = {
+        "both_cloudy": "valid and official cloud mask cloudy and synthetic condensate column "
+        f"(render_ir cloud-mask-out, total hydrometeor mixing ratio > {CLOUD_MASK_THRESHOLD_KG_KG:g} kg/kg)",
+        "observed_only_cloudy": "valid and official cloud mask cloudy and NOT synthetic condensate column",
+        "synthetic_only_cloudy": "valid and synthetic condensate column and NOT official cloud mask cloudy",
+    }
+    observed_spec = regimes.get("cloudy")
+    if observed_spec is None or not observed_spec.get("available"):
+        reason = (
+            observed_spec.get("unavailable_reason", "official cloud mask unavailable")
+            if observed_spec
+            else "official cloud mask unavailable"
+        )
+        for name, definition in definitions.items():
+            regimes[name] = {
+                "available": False,
+                "definition": definition,
+                "unavailable_reason": reason,
+            }
+        return {"available": False, "reason": reason}
+    observed_cloudy = observed_spec["mask"]
+    both = observed_cloudy & synthetic_cloudy
+    observed_only = observed_cloudy & ~synthetic_cloudy
+    synthetic_only = synthetic_cloudy & ~observed_cloudy
+    for name, mask in (
+        ("both_cloudy", both),
+        ("observed_only_cloudy", observed_only),
+        ("synthetic_only_cloudy", synthetic_only),
+    ):
+        regimes[name] = {
+            "available": True,
+            "definition": definitions[name],
+            "mask": mask,
+        }
+    valid_count = int(np.sum(valid))
+    both_count = int(np.sum(both))
+    observed_only_count = int(np.sum(observed_only))
+    synthetic_only_count = int(np.sum(synthetic_only))
+    union_count = int(np.sum(observed_cloudy | synthetic_cloudy))
+    observed_count = both_count + observed_only_count
+    synthetic_count = both_count + synthetic_only_count
+    return {
+        "available": True,
+        "observed_source": observed_spec["definition"],
+        "synthetic_source": (
+            "render_ir cloud-mask-out u8 plane; cloudy = total hydrometeor mixing ratio "
+            f"> {CLOUD_MASK_THRESHOLD_KG_KG:g} kg/kg anywhere in the column"
+        ),
+        "counts": {
+            "valid": valid_count,
+            "observed_cloudy": observed_count,
+            "synthetic_cloudy": synthetic_count,
+            "both_cloudy": both_count,
+            "observed_only_cloudy": observed_only_count,
+            "synthetic_only_cloudy": synthetic_only_count,
+            "cloudy_union": union_count,
+            "neither_cloudy": valid_count - union_count,
+        },
+        "fractions_of_valid": {
+            "observed_cloudy": observed_count / valid_count if valid_count else None,
+            "synthetic_cloudy": synthetic_count / valid_count if valid_count else None,
+            "both_cloudy": both_count / valid_count if valid_count else None,
+        },
+        "cloud_mask_contingency": {
+            "hits": both_count,
+            "misses": observed_only_count,
+            "false_alarms": synthetic_only_count,
+            "correct_negatives": valid_count - union_count,
+            "probability_of_detection": both_count / observed_count if observed_count else None,
+            "false_alarm_ratio": synthetic_only_count / synthetic_count
+            if synthetic_count
+            else None,
+            "critical_success_index": both_count / union_count if union_count else None,
+        },
+        "interpretation": (
+            "both_cloudy isolates the radiative observation operator from forecast cloud "
+            "placement; observed_only/synthetic_only carry forecast displacement, timing, "
+            "and state error. The contingency scores the model condensate column against "
+            "the official ABI cloud mask and is a forecast diagnostic, not an operator one."
+        ),
+    }
+
+
+def cloud_mask_input_record(path: Path) -> dict[str, Any]:
+    return {
+        "file": path.name,
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size,
+        "kind": "u8-cloud-mask",
+        "layout": (
+            "north-first row-major uint8; 0 clear, 1 condensate column, 255 no-data "
+            "(render_ir cloud-mask-out)"
+        ),
+        "threshold_kg_kg": CLOUD_MASK_THRESHOLD_KG_KG,
+    }
 
 
 def observed_rgb(
@@ -1174,6 +1332,7 @@ def validate(
     thresholds: list[float] | None,
     scales: list[int],
     source_manifest: Path | None,
+    cloud_mask_path: Path | None = None,
 ) -> dict[str, Any]:
     np, Image, ImageDraw = require_dependencies()
     arrays = load_reference(np, reference_path)
@@ -1192,6 +1351,10 @@ def validate(
         raise RuntimeError(
             "aligned ABI reference and synthetic input have no jointly valid pixels"
         )
+    cloud_mask_summary = None
+    if cloud_mask_path is not None:
+        cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape)
+        cloud_mask_summary = add_synthetic_cloud_regimes(np, regimes, cloud_mask)
     thresholds = list(
         thresholds or (DISPLAY_THRESHOLDS if kind == "png" else RAW_THRESHOLDS)
     )
@@ -1304,6 +1467,9 @@ def validate(
             "fss_scales_pixels": scales,
         },
     }
+    if cloud_mask_path is not None:
+        report["inputs"]["synthetic_cloud_mask"] = cloud_mask_input_record(cloud_mask_path)
+        report["synthetic_cloud_mask"] = cloud_mask_summary
     report_bytes = json_bytes(report)
     report_sha = immutable_write(output_dir / "validation.json", report_bytes)
     return {
@@ -1325,6 +1491,7 @@ def validate_thermal(
     thresholds: list[float] | None,
     scales: list[int],
     source_manifest: Path | None,
+    cloud_mask_path: Path | None = None,
 ) -> dict[str, Any]:
     """Validate a scalar SimSat Band 13 BT plane against aligned ABI C13."""
     np, Image, ImageDraw = require_dependencies()
@@ -1343,6 +1510,10 @@ def validate_thermal(
         raise RuntimeError(
             "aligned ABI C13 reference and synthetic BT input have no jointly valid pixels"
         )
+    cloud_mask_summary = None
+    if cloud_mask_path is not None:
+        cloud_mask = load_synthetic_cloud_mask(np, cloud_mask_path, shape)
+        cloud_mask_summary = add_synthetic_cloud_regimes(np, regimes, cloud_mask)
     thresholds = list(thresholds or THERMAL_THRESHOLDS_K)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1474,6 +1645,9 @@ def validate_thermal(
             "fss_scales_pixels": scales,
         },
     }
+    if cloud_mask_path is not None:
+        report["inputs"]["synthetic_cloud_mask"] = cloud_mask_input_record(cloud_mask_path)
+        report["synthetic_cloud_mask"] = cloud_mask_summary
     report_bytes = json_bytes(report)
     report_sha = immutable_write(output_dir / "validation.json", report_bytes)
     return {
@@ -1582,6 +1756,72 @@ def self_check() -> int:
             for threshold in thermal_report["cold_cloud_objects"]["thresholds"]
         )
 
+        # Synthetic cloud mask: the official BCM (columns > width/2) shifted 3 columns
+        # WEST with the easternmost 3 columns left clear (plus a no-data corner), so all
+        # three forecast-vs-operator regimes are non-empty (synthetic-only on the west
+        # edge of the cloud, observed-only on the east), and the reports WITHOUT the
+        # option carry none of the new keys.
+        cloud_mask = np.full((height, width), CLOUD_MASK_CLEAR, dtype=np.uint8)
+        cloud_mask[:, :-3] = np.where(bcm[:, 3:] > 0.5, CLOUD_MASK_CLOUDY, CLOUD_MASK_CLEAR)
+        cloud_mask[-2:, -2:] = CLOUD_MASK_NO_DATA
+        mask_path = root / "cloud-mask.bin"
+        cloud_mask.tofile(mask_path)
+        new_regimes = ("both_cloudy", "observed_only_cloudy", "synthetic_only_cloudy")
+        for report in (raw_report, png_report, thermal_report):
+            assert not any(name in report["regimes"] for name in new_regimes)
+            assert "synthetic_cloud_mask" not in report
+            assert "synthetic_cloud_mask" not in report["inputs"]
+        masked_thermal = validate_thermal(
+            scalar,
+            reference,
+            root / "thermal-mask-out",
+            list(THERMAL_THRESHOLDS_K),
+            [1, 3],
+            None,
+            mask_path,
+        )
+        masked_raw = validate(
+            raw,
+            reference,
+            root / "raw-mask-out",
+            "f32le-rgb",
+            [0.1, 0.3],
+            [1, 3],
+            None,
+            mask_path,
+        )
+        for result, metric in ((masked_thermal, "brightness_temperature_kelvin"), (masked_raw, "luminance")):
+            report = json.loads(Path(result["report"]).read_text(encoding="utf-8"))
+            counts = report["synthetic_cloud_mask"]["counts"]
+            assert all(report["regimes"][name]["available"] for name in new_regimes)
+            assert all(report["regimes"][name]["count"] > 0 for name in new_regimes)
+            assert all(metric in report["regimes"][name] for name in new_regimes)
+            assert (
+                sum(report["regimes"][name]["count"] for name in new_regimes)
+                == counts["cloudy_union"]
+            )
+            assert counts["both_cloudy"] + counts["observed_only_cloudy"] == report["regimes"]["cloudy"]["count"]
+            assert counts["cloudy_union"] + counts["neither_cloudy"] == report["regimes"]["valid"]["count"]
+            assert report["inputs"]["synthetic_cloud_mask"]["kind"] == "u8-cloud-mask"
+            # The pre-existing regimes are untouched by the option.
+            baseline = thermal_report if metric == "brightness_temperature_kelvin" else raw_report
+            for name, record in baseline["regimes"].items():
+                assert report["regimes"][name] == record, name
+        bad_mask = root / "bad-mask.bin"
+        bad_mask.write_bytes(bytes([7]) * (height * width))
+        try:
+            load_synthetic_cloud_mask(np, bad_mask, (height, width))
+        except RuntimeError as error:
+            assert "codes outside" in str(error)
+        else:
+            raise AssertionError("cloud mask with an undefined code did not fail")
+        try:
+            load_synthetic_cloud_mask(np, mask_path, (height, width + 1))
+        except RuntimeError as error:
+            assert "size mismatch" in str(error)
+        else:
+            raise AssertionError("mis-sized cloud mask did not fail")
+
         broken = root / "broken.bin"
         broken.write_bytes(raw.read_bytes()[:-4])
         try:
@@ -1610,6 +1850,7 @@ def self_check() -> int:
                 "abi_band13_scalar_layout_and_identity": "passed",
                 "abi_band13_threshold_fss_and_objects": "passed",
                 "abi_band13_malformed_input": "passed",
+                "synthetic_cloud_mask_regimes": "passed",
             },
             indent=2,
             sort_keys=True,
@@ -1631,6 +1872,7 @@ def main() -> int:
                 args.fss_thresholds,
                 args.fss_scales,
                 args.source_manifest.resolve() if args.source_manifest else None,
+                args.synthetic_cloud_mask.resolve() if args.synthetic_cloud_mask else None,
             )
         else:
             result = validate(
@@ -1641,6 +1883,7 @@ def main() -> int:
                 args.fss_thresholds,
                 args.fss_scales,
                 args.source_manifest.resolve() if args.source_manifest else None,
+                args.synthetic_cloud_mask.resolve() if args.synthetic_cloud_mask else None,
             )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0

@@ -936,6 +936,8 @@ fn render_params(opts: &Opts) -> RenderParams {
         thermal_sensor: opts.thermal_sensor,
         instrument_footprint: opts.instrument_footprint,
         derived_colormap: false,
+        // Visible products never carry the thermal-only condensate cloud mask.
+        condensate_cloud_mask_kg_kg: None,
         raster_override: None,
         ground_gain: opts.ground_gain,
         cloud_softclip: opts.cloud_softclip,

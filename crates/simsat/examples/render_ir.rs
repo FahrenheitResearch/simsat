@@ -14,6 +14,12 @@
 //!   input=<path>        REQUIRED. A wrfout file (ingested if not cached) OR a run.json.
 //!   out=<file.png>      REQUIRED. Output PNG path (RGB8, row 0 = north).
 //!   bt-out=<path.bin>   OPTIONAL audit dump: north-first unletterboxed f32le Kelvin plane.
+//!   cloud-mask-out=<path.bin> OPTIONAL synthetic condensate CLOUD MASK on the same raster:
+//!                       north-first unletterboxed u8 plane, 0 = clear, 1 = the column carries
+//!                       total hydrometeor mixing ratio above 1e-6 kg/kg
+//!                       (`derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG`), 255 = no data.
+//!                       The validator's `--synthetic-cloud-mask` input (forecast-vs-operator
+//!                       "both cloudy" regimes). Thermal products only; never alters the BT.
 //!   sat=<preset>        goes-east | goes-west | himawari    (default goes-east)
 //!   geo-navigation=<mode> model-sphere | goes-r-abi (default model-sphere)
 //!   timestep=<n>        time index (default 0).
@@ -66,6 +72,8 @@ struct Opts {
     out: PathBuf,
     /// Optional audit dump of the raw, unletterboxed brightness-temperature plane.
     bt_out: Option<PathBuf>,
+    /// Optional dump of the synthetic condensate cloud mask (u8, same raster as `bt_out`).
+    cloud_mask_out: Option<PathBuf>,
     sat: SatellitePreset,
     geo_navigation: GeoNavigation,
     timestep: usize,
@@ -148,6 +156,12 @@ fn run(args: &[String]) -> Result<(), String> {
         // A derived field asks the api to also produce the basic studio colormap RGB (the
         // harness writes a coloured PNG). Ignored by the IR/WV products.
         derived_colormap: opts.derived.is_some(),
+        // The mask is computed only when its dump was asked for (the BT plane is identical
+        // either way); the threshold is the documented library default.
+        condensate_cloud_mask_kg_kg: opts
+            .cloud_mask_out
+            .as_ref()
+            .map(|_| derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG),
         // Visible-only fields are irrelevant to the thermal IR march.
         bluemarble: BlueMarble::FlatAlbedo,
         ..RenderParams::new(opts.input.clone())
@@ -260,6 +274,30 @@ fn run(args: &[String]) -> Result<(), String> {
             path.display()
         );
     }
+    if let Some(path) = &opts.cloud_mask_out {
+        let mask = result
+            .cloud_mask
+            .as_ref()
+            .ok_or("cloud-mask-out= was requested but the render returned no cloud mask")?;
+        write_u8_plane(path, mask, rnx, rny)?;
+        let in_domain = mask
+            .iter()
+            .filter(|&&m| m != derived::CLOUD_MASK_NO_DATA)
+            .count();
+        let cloudy = mask
+            .iter()
+            .filter(|&&m| m == derived::CLOUD_MASK_CLOUDY)
+            .count();
+        eprintln!(
+            "render_ir: wrote north-first {}x{} u8 condensate cloud mask {} (0 clear, 1 condensate > {:.0e} kg/kg, 255 no-data; cloudy fraction {:.3} of {} in-domain pixels)",
+            rnx,
+            rny,
+            path.display(),
+            derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG,
+            cloudy as f64 / in_domain.max(1) as f64,
+            in_domain,
+        );
+    }
 
     // Optional canvas letterbox to a fixed figure size.
     let (final_nx, final_ny, final_rgb) = match opts.canvas {
@@ -336,11 +374,25 @@ fn write_f32le(path: &Path, values: &[f32]) -> Result<(), String> {
         .map_err(|e| format!("flush f32le BT dump {}: {e}", path.display()))
 }
 
+/// Write a north-first u8 plane (`ny * nx` bytes, row-major) — the cloud-mask dump. Like the
+/// f32le BT dump it is written BEFORE any canvas letterbox so its layout is exactly the raster.
+fn write_u8_plane(path: &Path, values: &[u8], nx: usize, ny: usize) -> Result<(), String> {
+    if values.len() != nx * ny {
+        return Err(format!(
+            "cloud mask byte count {} != {nx}x{ny}",
+            values.len()
+        ));
+    }
+    std::fs::write(path, values)
+        .map_err(|e| format!("write u8 cloud-mask dump {}: {e}", path.display()))
+}
+
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut input: Option<PathBuf> = None;
     let mut storage_profile = StorageProfile::CompactU8;
     let mut out: Option<PathBuf> = None;
     let mut bt_out: Option<PathBuf> = None;
+    let mut cloud_mask_out: Option<PathBuf> = None;
     let mut sat = SatellitePreset::GoesEast;
     let mut geo_navigation = GeoNavigation::ModelSphere;
     let mut timestep = 0usize;
@@ -365,6 +417,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "input" | "wrfout" | "in" => input = Some(PathBuf::from(v)),
             "out" | "output" | "png" => out = Some(PathBuf::from(v)),
             "bt-out" | "bt_out" | "btout" => bt_out = Some(PathBuf::from(v)),
+            "cloud-mask-out" | "cloud_mask_out" | "cloudmaskout" => {
+                cloud_mask_out = Some(PathBuf::from(v))
+            }
             "sat" | "satellite" => sat = parse_sat(v)?,
             "geo-navigation" | "geo_navigation" | "navigation" => {
                 geo_navigation = parse_geo_navigation(v)?
@@ -436,11 +491,18 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 .to_string(),
         );
     }
+    if cloud_mask_out.is_some() && derived.is_some() {
+        return Err(
+            "cloud-mask-out= applies only to thermal IR/WV brightness-temperature products (omit derived=)"
+                .to_string(),
+        );
+    }
     Ok(Opts {
         input: input.ok_or("missing required input=<path>")?,
         storage_profile,
         out: out.ok_or("missing required out=<file.png>")?,
         bt_out,
+        cloud_mask_out,
         sat,
         geo_navigation,
         timestep,
@@ -522,6 +584,8 @@ fn print_usage() {
          \x20 input=<path>        wrfout (ingest-if-needed) or a cached run.json  [required]\n\
          \x20 out=<file.png>      output PNG (RGB8, row 0 = north)                [required]\n\
          \x20 bt-out=<file.bin>   audit dump: north-first unletterboxed f32le Kelvin plane\n\
+         \x20 cloud-mask-out=<file.bin> synthetic condensate cloud mask, same raster: u8 north-first,\n\
+         \x20                     0 clear / 1 condensate > 1e-6 kg/kg / 255 no-data (thermal only)\n\
          \x20 storage-profile=<mode> compact-u8 | science-cloud-f16 (default compact-u8)\n\
          \x20 sat=<preset>        goes-east | goes-west | himawari   (default goes-east)\n\
          \x20 timestep=<n>        time index (default 0)\n\
@@ -559,6 +623,21 @@ mod tests {
             parse_opts(&science).unwrap().storage_profile,
             StorageProfile::ScienceCloudF16
         );
+    }
+
+    #[test]
+    fn cloud_mask_out_requests_the_mask_and_is_refused_for_derived_fields() {
+        let base = vec!["input=input".to_string(), "out=out.png".to_string()];
+        assert!(parse_opts(&base).unwrap().cloud_mask_out.is_none());
+        let mut with_mask = base.clone();
+        with_mask.push("cloud-mask-out=mask.bin".to_string());
+        assert_eq!(
+            parse_opts(&with_mask).unwrap().cloud_mask_out,
+            Some(PathBuf::from("mask.bin"))
+        );
+        let mut derived = with_mask;
+        derived.push("derived=cod".to_string());
+        assert!(parse_opts(&derived).is_err());
     }
 
     #[test]

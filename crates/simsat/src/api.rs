@@ -583,6 +583,16 @@ pub struct RenderParams {
     /// raw physical `f32` field is always returned). `false` (the default) = raw field only —
     /// the binding's primary deliverable; the studio / CLI set it `true` for the coloured map.
     pub derived_colormap: bool,
+    /// Optional synthetic CONDENSATE CLOUD MASK threshold (kg kg^-1). `Some(threshold)` makes
+    /// the thermal products ([`Product::Ir`] / [`Product::WaterVapor`]) also return
+    /// [`RenderResult::cloud_mask`]: a u8 plane on the SAME raster as the BT plane flagging
+    /// every column whose total hydrometeor mixing ratio exceeds the threshold anywhere
+    /// ([`crate::derived::condensate_cloud_mask_field`]; the customary
+    /// [`crate::derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG`] = 1e-6 kg kg^-1). `None`
+    /// (the default) = no mask; the BT plane is byte-identical either way. This is the
+    /// validator's forecast-vs-operator separator (a "both cloudy" regime), not a display
+    /// product. Non-thermal products ignore it.
+    pub condensate_cloud_mask_kg_kg: Option<f64>,
     /// An explicit raster to render at instead of the one built from `view`/`resolution`
     /// (the `render_frame` supersample QA path; geostationary visible only). `None` =
     /// build it. NEVER set this from the Python binding.
@@ -664,6 +674,7 @@ impl RenderParams {
             thermal_sensor: ThermalSensor::FastGray,
             instrument_footprint: InstrumentFootprint::Off,
             derived_colormap: false,
+            condensate_cloud_mask_kg_kg: None,
             raster_override: None,
             ground_gain: None,
             cloud_softclip: None,
@@ -925,6 +936,14 @@ pub struct RenderResult {
     pub science_warnings: Vec<String>,
     /// Storage profile actually decoded for this frame.
     pub storage_profile: StorageProfile,
+    /// The synthetic condensate cloud mask (`nx*ny` u8, row 0 = north; codes
+    /// [`crate::derived::CLOUD_MASK_CLEAR`] / [`CLOUD_MASK_CLOUDY`] /
+    /// [`CLOUD_MASK_NO_DATA`]) — present iff [`RenderParams::condensate_cloud_mask_kg_kg`]
+    /// was set on a thermal product; `None` for every other render.
+    ///
+    /// [`CLOUD_MASK_CLOUDY`]: crate::derived::CLOUD_MASK_CLOUDY
+    /// [`CLOUD_MASK_NO_DATA`]: crate::derived::CLOUD_MASK_NO_DATA
+    pub cloud_mask: Option<Vec<u8>>,
 }
 
 /// Resolved scene inputs (a wrfout ingest-if-needed, or a cached run.json).
@@ -1845,6 +1864,7 @@ fn render_visible_scene(
         instrument_footprint: InstrumentFootprint::Off,
         science_warnings: Vec::new(),
         storage_profile: src.brick.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -2145,6 +2165,22 @@ fn render_ir_scene(
         .ir_enhancement
         .map(|enh| rgba_to_rgb_black_space(&render_ir_rgba(&bt, band, enh), raster.nx, raster.ny));
 
+    // Optional synthetic condensate cloud mask on the SAME raster as the BT plane (nearest
+    // per-column lookup through the raster's grid indices — exact for the top-down native
+    // map). A validator-side forecast-vs-operator separator; it never touches the BT march.
+    let cloud_mask = params.condensate_cloud_mask_kg_kg.map(|threshold| {
+        let native = derived::condensate_cloud_mask_field(brick, threshold);
+        derived::resample_mask(
+            &native,
+            nx,
+            ny,
+            &raster.grid_i,
+            &raster.grid_j,
+            raster.nx,
+            raster.ny,
+        )
+    });
+
     let (time, time_is_fallback) = resolve_frame_time(time_iso.as_deref());
     let georef_out = build_georef(params.view, proj, georef, &raster, nx, ny, margin);
     Ok(RenderResult {
@@ -2189,6 +2225,7 @@ fn render_ir_scene(
             .map(str::to_string)
             .collect(),
         storage_profile: src.brick.storage_profile,
+        cloud_mask,
     })
 }
 
@@ -2285,6 +2322,7 @@ fn render_geocolor_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         instrument_footprint: ir.instrument_footprint,
         science_warnings: ir.science_warnings.clone(),
         storage_profile: vis.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -2367,6 +2405,7 @@ fn render_sandwich_scene(src: &SceneSource, params: &RenderParams) -> Result<Ren
         instrument_footprint: ir.instrument_footprint,
         science_warnings: ir.science_warnings.clone(),
         storage_profile: vis.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -2461,6 +2500,7 @@ fn render_derived_scene(
         instrument_footprint: InstrumentFootprint::Off,
         science_warnings: Vec::new(),
         storage_profile: src.brick.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -2701,6 +2741,7 @@ fn render_cloud_layer_scene(
         instrument_footprint: InstrumentFootprint::Off,
         science_warnings: Vec::new(),
         storage_profile: src.brick.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -2992,6 +3033,7 @@ fn render_perspective_scene(
         instrument_footprint: InstrumentFootprint::Off,
         science_warnings: Vec::new(),
         storage_profile: src.brick.storage_profile,
+        cloud_mask: None,
     })
 }
 
@@ -4564,6 +4606,73 @@ mod tests {
                 (expected, got) => panic!("perspective mismatch: {expected:?} vs {got:?}"),
             }
             assert!(!got.granulation);
+        }
+    }
+
+    #[test]
+    fn ir_condensate_cloud_mask_flags_the_cloudy_column_on_the_bt_raster() {
+        // A clear synthetic scene with ONE thick liquid column injected: the optional
+        // cloud mask comes back on the same top-down raster as the BT plane (row 0 =
+        // north, `grid_j == ny-1-py`), flags exactly that column, is absent when not
+        // requested, and never changes the BT plane.
+        let (nx, ny, nz) = (20usize, 20usize, 32usize);
+        let mut src = synthetic_source(nx, ny, nz, 3000.0);
+        let (ci, cj) = (5usize, 12usize);
+        // 1e-2 m^-1 of 10 um liquid at 2-3 km: q = ext*rho_w*r_e/(1.5*rho_air) ~ 8e-5 kg/kg,
+        // ~2 decades above the 1e-6 threshold (`derived::condensate_mixing_ratio_kg_kg`),
+        // and tau_vis = 10 over the 4 x 250 m layers -> IR-opaque, BT = cloud-top T.
+        let ext = 1.0e-2f32;
+        let scale = LogQuant::from_values(&[ext]);
+        src.brick.quant.0.insert("ext_liquid".to_string(), scale);
+        for k in 8..12 {
+            src.brick.ext_liquid[(k * ny + cj) * nx + ci] = scale.encode(ext);
+        }
+        let mut p = synthetic_params(ViewMode::TopDownMap);
+        p.condensate_cloud_mask_kg_kg = Some(derived::CONDENSATE_CLOUD_MASK_THRESHOLD_KG_KG);
+        let res = render_ir_scene(&src, &p, IrConfig::band13()).unwrap();
+        let mask = res.cloud_mask.as_ref().expect("cloud mask requested");
+        assert_eq!((res.nx, res.ny), (nx, ny));
+        assert_eq!(mask.len(), nx * ny);
+        let cloudy: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|&(_, &m)| m == derived::CLOUD_MASK_CLOUDY)
+            .map(|(i, _)| i)
+            .collect();
+        let idx = (ny - 1 - cj) * nx + ci;
+        assert_eq!(
+            cloudy,
+            vec![idx],
+            "exactly the injected column, north-first"
+        );
+        assert!(
+            mask.iter().all(|&m| m != derived::CLOUD_MASK_NO_DATA),
+            "the native top-down raster has no off-domain pixel"
+        );
+        // The BT plane agrees: the flagged pixel is much colder than a clear pixel a few
+        // cells east (the 2.75 km cloud top is ~18 K colder than the 291 K ground).
+        match &res.data {
+            FrameData::Ir { bt_kelvin, .. } => assert!(
+                bt_kelvin[idx] < bt_kelvin[idx + 3] - 5.0,
+                "cloudy BT {} vs clear BT {}",
+                bt_kelvin[idx],
+                bt_kelvin[idx + 3]
+            ),
+            other => panic!("expected Ir, got {other:?}"),
+        }
+        // Not requested -> no mask, and the BT plane is bit-identical.
+        let plain = render_ir_scene(
+            &src,
+            &synthetic_params(ViewMode::TopDownMap),
+            IrConfig::band13(),
+        )
+        .unwrap();
+        assert!(plain.cloud_mask.is_none());
+        match (&plain.data, &res.data) {
+            (FrameData::Ir { bt_kelvin: a, .. }, FrameData::Ir { bt_kelvin: b, .. }) => {
+                assert_eq!(a, b)
+            }
+            _ => panic!("expected Ir frames"),
         }
     }
 
