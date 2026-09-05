@@ -116,8 +116,8 @@ const WATER_ALBEDO_DAY_SCALE: f32 = 0.35; // daylight water scale (horizon/night
 // CPU shipping path selects (10, 1.5) for Offline via MarchConfig::new. Both sides
 // share the WS1 shell-exit extension + stratified jitter below (documented
 // divergence, per the M4/M5 pattern).
-const SUN_MARCH_STEPS: i32 = 6;    // secondary sun-march steps (depth-resolved shadow)
-const SUN_MARCH_GROWTH: f32 = 2.0; // exponential step growth
+const SUN_MARCH_STEP_MULT: f32 = 1.0; // CPU interactive light-integration tier
+const SUN_MARCH_EMPTY_MULT: f32 = 4.0; // smaller than the eight-cell occupancy guard
 const SUN_MARCH_JITTER: f32 = 0.0; // stratified-jitter amplitude (clouds.rs SUN_MARCH_JITTER_AMP; 0 = fixed midpoint, see the look note there)
 const PHASE_LIQUID_G1: f32 = 0.85;
 const PHASE_LIQUID_G2: f32 = -0.15;
@@ -195,7 +195,7 @@ struct Uniforms {
     geo3: vec4<f32>,   // south_pole, unused, unused, unused
     ql: vec4<f32>,     // ext_liquid vmin,vmax ; ext_ice vmin,vmax
     qp: vec4<f32>,     // ext_precip vmin,vmax ; tau_up vmin,vmax
-    m0: vec4<f32>,     // coarse_step_m, fine_step_m, max_steps, unused (was detail_taps)
+    m0: vec4<f32>,     // coarse_step_m, fine_step_m, nominal step budget, unused (was detail_taps)
     m1: vec4<f32>,     // exposure, octaves, beer_powder, ground_albedo (sun march uses u.dims.w)
     sod_c: vec4<f32>,  // sun_od center xyz, transmittance_floor
     sod_u: vec4<f32>,  // au xyz, u_min
@@ -1307,49 +1307,53 @@ fn hash01(p: vec3<f32>) -> f32 {
     return f32(h) / 4294967296.0;
 }
 
-// Depth-resolved cloud sun optical depth: a short secondary light march toward the sun
-// FROM the sample (the cloud between the sample and the sun), exponentially-spaced so
-// the near field that dominates the sunlit face is resolved and the far tail is cheap.
-// Mirrors clouds.rs::cloud_sun_optical_depth (M4 review FINDING 1). The sun-OD map is no
-// longer consulted here (a 2-D total-column scalar cannot give a per-depth partial);
-// outside this function its total is used only for ground shadow and multiscatter
-// support, never for the sample-to-sun Beer term.
-// WS1: each ray samples its segments at a deterministic stratified hash offset instead
-// of the fixed midpoint, and a two-sample TAIL covers the remaining in-shell slant
-// toward the sun past the schedule's natural reach (a distant occluder along a low sun
-// ray must still shadow; the near field keeps the exact unextended schedule).
+// Depth-resolved tau = integral sigma_t ds, mirroring clouds.rs. Resolve every
+// occupied interval at the finest voxel pitch (the GPU preview is the interactive
+// tier); only the dilated occupancy mask permits four-voxel empty skips. No fixed
+// sample budget or exponential tail can miss a detached cloud. Clip to the last
+// supported sample plane, not the additional empty cell of the primary shell.
 fn cloud_sun_optical_depth(p: vec3<f32>, sun: vec3<f32>) -> f32 {
-    let base = max(u.dims.w, 1.0); // base step = voxel pitch
+    if (u.dims.z < 2.0) {
+        return 0.0;
+    }
+    let top = ray_sphere(p, sun, u.vert.z - u.vert.y);
+    if (top.y < top.x || top.y <= 0.0) {
+        return 0.0;
+    }
+    let t_enter = max(top.x, 0.0);
+    var t_exit = top.y;
+    let bot = ray_sphere(p, sun, u.vert.w);
+    if (bot.y >= bot.x && bot.x > t_enter && bot.x < t_exit) {
+        t_exit = bot.x;
+    }
+    let fine = max(u.dims.w, 1.0) * SUN_MARCH_STEP_MULT;
+    let coarse = max(u.dims.w, 1.0) * SUN_MARCH_EMPTY_MULT;
     let offset = 0.5 + SUN_MARCH_JITTER * (hash01(p) - 0.5);
     var tau = 0.0;
-    var dist = 0.0;
-    var ds = base;
-    for (var k: i32 = 0; k < SUN_MARCH_STEPS; k = k + 1) {
-        let pp = p + sun * (dist + offset * ds);
-        let s = sample_volume(ecef_to_brick(pp));
-        tau = tau + (s.x + s.y + s.z) * ds;
+    var dist = t_enter;
+    loop {
+        if (dist >= t_exit) {
+            break;
+        }
+        let b = ecef_to_brick(p + sun * dist);
+        let is_occ = occupied(b);
+        var ds = coarse;
+        if (is_occ) {
+            ds = fine;
+        }
+        ds = min(ds, t_exit - dist);
+        if (ds <= 0.0) {
+            break;
+        }
+        if (is_occ) {
+            let pp = p + sun * (dist + offset * ds);
+            let s = sample_volume(ecef_to_brick(pp));
+            tau = tau + (s.x + s.y + s.z) * ds;
+        }
         dist = dist + ds;
-        ds = ds * SUN_MARCH_GROWTH;
     }
-    let top = ray_sphere(p, sun, u.vert.z);
-    if (top.y >= top.x && top.y > 0.0) {
-        var t_exit = top.y;
-        let bot = ray_sphere(p, sun, u.vert.w);
-        if (bot.y >= bot.x && bot.x > 0.0 && bot.x < t_exit) {
-            t_exit = bot.x;
-        }
-        if (t_exit > dist) {
-            let half = 0.5 * (t_exit - dist);
-            for (var m: i32 = 0; m < 2; m = m + 1) {
-                let pp = p + sun * (dist + offset * half);
-                let s = sample_volume(ecef_to_brick(pp));
-                tau = tau + (s.x + s.y + s.z) * half;
-                dist = dist + half;
-            }
-        }
-    }
-    // Keep the compute-generated sun-OD texture and uploaded volume raw. Scale only
-    // this visible-light consumer; derived COD and thermal IR remain physical.
+    // Full tau is needed even when direct Beer transmittance is small: the higher
+    // scattering orders use reduced optical depths. Scale only at consumption.
     return tau * cloud_od_scale();
 }
 
@@ -1451,7 +1455,11 @@ fn march_cloud(cam: vec3<f32>, view: vec3<f32>, sun: vec3<f32>) -> CloudResult {
     }
     let coarse = u.m0.x;
     let fine = u.m0.y;
-    let max_steps = i32(u.m0.z);
+    // Cover the complete ray at the shortest interval, just as the CPU does. The
+    // preview's nominal budget must not erase distant transparent clouds. Shallow
+    // views can therefore cost more; spacing and the opacity early-out are unchanged.
+    let ray_steps = i32(ceil(seg / min(coarse, fine))) + 1;
+    let max_steps = max(i32(u.m0.z), ray_steps);
     let floor_t = u.sod_c.w;
     let e_sun = u.solar.xyz;
     let cos_vs = dot(view, sun);

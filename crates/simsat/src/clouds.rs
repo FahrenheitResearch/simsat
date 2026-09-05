@@ -11,7 +11,7 @@
 //!     line in ECEF, per step ECEF -> lat/lon/h -> projection forward -> fractional
 //!     (i, j) -> brick sample;
 //!   - adaptive stepping: coarse ~2x voxel-pitch steps through empty space using a
-//!     low-res occupancy mip, refined ~0.5x pitch inside cloud (caps 192/384);
+//!     low-res occupancy mip, refined ~0.5x pitch inside cloud (ray-length budget);
 //!   - dual-lobe Henyey-Greenstein phase per class (liquid/ice, precip on the ice
 //!     lobe), single-scatter albedo 1.0 (conservative);
 //!   - sun transmittance = sun-OD-map fetch + short-range detail taps (Nubis);
@@ -70,28 +70,22 @@ pub const AMBIENT_W_BELOW: f64 = 0.3;
 /// Default occupancy-mip downsample factor (per axis): 8x (design section 4).
 pub const OCCUPANCY_MIP_FACTOR: usize = 8;
 
-/// Secondary sun-march (design section 4, the Nubis/Frostbite light march) default
-/// step count. Short by design: exponentially-spaced samples reach the top of a thick
-/// anvil in a handful of taps while resolving the near field that dominates the edge.
-pub const SUN_MARCH_STEPS: usize = 6;
-/// Growth factor of the exponentially-spaced sun-march steps (each step is this
-/// multiple of the previous). With a `voxel_pitch` base and 6 steps the reach is
-/// `pitch*(growth^6 - 1)/(growth - 1)` = 63x pitch at growth 2 (~15.75 km at 250 m).
-pub const SUN_MARCH_GROWTH: f64 = 2.0;
-/// OFFLINE secondary sun-march step count (WS1 march-physics pass). The offline /
-/// stored-frame quality tier buys a denser, slower-growing light march: 10 steps at
-/// growth 1.5 reach `(1.5^10 - 1)/0.5` = ~113x pitch (~28 km at 250 m) with a much
-/// finer near field than the interactive `(6, 2.0)` schedule. Selected by
-/// [`MarchConfig::new`] from the [`StepQuality`]; interactive keeps `(6, 2.0)`.
-pub const SUN_MARCH_STEPS_OFFLINE: usize = 10;
-/// OFFLINE secondary sun-march growth factor (see [`SUN_MARCH_STEPS_OFFLINE`]).
-pub const SUN_MARCH_GROWTH_OFFLINE: f64 = 1.5;
+/// Maximum occupied light-ray interval in units of the finest voxel pitch.
+/// Midpoint quadrature resolves the reconstructed extinction field; the offline
+/// tier halves the interval for a deterministic integration-convergence check.
+/// These are numerical resolution choices, not cloud-brightness calibration.
+pub const SUN_MARCH_STEP_MULT: f64 = 1.0;
+/// Offline light-ray interval relative to the finest voxel pitch.
+pub const SUN_MARCH_STEP_MULT_OFFLINE: f64 = 0.5;
+/// Empty-space interval. The one-block-dilated occupancy mip has an eight-cell
+/// guard; four finest voxels stay inside that guard, including at domain entry.
+pub const SUN_MARCH_EMPTY_MULT: f64 = 4.0;
 /// Default stratified-sampling jitter amplitude for the secondary sun march, in
-/// `[0, 1]` ([`MarchConfig::sun_march_jitter_amp`]). When non-zero, the exponential
-/// schedule samples each segment at a DETERMINISTIC hash-offset point instead of
+/// `[0, 1]` ([`MarchConfig::sun_march_jitter_amp`]). When non-zero, the bounded
+/// march samples each segment at a DETERMINISTIC hash-offset point instead of
 /// the fixed midpoint (classic stratified sampling: one uniform offset per ray,
 /// from [`hash01_position`]), which decorrelates the banding a fixed-phase
-/// geometric schedule can imprint on smooth cloud fields. `0.0` = the fixed
+/// sampling schedule can imprint on smooth cloud fields. `0.0` = the fixed
 /// midpoint; `1.0` = the full stratum.
 ///
 /// DEFAULT 0.0 (a documented look decision, WS1): at full amplitude the jitter
@@ -2886,9 +2880,9 @@ impl SunOdMap {
 /// Step quality — the two design step ceilings (section 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepQuality {
-    /// 192 primary steps (interactive preview).
+    /// Interactive preview; 192 nominal primary steps, extended to cover the ray.
     Interactive,
-    /// 384 primary steps (offline / stored frame — full quality).
+    /// Offline / stored frame; 384 nominal primary steps, extended to cover the ray.
     Offline,
 }
 
@@ -2942,25 +2936,19 @@ pub struct MarchConfig {
     pub coarse_mult: f64,
     /// Fine-step multiplier inside cloud (~0.5x).
     pub fine_mult: f64,
-    /// Hard primary-step cap (192 interactive / 384 offline).
+    /// Nominal primary-step budget (192 interactive / 384 offline). The march raises
+    /// this to ceil(ray length / shortest step) + 1 when necessary, so an oblique
+    /// transparent cloud cannot disappear merely because the camera ray is long.
+    /// Preview cost can therefore grow with slant distance; sample spacing and the
+    /// view-transmittance early-out remain the quality/performance controls.
     pub max_steps: usize,
-    /// Number of exponentially-spaced steps in the secondary sun march (design
-    /// section 4). This is the DEPTH-RESOLVED cloud self-shadow: from each in-cloud
-    /// sample the march accumulates the real extinction along the sun ray FROM THAT
-    /// SAMPLE toward the top of the cloud, so a thick-anvil top (little cloud above it
-    /// toward the sun) is near-fully sunlit while the base (whole cloud above it) is
-    /// shadowed. Replaces the fix2 depth-blind total-column sun-OD-map term (M4 review
-    /// FINDING 1); the orthographic sun-OD map remains the ground-shadow source and a
-    /// total-column support measure for the thin-limit multiscatter gate. It is never
-    /// substituted for the depth-resolved sun transmittance.
-    pub sun_march_steps: usize,
-    /// Base (first) sun-march step length (m); each subsequent step grows by
-    /// `sun_march_growth`. Defaults to the voxel pitch so the near field is resolved.
+    /// Maximum occupied interval (m) in the secondary sun optical-depth integral.
+    /// Interactive uses the finest voxel pitch; offline uses half that pitch.
+    /// The consumer caps this at the finest pitch and integrates to the supported
+    /// volume exit, rather than stopping after a fixed number of samples.
     pub sun_march_step_m: f64,
-    /// Growth factor of the exponentially-spaced sun-march steps.
-    pub sun_march_growth: f64,
     /// Stratified-sampling jitter amplitude for the secondary sun march, `[0, 1]`
-    /// (WS1 march-physics pass): each ray samples its exponential segments at a
+    /// (WS1 march-physics pass): each ray samples its bounded segments at a
     /// deterministic hash-offset point (`0.5 + amp*(hash01_position(p) - 0.5)` of
     /// the segment) instead of the fixed midpoint, decorrelating schedule banding.
     /// `0.0` reproduces the fixed-midpoint march exactly (the neutrality test pins
@@ -3048,22 +3036,15 @@ pub struct MarchConfig {
 impl MarchConfig {
     /// Defaults for a step quality and voxel pitch.
     pub fn new(quality: StepQuality, voxel_pitch_m: f64) -> Self {
-        // The secondary sun-march schedule follows the step quality (WS1
-        // march-physics pass): the offline / stored-frame tier gets the denser,
-        // slower-growing (10, 1.5) schedule (finer near field AND ~28 km natural
-        // reach); interactive keeps the cheap (6, 2.0). Both are further EXTENDED
-        // per sample to the in-shell slant reach by `cloud_sun_optical_depth`.
-        let (sun_steps, sun_growth) = match quality {
-            StepQuality::Interactive => (SUN_MARCH_STEPS, SUN_MARCH_GROWTH),
-            StepQuality::Offline => (SUN_MARCH_STEPS_OFFLINE, SUN_MARCH_GROWTH_OFFLINE),
+        let sun_step_mult = match quality {
+            StepQuality::Interactive => SUN_MARCH_STEP_MULT,
+            StepQuality::Offline => SUN_MARCH_STEP_MULT_OFFLINE,
         };
         Self {
             coarse_mult: 2.0,
             fine_mult: 0.5,
             max_steps: quality.max_steps(),
-            sun_march_steps: sun_steps,
-            sun_march_step_m: voxel_pitch_m,
-            sun_march_growth: sun_growth,
+            sun_march_step_m: voxel_pitch_m * sun_step_mult,
             sun_march_jitter_amp: SUN_MARCH_JITTER_AMP,
             octaves: DEFAULT_OCTAVES,
             multiscatter_mode: CloudMultiscatterMode::LegacyOctaves,
@@ -3148,84 +3129,68 @@ impl CloudMarch {
     };
 }
 
-/// The DEPTH-RESOLVED cloud sun optical depth: the optical depth along the sun ray
-/// FROM the sample `p` toward the sun (i.e. the cloud between `p` and the sun), by a
-/// short secondary light march (the standard Nubis/Frostbite pattern, design section
-/// 4). Exponentially-spaced steps (`sun_march_steps` of them, each `sun_march_growth`x
-/// the previous, starting at `sun_march_step_m`) sample the real extinction along the
-/// sun direction and accumulate `sigma_t * ds`. The near field — which dominates the
-/// self-shadow of the sunlit face — is finely resolved; the far tail is cheap and only
-/// matters where it has already driven the transmittance to ~0.
+/// Depth-resolved optical depth from `p` toward the sun through the reconstructed
+/// extinction field: tau = integral sigma_t(s) ds. Beer transmittance is evaluated
+/// by the caller, once, from this integral (PBRT 4e, Volume Scattering / Transmittance:
+/// https://pbr-book.org/4ed/Volume_Scattering/Transmittance).
 ///
-/// This REPLACES the fix2 depth-blind term (`sun_od.sample(p) * 0.5 + detail taps`),
-/// which handed every sample `0.5 *` the WHOLE-column optical depth and so killed the
-/// direct-sun term for the top/sun-facing samples of any thick cloud (M4 review
-/// FINDING 1). A single 2-D total-column scalar fundamentally cannot give a per-depth
-/// transmittance, so the map is no longer consulted here; outside this function it
-/// survives for the ground cloud-shadow ([`ground_cloud_shadow`]), where the whole
-/// column IS the cloud between the ground and the sun, and as a missing-`tau_up`
-/// support fallback for legacy/synthetic volumes.
+/// Occupied intervals are bounded by the finest voxel pitch (half a voxel offline).
+/// The old exponential midpoint schedule and two-sample tail could miss detached
+/// clouds or multiply a thin cloud by a many-kilometre interval. Resolve the entire
+/// supported ray instead. The dilated occupancy mip skips only conservatively empty
+/// space; it does not estimate opacity. There is no optical-depth early-out: the
+/// higher-order source uses attenuated optical depths and still needs the full tau.
+///
+/// `sample()` is zero above the final sample plane, `(nz-1)*dz`, although the primary
+/// march shell extends to `nz*dz`. Clipping the light integral to the actual support
+/// avoids letting the last midpoint turn that one-cell discontinuity into a depth-
+/// dependent shadow error. Horizontal support remains the sampler's zero boundary.
+/// The orthographic sun-OD map supplies ground shadows and optional granulation
+/// coherence only; it is never substituted for this depth-resolved integral.
 fn cloud_sun_optical_depth(scene: &CloudScene, p: [f64; 3]) -> f64 {
+    let vol = scene.vol;
+    if vol.nz < 2 {
+        return 0.0;
+    }
+    let Some((t_enter, t_exit)) =
+        ray_shell_segment(p, scene.sun_ecef, vol.r_bottom(), vol.r_top() - vol.dz_m)
+    else {
+        return 0.0;
+    };
     let cfg = &scene.cfg;
-    let n = cfg.sun_march_steps.max(1);
-    let growth = cfg.sun_march_growth.max(1.0);
-    let base = cfg.sun_march_step_m.max(1.0);
-    // Deterministic stratified jitter (see MarchConfig::sun_march_jitter_amp): one
-    // hash offset per ray applied within every segment; amp 0 = the fixed midpoint.
+    let pitch = vol.voxel_pitch_m();
+    let fine = cfg.sun_march_step_m.clamp(1.0, pitch);
+    // Respect a smaller custom occupancy factor as well as the shipping factor 8.
+    let coarse = pitch * SUN_MARCH_EMPTY_MULT.min((scene.mip.factor as f64 * 0.5).max(1.0));
     let amp = cfg.sun_march_jitter_amp.clamp(0.0, 1.0);
     let offset = if amp > 0.0 {
         0.5 + amp * (hash01_position(p) - 0.5)
     } else {
         0.5
     };
-    let mut tau = 0.0f64;
-    let mut dist = 0.0f64;
-    let mut ds = base;
     let coherence = scene.sun_od.gran_coherence.as_ref();
-    for _ in 0..n {
-        // Sample within the segment (dist .. dist+ds) at the stratified offset,
-        // toward the sun. Samples the SAME (optionally granulated, coherence-gated)
-        // field as the primary view march, so cloud self-shadowing matches the
-        // eroded cloud.
-        let pp = madd3(p, scene.sun_ecef, dist + offset * ds);
-        let (fi, fj, fk, _) = ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
-        tau += scene
-            .vol
-            .sample_granulated_gated(fi, fj, fk, cfg.granulation, coherence)
-            .total_ext()
-            * ds;
-        dist += ds;
-        ds *= growth;
-    }
-    // TAIL EXTENSION (WS1 march-physics pass): the fixed geometric schedule reaches
-    // only `base*(g^n - 1)/(g - 1)` of slant (~63x pitch interactive, ~113x
-    // offline), so an anvil 20+ km along a low sun ray cast NO shadow at all on the
-    // cloud below it. Cover the REMAINING in-shell slant toward the sun (up to
-    // `ray_shell_segment`'s exit) with two stratified samples. The near field keeps
-    // the EXACT unextended schedule — cloud self-shadow accuracy is never degraded,
-    // and a short high-sun column (exit inside the natural reach) is bit-identical
-    // to the unextended march. The tail is a coarse, honest, jitter-decorrelated
-    // estimate of far occlusion; its reach discontinuity at the horizon-grazing
-    // ground/shell-exit switch only moves far samples, not the near field.
-    if let Some((_, t_exit)) =
-        ray_shell_segment(p, scene.sun_ecef, scene.vol.r_bottom(), scene.vol.r_top())
-        && t_exit > dist
-    {
-        let half = 0.5 * (t_exit - dist);
-        for _ in 0..2 {
-            let pp = madd3(p, scene.sun_ecef, dist + offset * half);
-            let (fi, fj, fk, _) =
-                ecef_to_brick(pp, scene.georef, scene.vol.z_min_m, scene.vol.dz_m);
-            tau += scene
-                .vol
-                .sample_granulated_gated(fi, fj, fk, cfg.granulation, coherence)
-                .total_ext()
-                * half;
-            dist += half;
+    let mut tau = 0.0;
+    let mut dist = t_enter;
+    while dist < t_exit {
+        let start = madd3(p, scene.sun_ecef, dist);
+        let (fi, fj, fk, _) = ecef_to_brick(start, scene.georef, vol.z_min_m, vol.dz_m);
+        let occupied = scene.mip.maxext_at(fi, fj, fk) > 0.0;
+        let ds = (if occupied { fine } else { coarse }).min(t_exit - dist);
+        if ds <= 0.0 {
+            break;
         }
+        if occupied {
+            let pp = madd3(p, scene.sun_ecef, dist + offset * ds);
+            let (mi, mj, mk, _) = ecef_to_brick(pp, scene.georef, vol.z_min_m, vol.dz_m);
+            tau += vol
+                .sample_granulated_gated(mi, mj, mk, cfg.granulation, coherence)
+                .total_ext()
+                * ds;
+        }
+        dist += ds;
     }
-    // The decoded field and cached sun-OD map stay physical/raw. The visible QA
-    // multiplier is applied at consumption so derived COD and thermal IR are untouched.
+    // Cached extinction and tau_up remain physical/raw; only this visible consumer
+    // receives the explicitly selected optical-depth scale. Thermal IR is untouched.
     tau * cfg.validated_cloud_optical_depth_scale()
 }
 
@@ -3251,7 +3216,11 @@ pub fn sun_horizon_disk_fraction(r: f64, mu_sun: f64) -> f64 {
 /// March the cloud volume along one view ray (design section 4). Front-to-back from
 /// the brick-shell entry to the ground/exit, adaptive stepping via the occupancy mip.
 /// Returns the in-scattered cloud radiance, the view transmittance, and the cloud's
-/// visual-centroid traversal fraction. Twin of the WGSL `march_cloud`.
+/// visual-centroid traversal fraction. The step budget covers the complete ray at
+/// the shortest configured interval; opacity early-out remains active. In particular,
+/// a long, optically thin oblique ray must not silently become clear after 384 steps.
+/// This also applies to GPU preview: correctness can cost more than its nominal
+/// frame budget. Twin of the WGSL `march_cloud`.
 pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMarch {
     let vol = scene.vol;
     let Some((t_enter, t_exit)) = ray_shell_segment(cam, view, vol.r_bottom(), vol.r_top()) else {
@@ -3264,6 +3233,11 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
     let pitch = vol.voxel_pitch_m();
     let coarse = scene.cfg.coarse_mult * pitch;
     let fine = scene.cfg.fine_mult * pitch;
+    // At most ceil(seg / min_step) full intervals plus one final clipped interval.
+    // Retain the nominal budget for short rays, but never use it to cut off a long
+    // transparent path. Every sample and the existing opacity early-out stay intact.
+    let ray_steps = (seg / fine.min(coarse)).ceil() as usize;
+    let max_steps = scene.cfg.max_steps.max(ray_steps.saturating_add(1));
     let e_sun = SOLAR_IRRADIANCE_RGB;
     let cos_vs = dot3(view, scene.sun_ecef);
     let od_scale = scene.cfg.validated_cloud_optical_depth_scale();
@@ -3276,7 +3250,7 @@ pub fn march_cloud(scene: &CloudScene, cam: [f64; 3], view: [f64; 3]) -> CloudMa
     let mut w_weight = 0.0f64;
     let mut steps = 0usize;
 
-    while t < t_exit && steps < scene.cfg.max_steps && trans > scene.cfg.transmittance_floor {
+    while t < t_exit && steps < max_steps && trans > scene.cfg.transmittance_floor {
         let p = madd3(cam, view, t);
         let (fi, fj, fk, _r) = ecef_to_brick(p, scene.georef, vol.z_min_m, vol.dz_m);
         let occ = scene.mip.maxext_at(fi, fj, fk);
@@ -5413,6 +5387,127 @@ mod tests {
     }
 
     #[test]
+    fn long_oblique_thin_cloud_matches_analytic_transmittance() {
+        // A realistic 0..20 km cloud shell viewed from 24 km at a shallow angle.
+        // The ray remains within this broad horizontal domain all the way to ground.
+        // Its optically thin cloud does not trigger the opacity early-out, and the
+        // full path exceeds both old primary budgets at the existing 125 m spacing.
+        let (nx, ny, nz) = (100, 24, 80);
+        let dz = 250.0;
+        let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (2.0e-6, 0.0, 0.0));
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let cam = brick_to_ecef(&georef, 10.0, 12.0, 96.0, 0.0, dz).unwrap();
+        let target = brick_to_ecef(&georef, 35.0, 12.0, 34.0, 0.0, dz).unwrap();
+        let view = norm3([target[0] - cam[0], target[1] - cam[1], target[2] - cam[2]]);
+        let sun = norm3(target);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
+        let (luts, sky_sh) = shared_luts();
+        let (enter, exit) = ray_shell_segment(cam, view, vol.r_bottom(), vol.r_top() - dz).unwrap();
+        let end = madd3(cam, view, exit);
+        let (end_i, end_j, _, _) = ecef_to_brick(end, &georef, 0.0, dz);
+        assert!((1.0..(nx - 2) as f64).contains(&end_i));
+        assert!((1.0..(ny - 2) as f64).contains(&end_j));
+        let sigma = vol.total_ext_cell(50, 12, 40);
+        let expected_tau = sigma * (exit - enter);
+        for quality in [StepQuality::Interactive, StepQuality::Offline] {
+            let scene = CloudScene {
+                vol: &vol,
+                mip: &mip,
+                sun_od: &sun_od,
+                georef: &georef,
+                luts,
+                sky_sh,
+                sun_ecef: sun,
+                cfg: MarchConfig {
+                    cloud_optical_depth_scale: 1.0,
+                    multiscatter_mode: CloudMultiscatterMode::SingleScatter,
+                    ..MarchConfig::new(quality, vol.voxel_pitch_m())
+                },
+            };
+            let fine = scene.cfg.fine_mult * vol.voxel_pitch_m();
+            assert!(exit - enter > scene.cfg.max_steps as f64 * fine);
+            let result = march_cloud(&scene, cam, view);
+            // The primary march retains its original midpoint sampling across the
+            // final sample-plane discontinuity. Its boundary error is <= one step.
+            let actual_tau = -result.transmittance.ln();
+            assert!(
+                (actual_tau - expected_tau).abs() <= sigma * fine + 1.0e-8,
+                "long thin ray: tau {actual_tau}, analytic {expected_tau}"
+            );
+            assert!(result.transmittance > scene.cfg.transmittance_floor);
+        }
+    }
+
+    #[test]
+    fn oblique_primary_march_reaches_detached_cloud_beyond_old_budget() {
+        // A barely scattering foreground keeps the occupancy conservative and the
+        // ray transparent. A detached cloud lies AFTER the old 384-step endpoint.
+        // The independent dense integral must include that cloud, and its opacity
+        // must place the returned centroid beyond the old endpoint as well.
+        let (nx, ny, nz) = (100, 24, 80);
+        let dz = 250.0;
+        let vol = build_volume(nx, ny, nz, dz, 3000.0, |i, _, k| {
+            let detached = (40..44).contains(&i) && (2..24).contains(&k);
+            (1.0e-8 + if detached { 2.0e-4 } else { 0.0 }, 0.0, 0.0)
+        });
+        let georef = test_georef(nx, ny, 3000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let cam = brick_to_ecef(&georef, 10.0, 12.0, 96.0, 0.0, dz).unwrap();
+        let target = brick_to_ecef(&georef, 35.0, 12.0, 34.0, 0.0, dz).unwrap();
+        let view = norm3([target[0] - cam[0], target[1] - cam[1], target[2] - cam[2]]);
+        let sun = norm3(target);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
+        let (luts, sky_sh) = shared_luts();
+        let scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts,
+            sky_sh,
+            sun_ecef: sun,
+            cfg: MarchConfig {
+                cloud_optical_depth_scale: 1.0,
+                multiscatter_mode: CloudMultiscatterMode::SingleScatter,
+                ..MarchConfig::new(StepQuality::Offline, vol.voxel_pitch_m())
+            },
+        };
+        let (enter, exit) = ray_shell_segment(cam, view, vol.r_bottom(), vol.r_top()).unwrap();
+        let old_end =
+            enter + scene.cfg.max_steps as f64 * scene.cfg.fine_mult * vol.voxel_pitch_m();
+        let old_p = madd3(cam, view, old_end);
+        let (old_i, _, _, _) = ecef_to_brick(old_p, &georef, 0.0, dz);
+        assert!(
+            old_i < 39.0,
+            "fixture cloud must be beyond old budget: i={old_i}"
+        );
+        let count = ((exit - enter) / (dz / 32.0)).ceil() as usize;
+        let ds = (exit - enter) / count as f64;
+        let mut reference_tau = 0.0;
+        for step in 0..count {
+            let p = madd3(cam, view, enter + (step as f64 + 0.5) * ds);
+            let (fi, fj, fk, _) = ecef_to_brick(p, &georef, 0.0, dz);
+            reference_tau += vol.sample(fi, fj, fk).total_ext() * ds;
+        }
+        assert!(
+            reference_tau > 1.0,
+            "fixture must contain an optically significant far cloud"
+        );
+        let result = march_cloud(&scene, cam, view);
+        assert!(
+            (-result.transmittance.ln() - reference_tau).abs() < 0.005,
+            "far cloud: tau {}, dense reference {reference_tau}",
+            -result.transmittance.ln()
+        );
+        assert!(
+            result.mean_t_m > old_end,
+            "far cloud must set centroid: {} <= {old_end}",
+            result.mean_t_m
+        );
+    }
+
+    #[test]
     fn empty_volume_marches_clear() {
         let (nx, ny, nz) = (16, 16, 16);
         let vol = build_volume(nx, ny, nz, 250.0, 3000.0, |_, _, _| (0.0, 0.0, 0.0));
@@ -6307,9 +6402,8 @@ mod tests {
         // A dense occluder ~20 km along the sun ray from the sample: the OLD fixed
         // interactive schedule (6 steps, growth 2, base = pitch 250 m) reached only
         // ~15.75 km of slant, so this occluder cast NO shadow at all (tau == 0,
-        // measured on the fail-before probe at ec80e88). The WS1 tail extension
-        // covers the remaining in-shell slant toward the sun with two stratified
-        // samples, so the occluder is sampled (fails before the fix).
+        // measured on the fail-before probe at ec80e88). The bounded light integral
+        // now resolves that distant cloud across its complete supported interval.
         let (nx, ny, nz) = (100, 16, 48);
         let (dx, dz) = (3000.0, 250.0);
         let vol = build_volume(nx, ny, nz, dz, dx, |i, j, k| {
@@ -6351,30 +6445,18 @@ mod tests {
     }
 
     #[test]
-    fn offline_sun_schedule_converges_better_than_interactive() {
-        // A uniform slab, sun at the local zenith: the true sampled-field optical
-        // depth from a bottom sample to the field top is analytic (the trilinear
-        // field is sigma up to z = (nz-1)*dz, 0 above). The denser offline (10, 1.5)
-        // schedule must approximate it better than the interactive (6, 2.0) one.
+    fn sun_march_uniform_slab_matches_analytic_depth_at_fractional_origins() {
         let (nx, ny, nz) = (16, 16, 40);
         let dz = 250.0;
-        let sigma = 2.0e-4;
-        let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (sigma, 0.0, 0.0));
+        let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, _| (2.0e-4, 0.0, 0.0));
+        let sigma = vol.total_ext_cell(8, 8, 8);
         let georef = test_georef(nx, ny, 3000.0);
         let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
         let center = brick_to_ecef(&georef, 8.0, 8.0, 20.0, 0.0, dz).unwrap();
-        let sun = norm3(center); // local zenith over the sample column
+        let sun = norm3(center);
         let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
         let (luts, sky_sh) = shared_luts();
-        let p = brick_to_ecef(&georef, 8.0, 8.0, 2.0, 0.0, dz).unwrap();
-        let tau_ref = sigma * ((nz - 1) as f64 - 2.0) * dz;
-        let tau_at = |quality: StepQuality| {
-            let cfg = MarchConfig {
-                sun_march_jitter_amp: 0.0,
-                // The convergence reference is the unscaled analytic optical depth.
-                cloud_optical_depth_scale: 1.0,
-                ..MarchConfig::new(quality, vol.voxel_pitch_m())
-            };
+        for quality in [StepQuality::Interactive, StepQuality::Offline] {
             let scene = CloudScene {
                 vol: &vol,
                 mip: &mip,
@@ -6383,24 +6465,128 @@ mod tests {
                 luts,
                 sky_sh,
                 sun_ecef: sun,
-                cfg,
+                cfg: MarchConfig {
+                    cloud_optical_depth_scale: 1.0,
+                    ..MarchConfig::new(quality, vol.voxel_pitch_m())
+                },
             };
-            cloud_sun_optical_depth(&scene, p)
+            for k in [0.01, 2.125, 17.333, 38.95] {
+                let p = brick_to_ecef(&georef, 8.0, 8.0, k, 0.0, dz).unwrap();
+                let expected = sigma * ((nz - 1) as f64 - k) * dz;
+                let actual = cloud_sun_optical_depth(&scene, p);
+                assert!(
+                    (actual - expected).abs() < 1.0e-7,
+                    "slab origin {k}: tau {actual}, analytic {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sun_march_preserves_translated_detached_layer_optical_depth() {
+        // Two nonzero sample planes reconstruct a layer with two linear skirts.
+        // Its exact vertical integral is 2*dz*sigma wherever the layer is placed.
+        // Moving it through the old exponential schedule could miss it entirely.
+        let (nx, ny, nz) = (16, 16, 100);
+        let dz = 250.0;
+        let georef = test_georef(nx, ny, 3000.0);
+        let p = brick_to_ecef(&georef, 8.0, 8.0, 2.25, 0.0, dz).unwrap();
+        let sun = norm3(p);
+        let (luts, sky_sh) = shared_luts();
+        for layer in [12, 20, 32, 46, 64, 80] {
+            let vol = build_volume(nx, ny, nz, dz, 3000.0, |_, _, k| {
+                (
+                    if (layer..layer + 2).contains(&k) {
+                        5.0e-4
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                )
+            });
+            let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+            let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
+            let expected = 2.0 * dz * vol.total_ext_cell(8, 8, layer);
+            for quality in [StepQuality::Interactive, StepQuality::Offline] {
+                let scene = CloudScene {
+                    vol: &vol,
+                    mip: &mip,
+                    sun_od: &sun_od,
+                    georef: &georef,
+                    luts,
+                    sky_sh,
+                    sun_ecef: sun,
+                    cfg: MarchConfig {
+                        cloud_optical_depth_scale: 1.0,
+                        ..MarchConfig::new(quality, vol.voxel_pitch_m())
+                    },
+                };
+                let actual = cloud_sun_optical_depth(&scene, p);
+                assert!(
+                    (actual - expected).abs() < 1.0e-7,
+                    "layer {layer}: tau {actual}, analytic {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sun_march_oblique_varying_field_converges_under_interval_halving() {
+        let (nx, ny, nz) = (48, 16, 48);
+        let dz = 250.0;
+        let vol = build_volume(nx, ny, nz, dz, 1000.0, |i, _, k| {
+            let x = i as f64 / (nx - 1) as f64;
+            let z = k as f64 / (nz - 1) as f64;
+            (1.0e-3 * x * x * z * z, 0.0, 0.0)
+        });
+        let georef = test_georef(nx, ny, 1000.0);
+        let mip = OccupancyMip::build(&vol, OCCUPANCY_MIP_FACTOR);
+        let p = brick_to_ecef(&georef, 10.0, 8.0, 3.27, 0.0, dz).unwrap();
+        let q = brick_to_ecef(&georef, 25.0, 8.0, 45.0, 0.0, dz).unwrap();
+        let sun = norm3([q[0] - p[0], q[1] - p[1], q[2] - p[2]]);
+        let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
+        let (luts, sky_sh) = shared_luts();
+        let mut scene = CloudScene {
+            vol: &vol,
+            mip: &mip,
+            sun_od: &sun_od,
+            georef: &georef,
+            luts,
+            sky_sh,
+            sun_ecef: sun,
+            cfg: MarchConfig {
+                cloud_optical_depth_scale: 1.0,
+                ..MarchConfig::new(StepQuality::Interactive, vol.voxel_pitch_m())
+            },
         };
-        let err_int = (tau_at(StepQuality::Interactive) - tau_ref).abs();
-        let err_off = (tau_at(StepQuality::Offline) - tau_ref).abs();
+        let coarse = cloud_sun_optical_depth(&scene, p);
+        scene.cfg.sun_march_step_m *= 0.5;
+        let fine = cloud_sun_optical_depth(&scene, p);
+        // Independent dense integral: no occupancy, no production stepping helper.
+        let (_, exit) = ray_shell_segment(p, sun, vol.r_bottom(), vol.r_top() - dz).unwrap();
+        let count = (exit / (dz / 64.0)).ceil() as usize;
+        let ds = exit / count as f64;
+        let mut reference = 0.0;
+        for step in 0..count {
+            let pp = madd3(p, sun, (step as f64 + 0.5) * ds);
+            let (fi, fj, fk, _) = ecef_to_brick(pp, &georef, 0.0, dz);
+            reference += vol.sample(fi, fj, fk).total_ext() * ds;
+        }
+        let coarse_error = (coarse - reference).abs();
+        let fine_error = (fine - reference).abs();
         assert!(
-            err_off < err_int,
-            "the offline schedule must converge better: {err_off} !< {err_int} (tau_ref {tau_ref})"
+            fine_error <= coarse_error + 1.0e-8,
+            "halving must converge: coarse {coarse_error}, fine {fine_error}"
         );
         assert!(
-            err_off < 0.35 * tau_ref,
-            "offline error should be moderate: {err_off} vs tau {tau_ref}"
+            fine_error < reference * 5.0e-4,
+            "offline relative error exceeds 0.05%: {fine_error} / {reference}"
         );
     }
 
     #[test]
-    fn sun_march_jitter_is_deterministic_and_amp0_neutral() {
+    fn sun_march_jitter_is_deterministic_and_amp0_matches_midpoints() {
         // The hash is a pure, platform-stable function of the position.
         let a = hash01_position([1.0e6, -2.0e6, 5.5e6]);
         let b = hash01_position([1.0e6, -2.0e6, 5.5e6]);
@@ -6421,8 +6607,8 @@ mod tests {
         let sun = norm3(center);
         let sun_od = accumulate_sun_od(&vol, &georef, sun, 4);
         let (luts, sky_sh) = shared_luts();
-        // Sample high enough that the shell exit is closer than the natural reach,
-        // so no schedule extension applies (the reference below assumes base pitch).
+        // Uniform occupied column: independently reproduce the bounded midpoint
+        // integral without using the production stepping or occupancy decisions.
         let p = brick_to_ecef(&georef, 8.0, 8.0, 20.0, 0.0, dz).unwrap();
         let tau_amp = |amp: f64| {
             let cfg = MarchConfig {
@@ -6443,19 +6629,19 @@ mod tests {
             };
             cloud_sun_optical_depth(&scene, p)
         };
-        // Neutrality: amp 0 == an independently-computed fixed-midpoint schedule.
+        let (_, exit) = ray_shell_segment(p, sun, vol.r_bottom(), vol.r_top() - dz).unwrap();
         let mut tau_ref = 0.0f64;
-        let (mut dist, mut ds) = (0.0f64, vol.voxel_pitch_m());
-        for _ in 0..SUN_MARCH_STEPS {
+        let mut dist = 0.0f64;
+        while dist < exit {
+            let ds = vol.voxel_pitch_m().min(exit - dist);
             let pp = madd3(p, sun, dist + 0.5 * ds);
             let (fi, fj, fk, _) = ecef_to_brick(pp, &georef, vol.z_min_m, vol.dz_m);
             tau_ref += vol.sample(fi, fj, fk).total_ext() * ds;
             dist += ds;
-            ds *= SUN_MARCH_GROWTH;
         }
         assert!(
             (tau_amp(0.0) - tau_ref).abs() < 1.0e-12,
-            "amp 0 must reproduce the fixed-midpoint march: {} vs {tau_ref}",
+            "amp 0 must match bounded midpoints: {} vs {tau_ref}",
             tau_amp(0.0)
         );
         // Determinism of the jittered march.
