@@ -1,0 +1,52 @@
+{
+  "schema": "simsat-abi-solar-weights-v1",
+  "source_url": "https://lasp.colorado.edu/lisird/latis/dap/tsis1_hsrs.csv?wavelength>=400&wavelength<=1000",
+  "source_sha256": "ea6d0e219925a69607a485451ed2a8dcaf8b2f583b646b04a94122feef4d697f",
+  "source_bytes": 28797583,
+  "source_paper": "https://doi.org/10.1029/2020GL091709",
+  "source_retrieved_utc": "2026-09-05T05:05:39.822157+00:00",
+  "source_reference": "TSIS-1 HSRS reference solar spectrum at 1 AU; not observation-date irradiance",
+  "integration": "two-point Gauss per merged E and R interval; piecewise-linear L_lambda/E_lambda at exact SRF nodes",
+  "units": {
+    "wavelength": "um",
+    "weights": "W m^-2 at 1 AU"
+  },
+  "uncertainty": "source spectral uncertainty column retained in original retrieval; covariance unavailable, not propagated to weights",
+  "limitations": [
+    "scalar unpolarized transfer only",
+    "transfer must resolve atmospheric absorption structure separately",
+    "response includes exactly the tabulated endpoints; unprovided out-of-band tails are not inferred"
+  ],
+  "bands": [
+    {
+      "band": 1,
+      "file": "abi-fm4-c01-hsrs-weights.txt",
+      "sha256": "d98f065f17fbf69e02b895657fa41b28ab4a2006ea002ca7bf10896db63e5eb7",
+      "srf_sha256": "8076ba1b487b706574b55158e02a69a9a7e6b457c6ec9d20c92180b5b32c47fe",
+      "nodes": 2628,
+      "response_integral_um": 0.037568076453999996,
+      "solar_response_integral_w_m2": 76.71185464729498,
+      "mean_solar_irradiance_w_m2_um": 2041.9425716731691
+    },
+    {
+      "band": 2,
+      "file": "abi-fm4-c02-hsrs-weights.txt",
+      "sha256": "a383effcf6ba5bbee6642350f0220a23152d88052b91408593b58230755069e5",
+      "srf_sha256": "7b025f14cb49fd02e898f0af3dc57155211f87a8fc3a41e27f1462a1c0a53de6",
+      "nodes": 3167,
+      "response_integral_um": 0.082705002422,
+      "solar_response_integral_w_m2": 134.15676468201963,
+      "mean_solar_irradiance_w_m2_um": 1622.1118524063202
+    },
+    {
+      "band": 3,
+      "file": "abi-fm4-c03-hsrs-weights.txt",
+      "sha256": "be25cb14b4a0785e545e5fd8542539d259bcc63ec3921590ae908eb1defde79f",
+      "srf_sha256": "ba962645bdb8ca434c8c474ae7d5d6cf0bb337fd96e0a21e55e7ca9b9f4e8b7e",
+      "nodes": 1027,
+      "response_integral_um": 0.034775541778000005,
+      "solar_response_integral_w_m2": 33.14784312859485,
+      "mean_solar_irradiance_w_m2_um": 953.1941541041674
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 3020,
+  "check": "spectral-molecular-cpu-wgsl",
+  "co2_ppm": [
+    0,
+    300,
+    360,
+    1000
+  ],
+  "driver": "NVIDIA",
+  "driver_info": "610.74",
+  "max_relative_error": {
+    "cross_section": 7.554021816957857e-07,
+    "king_factor": 1.6404832137162373e-07,
+    "optical_depth": 7.718936336775784e-07,
+    "phase": 2.2374324770702003e-07
+  },
+  "passed": true,
+  "scattering_cosines": [
+    -1,
+    -0.5,
+    0,
+    0.5,
+    1
+  ],
+  "tolerance": 2e-05,
+  "wavelength_um": [
+    0.25,
+    1.0
+  ]
+}

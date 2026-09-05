@@ -146,10 +146,13 @@ pub mod precision_audit;
 pub mod render;
 pub mod sandwich;
 pub mod solar;
+pub mod spectral_molecular;
+pub mod spectral_transport;
 pub mod store_out;
 pub mod thermal_sensor;
 pub mod topdown;
 pub mod visible_sensor;
+pub mod visible_solar;
 pub mod web_layer;
 pub mod wv;
 

@@ -1701,8 +1701,8 @@ mod tests {
         let a = sample_medium(OZONE_CENTER_M, &display);
         let b = sample_medium(OZONE_CENTER_M, &sensor);
         assert_eq!(a.scattering, b.scattering);
-        for c in 0..3 {
-            let expected = OZONE_ABSORPTION[c] * (1.0 - 1.0 / OZONE_STRENGTH);
+        for (c, ozone_absorption) in OZONE_ABSORPTION.iter().enumerate() {
+            let expected = ozone_absorption * (1.0 - 1.0 / OZONE_STRENGTH);
             assert!((a.extinction[c] - b.extinction[c] - expected).abs() < 1e-18);
         }
         assert_eq!(

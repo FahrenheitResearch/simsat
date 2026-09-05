@@ -1,0 +1,27 @@
+{
+  "absolute_tolerance": 1e-08,
+  "adapter": "NVIDIA GeForce RTX 3080",
+  "backend": "Vulkan",
+  "cases": 600,
+  "check": "spectral-first-order-transport-cpu-wgsl",
+  "driver": "NVIDIA",
+  "driver_info": "610.74",
+  "limitations": "Tests direct first-order kernels; not full image or multiple-scattering parity.",
+  "max_absolute_error": [
+    1.0712526338219064e-08,
+    2.423994442668498e-09,
+    7.447907213187221e-08
+  ],
+  "max_relative_error_where_reference_above_1e-8": [
+    9.328471649719868e-07,
+    4.158952638826563e-07,
+    1.0053623194672814e-07
+  ],
+  "outputs": [
+    "scattered_L_over_E_sr1",
+    "surface_L_over_E_sr1",
+    "view_transmittance"
+  ],
+  "passed": true,
+  "relative_tolerance": 2e-05
+}
